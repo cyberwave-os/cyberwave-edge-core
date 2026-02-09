@@ -20,7 +20,7 @@ rm -rf build dist *.spec __pyinstaller_entry.py
 # Create a wrapper entry point that uses absolute imports
 cat > __pyinstaller_entry.py << 'EOF'
 """PyInstaller entry point for Cyberwave CLI."""
-from ccyberwave_edge_core.main import main
+from cyberwave_edge_core.main import main
 
 if __name__ == "__main__":
     main()
@@ -31,7 +31,7 @@ echo "Building standalone binary..."
 pyinstaller \
     --onefile \
     --name cyberwave-edge-core \
-    --hidden-import ccyberwave_edge_core \
+    --hidden-import cyberwave_edge_core \
     --hidden-import click \
     --hidden-import rich \
     --hidden-import httpx \
