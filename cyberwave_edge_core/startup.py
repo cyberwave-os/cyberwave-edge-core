@@ -15,11 +15,13 @@ import json
 import logging
 import os
 import platform
+import shutil
+import subprocess
 import uuid
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from cyberwave import Cyberwave
@@ -116,7 +118,7 @@ def check_mqtt_connection(token: str) -> bool:
     defaults.  Returns ``True`` if the connection succeeds.
     """
     try:
-        client = Cyberwave(token=token)
+        client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
         if connected:
@@ -133,14 +135,12 @@ def load_devices() -> List[Device]:
     The file is expected to contain a JSON array of device objects::
 
         [
-          {
-            "slug": "the-robot-studio/so101",
+          {"slug": "the-robot-studio/so101",
             "metadata": {"type": "follower-arm"},
             "name": "so101",
             "port": "/dev/ttty"
           },
-          {
-            "slug": "cyberwave/camera",
+          {"slug": "cyberwave/camera",
             "metadata": {"type": "camera"},
             "name": "camera1",
             "port": "/dev/video0"
@@ -243,13 +243,178 @@ def get_or_create_fingerprint() -> Optional[str]:
     return fingerprint
 
 
+def _run_docker_image(
+    image: str,
+    *,
+    twin_uuid: str,
+    token: str,
+) -> bool:
+    """Pull and run a driver Docker container for a twin.
+
+    The container is started in detached mode with ``--restart unless-stopped``
+    so it persists across reboots.  Environment variables are passed so the
+    driver can authenticate with the Cyberwave backend and know which twin it
+    controls.
+
+    Returns ``True`` if the container was started successfully.
+    """
+    if not shutil.which("docker"):
+        logger.error("Docker is not installed or not in PATH")
+        return False
+
+    container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+
+    # Remove any existing container with the same name (idempotent re-runs)
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True,
+        timeout=30,
+    )
+
+    # Pull the image
+    logger.info("Pulling docker image: %s", image)
+    try:
+        subprocess.run(
+            ["docker", "pull", image],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to pull docker image %s: %s", image, exc.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("Docker pull timed out for image: %s", image)
+        return False
+
+    # Build env vars for the container
+    env_vars: List[str] = [
+        "-e",
+        f"CYBERWAVE_TWIN_UUID={twin_uuid}",
+        "-e",
+        f"CYBERWAVE_TOKEN={token}",
+    ]
+    api_url = os.getenv("CYBERWAVE_API_URL")
+    if api_url:
+        env_vars += ["-e", f"CYBERWAVE_API_URL={api_url}"]
+    mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST")
+    if mqtt_host:
+        env_vars += ["-e", f"CYBERWAVE_MQTT_HOST={mqtt_host}"]
+
+    # Run the container
+    cmd = [
+        "docker",
+        "run",
+        "--detach",
+        "--restart",
+        "unless-stopped",
+        "--network",
+        "host",
+        "--name",
+        container_name,
+        *env_vars,
+        image,
+    ]
+    logger.info("Starting docker container %s from image %s", container_name, image)
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return True
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to start container %s: %s", container_name, exc.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("Docker run timed out for image: %s", image)
+        return False
+
+
+def fetch_and_run_twin_drivers(
+    token: str,
+    environment_uuid: str,
+    fingerprint: str,
+) -> List[Dict[str, Any]]:
+    """Fetch twins for the environment, match by edge fingerprint, and run drivers.
+
+    For each twin in the environment whose ``metadata.edge_fingerprint``
+    matches the local fingerprint, this function fetches the twin's asset,
+    looks for a ``driver_docker_image`` key in the asset metadata, and starts
+    the corresponding Docker container.
+
+    Returns a list of result dicts with twin info and whether the container
+    started successfully.
+    """
+    client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
+
+    # List twins for the environment via the SDK
+    twins = client.twins.list(environment_id=environment_uuid)
+    if not twins:
+        logger.info("No twins found for environment %s", environment_uuid)
+        return []
+
+    results: List[Dict[str, Any]] = []
+
+    for twin in twins:
+        twin_uuid = twin.uuid
+
+        # The CLI writes edge_fingerprint into twin metadata when the user
+        # selects which twins this edge controls.  Match on that field.
+        twin_metadata = twin.metadata if isinstance(twin.metadata, dict) else {}
+        if twin_metadata.get("edge_fingerprint") != fingerprint:
+            continue
+
+        logger.info(
+            "Twin '%s' (%s) is linked to this edge (fingerprint=%s)",
+            twin.name,
+            twin_uuid,
+            fingerprint,
+        )
+
+        # Get the asset to check for driver_docker_image
+        try:
+            asset = client.assets.get(twin.asset_uuid)
+        except Exception as exc:
+            logger.warning(
+                "Failed to get asset %s for twin %s: %s",
+                twin.asset_uuid,
+                twin_uuid,
+                exc,
+            )
+            continue
+
+        asset_metadata = asset.metadata or {}
+        driver_image = asset_metadata.get("driver_docker_image")
+
+        if not driver_image:
+            logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
+            continue
+
+        logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
+        success = _run_docker_image(driver_image, twin_uuid=twin_uuid, token=token)
+        results.append(
+            {
+                "twin_uuid": twin_uuid,
+                "twin_name": twin.name,
+                "driver_image": driver_image,
+                "success": success,
+            }
+        )
+
+    return results
+
+
 def register_edge(token: str) -> bool:
     fingerprint = get_or_create_fingerprint()
     if not fingerprint:
         logger.warning("Could not load or create edge fingerprint")
         return False
 
-    client = Cyberwave(token=token)
+    client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
     edge = client.edges.create(
         fingerprint=fingerprint,
     )
@@ -323,12 +488,27 @@ def run_startup_checks() -> bool:
         console.print(f"[green]OK[/green] [dim]({environment_uuid})[/dim]")
     else:
         console.print("[yellow]NONE[/yellow]")
-        console.print(
-            f"\n  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]"
-        )
-        console.print(
-            "  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]"
-        )
+        console.print(f"\n  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]")
+        console.print("  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]")
+
+    # 6 — fetch twins, match by fingerprint, and run driver docker images
+    if environment_uuid:
+        console.print("  Fetching twin drivers …", end=" ")
+        fingerprint = get_or_create_fingerprint()
+        if not fingerprint:
+            console.print("[red]FAIL[/red]")
+            console.print("\n  [red]Could not determine edge fingerprint.[/red]")
+        else:
+            results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
+            if not results:
+                console.print("[yellow]NONE[/yellow]")
+                console.print("  [dim]No twins with driver images matched this edge.[/dim]")
+            else:
+                started = sum(1 for r in results if r["success"])
+                console.print(f"[green]{started}/{len(results)} driver(s) started[/green]")
+                for r in results:
+                    status = "[green]OK[/green]" if r["success"] else "[red]FAIL[/red]"
+                    console.print(f"    {r['twin_name']} → {r['driver_image']} {status}")
 
     console.print("\n[green]All startup checks passed.[/green]\n")
     return True

@@ -32,4 +32,4 @@ The edge core should:
 4. ~~Get or create the edge with the Cyberwave Backend (device fingerprint, persisted in ~/.cyberwave/fingerprint.json)~~
 5. Check if the MQTT connection works DONE
 6. ~~Check if there is an environment connected to the edge (in ~/.cyberwave/environment.json, format: {"uuid":"unique-uuid-of-the-environment"})~~
-7. If so, call the API and download the twins for that particular environment. Check if any digital twin of the environments have the fingerprint of the edge
+7. ~~If so, call the API and download the twins for that particular environment. Check if any digital twin of the environments have the fingerprint of the edge. If so, for every twin: call the assets API with the UUID of the asset of that twin; in the asset's metadata, look for the driver_docker_image field; then run the docker image~~
