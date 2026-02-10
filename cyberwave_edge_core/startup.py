@@ -5,6 +5,7 @@ On every boot the edge core must:
   2. Validate the token against the Cyberwave REST API
   3. Verify that it can connect to the MQTT broker
   4. Load configured devices from ``~/.cyberwave/devices.json``
+  5. Check whether an environment is linked via ``~/.cyberwave/environment.json``
 
 This module exposes each check individually (for the ``status`` command)
 and a single ``run_startup_checks()`` orchestrator for the boot path.
@@ -13,13 +14,16 @@ and a single ``run_startup_checks()`` orchestrator for the boot path.
 import json
 import logging
 import os
+import platform
+import uuid
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import List, Optional
 
 import httpx
-from rich.console import Console
 from cyberwave import Cyberwave
+from rich.console import Console
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -29,6 +33,8 @@ console = Console()
 CONFIG_DIR = Path.home() / ".cyberwave"
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 DEVICES_FILE = CONFIG_DIR / "devices.json"
+FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
+ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
 AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
 
@@ -127,8 +133,18 @@ def load_devices() -> List[Device]:
     The file is expected to contain a JSON array of device objects::
 
         [
-          {"slug": "the-robot-studio/so101", "metadata": {"type": "follower-arm"}, "name": "so101", "port": "/dev/ttty"},
-          {"slug": "cyberwave/camera", "metadata": {"type": "camera"}, "name": "camera1", "port": "/dev/video0"}
+          {
+            "slug": "the-robot-studio/so101",
+            "metadata": {"type": "follower-arm"},
+            "name": "so101",
+            "port": "/dev/ttty"
+          },
+          {
+            "slug": "cyberwave/camera",
+            "metadata": {"type": "camera"},
+            "name": "camera1",
+            "port": "/dev/video0"
+          }
         ]
 
     Returns an empty list when the file is missing or cannot be parsed.
@@ -147,20 +163,97 @@ def load_devices() -> List[Device]:
         return []
 
 
+def load_environment_uuid() -> Optional[str]:
+    """Load linked environment UUID from ~/.cyberwave/environment.json.
+
+    Expected format:
+        {"uuid": "unique-uuid-of-the-environment"}
+    """
+    if not ENVIRONMENT_FILE.exists():
+        return None
+    try:
+        with open(ENVIRONMENT_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logger.warning("environment.json should contain a JSON object")
+            return None
+
+        env_uuid = data.get("uuid")
+        if not isinstance(env_uuid, str) or not env_uuid.strip():
+            logger.warning("environment.json must contain a non-empty 'uuid' field")
+            return None
+
+        normalized_uuid = str(uuid.UUID(env_uuid.strip()))
+        return normalized_uuid
+    except ValueError:
+        logger.warning("environment.json contains an invalid UUID format")
+        return None
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to read environment file: %s", exc)
+        return None
+
+
 # ---- orchestrator ------------------------------------------------------------
 
 
 def generate_fingerprint() -> str:
-    # TODO: Generate a fingerprint for the edge based on the device information
-    return "ghaasa"
+    """Generate a stable fingerprint based on host characteristics."""
+    raw = f"{platform.node()}|{platform.system()}|{platform.machine()}|{uuid.getnode()}"
+    digest = sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{platform.system().lower()}-{digest}"
+
+
+def load_saved_fingerprint() -> Optional[str]:
+    """Load a previously persisted fingerprint from disk."""
+    if not FINGERPRINT_FILE.exists():
+        return None
+    try:
+        with open(FINGERPRINT_FILE) as f:
+            data = json.load(f)
+        fingerprint = data.get("fingerprint")
+        if isinstance(fingerprint, str) and fingerprint.strip():
+            return fingerprint.strip()
+        return None
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to read fingerprint file: %s", exc)
+        return None
+
+
+def save_fingerprint(fingerprint: str) -> bool:
+    """Persist fingerprint to ~/.cyberwave/fingerprint.json."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(FINGERPRINT_FILE, "w") as f:
+            json.dump({"fingerprint": fingerprint}, f, indent=2)
+            f.write("\n")
+        return True
+    except OSError as exc:
+        logger.warning("Failed to save fingerprint file: %s", exc)
+        return False
+
+
+def get_or_create_fingerprint() -> Optional[str]:
+    """Load fingerprint from disk, or generate and persist a new one."""
+    saved = load_saved_fingerprint()
+    if saved:
+        return saved
+    fingerprint = generate_fingerprint()
+    if not save_fingerprint(fingerprint):
+        return None
+    return fingerprint
 
 
 def register_edge(token: str) -> bool:
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        logger.warning("Could not load or create edge fingerprint")
+        return False
+
     client = Cyberwave(token=token)
     edge = client.edges.create(
-        fingerprint=generate_fingerprint(),
+        fingerprint=fingerprint,
     )
-    return edge
+    return bool(edge)
 
 
 def run_startup_checks() -> bool:
@@ -222,6 +315,20 @@ def run_startup_checks() -> bool:
         console.print(f"[green]{len(devices)} device(s)[/green]")
         for dev in devices:
             console.print(f"    {dev.name} [dim]({dev.type})[/dim] @ {dev.port}")
+
+    # 5 — linked environment
+    console.print("  Checking environment … ", end=" ")
+    environment_uuid = load_environment_uuid()
+    if environment_uuid:
+        console.print(f"[green]OK[/green] [dim]({environment_uuid})[/dim]")
+    else:
+        console.print("[yellow]NONE[/yellow]")
+        console.print(
+            f"\n  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]"
+        )
+        console.print(
+            "  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]"
+        )
 
     console.print("\n[green]All startup checks passed.[/green]\n")
     return True

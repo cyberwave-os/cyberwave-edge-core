@@ -29,6 +29,7 @@ The edge core should:
 1. Assume it is starting on boot
 2. ~~Check if it can connect to MQTT and if the token saved in ~/.cyberwave/credentials.json is valid~~
 3. ~~Check an internal file (~/.cyberwave/devices.json) to see if any device is set up~~
-4. Check if it has the correct driver for that device (we'll do this later)
-5. Get or create the edge with the Cyberwave Backend (device fingerprint)
-6. Start listening to MQTT commands for the device
+4. ~~Get or create the edge with the Cyberwave Backend (device fingerprint, persisted in ~/.cyberwave/fingerprint.json)~~
+5. Check if the MQTT connection works DONE
+6. ~~Check if there is an environment connected to the edge (in ~/.cyberwave/environment.json, format: {"uuid":"unique-uuid-of-the-environment"})~~
+7. If so, call the API and download the twins for that particular environment. Check if any digital twin of the environments have the fingerprint of the edge
