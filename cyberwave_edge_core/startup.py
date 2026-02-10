@@ -19,6 +19,7 @@ from typing import List, Optional
 
 import httpx
 from rich.console import Console
+from cyberwave import Cyberwave
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -28,7 +29,7 @@ console = Console()
 CONFIG_DIR = Path.home() / ".cyberwave"
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 DEVICES_FILE = CONFIG_DIR / "devices.json"
-DEFAULT_API_URL = "https://api.cyberwave.com"
+DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
 AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
 
 
@@ -43,6 +44,8 @@ class Device:
         type: Device type identifier (e.g. ``"rgb-camera"``, ``"lidar"``).
         name: Human-readable name (e.g. ``"camera1"``).
         port: System device path (e.g. ``"/dev/video0"``).
+
+    TODO: This data structure is temporary; this will eventually be the same as the twin
     """
 
     type: str
@@ -107,8 +110,6 @@ def check_mqtt_connection(token: str) -> bool:
     defaults.  Returns ``True`` if the connection succeeds.
     """
     try:
-        from cyberwave import Cyberwave
-
         client = Cyberwave(token=token)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
@@ -149,6 +150,19 @@ def load_devices() -> List[Device]:
 # ---- orchestrator ------------------------------------------------------------
 
 
+def generate_fingerprint() -> str:
+    # TODO: Generate a fingerprint for the edge based on the device information
+    return "ghaasa"
+
+
+def register_edge(token: str) -> bool:
+    client = Cyberwave(token=token)
+    edge = client.edges.create(
+        fingerprint=generate_fingerprint(),
+    )
+    return edge
+
+
 def run_startup_checks() -> bool:
     """Execute every boot-time check in sequence.
 
@@ -185,6 +199,15 @@ def run_startup_checks() -> bool:
         console.print("[red]FAIL[/red]")
         console.print("\n  [red]Could not connect to the MQTT broker.[/red]")
         console.print("  [dim]Check network connectivity and MQTT configuration.[/dim]")
+        return False
+
+    # 3b: Edge registering
+    console.print("  Registering edge …     ", end=" ")
+    if register_edge(token):
+        console.print("[green]OK[/green]")
+    else:
+        console.print("[red]FAIL[/red]")
+        console.print("\n  [red]Could not register the edge.[/red]")
         return False
 
     # 4 — configured devices
