@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -499,8 +500,14 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
                 exc,
             )
 
+    def _json_default(obj: Any) -> Any:
+        """Handle non-serializable types (e.g. datetime from SDK responses)."""
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
     with open(twin_json_file, "w") as f:
-        json.dump(twin_data, f, indent=2)
+        json.dump(twin_data, f, indent=2, default=_json_default)
     return True
 
 
