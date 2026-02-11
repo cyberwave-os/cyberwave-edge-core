@@ -301,6 +301,10 @@ def _run_docker_image(
     mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
         env_vars += ["-e", f"CYBERWAVE_MQTT_HOST={mqtt_host}"]
+    twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
+    if twin_json_file.exists():
+        env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
+        env_vars += ["-e", f"CYBERWAVE_TWIN_JSON_FILE=/app/{twin_uuid}.json"]
 
     # Run the container
     cmd = [
@@ -390,6 +394,8 @@ def fetch_and_run_twin_drivers(
         asset_metadata = asset.metadata or {}
         driver_image = asset_metadata.get("driver_docker_image")
 
+        write_or_update_twin_json_file(twin_uuid, twin.to_dict(), asset.to_dict())
+
         if not driver_image:
             logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
             continue
@@ -419,6 +425,18 @@ def register_edge(token: str) -> bool:
         fingerprint=fingerprint,
     )
     return bool(edge)
+
+
+def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: dict) -> bool:
+    """
+    Writes the content of the JSON twin into the disk, so that the docker container can read it
+    and use it to start the driver correctly.
+    """
+    twin_data["asset"] = asset_data
+    twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
+    with open(twin_json_file, "w") as f:
+        json.dump(twin_data, f, indent=2)
+    return True
 
 
 def run_startup_checks() -> bool:
@@ -491,7 +509,7 @@ def run_startup_checks() -> bool:
         console.print(f"\n  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]")
         console.print("  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]")
 
-    # 6 — fetch twins, match by fingerprint, and run driver docker images
+    # 6 — fetch twins, match by fingerprint, write twin.json file, and run driver docker images
     if environment_uuid:
         console.print("  Fetching twin drivers …", end=" ")
         fingerprint = get_or_create_fingerprint()
