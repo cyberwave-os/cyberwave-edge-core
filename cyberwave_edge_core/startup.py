@@ -427,13 +427,46 @@ def register_edge(token: str) -> bool:
     return bool(edge)
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base* and return the result.
+
+    - Dict values are merged recursively.
+    - All other values in *override* take precedence over *base*.
+    - Keys that only exist in *base* are preserved.
+    """
+    merged = base.copy()
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: dict) -> bool:
     """
     Writes the content of the JSON twin into the disk, so that the docker container can read it
     and use it to start the driver correctly.
+
+    If the JSON file already exists on disk, the new data is deep-merged on top
+    of the existing content so that any locally-written keys are preserved.
     """
     twin_data["asset"] = asset_data
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
+
+    # Merge with existing data so local-only keys are not lost.
+    if twin_json_file.exists():
+        try:
+            with open(twin_json_file) as f:
+                existing_data: dict = json.load(f)
+            twin_data = _deep_merge(existing_data, twin_data)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Could not read existing twin file %s, overwriting: %s",
+                twin_json_file,
+                exc,
+            )
+
     with open(twin_json_file, "w") as f:
         json.dump(twin_data, f, indent=2)
     return True
@@ -509,7 +542,7 @@ def run_startup_checks() -> bool:
         console.print(f"\n  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]")
         console.print("  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]")
 
-    # 6 — fetch twins, match by fingerprint, write twin.json file, and run driver docker images
+    # 6 — fetch twins, match by fingerprint, write {twin_uuid}.json file, and run driver docker images
     if environment_uuid:
         console.print("  Fetching twin drivers …", end=" ")
         fingerprint = get_or_create_fingerprint()
