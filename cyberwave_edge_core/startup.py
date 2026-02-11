@@ -305,6 +305,8 @@ def _run_docker_image(
     if twin_json_file.exists():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
         env_vars += ["-e", f"CYBERWAVE_TWIN_JSON_FILE=/app/{twin_uuid}.json"]
+    # sync the whole ~/.cyberwave directory into the container
+    env_vars += ["-v", f"{CONFIG_DIR}:/app/.cyberwave"]
 
     # Run the container
     cmd = [
