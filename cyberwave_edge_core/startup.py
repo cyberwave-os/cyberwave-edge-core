@@ -314,6 +314,7 @@ def _run_docker_image(
         "--restart",
         "unless-stopped",
         "--network",
+        "--privileged",
         "host",
         "--name",
         container_name,
@@ -392,13 +393,21 @@ def fetch_and_run_twin_drivers(
             continue
 
         asset_metadata = asset.metadata or {}
-        driver_image = asset_metadata.get("driver_docker_image")
+        drivers = asset_metadata.get("drivers")
+        if not drivers:
+            logger.warning("No drivers specified in asset metadata for twin '%s'", twin.name)
+            raise ValueError(
+                "No drivers specified in asset metadata for paired twin '%s'", twin.name
+            )
+        driver_image = _get_best_driver_image(drivers)
 
         write_or_update_twin_json_file(twin_uuid, twin.to_dict(), asset.to_dict())
 
         if not driver_image:
             logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
-            continue
+            raise ValueError(
+                "No drivers specified in asset metadata for paired twin '%s'", twin.name
+            )
 
         logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
         success = _run_docker_image(driver_image, twin_uuid=twin_uuid, token=token)
@@ -412,6 +421,27 @@ def fetch_and_run_twin_drivers(
         )
 
     return results
+
+
+def _get_best_driver_image(drivers: Dict[str, Dict[str, str]]) -> str:
+    """
+    Given a list of drivers specified in the metadata of the asset,
+    and given the hardware where the edge is running,
+    return the best driver to run.
+    TODO: this is missing as of now, always returning the default
+
+    "drivers": {
+        "default": {"docker_image": "helloworld" },
+        "mac":{"docker_image": "helloworld" }
+    },
+    """
+    if drivers["default"]:
+        if not drivers["default"]["docker_image"] or not isinstance(
+            drivers["default"]["docker_image"], str
+        ):
+            raise ValueError("No docker_image specified for default driver")
+        return drivers["default"]["docker_image"]
+    raise ValueError("No default driver specified")
 
 
 def register_edge(token: str) -> bool:
