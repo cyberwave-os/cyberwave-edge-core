@@ -73,3 +73,5 @@ A Cyberwave driver is a Docker image that is capable of interacting with the dev
 The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [https://docs.cyberwave.com/api-reference/rest/TwinSchema](Twin reference here), [https://docs.cyberwave.com/api-reference/rest/AssetSchema](Asset reference here).
 
 As a driver, you can change the JSON file. The core will, when connectivity is present, sync it with the one in the backend.
+
+When writing drivers, use the official Cyberwave SDK to communicate with the backend, as it will abstract a bunch of complexity in the MQTT handshake, REST API authentication, and more.
