@@ -42,25 +42,34 @@ cyberwave-edge-core
 
 The edge core reads configuration from `~/.cyberwave/`:
 
-| File               | Description             |
-| ------------------ | ----------------------- |
-| `credentials.json` | API token               |
-| `devices.json`     | Configured devices      |
-| `fingerprint.json` | Device fingerprint      |
-| `environment.json` | Linked environment UUID |
+| File               | Description               |
+| ------------------ | ------------------------- |
+| `credentials.json` | API token, environment ID |
+| `fingerprint.json` | Device fingerprint        |
+| `environment.json` | Linked environment UUID   |
 
-You can override the API URL with the `CYBERWAVE_API_URL` environment variable.
+Of the files above, the `core` needs only the `credentials.json` file. You can easily populate it with the `cyberwave-cli` as described in the quickstart. The
 
-## TODO
+The `fingerprint.json` is populated by the core itself.
 
-The edge core should:
+## How the edge works
 
-1. Assume it is starting on boot
-2. ~~Check if it can connect to MQTT and if the token saved in ~/.cyberwave/credentials.json is valid~~
-3. ~~Check an internal file (~/.cyberwave/devices.json) to see if any device is set up~~
-4. ~~Get or create the edge with the Cyberwave Backend (device fingerprint, persisted in ~/.cyberwave/fingerprint.json)~~
-5. Check if the MQTT connection works DONE
-6. ~~Check if there is an environment connected to the edge (in ~/.cyberwave/environment.json, format: {"uuid":"unique-uuid-of-the-environment"})~~
-7. ~~If so, call the API and download the twins for that particular environment. Check if any digital twin of the environments have the fingerprint of the edge. If so, for every twin: call the assets API with the UUID of the asset of that twin; in the asset's metadata, look for the driver_docker_image field; then run the docker image~~
-8. Add a daemon or process that always checks if the dockers are running and are healthy > DONE
-9. Add parameters to the docker: their data should be grabbed from the twin's metadata and used in running the docker > DONE. it passes the whole twin object, injecting also the asset object.
+Once it's started (either via CLI or via service) the core does the following:
+
+1. Checks if the credentials stored in `credentials.json` are valid
+2. Connects to the backend MQTT and checks if the connection is up and running
+3. Registers the `edge` device is running on, or updates its registration record. Each `edge` device is defined by a unique hardware fingerprint
+4. Downloads the latest environment from the backend and downloads the list of devices connected to the edge
+5. For each `twin`, present in the environment, and connected to the edge: It starts the twin's docker driver image
+
+## Writing compatible drivers
+
+A Cyberwave driver is a Docker image that is capable of interacting with the device's hardware, sending and getting data from the Cyberwave backend. Every time the core starts a driver Docker image, the `core` does so by defining the following environment variables:
+
+- `CYBERWAVE_TWIN_UUID`
+- `CYBERWAVE_TOKEN`
+- `CYBERWAVE_TWIN_JSON_FILE`
+
+The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [https://docs.cyberwave.com/api-reference/rest/TwinSchema](Twin reference here), [https://docs.cyberwave.com/api-reference/rest/AssetSchema](Asset reference here).
+
+As a driver, you can change the JSON file. The core will, when connectivity is present, sync it with the one in the backend.

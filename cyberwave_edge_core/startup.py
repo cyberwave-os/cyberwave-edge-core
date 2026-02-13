@@ -246,6 +246,8 @@ def _run_docker_image(
     mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
         env_vars += ["-e", f"CYBERWAVE_MQTT_HOST={mqtt_host}"]
+    if CYBERWAVE_ENVIRONMENT != "production":
+        env_vars += ["-e", f"CYBERWAVE_ENVIRONMENT={CYBERWAVE_ENVIRONMENT}"]
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
     if twin_json_file.exists():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
@@ -314,7 +316,7 @@ def fetch_and_run_twin_drivers(
     for twin in twins:
         twin_uuid = twin.uuid
 
-        # The CLI writes edge_fingerprint into twin metadata when the user
+        # The edge writes edge_fingerprint into twin metadata when the user
         # selects which twins this edge controls.  Match on that field.
         twin_metadata = twin.metadata if isinstance(twin.metadata, dict) else {}
         if twin_metadata.get("edge_fingerprint") != fingerprint:
@@ -491,7 +493,6 @@ def run_startup_checks() -> bool:
         console.print("[red]FAIL[/red]")
         console.print("\n  [red]Could not connect to the MQTT broker.[/red]")
         console.print("  [dim]Check network connectivity and MQTT configuration.[/dim]")
-        return False
 
     # 4: Edge registering
     console.print("  Registering edge …     ", end=" ")
