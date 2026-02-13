@@ -42,38 +42,9 @@ DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
 AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
 
 
-# ---- data models -------------------------------------------------------------
-
-
-@dataclass
-class Device:
-    """A single device configured on this edge node.
-
-    Attributes:
-        type: Device type identifier (e.g. ``"rgb-camera"``, ``"lidar"``).
-        name: Human-readable name (e.g. ``"camera1"``).
-        port: System device path (e.g. ``"/dev/video0"``).
-
-    TODO: This data structure is temporary; this will eventually be the same as the twin
-    """
-
-    type: str
-    name: str
-    port: str
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "Device":
-        return cls(
-            type=data.get("type", ""),
-            name=data.get("name", ""),
-            port=data.get("port", ""),
-        )
-
-
-# ---- individual checks -------------------------------------------------------
+def load_devices() -> List[str]:
+    """Load the list of devices from the environment.json file."""
+    raise NotImplementedError("Not implemented")
 
 
 def load_token() -> Optional[str]:
@@ -128,40 +99,6 @@ def check_mqtt_connection(token: str) -> bool:
     except Exception as exc:
         logger.warning("MQTT connection check failed: %s", exc)
         return False
-
-
-def load_devices() -> List[Device]:
-    f"""Load the device list from *~/.cyberwave/devices.json*.
-
-    The file is expected to contain a JSON array of device objects::
-
-        [
-          {"slug": "the-robot-studio/so101",
-            "metadata": {"type": "follower-arm"},
-            "name": "so101",
-            "port": "/dev/ttty"
-          },
-          {"slug": "cyberwave/camera",
-            "metadata": {"type": "camera"},
-            "name": "camera1",
-            "port": "/dev/video0"
-          }
-        ]
-
-    Returns an empty list when the file is missing or cannot be parsed.
-    """
-    if not DEVICES_FILE.exists():
-        return []
-    try:
-        with open(DEVICES_FILE) as f:
-            raw = json.load(f)
-        if not isinstance(raw, list):
-            logger.warning("devices.json should contain a JSON array")
-            return []
-        return [Device.from_dict(entry) for entry in raw if isinstance(entry, dict)]
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read devices file: %s", exc)
-        return []
 
 
 def load_environment_uuid() -> Optional[str]:
@@ -549,7 +486,7 @@ def run_startup_checks() -> bool:
         console.print("  [dim]Check network connectivity and MQTT configuration.[/dim]")
         return False
 
-    # 3b: Edge registering
+    # 4: Edge registering
     console.print("  Registering edge …     ", end=" ")
     if register_edge(token):
         console.print("[green]OK[/green]")
@@ -557,19 +494,6 @@ def run_startup_checks() -> bool:
         console.print("[red]FAIL[/red]")
         console.print("\n  [red]Could not register the edge.[/red]")
         return False
-
-    # 4 — configured devices
-    console.print("  Loading devices …      ", end=" ")
-    devices = load_devices()
-    if not devices:
-        console.print("[yellow]NONE[/yellow]")
-        console.print(f"\n  [yellow]No devices configured in {DEVICES_FILE}[/yellow]")
-        console.print("  [dim]Add devices to the file or run 'cyberwave edge pull'.[/dim]")
-        # Not a fatal error — the edge core can run without devices
-    else:
-        console.print(f"[green]{len(devices)} device(s)[/green]")
-        for dev in devices:
-            console.print(f"    {dev.name} [dim]({dev.type})[/dim] @ {dev.port}")
 
     # 5 — linked environment
     console.print("  Checking environment … ", end=" ")
