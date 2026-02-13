@@ -41,6 +41,8 @@ ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
 AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
 
+CYBERWAVE_ENVIRONMENT = os.getenv("CYBERWAVE_ENVIRONMENT", "production")
+
 
 def load_devices() -> List[str]:
     """Load the list of devices from the environment.json file."""
@@ -201,6 +203,11 @@ def _run_docker_image(
         return False
 
     container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+
+    if CYBERWAVE_ENVIRONMENT != "production":
+        image = (
+            f"{image}:{CYBERWAVE_ENVIRONMENT}"  # for example: cyberwaveos/cyberwave-edge-so101:dev
+        )
 
     # Remove any existing container with the same name (idempotent re-runs)
     subprocess.run(
