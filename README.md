@@ -54,15 +54,15 @@ cyberwave-edge-core
 
 ### Configuration
 
-The edge core reads configuration from `~/.cyberwave/`:
+The edge core reads configuration from `/etc/cyberwave/` (overridable via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable, which is set in the systemd unit):
 
 | File               | Description               |
 | ------------------ | ------------------------- |
-| `credentials.json` | API token, environment ID |
+| `credentials.json` | API token, workspace info |
 | `fingerprint.json` | Device fingerprint        |
 | `environment.json` | Linked environment UUID   |
 
-Of the files above, the `core` needs only the `credentials.json` file. You can easily populate it with the `cyberwave-cli` as described in the quickstart. The
+Of the files above, the `core` needs only the `credentials.json` file. You can easily populate it with the `cyberwave-cli` as described in the quickstart.
 
 The `fingerprint.json` is populated by the core itself.
 
