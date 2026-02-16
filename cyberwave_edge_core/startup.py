@@ -1,11 +1,14 @@
 """Boot-time startup checks for the Cyberwave Edge Core.
 
 On every boot the edge core must:
-  1. Read the API token from ``~/.cyberwave/credentials.json``
+  1. Read the API token from ``/etc/cyberwave/credentials.json``
   2. Validate the token against the Cyberwave REST API
   3. Verify that it can connect to the MQTT broker
-  4. Load configured devices from ``~/.cyberwave/devices.json``
-  5. Check whether an environment is linked via ``~/.cyberwave/environment.json``
+  4. Load configured devices from ``/etc/cyberwave/devices.json``
+  5. Check whether an environment is linked via ``/etc/cyberwave/environment.json``
+
+The config directory defaults to ``/etc/cyberwave`` and can be overridden with
+the ``CYBERWAVE_EDGE_CONFIG_DIR`` environment variable (set in the systemd unit).
 
 This module exposes each check individually (for the ``status`` command)
 and a single ``run_startup_checks()`` orchestrator for the boot path.
@@ -33,7 +36,10 @@ console = Console()
 
 # ---- constants ---------------------------------------------------------------
 
-CONFIG_DIR = Path.home() / ".cyberwave"
+# System-wide edge config directory.  The systemd unit sets
+# CYBERWAVE_EDGE_CONFIG_DIR=/etc/cyberwave; fall back to the same path
+# if the env var is absent (e.g. manual invocation).
+CONFIG_DIR = Path(os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "/etc/cyberwave"))
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 DEVICES_FILE = CONFIG_DIR / "devices.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
@@ -50,7 +56,7 @@ def load_devices() -> List[str]:
 
 
 def load_token() -> Optional[str]:
-    """Load the API token from *~/.cyberwave/credentials.json*.
+    """Load the API token from the edge config credentials file.
 
     Returns the token string, or ``None`` if the file is missing or
     cannot be parsed.
@@ -104,7 +110,7 @@ def check_mqtt_connection(token: str) -> bool:
 
 
 def load_environment_uuid() -> Optional[str]:
-    """Load linked environment UUID from ~/.cyberwave/environment.json.
+    """Load linked environment UUID from the edge config environment file.
 
     Expected format:
         {"uuid": "unique-uuid-of-the-environment"}
@@ -160,7 +166,7 @@ def load_saved_fingerprint() -> Optional[str]:
 
 
 def save_fingerprint(fingerprint: str) -> bool:
-    """Persist fingerprint to ~/.cyberwave/fingerprint.json."""
+    """Persist fingerprint to the edge config directory."""
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(FINGERPRINT_FILE, "w") as f:
@@ -252,7 +258,7 @@ def _run_docker_image(
     if twin_json_file.exists():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
         env_vars += ["-e", f"CYBERWAVE_TWIN_JSON_FILE=/app/{twin_uuid}.json"]
-    # sync the whole ~/.cyberwave directory into the container
+    # sync the edge config directory into the container
     env_vars += ["-v", f"{CONFIG_DIR}:/app/.cyberwave"]
 
     # Run the container
