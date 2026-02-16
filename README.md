@@ -5,20 +5,34 @@ This Edge component acts as an orchestrator of your Cyberwave edge components.
 ## Quickstart (Linux machines)
 
 ```bash
-# ssh into your edge device then
-sudo apt-get install cyberwave-cli
+# Install teh CLI from *one-time setup)
+curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-cli/gpgkey" | sudo gpg --dearmor -o /etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg
 
-sudo cyberwave edge
+# Configure the source
+echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-cli/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-cli/any/ any main" | sudo tee /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-cli.list > /dev/null
+
+# Install the CLI
+sudo apt update && sudo apt install cyberwave-cli
+
+# Use the CLI to complete the edge setup
+sudo cyberwave edge install
 ```
 
 The cyberwave-cli will ask you to log in with your Cyberwave credentials and then will proceed installing the `cyberwave-edge-core` on your edge device.
 
 > Don't have a Cyberwave account? Get one at [https://cyberwave.com](cyberwave.com)
 
-## Manual usage
+## Manual install and usage
 
 ```bash
-sudo apt-get install cyberwave-edge-core
+# Install the registry signing key:
+
+curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey" | gpg --dearmor -o /etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg
+
+# Configure the source:
+
+
+echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main" > /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list
 
 # Run all startup checks (validate token, MQTT, devices, environment)
 cyberwave-edge-core
