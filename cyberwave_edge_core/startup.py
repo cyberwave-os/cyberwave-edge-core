@@ -62,13 +62,24 @@ def load_token() -> Optional[str]:
     cannot be parsed.
     """
     if not CREDENTIALS_FILE.exists():
+        logger.warning("Credentials file not found: %s", CREDENTIALS_FILE)
         return None
     try:
         with open(CREDENTIALS_FILE) as f:
             data = json.load(f)
-        return data.get("token") or None
+        token = data.get("token") or None
+        if token:
+            masked = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
+            logger.info("Loaded token from %s (token: %s)", CREDENTIALS_FILE, masked)
+        else:
+            logger.warning(
+                "Credentials file %s exists but has no 'token' field. Keys present: %s",
+                CREDENTIALS_FILE,
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+            )
+        return token
     except (json.JSONDecodeError, OSError) as exc:
-        logger.debug("Failed to read credentials file: %s", exc)
+        logger.warning("Failed to read credentials file %s: %s", CREDENTIALS_FILE, exc)
         return None
 
 
@@ -78,15 +89,33 @@ def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
     Returns ``True`` when the backend responds with HTTP 200.
     """
     base_url = base_url or os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    url = f"{base_url}{AUTH_USER_ENDPOINT}"
+    masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
+    logger.info("Validating token against %s (token: %s)", url, masked_token)
     try:
         resp = httpx.get(
-            f"{base_url}{AUTH_USER_ENDPOINT}",
+            url,
             headers={"Authorization": f"Token {token}"},
             timeout=15.0,
         )
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            logger.info("Token validated successfully (HTTP 200)")
+            return True
+        # Non-200: log details so the user can diagnose the problem.
+        body_snippet = resp.text[:500] if resp.text else "(empty body)"
+        logger.warning(
+            "Token validation failed: HTTP %d from %s — %s",
+            resp.status_code,
+            url,
+            body_snippet,
+        )
+        return False
     except httpx.RequestError as exc:
-        logger.warning("API unreachable during token validation: %s", exc)
+        logger.warning(
+            "API unreachable during token validation (%s): %s",
+            url,
+            exc,
+        )
         return False
 
 
@@ -97,15 +126,24 @@ def check_mqtt_connection(token: str) -> bool:
     variables (``CYBERWAVE_MQTT_HOST``, etc.) and falls back to sensible
     defaults.  Returns ``True`` if the connection succeeds.
     """
+    mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST", "(default)")
+    logger.info(
+        "Attempting MQTT connection (api_url=%s, mqtt_host=%s)",
+        DEFAULT_API_URL,
+        mqtt_host,
+    )
     try:
         client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
         if connected:
+            logger.info("MQTT connection successful")
             client.mqtt.disconnect()
+        else:
+            logger.warning("MQTT client connected but reports not connected")
         return connected
     except Exception as exc:
-        logger.warning("MQTT connection check failed: %s", exc)
+        logger.warning("MQTT connection check failed: %s: %s", type(exc).__name__, exc)
         return False
 
 
@@ -405,11 +443,20 @@ def register_edge(token: str) -> bool:
         logger.warning("Could not load or create edge fingerprint")
         return False
 
-    client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
-    edge = client.edges.create(
-        fingerprint=fingerprint,
-    )
-    return bool(edge)
+    logger.info("Registering edge with fingerprint=%s at %s", fingerprint, DEFAULT_API_URL)
+    try:
+        client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
+        edge = client.edges.create(
+            fingerprint=fingerprint,
+        )
+        if edge:
+            logger.info("Edge registered successfully")
+        else:
+            logger.warning("Edge registration returned falsy response")
+        return bool(edge)
+    except Exception as exc:
+        logger.warning("Edge registration failed: %s: %s", type(exc).__name__, exc)
+        return False
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -471,6 +518,13 @@ def run_startup_checks() -> bool:
     """
     console.print("\n[bold]Cyberwave Edge Core — startup checks[/bold]\n")
 
+    # Log resolved configuration for troubleshooting
+    api_url = os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    console.print(f"  [dim]Config dir:  {CONFIG_DIR}[/dim]")
+    console.print(f"  [dim]API URL:     {api_url}[/dim]")
+    console.print(f"  [dim]Environment: {CYBERWAVE_ENVIRONMENT}[/dim]")
+    console.print()
+
     # 1 — credentials file
     console.print("  Checking credentials …", end=" ")
     token = load_token()
@@ -487,7 +541,12 @@ def run_startup_checks() -> bool:
         console.print("[green]OK[/green]")
     else:
         console.print("[red]FAIL[/red]")
-        console.print("\n  [red]Token is invalid or the API is unreachable.[/red]")
+        console.print(
+            f"\n  [red]Token validation failed against {api_url}{AUTH_USER_ENDPOINT}[/red]"
+        )
+        console.print(
+            "  [dim]Check 'journalctl -u cyberwave-edge-core' for detailed HTTP error.[/dim]"
+        )
         console.print("  [dim]Run 'cyberwave login' to refresh your credentials.[/dim]")
         return False
 
@@ -519,7 +578,7 @@ def run_startup_checks() -> bool:
         console.print(f"\n  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]")
         console.print("  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]")
 
-    # 6 — fetch twins, match by fingerprint, write {twin_uuid}.json file, and run driver docker images
+    # 6 — fetch twins, match by fingerprint, write JSON file, run drivers
     if environment_uuid:
         console.print("  Fetching twin drivers …", end=" ")
         fingerprint = get_or_create_fingerprint()

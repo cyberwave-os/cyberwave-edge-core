@@ -1,5 +1,6 @@
 """Cyberwave Edge Core CLI entry point."""
 
+import logging
 import sys
 
 import click
@@ -14,6 +15,15 @@ from .startup import (
 )
 
 console = Console()
+
+# Configure logging so info/warning/error messages appear in journald.
+# The systemd journal captures stderr; use a clear format so log lines
+# are easy to filter with journalctl.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s",
+    stream=sys.stderr,
+)
 
 
 @click.group(invoke_without_command=True)
