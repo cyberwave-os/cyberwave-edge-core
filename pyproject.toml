@@ -1,6 +1,6 @@
 [project]
 name = "cyberwave-edge-core"
-version = "0.0.5"
+version = "0.0.6"
 description = "The core component of the Cyberwave Edge Node"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,7 +25,7 @@ dependencies = [
     "click>=8.1.0",
     "httpx>=0.25.0",
     "rich>=13.0.0",
-    "cyberwave>=0.2.26",
+    "cyberwave>=0.3.11",
 ]
 
 [project.optional-dependencies]
