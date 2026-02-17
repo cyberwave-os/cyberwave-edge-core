@@ -27,7 +27,6 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import httpx
 from cyberwave import Cyberwave
 from rich.console import Console
 
@@ -45,7 +44,6 @@ DEVICES_FILE = CONFIG_DIR / "devices.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
-AUTH_USER_ENDPOINT = "/dj-rest-auth/user/"
 
 CYBERWAVE_ENVIRONMENT = os.getenv("CYBERWAVE_ENVIRONMENT", "production")
 
@@ -84,38 +82,20 @@ def load_token() -> Optional[str]:
 
 
 def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
-    """Validate *token* by calling the backend ``/dj-rest-auth/user/`` endpoint.
+    """Validate *token* by listing workspaces via the Cyberwave SDK.
 
-    Returns ``True`` when the backend responds with HTTP 200.
+    Returns ``True`` when the SDK call succeeds (i.e. the token is valid).
     """
     base_url = base_url or os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
-    url = f"{base_url}{AUTH_USER_ENDPOINT}"
     masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
-    logger.info("Validating token against %s (token: %s)", url, masked_token)
+    logger.info("Validating token against %s via SDK (token: %s)", base_url, masked_token)
     try:
-        resp = httpx.get(
-            url,
-            headers={"Authorization": f"Token {token}"},
-            timeout=15.0,
-        )
-        if resp.status_code == 200:
-            logger.info("Token validated successfully (HTTP 200)")
-            return True
-        # Non-200: log details so the user can diagnose the problem.
-        body_snippet = resp.text[:500] if resp.text else "(empty body)"
-        logger.warning(
-            "Token validation failed: HTTP %d from %s — %s",
-            resp.status_code,
-            url,
-            body_snippet,
-        )
-        return False
-    except httpx.RequestError as exc:
-        logger.warning(
-            "API unreachable during token validation (%s): %s",
-            url,
-            exc,
-        )
+        client = Cyberwave(base_url=base_url, token=token)
+        client.workspaces.list()
+        logger.info("Token validated successfully (workspaces listed)")
+        return True
+    except Exception as exc:
+        logger.warning("Token validation failed (%s): %s", base_url, exc)
         return False
 
 
@@ -542,10 +522,10 @@ def run_startup_checks() -> bool:
     else:
         console.print("[red]FAIL[/red]")
         console.print(
-            f"\n  [red]Token validation failed against {api_url}{AUTH_USER_ENDPOINT}[/red]"
+            f"\n  [red]Token validation failed against {api_url}[/red]"
         )
         console.print(
-            "  [dim]Check 'journalctl -u cyberwave-edge-core' for detailed HTTP error.[/dim]"
+            "  [dim]Check 'journalctl -u cyberwave-edge-core' for details.[/dim]"
         )
         console.print("  [dim]Run 'cyberwave login' to refresh your credentials.[/dim]")
         return False
