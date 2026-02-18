@@ -35,6 +35,7 @@ pyinstaller \
     --hidden-import click \
     --hidden-import rich \
     --hidden-import httpx \
+    --collect-submodules cyberwave \
     --collect-submodules rich._unicode_data \
     __pyinstaller_entry.py
 
