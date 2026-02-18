@@ -20,7 +20,7 @@ sudo cyberwave edge install
 
 The cyberwave-cli will ask you to log in with your Cyberwave credentials and then will proceed installing the `cyberwave-edge-core` on your edge device.
 
-> Don't have a Cyberwave account? Get one at [https://cyberwave.com](cyberwave.com)
+> Don't have a Cyberwave account? Get one at [cyberwave.com](https://cyberwave.com)
 
 ## Manual install and usage
 
@@ -84,7 +84,7 @@ A Cyberwave driver is a Docker image that is capable of interacting with the dev
 - `CYBERWAVE_TOKEN`
 - `CYBERWAVE_TWIN_JSON_FILE`
 
-The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [https://docs.cyberwave.com/api-reference/rest/TwinSchema](Twin reference here), [https://docs.cyberwave.com/api-reference/rest/AssetSchema](Asset reference here).
+The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
 
 As a driver, you can change the JSON file. The core will, when connectivity is present, sync it with the one in the backend.
 
