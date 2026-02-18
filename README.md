@@ -89,3 +89,19 @@ The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file i
 As a driver, you can change the JSON file. The core will, when connectivity is present, sync it with the one in the backend.
 
 When writing drivers, use the official Cyberwave SDK to communicate with the backend, as it will abstract a bunch of complexity in the MQTT handshake, REST API authentication, and more.
+
+Once you wrote a driver, you can add its details in the twin's metadata (or the asset's metadata if you own it). Right now the edit is manual and directly in the metadata. To edit the metadata, you can switch to Advanced editing in the environment or in the asset editing.
+
+> Note: If you change the metadata on the asset, every twin created out of that asset from that moment on will have the same metadata as the asset, as the starting point
+
+The driver object in the metadata looks like this:
+
+```json
+"drivers": {
+    "default": {
+        "docker_image":"cyberwaveos/so101-driver", // this is either a public image on the Docker hub or on your own registry
+        "version": "0.0.1", // this field is optional
+        "params" : ["--network local", "--add-host host.docker.internal:host-gateway"] // this is also optional
+    }
+}
+```
