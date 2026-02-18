@@ -209,6 +209,7 @@ def get_or_create_fingerprint() -> Optional[str]:
 
 def _run_docker_image(
     image: str,
+    params: list[str],
     *,
     twin_uuid: str,
     token: str,
@@ -286,11 +287,12 @@ def _run_docker_image(
         "--detach",
         "--restart",
         "unless-stopped",
-        "--network",
         "--privileged",
+        "--network",
         "host",
         "--name",
         container_name,
+        *params,
         *env_vars,
         image,
     ]
@@ -372,7 +374,7 @@ def fetch_and_run_twin_drivers(
             raise ValueError(
                 "No drivers specified in asset metadata for paired twin '%s'", twin.name
             )
-        driver_image = _get_best_driver_image(drivers)
+        driver_image, driver_params = _get_best_driver_image_and_params(drivers)
 
         write_or_update_twin_json_file(twin_uuid, twin.to_dict(), asset.to_dict())
 
@@ -383,7 +385,7 @@ def fetch_and_run_twin_drivers(
             )
 
         logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
-        success = _run_docker_image(driver_image, twin_uuid=twin_uuid, token=token)
+        success = _run_docker_image(driver_image, driver_params, twin_uuid=twin_uuid, token=token)
         results.append(
             {
                 "twin_uuid": twin_uuid,
@@ -396,16 +398,18 @@ def fetch_and_run_twin_drivers(
     return results
 
 
-def _get_best_driver_image(drivers: Dict[str, Dict[str, str]]) -> str:
+def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tuple[str, list[str]]:
     """
     Given a list of drivers specified in the metadata of the asset,
     and given the hardware where the edge is running,
-    return the best driver to run.
+    Returns:
+    - The best driver to run.
+    - A list of parameters to pass to the driver when doing docker run
     TODO: this is missing as of now, always returning the default
 
     "drivers": {
-        "default": {"docker_image": "helloworld" },
-        "mac":{"docker_image": "helloworld" }
+        "default": {"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
+        "mac":{"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
     },
     """
     if drivers["default"]:
@@ -413,7 +417,7 @@ def _get_best_driver_image(drivers: Dict[str, Dict[str, str]]) -> str:
             drivers["default"]["docker_image"], str
         ):
             raise ValueError("No docker_image specified for default driver")
-        return drivers["default"]["docker_image"]
+        return drivers["default"]["docker_image"], drivers["default"].get("params", [])
     raise ValueError("No default driver specified")
 
 
@@ -521,12 +525,8 @@ def run_startup_checks() -> bool:
         console.print("[green]OK[/green]")
     else:
         console.print("[red]FAIL[/red]")
-        console.print(
-            f"\n  [red]Token validation failed against {api_url}[/red]"
-        )
-        console.print(
-            "  [dim]Check 'journalctl -u cyberwave-edge-core' for details.[/dim]"
-        )
+        console.print(f"\n  [red]Token validation failed against {api_url}[/red]")
+        console.print("  [dim]Check 'journalctl -u cyberwave-edge-core' for details.[/dim]")
         console.print("  [dim]Run 'cyberwave login' to refresh your credentials.[/dim]")
         return False
 
