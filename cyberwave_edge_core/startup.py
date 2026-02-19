@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -37,6 +38,10 @@ console = Console()
 
 # Track active log streaming threads per container to avoid duplicates.
 _CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
+_DRIVER_LOG_LEVEL_PATTERN = re.compile(
+    r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b", re.IGNORECASE
+)
+_MAX_DRIVER_LOG_MESSAGE_LENGTH = 4000
 
 # ---- constants ---------------------------------------------------------------
 
@@ -228,6 +233,7 @@ def _run_docker_image(
     *,
     twin_uuid: str,
     token: str,
+    environment_uuid: str,
 ) -> bool:
     """Pull and run a driver Docker container for a twin.
 
@@ -320,7 +326,12 @@ def _run_docker_image(
             text=True,
             timeout=60,
         )
-        _stream_container_logs(container_name)
+        _stream_container_logs(
+            container_name,
+            twin_uuid=twin_uuid,
+            token=token,
+            environment_uuid=environment_uuid,
+        )
         return True
     except subprocess.CalledProcessError as exc:
         logger.error("Failed to start container %s: %s", container_name, exc.stderr)
@@ -330,7 +341,9 @@ def _run_docker_image(
         return False
 
 
-def _stream_container_logs(container_name: str) -> None:
+def _stream_container_logs(
+    container_name: str, *, twin_uuid: str, token: str, environment_uuid: str
+) -> None:
     """Stream container logs into this service logger in the background."""
     existing = _CONTAINER_LOG_THREADS.get(container_name)
     if existing and existing.is_alive():
@@ -338,7 +351,7 @@ def _stream_container_logs(container_name: str) -> None:
 
     thread = threading.Thread(
         target=_follow_container_logs,
-        args=(container_name,),
+        args=(container_name, twin_uuid, token, environment_uuid),
         name=f"docker-logs-{container_name}",
         daemon=True,
     )
@@ -346,11 +359,62 @@ def _stream_container_logs(container_name: str) -> None:
     thread.start()
 
 
-def _follow_container_logs(container_name: str) -> None:
-    """Follow `docker logs -f` and forward lines to the service logger."""
+def _infer_driver_log_level(message: str) -> str:
+    """Infer a log level from a raw driver log line."""
+    match = _DRIVER_LOG_LEVEL_PATTERN.search(message)
+    if not match:
+        return "INFO"
+
+    level = match.group(1).upper()
+    if level == "WARN":
+        return "WARNING"
+    if level == "FATAL":
+        return "CRITICAL"
+    return level
+
+
+def _publish_driver_log_telemetry(
+    client: Cyberwave,
+    *,
+    twin_uuid: str,
+    environment_uuid: str,
+    container_name: str,
+    message: str,
+) -> None:
+    """Publish a single driver log line into twin telemetry."""
+    topic = f"{client.mqtt.topic_prefix}cyberwave/twin/{twin_uuid}/telemetry"
+    payload = {
+        "type": "driver_log",
+        "level": _infer_driver_log_level(message),
+        "message": message[:_MAX_DRIVER_LOG_MESSAGE_LENGTH],
+        "container_name": container_name,
+        "environment_uuid": environment_uuid,
+        "source": "edge_core",
+        "timestamp": time.time_ns(),
+    }
+    client.mqtt.publish(topic, payload)
+
+
+def _follow_container_logs(
+    container_name: str, twin_uuid: str, token: str, environment_uuid: str
+) -> None:
+    """Follow `docker logs -f` and forward lines to service + telemetry logs."""
     if not shutil.which("docker"):
         logger.warning("Cannot stream logs: Docker is not installed")
         return
+
+    telemetry_client: Optional[Cyberwave] = None
+    try:
+        telemetry_client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
+        telemetry_client.mqtt.connect()
+    except Exception as exc:
+        logger.warning(
+            "Driver log telemetry disabled for twin %s (%s): %s",
+            twin_uuid,
+            container_name,
+            exc,
+        )
+        telemetry_client = None
 
     logger.info("Forwarding logs for container %s to service logs", container_name)
     try:
@@ -373,9 +437,29 @@ def _follow_container_logs(container_name: str) -> None:
             message = line.rstrip()
             if message:
                 logger.info("[driver:%s] %s", container_name, message)
+                if telemetry_client:
+                    try:
+                        _publish_driver_log_telemetry(
+                            telemetry_client,
+                            twin_uuid=twin_uuid,
+                            environment_uuid=environment_uuid,
+                            container_name=container_name,
+                            message=message,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to publish driver log telemetry for twin %s: %s",
+                            twin_uuid,
+                            exc,
+                        )
     except Exception as exc:
         logger.warning("Error while streaming logs for %s: %s", container_name, exc)
     finally:
+        if telemetry_client:
+            try:
+                telemetry_client.mqtt.disconnect()
+            except Exception:
+                pass
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -475,7 +559,11 @@ def fetch_and_run_twin_drivers(
         logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
         try:
             success = _run_docker_image(
-                driver_image, driver_params, twin_uuid=twin_uuid, token=token
+                driver_image,
+                driver_params,
+                twin_uuid=twin_uuid,
+                token=token,
+                environment_uuid=environment_uuid,
             )
             results.append(
                 {
