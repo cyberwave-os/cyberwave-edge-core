@@ -20,6 +20,7 @@ import os
 import platform
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
@@ -127,7 +128,7 @@ def check_mqtt_connection(token: str) -> bool:
         return False
 
 
-def load_environment_uuid() -> Optional[str]:
+def load_environment_uuid(*, retries: int = 0, retry_delay_seconds: float = 0.2) -> Optional[str]:
     """Load linked environment UUID from the edge config environment file.
 
     Expected format:
@@ -135,26 +136,36 @@ def load_environment_uuid() -> Optional[str]:
     """
     if not ENVIRONMENT_FILE.exists():
         return None
-    try:
-        with open(ENVIRONMENT_FILE) as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            logger.warning("environment.json should contain a JSON object")
-            return None
 
-        env_uuid = data.get("uuid")
-        if not isinstance(env_uuid, str) or not env_uuid.strip():
-            logger.warning("environment.json must contain a non-empty 'uuid' field")
-            return None
+    max_attempts = max(1, retries + 1)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with open(ENVIRONMENT_FILE) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                logger.warning("environment.json should contain a JSON object")
+                return None
 
-        normalized_uuid = str(uuid.UUID(env_uuid.strip()))
-        return normalized_uuid
-    except ValueError:
-        logger.warning("environment.json contains an invalid UUID format")
-        return None
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read environment file: %s", exc)
-        return None
+            env_uuid = data.get("uuid")
+            if not isinstance(env_uuid, str) or not env_uuid.strip():
+                if attempt < max_attempts:
+                    time.sleep(retry_delay_seconds)
+                    continue
+                logger.warning("environment.json must contain a non-empty 'uuid' field")
+                return None
+
+            normalized_uuid = str(uuid.UUID(env_uuid.strip()))
+            return normalized_uuid
+        except ValueError:
+            logger.warning("environment.json contains an invalid UUID format")
+            return None
+        except (json.JSONDecodeError, OSError) as exc:
+            if attempt < max_attempts:
+                time.sleep(retry_delay_seconds)
+                continue
+            logger.warning("Failed to read environment file: %s", exc)
+            return None
+    raise RuntimeError("Failed to load environment UUID from environment.json")
 
 
 # ---- orchestrator ------------------------------------------------------------
@@ -229,10 +240,10 @@ def _run_docker_image(
 
     container_name = f"cyberwave-driver-{twin_uuid[:8]}"
 
-    if CYBERWAVE_ENVIRONMENT != "production":
-        image = (
-            f"{image}:{CYBERWAVE_ENVIRONMENT}"  # for example: cyberwaveos/cyberwave-edge-so101:dev
-        )
+    # check if the docker image has a tag first
+    if ":" not in image:
+        if CYBERWAVE_ENVIRONMENT != "production":
+            image = f"{image}:{CYBERWAVE_ENVIRONMENT}"  # for example: cyberwaveos/cyberwave-edge-so101:dev
 
     # Remove any existing container with the same name (idempotent re-runs)
     subprocess.run(
@@ -367,13 +378,20 @@ def fetch_and_run_twin_drivers(
             )
             continue
 
-        asset_metadata = asset.metadata or {}
-        drivers = asset_metadata.get("drivers")
+        drivers = twin_metadata.get("drivers")
         if not drivers:
-            logger.warning("No drivers specified in asset metadata for twin '%s'", twin.name)
-            raise ValueError(
-                "No drivers specified in asset metadata for paired twin '%s'", twin.name
-            )
+            # try fallback to asset metadata
+            drivers = asset.metadata.get("drivers")
+            if not drivers:
+                logger.warning("No drivers specified in asset metadata for twin '%s'", twin.name)
+                raise ValueError(
+                    "No drivers specified in asset metadata for paired twin '%s'", twin.name
+                )
+            else:
+                logger.warning(
+                    "No drivers specified in twin metadata for twin '%s', found drivers in asset metadata",
+                    twin.name,
+                )
         driver_image, driver_params = _get_best_driver_image_and_params(drivers)
 
         write_or_update_twin_json_file(twin_uuid, twin.to_dict(), asset.to_dict())
@@ -550,7 +568,7 @@ def run_startup_checks() -> bool:
 
     # 5 — linked environment
     console.print("  Checking environment … ", end=" ")
-    environment_uuid = load_environment_uuid()
+    environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
     if environment_uuid:
         console.print(f"[green]OK[/green] [dim]({environment_uuid})[/dim]")
     else:
