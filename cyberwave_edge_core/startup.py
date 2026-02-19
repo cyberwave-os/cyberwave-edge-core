@@ -20,6 +20,7 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -33,6 +34,9 @@ from rich.console import Console
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+# Track active log streaming threads per container to avoid duplicates.
+_CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
 
 # ---- constants ---------------------------------------------------------------
 
@@ -316,6 +320,7 @@ def _run_docker_image(
             text=True,
             timeout=60,
         )
+        _stream_container_logs(container_name)
         return True
     except subprocess.CalledProcessError as exc:
         logger.error("Failed to start container %s: %s", container_name, exc.stderr)
@@ -323,6 +328,59 @@ def _run_docker_image(
     except subprocess.TimeoutExpired:
         logger.error("Docker run timed out for image: %s", image)
         return False
+
+
+def _stream_container_logs(container_name: str) -> None:
+    """Stream container logs into this service logger in the background."""
+    existing = _CONTAINER_LOG_THREADS.get(container_name)
+    if existing and existing.is_alive():
+        return
+
+    thread = threading.Thread(
+        target=_follow_container_logs,
+        args=(container_name,),
+        name=f"docker-logs-{container_name}",
+        daemon=True,
+    )
+    _CONTAINER_LOG_THREADS[container_name] = thread
+    thread.start()
+
+
+def _follow_container_logs(container_name: str) -> None:
+    """Follow `docker logs -f` and forward lines to the service logger."""
+    if not shutil.which("docker"):
+        logger.warning("Cannot stream logs: Docker is not installed")
+        return
+
+    logger.info("Forwarding logs for container %s to service logs", container_name)
+    try:
+        process = subprocess.Popen(
+            ["docker", "logs", "-f", container_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError as exc:
+        logger.warning("Failed to start docker log streaming for %s: %s", container_name, exc)
+        return
+
+    try:
+        if not process.stdout:
+            logger.warning("No stdout stream when following logs for %s", container_name)
+            return
+
+        for line in process.stdout:
+            message = line.rstrip()
+            if message:
+                logger.info("[driver:%s] %s", container_name, message)
+    except Exception as exc:
+        logger.warning("Error while streaming logs for %s: %s", container_name, exc)
+    finally:
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        logger.info("Stopped forwarding logs for container %s", container_name)
 
 
 def fetch_and_run_twin_drivers(
