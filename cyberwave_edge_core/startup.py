@@ -384,6 +384,12 @@ def fetch_and_run_twin_drivers(
             drivers = asset.metadata.get("drivers")
             if not drivers:
                 logger.warning("No drivers specified in asset metadata for twin '%s'", twin.name)
+                _send_alert_for_twin(
+                    twin_uuid,
+                    "No drivers specified",
+                    "No drivers specified in asset metadata for twin '%s'",
+                    "error",
+                )
                 raise ValueError(
                     "No drivers specified in asset metadata for paired twin '%s'", twin.name
                 )
@@ -398,22 +404,66 @@ def fetch_and_run_twin_drivers(
 
         if not driver_image:
             logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
+            _send_alert_for_twin(
+                twin_uuid,
+                "No driver_docker_image in asset metadata",
+                "No driver_docker_image in asset metadata for twin '%s'",
+                "error",
+            )
             raise ValueError(
                 "No drivers specified in asset metadata for paired twin '%s'", twin.name
             )
 
         logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
-        success = _run_docker_image(driver_image, driver_params, twin_uuid=twin_uuid, token=token)
-        results.append(
-            {
-                "twin_uuid": twin_uuid,
-                "twin_name": twin.name,
-                "driver_image": driver_image,
-                "success": success,
-            }
-        )
+        try:
+            success = _run_docker_image(
+                driver_image, driver_params, twin_uuid=twin_uuid, token=token
+            )
+            results.append(
+                {
+                    "twin_uuid": twin_uuid,
+                    "twin_name": twin.name,
+                    "driver_image": driver_image,
+                    "success": success,
+                }
+            )
+        except Exception as exc:
+            _send_alert_for_twin(
+                twin_uuid,
+                "Failed to run driver docker image",
+                "Failed to run driver docker image for twin '%s': %s",
+                "error",
+            )
+            logger.error(
+                "Failed to run driver docker image %s for twin '%s': %s",
+                driver_image,
+                twin.name,
+                exc,
+            )
 
     return results
+
+
+def _send_alert_for_twin(
+    twin_uuid: str,
+    alert_title: str,
+    alert_description: str,
+    alert_type: str,
+    severity: str = "warning",
+) -> None:
+    """
+    Send an alert to the twin.
+    """
+    client = Cyberwave(base_url=DEFAULT_API_URL, token=load_token())
+    twin = client.twin(twin_id=twin_uuid)
+    # Create an alert
+    twin.alerts.create(
+        name=alert_title,
+        description=alert_description,
+        severity=severity,  # info | warning | error | critical
+        alert_type=alert_type,
+        source_type="edge",  # edge | cloud | workflow
+    )
 
 
 def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tuple[str, list[str]]:
