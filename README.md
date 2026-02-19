@@ -5,7 +5,7 @@ This Edge component acts as an orchestrator of your Cyberwave edge components.
 ## Quickstart (Linux machines)
 
 ```bash
-# Install teh CLI from *one-time setup)
+# Install the CLI (one time setup)
 curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-cli/gpgkey" | sudo gpg --dearmor -o /etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg
 
 # Configure the source
@@ -21,36 +21,6 @@ sudo cyberwave edge install
 The cyberwave-cli will ask you to log in with your Cyberwave credentials and then will proceed installing the `cyberwave-edge-core` on your edge device.
 
 > Don't have a Cyberwave account? Get one at [cyberwave.com](https://cyberwave.com)
-
-## Manual install and usage
-
-```bash
-# Install the registry signing key:
-
-curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey" | gpg --dearmor -o /etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg
-
-# Configure the source:
-
-
-echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main" > /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list
-
-# Run all startup checks (validate token, MQTT, devices, environment)
-cyberwave-edge-core
-
-# Show current credential, token, MQTT, and device status
-cyberwave-edge-core status
-
-# Show version
-cyberwave-edge-core --version
-```
-
-To run against dev:
-
-```bash
-export CYBERWAVE_ENVIRONMENT="dev"
-export CYBERWAVE_BASE_URL="https://api-dev.cyberwave.com"
-cyberwave-edge-core
-```
 
 ### Configuration
 
@@ -104,4 +74,37 @@ The driver object in the metadata looks like this:
         "params" : ["--network local", "--add-host host.docker.internal:host-gateway"] // this is also optional
     }
 }
+```
+
+## Advanced usage
+
+### Manual install and usage
+
+```bash
+# Install the registry signing key:
+
+curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey" | gpg --dearmor -o /etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg
+
+# Configure the source:
+
+echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main" > /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list
+
+# Run all startup checks (validate token, MQTT, devices, environment)
+cyberwave-edge-core
+
+# Show current credential, token, MQTT, and device status
+cyberwave-edge-core status
+
+# Show version
+cyberwave-edge-core --version
+```
+
+### Other env vars
+
+To run against dev:
+
+```bash
+export CYBERWAVE_ENVIRONMENT="dev"
+export CYBERWAVE_BASE_URL="https://api-dev.cyberwave.com"
+cyberwave-edge-core
 ```
