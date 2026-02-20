@@ -24,7 +24,6 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -53,9 +52,52 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 DEVICES_FILE = CONFIG_DIR / "devices.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
-DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
 
-CYBERWAVE_ENVIRONMENT = os.getenv("CYBERWAVE_ENVIRONMENT", "production")
+
+def _load_credentials_payload() -> dict[str, Any]:
+    """Load raw credentials JSON payload."""
+    if not CREDENTIALS_FILE.exists():
+        return {}
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _load_credential_env_overrides() -> dict[str, str]:
+    """Read persisted CYBERWAVE_* overrides from credentials.json."""
+    payload = _load_credentials_payload()
+    overrides: dict[str, str] = {}
+    for key, value in payload.items():
+        if key.startswith("CYBERWAVE_") and isinstance(value, str) and value.strip():
+            overrides[key] = value.strip()
+    return overrides
+
+
+_CREDENTIAL_ENV_OVERRIDES = _load_credential_env_overrides()
+
+
+def _runtime_value(name: str, default: str, *, aliases: tuple[str, ...] = ()) -> str:
+    """Resolve runtime setting from env vars, then credentials.json, then default."""
+    for key in (name, *aliases):
+        value = os.getenv(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in (name, *aliases):
+        value = _CREDENTIAL_ENV_OVERRIDES.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return default
+
+
+DEFAULT_API_URL = _runtime_value(
+    "CYBERWAVE_API_URL",
+    "https://api.cyberwave.com",
+    aliases=("CYBERWAVE_BASE_URL",),
+)
+CYBERWAVE_ENVIRONMENT = _runtime_value("CYBERWAVE_ENVIRONMENT", "production")
 
 
 def load_devices() -> List[str]:
@@ -73,8 +115,7 @@ def load_token() -> Optional[str]:
         logger.warning("Credentials file not found: %s", CREDENTIALS_FILE)
         return None
     try:
-        with open(CREDENTIALS_FILE) as f:
-            data = json.load(f)
+        data = _load_credentials_payload()
         token = data.get("token") or None
         if token:
             masked = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
@@ -96,7 +137,7 @@ def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
 
     Returns ``True`` when the SDK call succeeds (i.e. the token is valid).
     """
-    base_url = base_url or os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    base_url = base_url or DEFAULT_API_URL
     masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
     logger.info("Validating token against %s via SDK (token: %s)", base_url, masked_token)
     try:
@@ -253,7 +294,7 @@ def _run_docker_image(
     # check if the docker image has a tag first
     if ":" not in image:
         if CYBERWAVE_ENVIRONMENT != "production":
-            image = f"{image}:{CYBERWAVE_ENVIRONMENT}"  # for example: cyberwaveos/cyberwave-edge-so101:dev
+            image = f"{image}:{CYBERWAVE_ENVIRONMENT}"
 
     # Remove any existing container with the same name (idempotent re-runs)
     subprocess.run(
@@ -286,9 +327,7 @@ def _run_docker_image(
         "-e",
         f"CYBERWAVE_TOKEN={token}",
     ]
-    api_url = os.getenv("CYBERWAVE_API_URL")
-    if api_url:
-        env_vars += ["-e", f"CYBERWAVE_API_URL={api_url}"]
+    env_vars += ["-e", f"CYBERWAVE_API_URL={DEFAULT_API_URL}"]
     mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
         env_vars += ["-e", f"CYBERWAVE_MQTT_HOST={mqtt_host}"]
@@ -537,7 +576,8 @@ def fetch_and_run_twin_drivers(
                 )
             else:
                 logger.warning(
-                    "No drivers specified in twin metadata for twin '%s', found drivers in asset metadata",
+                    "No drivers specified in twin metadata for twin '%s', "
+                    "found drivers in asset metadata",
                     twin.name,
                 )
         driver_image, driver_params = _get_best_driver_image_and_params(drivers)
@@ -612,7 +652,7 @@ def _send_alert_for_twin(
     )
 
 
-def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tuple[str, list[str]]:
+def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, Any]]) -> tuple[str, list[str]]:
     """
     Given a list of drivers specified in the metadata of the asset,
     and given the hardware where the edge is running,
@@ -622,8 +662,16 @@ def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tup
     TODO: this is missing as of now, always returning the default
 
     "drivers": {
-        "default": {"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
-        "mac":{"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
+        "default": {
+            "docker_image": "helloworld",
+            "version": "0.1.0",
+            "params": ["--param1", "--param2"]
+        },
+        "mac": {
+            "docker_image": "helloworld",
+            "version": "0.1.0",
+            "params": ["--param1", "--param2"]
+        },
     },
     """
     if drivers["default"]:
@@ -631,7 +679,10 @@ def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tup
             drivers["default"]["docker_image"], str
         ):
             raise ValueError("No docker_image specified for default driver")
-        return drivers["default"]["docker_image"], drivers["default"].get("params", [])
+        params = drivers["default"].get("params", [])
+        if not isinstance(params, list):
+            params = []
+        return drivers["default"]["docker_image"], [str(param) for param in params]
     raise ValueError("No default driver specified")
 
 
@@ -717,7 +768,7 @@ def run_startup_checks() -> bool:
     console.print("\n[bold]Cyberwave Edge Core — startup checks[/bold]\n")
 
     # Log resolved configuration for troubleshooting
-    api_url = os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    api_url = DEFAULT_API_URL
     console.print(f"  [dim]Config dir:  {CONFIG_DIR}[/dim]")
     console.print(f"  [dim]API URL:     {api_url}[/dim]")
     console.print(f"  [dim]Environment: {CYBERWAVE_ENVIRONMENT}[/dim]")
