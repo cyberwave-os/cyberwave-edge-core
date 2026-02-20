@@ -311,6 +311,34 @@ def _run_docker_image(
         *env_vars,
         image,
     ]
+    if logger.isEnabledFor(logging.DEBUG):
+        debug_env_vars: list[str] = []
+        for index, item in enumerate(env_vars):
+            if item != "-e" or index + 1 >= len(env_vars):
+                continue
+            key, sep, value = env_vars[index + 1].partition("=")
+            if sep and key == "CYBERWAVE_TOKEN":
+                value = f"{value[:6]}…{value[-4:]}" if len(value) > 12 else "***"
+            debug_env_vars.append(f"{key}{sep}{value}" if sep else env_vars[index + 1])
+
+        debug_cmd = [
+            (
+                f"CYBERWAVE_TOKEN={arg.split('=', 1)[1][:6]}…{arg.split('=', 1)[1][-4:]}"
+                if arg.startswith("CYBERWAVE_TOKEN=") and len(arg.split("=", 1)[1]) > 12
+                else "CYBERWAVE_TOKEN=***"
+                if arg.startswith("CYBERWAVE_TOKEN=")
+                else arg
+            )
+            for arg in cmd
+        ]
+        logger.debug(
+            "Docker run debug inputs for %s: image=%s params=%s env_vars=%s",
+            container_name,
+            image,
+            params,
+            debug_env_vars,
+        )
+        logger.debug("Docker run command args for %s: %s", container_name, debug_cmd)
     logger.info("Starting docker container %s from image %s", container_name, image)
     try:
         subprocess.run(
