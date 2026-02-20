@@ -18,12 +18,12 @@ import json
 import logging
 import os
 import platform
-import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -37,10 +37,6 @@ console = Console()
 
 # Track active log streaming threads per container to avoid duplicates.
 _CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
-_DRIVER_LOG_LEVEL_PATTERN = re.compile(
-    r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b", re.IGNORECASE
-)
-_MAX_DRIVER_LOG_MESSAGE_LENGTH = 4000
 
 # ---- constants ---------------------------------------------------------------
 
@@ -52,52 +48,9 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 DEVICES_FILE = CONFIG_DIR / "devices.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
+DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
 
-
-def _load_credentials_payload() -> dict[str, Any]:
-    """Load raw credentials JSON payload."""
-    if not CREDENTIALS_FILE.exists():
-        return {}
-    try:
-        with open(CREDENTIALS_FILE) as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _load_credential_env_overrides() -> dict[str, str]:
-    """Read persisted CYBERWAVE_* overrides from credentials.json."""
-    payload = _load_credentials_payload()
-    overrides: dict[str, str] = {}
-    for key, value in payload.items():
-        if key.startswith("CYBERWAVE_") and isinstance(value, str) and value.strip():
-            overrides[key] = value.strip()
-    return overrides
-
-
-_CREDENTIAL_ENV_OVERRIDES = _load_credential_env_overrides()
-
-
-def _runtime_value(name: str, default: str, *, aliases: tuple[str, ...] = ()) -> str:
-    """Resolve runtime setting from env vars, then credentials.json, then default."""
-    for key in (name, *aliases):
-        value = os.getenv(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    for key in (name, *aliases):
-        value = _CREDENTIAL_ENV_OVERRIDES.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return default
-
-
-DEFAULT_API_URL = _runtime_value(
-    "CYBERWAVE_API_URL",
-    "https://api.cyberwave.com",
-    aliases=("CYBERWAVE_BASE_URL",),
-)
-CYBERWAVE_ENVIRONMENT = _runtime_value("CYBERWAVE_ENVIRONMENT", "production")
+CYBERWAVE_ENVIRONMENT = os.getenv("CYBERWAVE_ENVIRONMENT", "production")
 
 
 def load_devices() -> List[str]:
@@ -115,7 +68,8 @@ def load_token() -> Optional[str]:
         logger.warning("Credentials file not found: %s", CREDENTIALS_FILE)
         return None
     try:
-        data = _load_credentials_payload()
+        with open(CREDENTIALS_FILE) as f:
+            data = json.load(f)
         token = data.get("token") or None
         if token:
             masked = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
@@ -137,7 +91,7 @@ def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
 
     Returns ``True`` when the SDK call succeeds (i.e. the token is valid).
     """
-    base_url = base_url or DEFAULT_API_URL
+    base_url = base_url or os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
     masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
     logger.info("Validating token against %s via SDK (token: %s)", base_url, masked_token)
     try:
@@ -274,7 +228,6 @@ def _run_docker_image(
     *,
     twin_uuid: str,
     token: str,
-    environment_uuid: str,
 ) -> bool:
     """Pull and run a driver Docker container for a twin.
 
@@ -294,7 +247,7 @@ def _run_docker_image(
     # check if the docker image has a tag first
     if ":" not in image:
         if CYBERWAVE_ENVIRONMENT != "production":
-            image = f"{image}:{CYBERWAVE_ENVIRONMENT}"
+            image = f"{image}:{CYBERWAVE_ENVIRONMENT}"  # for example: cyberwaveos/cyberwave-edge-so101:dev
 
     # Remove any existing container with the same name (idempotent re-runs)
     subprocess.run(
@@ -320,27 +273,21 @@ def _run_docker_image(
         logger.error("Docker pull timed out for image: %s", image)
         return False
 
-    # Build env vars for the container.
-    # Forward all resolved CYBERWAVE_* overrides (from env + credentials.json)
-    # so driver containers authenticate against the same backend as the core.
+    # Build env vars for the container
     env_vars: List[str] = [
-        "-e", f"CYBERWAVE_TWIN_UUID={twin_uuid}",
-        "-e", f"CYBERWAVE_TOKEN={token}",
-        "-e", f"CYBERWAVE_API_URL={DEFAULT_API_URL}",
-        "-e", f"CYBERWAVE_BASE_URL={DEFAULT_API_URL}",
+        "-e",
+        f"CYBERWAVE_TWIN_UUID={twin_uuid}",
+        "-e",
+        f"CYBERWAVE_TOKEN={token}",
     ]
-    if CYBERWAVE_ENVIRONMENT != "production":
-        env_vars += ["-e", f"CYBERWAVE_ENVIRONMENT={CYBERWAVE_ENVIRONMENT}"]
-    for key, value in _CREDENTIAL_ENV_OVERRIDES.items():
-        already_set = any(
-            e.startswith(f"{key}=") for i, e in enumerate(env_vars)
-            if i > 0 and env_vars[i - 1] == "-e"
-        )
-        if not already_set:
-            env_vars += ["-e", f"{key}={value}"]
+    api_url = os.getenv("CYBERWAVE_API_URL")
+    if api_url:
+        env_vars += ["-e", f"CYBERWAVE_API_URL={api_url}"]
     mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
         env_vars += ["-e", f"CYBERWAVE_MQTT_HOST={mqtt_host}"]
+    if CYBERWAVE_ENVIRONMENT != "production":
+        env_vars += ["-e", f"CYBERWAVE_ENVIRONMENT={CYBERWAVE_ENVIRONMENT}"]
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
     if twin_json_file.exists():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
@@ -373,12 +320,7 @@ def _run_docker_image(
             text=True,
             timeout=60,
         )
-        _stream_container_logs(
-            container_name,
-            twin_uuid=twin_uuid,
-            token=token,
-            environment_uuid=environment_uuid,
-        )
+        _stream_container_logs(container_name)
         return True
     except subprocess.CalledProcessError as exc:
         logger.error("Failed to start container %s: %s", container_name, exc.stderr)
@@ -388,9 +330,7 @@ def _run_docker_image(
         return False
 
 
-def _stream_container_logs(
-    container_name: str, *, twin_uuid: str, token: str, environment_uuid: str
-) -> None:
+def _stream_container_logs(container_name: str) -> None:
     """Stream container logs into this service logger in the background."""
     existing = _CONTAINER_LOG_THREADS.get(container_name)
     if existing and existing.is_alive():
@@ -398,7 +338,7 @@ def _stream_container_logs(
 
     thread = threading.Thread(
         target=_follow_container_logs,
-        args=(container_name, twin_uuid, token, environment_uuid),
+        args=(container_name,),
         name=f"docker-logs-{container_name}",
         daemon=True,
     )
@@ -406,64 +346,15 @@ def _stream_container_logs(
     thread.start()
 
 
-def _infer_driver_log_level(message: str) -> str:
-    """Infer a log level from a raw driver log line."""
-    match = _DRIVER_LOG_LEVEL_PATTERN.search(message)
-    if not match:
-        return "INFO"
-
-    level = match.group(1).upper()
-    if level == "WARN":
-        return "WARNING"
-    if level == "FATAL":
-        return "CRITICAL"
-    return level
-
-
-def _publish_driver_log_telemetry(
-    client: Cyberwave,
-    *,
-    twin_uuid: str,
-    environment_uuid: str,
-    container_name: str,
-    message: str,
-) -> None:
-    """Publish a single driver log line into twin telemetry."""
-    topic = f"{client.mqtt.topic_prefix}cyberwave/twin/{twin_uuid}/telemetry"
-    payload = {
-        "type": "driver_log",
-        "level": _infer_driver_log_level(message),
-        "message": message[:_MAX_DRIVER_LOG_MESSAGE_LENGTH],
-        "container_name": container_name,
-        "environment_uuid": environment_uuid,
-        "source": "edge_core",
-        "timestamp": time.time_ns(),
-    }
-    client.mqtt.publish(topic, payload)
-
-
-def _follow_container_logs(
-    container_name: str, twin_uuid: str, token: str, environment_uuid: str
-) -> None:
-    """Follow `docker logs -f` and forward lines to service + telemetry logs."""
+def _follow_container_logs(container_name: str) -> None:
+    """Follow `docker logs -f` and forward lines to the service logger."""
     if not shutil.which("docker"):
         logger.warning("Cannot stream logs: Docker is not installed")
         return
 
-    telemetry_client: Optional[Cyberwave] = None
-    try:
-        telemetry_client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
-        telemetry_client.mqtt.connect()
-    except Exception as exc:
-        logger.warning(
-            "Driver log telemetry disabled for twin %s (%s): %s",
-            twin_uuid,
-            container_name,
-            exc,
-        )
-        telemetry_client = None
-
     logger.info("Forwarding logs for container %s to service logs", container_name)
+    debug_log_stream = logger.isEnabledFor(logging.DEBUG)
+    received_lines = 0
     try:
         process = subprocess.Popen(
             ["docker", "logs", "-f", container_name],
@@ -483,35 +374,28 @@ def _follow_container_logs(
         for line in process.stdout:
             message = line.rstrip()
             if message:
+                received_lines += 1
                 logger.info("[driver:%s] %s", container_name, message)
-                if telemetry_client:
-                    try:
-                        _publish_driver_log_telemetry(
-                            telemetry_client,
-                            twin_uuid=twin_uuid,
-                            environment_uuid=environment_uuid,
-                            container_name=container_name,
-                            message=message,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to publish driver log telemetry for twin %s: %s",
-                            twin_uuid,
-                            exc,
-                        )
+                if debug_log_stream:
+                    # Extra local trace to confirm the edge core receives lines.
+                    logger.debug(
+                        "Container log line received (container=%s, line=%d, chars=%d)",
+                        container_name,
+                        received_lines,
+                        len(message),
+                    )
     except Exception as exc:
         logger.warning("Error while streaming logs for %s: %s", container_name, exc)
     finally:
-        if telemetry_client:
-            try:
-                telemetry_client.mqtt.disconnect()
-            except Exception:
-                pass
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             process.kill()
-        logger.info("Stopped forwarding logs for container %s", container_name)
+        logger.info(
+            "Stopped forwarding logs for container %s (lines_received=%d)",
+            container_name,
+            received_lines,
+        )
 
 
 def fetch_and_run_twin_drivers(
@@ -584,8 +468,7 @@ def fetch_and_run_twin_drivers(
                 )
             else:
                 logger.warning(
-                    "No drivers specified in twin metadata for twin '%s', "
-                    "found drivers in asset metadata",
+                    "No drivers specified in twin metadata for twin '%s', found drivers in asset metadata",
                     twin.name,
                 )
         driver_image, driver_params = _get_best_driver_image_and_params(drivers)
@@ -607,11 +490,7 @@ def fetch_and_run_twin_drivers(
         logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
         try:
             success = _run_docker_image(
-                driver_image,
-                driver_params,
-                twin_uuid=twin_uuid,
-                token=token,
-                environment_uuid=environment_uuid,
+                driver_image, driver_params, twin_uuid=twin_uuid, token=token
             )
             results.append(
                 {
@@ -660,7 +539,7 @@ def _send_alert_for_twin(
     )
 
 
-def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, Any]]) -> tuple[str, list[str]]:
+def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tuple[str, list[str]]:
     """
     Given a list of drivers specified in the metadata of the asset,
     and given the hardware where the edge is running,
@@ -670,16 +549,8 @@ def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, Any]]) -> tup
     TODO: this is missing as of now, always returning the default
 
     "drivers": {
-        "default": {
-            "docker_image": "helloworld",
-            "version": "0.1.0",
-            "params": ["--param1", "--param2"]
-        },
-        "mac": {
-            "docker_image": "helloworld",
-            "version": "0.1.0",
-            "params": ["--param1", "--param2"]
-        },
+        "default": {"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
+        "mac":{"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
     },
     """
     if drivers["default"]:
@@ -687,10 +558,7 @@ def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, Any]]) -> tup
             drivers["default"]["docker_image"], str
         ):
             raise ValueError("No docker_image specified for default driver")
-        params = drivers["default"].get("params", [])
-        if not isinstance(params, list):
-            params = []
-        return drivers["default"]["docker_image"], [str(param) for param in params]
+        return drivers["default"]["docker_image"], drivers["default"].get("params", [])
     raise ValueError("No default driver specified")
 
 
@@ -776,7 +644,7 @@ def run_startup_checks() -> bool:
     console.print("\n[bold]Cyberwave Edge Core — startup checks[/bold]\n")
 
     # Log resolved configuration for troubleshooting
-    api_url = DEFAULT_API_URL
+    api_url = os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
     console.print(f"  [dim]Config dir:  {CONFIG_DIR}[/dim]")
     console.print(f"  [dim]API URL:     {api_url}[/dim]")
     console.print(f"  [dim]Environment: {CYBERWAVE_ENVIRONMENT}[/dim]")

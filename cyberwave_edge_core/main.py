@@ -1,6 +1,7 @@
 """Cyberwave Edge Core CLI entry point."""
 
 import logging
+import os
 import sys
 
 import click
@@ -15,12 +16,19 @@ from .startup import (
 )
 
 console = Console()
+LOG_LEVEL_ENV_VAR = "CYBERWAVE_EDGE_LOG_LEVEL"
+
+
+def _resolve_log_level() -> int:
+    """Resolve logger level from env var with INFO fallback."""
+    raw_level = os.getenv(LOG_LEVEL_ENV_VAR, "INFO").upper()
+    return getattr(logging, raw_level, logging.INFO)
 
 # Configure logging so info/warning/error messages appear in journald.
 # The systemd journal captures stderr; use a clear format so log lines
 # are easy to filter with journalctl.
 logging.basicConfig(
-    level=logging.INFO,
+    level=_resolve_log_level(),
     format="%(levelname)s %(name)s: %(message)s",
     stream=sys.stderr,
 )
