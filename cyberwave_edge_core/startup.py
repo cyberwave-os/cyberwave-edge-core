@@ -320,19 +320,27 @@ def _run_docker_image(
         logger.error("Docker pull timed out for image: %s", image)
         return False
 
-    # Build env vars for the container
+    # Build env vars for the container.
+    # Forward all resolved CYBERWAVE_* overrides (from env + credentials.json)
+    # so driver containers authenticate against the same backend as the core.
     env_vars: List[str] = [
-        "-e",
-        f"CYBERWAVE_TWIN_UUID={twin_uuid}",
-        "-e",
-        f"CYBERWAVE_TOKEN={token}",
+        "-e", f"CYBERWAVE_TWIN_UUID={twin_uuid}",
+        "-e", f"CYBERWAVE_TOKEN={token}",
+        "-e", f"CYBERWAVE_API_URL={DEFAULT_API_URL}",
+        "-e", f"CYBERWAVE_BASE_URL={DEFAULT_API_URL}",
     ]
-    env_vars += ["-e", f"CYBERWAVE_API_URL={DEFAULT_API_URL}"]
+    if CYBERWAVE_ENVIRONMENT != "production":
+        env_vars += ["-e", f"CYBERWAVE_ENVIRONMENT={CYBERWAVE_ENVIRONMENT}"]
+    for key, value in _CREDENTIAL_ENV_OVERRIDES.items():
+        already_set = any(
+            e.startswith(f"{key}=") for i, e in enumerate(env_vars)
+            if i > 0 and env_vars[i - 1] == "-e"
+        )
+        if not already_set:
+            env_vars += ["-e", f"{key}={value}"]
     mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
         env_vars += ["-e", f"CYBERWAVE_MQTT_HOST={mqtt_host}"]
-    if CYBERWAVE_ENVIRONMENT != "production":
-        env_vars += ["-e", f"CYBERWAVE_ENVIRONMENT={CYBERWAVE_ENVIRONMENT}"]
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
     if twin_json_file.exists():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
