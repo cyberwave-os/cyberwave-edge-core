@@ -23,7 +23,6 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -48,9 +47,8 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 DEVICES_FILE = CONFIG_DIR / "devices.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
-DEFAULT_API_URL = os.getenv("CYBERWAVE_API_URL", "https://api.cyberwave.com")
-
-CYBERWAVE_ENVIRONMENT = os.getenv("CYBERWAVE_ENVIRONMENT", "production")
+DEFAULT_API_URL = "https://api.cyberwave.com"
+DEFAULT_ENVIRONMENT = "production"
 
 
 def load_devices() -> List[str]:
@@ -86,12 +84,68 @@ def load_token() -> Optional[str]:
         return None
 
 
+def load_credentials_envs() -> dict[str, str]:
+    """Load persisted runtime env vars from credentials.json.
+
+    Supports both the new schema:
+        {"envs": {"CYBERWAVE_API_URL": "..."}}
+    and legacy flat keys for backward compatibility.
+    """
+    if not CREDENTIALS_FILE.exists():
+        return {}
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    envs: dict[str, str] = {}
+    raw_envs = data.get("envs")
+    if isinstance(raw_envs, dict):
+        for key, value in raw_envs.items():
+            if (
+                isinstance(key, str)
+                and key.startswith("CYBERWAVE_")
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                envs[key] = value.strip()
+
+    # Backward compatibility with older credentials format.
+    for key in (
+        "CYBERWAVE_ENVIRONMENT",
+        "CYBERWAVE_EDGE_LOG_LEVEL",
+        "CYBERWAVE_API_URL",
+        "CYBERWAVE_BASE_URL",
+        "CYBERWAVE_MQTT_HOST",
+    ):
+        value = data.get(key)
+        if key not in envs and isinstance(value, str) and value.strip():
+            envs[key] = value.strip()
+    return envs
+
+
+def get_runtime_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Resolve runtime env var preferring process env, then credentials envs."""
+    process_value = os.getenv(name)
+    if isinstance(process_value, str) and process_value.strip():
+        return process_value.strip()
+
+    credentials_value = load_credentials_envs().get(name)
+    if isinstance(credentials_value, str) and credentials_value.strip():
+        return credentials_value.strip()
+    return default
+
+
 def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
     """Validate *token* by listing workspaces via the Cyberwave SDK.
 
     Returns ``True`` when the SDK call succeeds (i.e. the token is valid).
     """
-    base_url = base_url or os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    base_url = base_url or get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL)
     masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
     logger.info("Validating token against %s via SDK (token: %s)", base_url, masked_token)
     try:
@@ -111,14 +165,15 @@ def check_mqtt_connection(token: str) -> bool:
     variables (``CYBERWAVE_MQTT_HOST``, etc.) and falls back to sensible
     defaults.  Returns ``True`` if the connection succeeds.
     """
-    mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST", "(default)")
+    mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST", "(default)")
+    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     logger.info(
         "Attempting MQTT connection (api_url=%s, mqtt_host=%s)",
-        DEFAULT_API_URL,
+        api_url,
         mqtt_host,
     )
     try:
-        client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
+        client = Cyberwave(base_url=api_url, token=token)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
         if connected:
@@ -243,11 +298,15 @@ def _run_docker_image(
         return False
 
     container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+    runtime_environment = (
+        get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
+    ).lower()
 
     # check if the docker image has a tag first
     if ":" not in image:
-        if CYBERWAVE_ENVIRONMENT != "production":
-            image = f"{image}:{CYBERWAVE_ENVIRONMENT}"  # for example: cyberwaveos/cyberwave-edge-so101:dev
+        if runtime_environment != "production":
+            # Example: cyberwaveos/cyberwave-edge-so101:dev
+            image = f"{image}:{runtime_environment}"
 
     # Remove any existing container with the same name (idempotent re-runs)
     subprocess.run(
@@ -274,20 +333,29 @@ def _run_docker_image(
         return False
 
     # Build env vars for the container
-    env_vars: List[str] = [
-        "-e",
-        f"CYBERWAVE_TWIN_UUID={twin_uuid}",
-        "-e",
-        f"CYBERWAVE_TOKEN={token}",
-    ]
-    api_url = os.getenv("CYBERWAVE_API_URL")
+    container_env: dict[str, str] = {
+        "CYBERWAVE_TWIN_UUID": twin_uuid,
+        "CYBERWAVE_TOKEN": token,
+    }
+
+    api_url = get_runtime_env_var("CYBERWAVE_API_URL")
     if api_url:
-        env_vars += ["-e", f"CYBERWAVE_API_URL={api_url}"]
-    mqtt_host = os.getenv("CYBERWAVE_MQTT_HOST")
+        container_env["CYBERWAVE_API_URL"] = api_url
+    mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
-        env_vars += ["-e", f"CYBERWAVE_MQTT_HOST={mqtt_host}"]
-    if CYBERWAVE_ENVIRONMENT != "production":
-        env_vars += ["-e", f"CYBERWAVE_ENVIRONMENT={CYBERWAVE_ENVIRONMENT}"]
+        container_env["CYBERWAVE_MQTT_HOST"] = mqtt_host
+    if runtime_environment != "production":
+        container_env["CYBERWAVE_ENVIRONMENT"] = runtime_environment
+
+    # Also forward additional CYBERWAVE_* env vars persisted by the CLI.
+    for key, value in load_credentials_envs().items():
+        if key.startswith("CYBERWAVE_"):
+            container_env.setdefault(key, value)
+
+    env_vars: List[str] = []
+    for key, value in container_env.items():
+        env_vars += ["-e", f"{key}={value}"]
+
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
     if twin_json_file.exists():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
@@ -441,7 +509,8 @@ def fetch_and_run_twin_drivers(
     Returns a list of result dicts with twin info and whether the container
     started successfully.
     """
-    client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
+    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    client = Cyberwave(base_url=api_url, token=token)
 
     # List twins for the environment via the SDK
     twins = client.twins.list(environment_id=environment_uuid)
@@ -496,7 +565,10 @@ def fetch_and_run_twin_drivers(
                 )
             else:
                 logger.warning(
-                    "No drivers specified in twin metadata for twin '%s', found drivers in asset metadata",
+                    (
+                        "No drivers specified in twin metadata for twin '%s', "
+                        "found drivers in asset metadata"
+                    ),
                     twin.name,
                 )
         driver_image, driver_params = _get_best_driver_image_and_params(drivers)
@@ -555,7 +627,8 @@ def _send_alert_for_twin(
     """
     Send an alert to the twin.
     """
-    client = Cyberwave(base_url=DEFAULT_API_URL, token=load_token())
+    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    client = Cyberwave(base_url=api_url, token=load_token())
     twin = client.twin(twin_id=twin_uuid)
     # Create an alert
     twin.alerts.create(
@@ -577,8 +650,16 @@ def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tup
     TODO: this is missing as of now, always returning the default
 
     "drivers": {
-        "default": {"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
-        "mac":{"docker_image": "helloworld", "version": "0.1.0", "params": ["--param1", "--param2"]},
+        "default": {
+            "docker_image": "helloworld",
+            "version": "0.1.0",
+            "params": ["--param1", "--param2"],
+        },
+        "mac": {
+            "docker_image": "helloworld",
+            "version": "0.1.0",
+            "params": ["--param1", "--param2"],
+        },
     },
     """
     if drivers["default"]:
@@ -596,9 +677,10 @@ def register_edge(token: str) -> bool:
         logger.warning("Could not load or create edge fingerprint")
         return False
 
-    logger.info("Registering edge with fingerprint=%s at %s", fingerprint, DEFAULT_API_URL)
+    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    logger.info("Registering edge with fingerprint=%s at %s", fingerprint, api_url)
     try:
-        client = Cyberwave(base_url=DEFAULT_API_URL, token=token)
+        client = Cyberwave(base_url=api_url, token=token)
         edge = client.edges.create(
             fingerprint=fingerprint,
         )
@@ -672,10 +754,13 @@ def run_startup_checks() -> bool:
     console.print("\n[bold]Cyberwave Edge Core — startup checks[/bold]\n")
 
     # Log resolved configuration for troubleshooting
-    api_url = os.getenv("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    runtime_environment = (
+        get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
+    )
     console.print(f"  [dim]Config dir:  {CONFIG_DIR}[/dim]")
     console.print(f"  [dim]API URL:     {api_url}[/dim]")
-    console.print(f"  [dim]Environment: {CYBERWAVE_ENVIRONMENT}[/dim]")
+    console.print(f"  [dim]Environment: {runtime_environment}[/dim]")
     console.print()
 
     # 1 — credentials file
