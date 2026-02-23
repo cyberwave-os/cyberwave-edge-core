@@ -325,7 +325,7 @@ def _run_docker_image(
     # Build env vars for the container
     container_env: dict[str, str] = {
         "CYBERWAVE_TWIN_UUID": twin_uuid,
-        "CYBERWAVE_TOKEN": token,
+        "CYBERWAVE_API_KEY": token,
     }
 
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL")
@@ -375,16 +375,16 @@ def _run_docker_image(
             if item != "-e" or index + 1 >= len(env_vars):
                 continue
             key, sep, value = env_vars[index + 1].partition("=")
-            if sep and key == "CYBERWAVE_TOKEN":
+            if sep and key == "CYBERWAVE_API_KEY":
                 value = f"{value[:6]}…{value[-4:]}" if len(value) > 12 else "***"
             debug_env_vars.append(f"{key}{sep}{value}" if sep else env_vars[index + 1])
 
         debug_cmd = [
             (
-                f"CYBERWAVE_TOKEN={arg.split('=', 1)[1][:6]}…{arg.split('=', 1)[1][-4:]}"
-                if arg.startswith("CYBERWAVE_TOKEN=") and len(arg.split("=", 1)[1]) > 12
-                else "CYBERWAVE_TOKEN=***"
-                if arg.startswith("CYBERWAVE_TOKEN=")
+                f"CYBERWAVE_API_KEY={arg.split('=', 1)[1][:6]}…{arg.split('=', 1)[1][-4:]}"
+                if arg.startswith("CYBERWAVE_API_KEY=") and len(arg.split("=", 1)[1]) > 12
+                else "CYBERWAVE_API_KEY=***"
+                if arg.startswith("CYBERWAVE_API_KEY=")
                 else arg
             )
             for arg in cmd
