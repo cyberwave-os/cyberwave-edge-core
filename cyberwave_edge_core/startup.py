@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cyberwave import Cyberwave
-from cyberwave.fingerprint import generate_fingerprint as sdk_generate_fingerprint
+from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 
 logger = logging.getLogger(__name__)
@@ -227,11 +227,6 @@ def load_environment_uuid(*, retries: int = 0, retry_delay_seconds: float = 0.2)
 
 
 # ---- orchestrator ------------------------------------------------------------
-
-
-def generate_fingerprint() -> str:
-    """Generate the edge fingerprint using the shared SDK implementation."""
-    return sdk_generate_fingerprint()
 
 
 def load_saved_fingerprint() -> Optional[str]:
