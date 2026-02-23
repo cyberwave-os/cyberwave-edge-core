@@ -17,18 +17,17 @@ and a single ``run_startup_checks()`` orchestrator for the boot path.
 import json
 import logging
 import os
-import platform
 import shutil
 import subprocess
 import threading
 import time
 import uuid
 from datetime import date, datetime
-from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cyberwave import Cyberwave
+from cyberwave.fingerprint import generate_fingerprint as sdk_generate_fingerprint
 from rich.console import Console
 
 logger = logging.getLogger(__name__)
@@ -231,10 +230,8 @@ def load_environment_uuid(*, retries: int = 0, retry_delay_seconds: float = 0.2)
 
 
 def generate_fingerprint() -> str:
-    """Generate a stable fingerprint based on host characteristics."""
-    raw = f"{platform.node()}|{platform.system()}|{platform.machine()}|{uuid.getnode()}"
-    digest = sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return f"{platform.system().lower()}-{digest}"
+    """Generate the edge fingerprint using the shared SDK implementation."""
+    return sdk_generate_fingerprint()
 
 
 def load_saved_fingerprint() -> Optional[str]:
