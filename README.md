@@ -51,7 +51,7 @@ Once it's started (either via CLI or via service) the core does the following:
 A Cyberwave driver is a Docker image that is capable of interacting with the device's hardware, sending and getting data from the Cyberwave backend. Every time the core starts a driver Docker image, the `core` does so by defining the following environment variables:
 
 - `CYBERWAVE_TWIN_UUID`
-- `CYBERWAVE_TOKEN`
+- `CYBERWAVE_API_KEY`
 - `CYBERWAVE_TWIN_JSON_FILE`
 
 The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
@@ -105,8 +105,6 @@ To run against dev:
 
 ```bash
 export CYBERWAVE_ENVIRONMENT="dev"
-export CYBERWAVE_API_URL="https://api-dev.cyberwave.com"
-# Optional SDK alias (kept for compatibility):
 export CYBERWAVE_BASE_URL="https://api-dev.cyberwave.com"
 cyberwave-edge-core
 ```

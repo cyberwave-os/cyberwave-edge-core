@@ -88,9 +88,8 @@ def load_token() -> Optional[str]:
 def load_credentials_envs() -> dict[str, str]:
     """Load persisted runtime env vars from credentials.json.
 
-    Supports both the new schema:
-        {"envs": {"CYBERWAVE_API_URL": "..."}}
-    and legacy flat keys for backward compatibility.
+    Expected schema:
+        {"envs": {"CYBERWAVE_BASE_URL": "..."}}
     """
     if not CREDENTIALS_FILE.exists():
         return {}
@@ -115,11 +114,10 @@ def load_credentials_envs() -> dict[str, str]:
             ):
                 envs[key] = value.strip()
 
-    # Backward compatibility with older credentials format.
+    # Also support a subset of top-level keys when no "envs" map is present.
     for key in (
         "CYBERWAVE_ENVIRONMENT",
         "CYBERWAVE_EDGE_LOG_LEVEL",
-        "CYBERWAVE_API_URL",
         "CYBERWAVE_BASE_URL",
         "CYBERWAVE_MQTT_HOST",
     ):
@@ -146,7 +144,7 @@ def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
 
     Returns ``True`` when the SDK call succeeds (i.e. the token is valid).
     """
-    base_url = base_url or get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL)
+    base_url = base_url or get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL)
     masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
     logger.info("Validating token against %s via SDK (token: %s)", base_url, masked_token)
     try:
@@ -167,14 +165,14 @@ def check_mqtt_connection(token: str) -> bool:
     defaults.  Returns ``True`` if the connection succeeds.
     """
     mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST", "(default)")
-    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     logger.info(
-        "Attempting MQTT connection (api_url=%s, mqtt_host=%s)",
-        api_url,
+        "Attempting MQTT connection (base_url=%s, mqtt_host=%s)",
+        base_url,
         mqtt_host,
     )
     try:
-        client = Cyberwave(base_url=api_url, token=token)
+        client = Cyberwave(base_url=base_url, token=token)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
         if connected:
@@ -329,12 +327,12 @@ def _run_docker_image(
     # Build env vars for the container
     container_env: dict[str, str] = {
         "CYBERWAVE_TWIN_UUID": twin_uuid,
-        "CYBERWAVE_TOKEN": token,
+        "CYBERWAVE_API_KEY": token,
     }
 
-    api_url = get_runtime_env_var("CYBERWAVE_API_URL")
-    if api_url:
-        container_env["CYBERWAVE_API_URL"] = api_url
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL")
+    if base_url:
+        container_env["CYBERWAVE_BASE_URL"] = base_url
     mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
         container_env["CYBERWAVE_MQTT_HOST"] = mqtt_host
@@ -379,16 +377,16 @@ def _run_docker_image(
             if item != "-e" or index + 1 >= len(env_vars):
                 continue
             key, sep, value = env_vars[index + 1].partition("=")
-            if sep and key == "CYBERWAVE_TOKEN":
+            if sep and key == "CYBERWAVE_API_KEY":
                 value = f"{value[:6]}…{value[-4:]}" if len(value) > 12 else "***"
             debug_env_vars.append(f"{key}{sep}{value}" if sep else env_vars[index + 1])
 
         debug_cmd = [
             (
-                f"CYBERWAVE_TOKEN={arg.split('=', 1)[1][:6]}…{arg.split('=', 1)[1][-4:]}"
-                if arg.startswith("CYBERWAVE_TOKEN=") and len(arg.split("=", 1)[1]) > 12
-                else "CYBERWAVE_TOKEN=***"
-                if arg.startswith("CYBERWAVE_TOKEN=")
+                f"CYBERWAVE_API_KEY={arg.split('=', 1)[1][:6]}…{arg.split('=', 1)[1][-4:]}"
+                if arg.startswith("CYBERWAVE_API_KEY=") and len(arg.split("=", 1)[1]) > 12
+                else "CYBERWAVE_API_KEY=***"
+                if arg.startswith("CYBERWAVE_API_KEY=")
                 else arg
             )
             for arg in cmd
@@ -553,8 +551,8 @@ def fetch_and_run_twin_drivers(
     Returns a list of result dicts with twin info and whether the container
     started successfully.
     """
-    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-    client = Cyberwave(base_url=api_url, token=token)
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    client = Cyberwave(base_url=base_url, token=token)
 
     # List twins for the environment via the SDK
     twins = client.twins.list(environment_id=environment_uuid)
@@ -671,8 +669,8 @@ def _send_alert_for_twin(
     """
     Send an alert to the twin.
     """
-    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-    client = Cyberwave(base_url=api_url, token=load_token())
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    client = Cyberwave(base_url=base_url, token=load_token())
     twin = client.twin(twin_id=twin_uuid)
     # Create an alert
     twin.alerts.create(
@@ -721,10 +719,10 @@ def register_edge(token: str) -> bool:
         logger.warning("Could not load or create edge fingerprint")
         return False
 
-    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-    logger.info("Registering edge with fingerprint=%s at %s", fingerprint, api_url)
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    logger.info("Registering edge with fingerprint=%s at %s", fingerprint, base_url)
     try:
-        client = Cyberwave(base_url=api_url, token=token)
+        client = Cyberwave(base_url=base_url, token=token)
         edge = client.edges.create(
             fingerprint=fingerprint,
         )
@@ -798,12 +796,12 @@ def run_startup_checks() -> bool:
     console.print("\n[bold]Cyberwave Edge Core — startup checks[/bold]\n")
 
     # Log resolved configuration for troubleshooting
-    api_url = get_runtime_env_var("CYBERWAVE_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     runtime_environment = (
         get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
     )
     console.print(f"  [dim]Config dir:  {CONFIG_DIR}[/dim]")
-    console.print(f"  [dim]API URL:     {api_url}[/dim]")
+    console.print(f"  [dim]Base URL:    {base_url}[/dim]")
     console.print(f"  [dim]Environment: {runtime_environment}[/dim]")
     console.print()
 
@@ -823,7 +821,7 @@ def run_startup_checks() -> bool:
         console.print("[green]OK[/green]")
     else:
         console.print("[red]FAIL[/red]")
-        console.print(f"\n  [red]Token validation failed against {api_url}[/red]")
+        console.print(f"\n  [red]Token validation failed against {base_url}[/red]")
         console.print("  [dim]Check 'journalctl -u cyberwave-edge-core' for details.[/dim]")
         console.print("  [dim]Run 'cyberwave login' to refresh your credentials.[/dim]")
         return False
