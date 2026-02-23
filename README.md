@@ -105,8 +105,6 @@ To run against dev:
 
 ```bash
 export CYBERWAVE_ENVIRONMENT="dev"
-export CYBERWAVE_API_URL="https://api-dev.cyberwave.com"
-# Optional SDK alias (kept for compatibility):
 export CYBERWAVE_BASE_URL="https://api-dev.cyberwave.com"
 cyberwave-edge-core
 ```
