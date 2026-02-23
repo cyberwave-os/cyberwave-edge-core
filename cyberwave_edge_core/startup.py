@@ -48,6 +48,8 @@ FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
+DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
+LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
 
 
 def load_devices() -> List[str]:
@@ -432,6 +434,56 @@ def _stream_container_logs(container_name: str) -> None:
     )
     _CONTAINER_LOG_THREADS[container_name] = thread
     thread.start()
+
+
+def _list_running_driver_containers() -> list[str]:
+    """Return running driver container names managed by edge-core."""
+    if not shutil.which("docker"):
+        return []
+
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--format",
+                "{{.Names}}",
+                "--filter",
+                f"name=^{DRIVER_CONTAINER_PREFIX}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to list running driver containers: %s", exc)
+        return []
+
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def reconcile_driver_log_streams() -> int:
+    """Ensure active driver containers have an attached log-forwarding thread."""
+    running_containers = _list_running_driver_containers()
+    running_set = set(running_containers)
+
+    # Drop finished thread handles so we can re-attach later if needed.
+    stale = [
+        name
+        for name, thread in _CONTAINER_LOG_THREADS.items()
+        if not thread.is_alive() and name not in running_set
+    ]
+    for name in stale:
+        _CONTAINER_LOG_THREADS.pop(name, None)
+
+    attached = 0
+    for container_name in running_containers:
+        _stream_container_logs(container_name)
+        thread = _CONTAINER_LOG_THREADS.get(container_name)
+        if thread and thread.is_alive():
+            attached += 1
+    return attached
 
 
 def _follow_container_logs(container_name: str) -> None:
@@ -825,3 +877,19 @@ def run_startup_checks() -> bool:
 
     console.print("\n[green]All startup checks passed.[/green]\n")
     return True
+
+
+def run_runtime_loop() -> None:
+    """Keep edge-core alive and continuously reconcile driver log forwarding."""
+    logger.info(
+        "Entering edge-core runtime loop (interval=%.1fs)",
+        LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS,
+    )
+    while True:
+        attached = reconcile_driver_log_streams()
+        logger.debug(
+            "Driver log follower reconcile complete (active_streams=%d, tracked=%d)",
+            attached,
+            len(_CONTAINER_LOG_THREADS),
+        )
+        time.sleep(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)

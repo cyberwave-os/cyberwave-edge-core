@@ -11,6 +11,7 @@ from .startup import (
     check_mqtt_connection,
     load_devices,
     load_token,
+    run_runtime_loop,
     run_startup_checks,
     validate_token,
 )
@@ -55,6 +56,10 @@ def cli(ctx: click.Context) -> None:
         # Boot path: run all startup checks
         if not run_startup_checks():
             sys.exit(1)
+        try:
+            run_runtime_loop()
+        except KeyboardInterrupt:
+            logging.getLogger(__name__).info("Received stop signal, shutting down edge-core")
 
 
 @cli.command()
