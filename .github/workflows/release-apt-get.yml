@@ -27,8 +27,16 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-latest
+            variant: amd64
+            docker_image: ""
           - arch: arm64
             runner: ubuntu-24.04-arm
+            variant: arm64
+            docker_image: "ubuntu:22.04" # Raspberry Pi OS Bookworm (glibc 2.35)
+          # - arch: arm64
+          #   runner: ubuntu-24.04-arm
+          #   variant: arm64-jetson
+          #   docker_image: "ubuntu:22.04"  # JetPack 6 / Orin (glibc 2.35)
 
     steps:
       - name: Checkout code
@@ -50,16 +58,36 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install dependencies (native)
+        if: matrix.docker_image == ''
         run: |
           pip install --upgrade pip
           pip install -e ".[build]"
 
-      - name: Build binary with PyInstaller
+      - name: Build binary with PyInstaller (native)
+        if: matrix.docker_image == ''
         run: |
           chmod +x build.sh
           ./build.sh
           echo "✅ Binary built successfully"
+          ls -la dist/
+
+      - name: Build binary in Docker (pinned glibc)
+        if: matrix.docker_image != ''
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            ${{ matrix.docker_image }} \
+            bash -c "
+              apt-get update -qq && \
+              apt-get install -y -qq python3 python3-pip python3-venv binutils && \
+              python3 -m pip install --upgrade pip && \
+              python3 -m pip install -e '.[build]' && \
+              chmod +x build.sh && \
+              ./build.sh
+            "
+          echo "✅ Binary built successfully inside ${{ matrix.docker_image }}"
           ls -la dist/
 
       - name: Verify binary works
@@ -71,7 +99,8 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           ARCH="${{ matrix.arch }}"
-          PKG_DIR="${PACKAGE_NAME}_${VERSION}_${ARCH}"
+          VARIANT="${{ matrix.variant }}"
+          PKG_DIR="${PACKAGE_NAME}_${VERSION}_${VARIANT}"
 
           mkdir -p "${PKG_DIR}/DEBIAN"
           mkdir -p "${PKG_DIR}/usr/bin"
@@ -129,8 +158,8 @@ jobs:
       - name: Build .deb package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          ARCH="${{ matrix.arch }}"
-          PKG_DIR="${PACKAGE_NAME}_${VERSION}_${ARCH}"
+          VARIANT="${{ matrix.variant }}"
+          PKG_DIR="${PACKAGE_NAME}_${VERSION}_${VARIANT}"
 
           dpkg-deb --build "${PKG_DIR}"
           echo "✅ Debian package built"
@@ -139,7 +168,7 @@ jobs:
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deb-${{ matrix.arch }}
+          name: deb-${{ matrix.variant }}
           path: "*.deb"
           retention-days: 7
 
