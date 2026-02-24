@@ -24,12 +24,16 @@ apt-get install -y -qq --no-install-recommends \
     python3-pip \
     python3-venv
 
-if ! command -v pip >/dev/null 2>&1; then
-    ln -sf "$(command -v pip3)" /usr/local/bin/pip
+VENV_DIR="/tmp/edge-core-build-venv"
+if python3 -m venv "${VENV_DIR}"; then
+    "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
+    "${VENV_DIR}/bin/python" -m pip install -e ".[build]"
+    export PATH="${VENV_DIR}/bin:${PATH}"
+else
+    # Some minimal images may miss ensurepip; use explicit override as fallback.
+    python3 -m pip install --break-system-packages --upgrade pip setuptools wheel
+    python3 -m pip install --break-system-packages -e ".[build]"
 fi
-
-python3 -m pip install --upgrade pip setuptools wheel
-python3 -m pip install -e ".[build]"
 
 chmod +x ./build.sh
 ./build.sh
