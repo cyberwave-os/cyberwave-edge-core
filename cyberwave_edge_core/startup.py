@@ -349,7 +349,7 @@ def _run_docker_image(
         env_vars += ["-e", f"{key}={value}"]
 
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
-    if twin_json_file.exists():
+    if twin_json_file.is_file():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
         env_vars += ["-e", f"CYBERWAVE_TWIN_JSON_FILE=/app/{twin_uuid}.json"]
     # sync the edge config directory into the container
@@ -762,6 +762,15 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
     """
     twin_data["asset"] = asset_data
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
+
+    # Docker bind mounts create a directory when the source path doesn't exist.
+    # Clean up so we can write a regular file.
+    if twin_json_file.is_dir():
+        logger.warning(
+            "Twin file path %s is a directory (likely from a Docker bind mount), removing it",
+            twin_json_file,
+        )
+        shutil.rmtree(twin_json_file)
 
     # Merge with existing data so local-only keys are not lost.
     if twin_json_file.exists():
