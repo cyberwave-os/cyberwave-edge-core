@@ -31,12 +31,12 @@ jobs:
             docker_image: ""
           - arch: arm64
             runner: ubuntu-24.04-arm
-            variant: arm64-rpi
-            docker_image: "ubuntu:22.04"  # Raspberry Pi OS Bookworm (glibc 2.35)
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            variant: arm64-jetson
-            docker_image: "ubuntu:22.04"  # JetPack 6 / Orin (glibc 2.35)
+            variant: arm64
+            docker_image: "ubuntu:22.04" # Raspberry Pi OS Bookworm (glibc 2.35)
+          # - arch: arm64
+          #   runner: ubuntu-24.04-arm
+          #   variant: arm64-jetson
+          #   docker_image: "ubuntu:22.04"  # JetPack 6 / Orin (glibc 2.35)
 
     steps:
       - name: Checkout code
