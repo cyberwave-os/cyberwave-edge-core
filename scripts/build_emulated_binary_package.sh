@@ -1,0 +1,85 @@
+#!/bin/sh
+
+set -eu
+
+PACKAGE_NAME="cyberwave-edge-core"
+PACKAGE_VARIANT="${PACKAGE_VARIANT:-arm64}"
+OUTPUT_DIR="${OUTPUT_DIR:-./artifacts/${PACKAGE_VARIANT}}"
+
+echo "=== Building ${PACKAGE_NAME} package for ${PACKAGE_VARIANT} ==="
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends \
+    bash \
+    binutils \
+    build-essential \
+    ca-certificates \
+    dpkg-dev \
+    file \
+    libffi-dev \
+    libssl-dev \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv
+
+VENV_DIR="/tmp/edge-core-build-venv"
+if python3 -m venv "${VENV_DIR}"; then
+    "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
+    "${VENV_DIR}/bin/python" -m pip install \
+        "click>=8.1.0" \
+        "httpx>=0.25.0" \
+        "rich>=13.0.0" \
+        "cyberwave>=0.3.14" \
+        "pyinstaller>=6.0.0"
+    export PATH="${VENV_DIR}/bin:${PATH}"
+else
+    # Some minimal images may miss ensurepip; use explicit override as fallback.
+    python3 -m pip install --break-system-packages --upgrade pip setuptools wheel
+    python3 -m pip install --break-system-packages \
+        "click>=8.1.0" \
+        "httpx>=0.25.0" \
+        "rich>=13.0.0" \
+        "cyberwave>=0.3.14" \
+        "pyinstaller>=6.0.0"
+fi
+
+chmod +x ./build.sh
+./build.sh
+./dist/cyberwave-edge-core --version || ./dist/cyberwave-edge-core --help
+
+VERSION="$(python3 - <<'PY'
+import re
+from pathlib import Path
+
+text = Path("pyproject.toml").read_text(encoding="utf-8")
+match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+if not match:
+    raise SystemExit("Unable to find version in pyproject.toml")
+print(match.group(1))
+PY
+)"
+
+PKG_DIR="${PACKAGE_NAME}_${VERSION}_${PACKAGE_VARIANT}"
+rm -rf "${PKG_DIR}" "${PKG_DIR}.deb"
+mkdir -p "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr/bin"
+
+cp ./dist/cyberwave-edge-core "${PKG_DIR}/usr/bin/"
+chmod 755 "${PKG_DIR}/usr/bin/cyberwave-edge-core"
+
+cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+Package: ${PACKAGE_NAME}
+Version: ${VERSION}
+Section: utils
+Priority: optional
+Architecture: arm64
+Maintainer: Cyberwave <info@cyberwave.com>
+Description: cyberwave-edge-core compiled binary package
+EOF
+
+dpkg-deb --build "${PKG_DIR}"
+
+mkdir -p "${OUTPUT_DIR}"
+mv "${PKG_DIR}.deb" "${OUTPUT_DIR}/"
+echo "✅ Built package: ${OUTPUT_DIR}/${PKG_DIR}.deb"
