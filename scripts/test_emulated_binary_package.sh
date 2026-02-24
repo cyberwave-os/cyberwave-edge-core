@@ -7,6 +7,7 @@ DEVICE_DISTRO="${DEVICE_DISTRO:-unknown-distro}"
 PACKAGE_NAME="cyberwave-edge-core"
 
 echo "=== Emulated package test: ${DEVICE_NAME} (${DEVICE_DISTRO}) ==="
+echo "Binary-only validation mode (no edge-core pip install)."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -27,12 +28,22 @@ apt-get install -y -qq --no-install-recommends \
 VENV_DIR="/tmp/edge-core-build-venv"
 if python3 -m venv "${VENV_DIR}"; then
     "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
-    "${VENV_DIR}/bin/python" -m pip install -e ".[build]"
+    "${VENV_DIR}/bin/python" -m pip install \
+        "click>=8.1.0" \
+        "httpx>=0.25.0" \
+        "rich>=13.0.0" \
+        "cyberwave>=0.3.14" \
+        "pyinstaller>=6.0.0"
     export PATH="${VENV_DIR}/bin:${PATH}"
 else
     # Some minimal images may miss ensurepip; use explicit override as fallback.
     python3 -m pip install --break-system-packages --upgrade pip setuptools wheel
-    python3 -m pip install --break-system-packages -e ".[build]"
+    python3 -m pip install --break-system-packages \
+        "click>=8.1.0" \
+        "httpx>=0.25.0" \
+        "rich>=13.0.0" \
+        "cyberwave>=0.3.14" \
+        "pyinstaller>=6.0.0"
 fi
 
 chmod +x ./build.sh
