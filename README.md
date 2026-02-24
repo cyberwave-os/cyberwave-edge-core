@@ -81,36 +81,34 @@ The driver object in the metadata looks like this:
 Drivers and edge services should treat `metadata["edge_configs"]` as the source of truth for per-device runtime configuration.
 
 - Type: object/dictionary
-- Key: device fingerprint (`string`)
 - Value: binding object (`object`)
 
 Canonical shape:
 
 ```json
 "edge_configs": {
-  "macbook-pro-a1b2c3d4e5f6": {
-    "camera_config": {
-      "camera_id": "front",
-      "source": "rtsp://user:pass@192.168.1.20/stream",
-      "fps": 10,
-      "resolution": "VGA",
-      "camera_type": "cv2"
-    },
-    "device_info": {
-      "hostname": "edge-macbook",
-      "platform": "Darwin-arm64"
-    },
-    "registered_at": "2026-02-24T10:11:12.000000+00:00",
-    "last_sync": "2026-02-24T10:15:00.000000+00:00",
-    "edge_uuid": "8c1f72a0-5cb5-4f85-9d57-c170b50d4dbe",
-    "last_ip_address": "192.168.1.42",
-    "status_data": {
-      "uptime_seconds": 1234,
-      "streams": {
-        "front": {
-          "fps": 9.8,
-          "frames_sent": 10000
-        }
+  "edge_fingerprint": "macbook-pro-a1b2c3d4e5f6",
+  "camera_config": {
+    "camera_id": "front",
+    "source": "rtsp://user:pass@192.168.1.20/stream",
+    "fps": 10,
+    "resolution": "VGA",
+    "camera_type": "cv2"
+  },
+  "device_info": {
+    "hostname": "edge-macbook",
+    "platform": "Darwin-arm64"
+  },
+  "registered_at": "2026-02-24T10:11:12.000000+00:00",
+  "last_sync": "2026-02-24T10:15:00.000000+00:00",
+  "edge_uuid": "8c1f72a0-5cb5-4f85-9d57-c170b50d4dbe",
+  "last_ip_address": "192.168.1.42",
+  "status_data": {
+    "uptime_seconds": 1234,
+    "streams": {
+      "front": {
+        "fps": 9.8,
+        "frames_sent": 10000
       }
     }
   }
@@ -119,7 +117,8 @@ Canonical shape:
 
 Field notes:
 
-- `camera_config` (recommended): per-fingerprint camera/runtime config consumed by edge drivers.
+- `edge_fingerprint` (recommended): fingerprint of the edge currently serving this twin.
+- `camera_config` (recommended): per-device camera/runtime config consumed by edge drivers.
 - `device_info` (optional): descriptive hardware info (`hostname`, `platform`, etc.).
 - `registered_at`, `last_sync` (optional): ISO-8601 timestamps.
 - `edge_uuid` (optional): UUID of the Edge record associated with this fingerprint.
@@ -127,7 +126,8 @@ Field notes:
 
 Backward compatibility:
 
-- Older records may store camera settings in `cameras[0]` or as top-level fields under the fingerprint object.
+- Older records may still use the legacy map shape (`edge_configs[fingerprint] = {...}`).
+- Older records may store camera settings in `cameras[0]` or as top-level fields.
 - New writers should always write to `camera_config`.
 - Do not rely on `PUT /api/v1/edges/{uuid}/twins/{twin_uuid}/camera-config`; it is deprecated. Update twin metadata instead.
 
