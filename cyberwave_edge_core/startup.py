@@ -599,6 +599,35 @@ def fetch_and_run_twin_drivers(
             # try fallback to asset metadata
             drivers = asset.metadata.get("drivers")
             if not drivers:
+                # Skip if this twin is attached to another that has a driver (e.g. camera on SO101)
+                attach_to = (
+                    getattr(twin._data, "attach_to_twin_uuid", None)
+                    if hasattr(twin, "_data")
+                    else None
+                )
+                if not attach_to and isinstance(getattr(twin, "_data", None), dict):
+                    attach_to = twin._data.get("attach_to_twin_uuid")
+                if attach_to:
+                    parent = next((t for t in twins if str(t.uuid) == str(attach_to)), None)
+                    if parent:
+                        pm = parent.metadata if isinstance(parent.metadata, dict) else {}
+                        pd = pm.get("drivers")
+                        if not pd:
+                            try:
+                                pa = client.assets.get(
+                                    getattr(parent, "asset_uuid", None)
+                                    or getattr(parent, "asset_id", "")
+                                )
+                                pd = pa.metadata.get("drivers")
+                            except Exception:
+                                pd = None
+                        if pd:
+                            logger.info(
+                                "Skipping twin '%s' (no driver): attached to %s which has driver",
+                                twin.name,
+                                attach_to,
+                            )
+                            continue
                 logger.warning("No drivers specified in asset metadata for twin '%s'", twin.name)
                 _send_alert_for_twin(
                     twin_uuid,
