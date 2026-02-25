@@ -99,7 +99,8 @@ def _parse_v4l2_list_devices(output: str) -> list[CameraDevice]:
 def _get_v4l2_device_info(device_path: str) -> dict:
     """Get detailed info for a specific v4l2 device using `v4l2-ctl --device=X --all`.
 
-    Returns a dict with driver, card, bus_info, etc.
+    v4l2-ctl outputs "Driver name", "Card type", "Bus info" (and sometimes "Serial").
+    We normalize these to driver, card, bus_info, serial.
     """
     if not shutil.which("v4l2-ctl"):
         return {}
@@ -114,14 +115,24 @@ def _get_v4l2_device_info(device_path: str) -> dict:
         if result.returncode != 0:
             return {}
 
+        # v4l2-ctl uses "Driver name", "Card type", "Bus info" - normalize to our keys
+        key_aliases = {
+            "driver_name": "driver",
+            "driver": "driver",
+            "card_type": "card",
+            "card": "card",
+            "bus_info": "bus_info",
+            "serial": "serial",
+            "serial_number": "serial",
+        }
         info: dict = {}
         for line in result.stdout.splitlines():
             if ":" in line:
                 key, _, value = line.partition(":")
-                key = key.strip().lower().replace(" ", "_")
+                raw_key = key.strip().lower().replace(" ", "_")
                 value = value.strip()
-                if key in ("driver", "card", "bus_info", "serial"):
-                    info[key] = value
+                if raw_key in key_aliases and value:
+                    info[key_aliases[raw_key]] = value
         return info
     except Exception as exc:
         logger.debug("Failed to get v4l2 device info for %s: %s", device_path, exc)
@@ -148,11 +159,15 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
             text=True,
             timeout=10,
         )
-        if result.returncode != 0:
-            logger.warning("v4l2-ctl --list-devices failed: %s", result.stderr)
-            return []
+        if result.returncode != 0 and result.stderr:
+            logger.warning(
+                "v4l2-ctl reported errors (e.g. unplugged device) but continuing: %s",
+                result.stderr.strip(),
+            )
 
-        devices = _parse_v4l2_list_devices(result.stdout)
+        # Parse stdout regardless of return code - v4l2-ctl may output valid devices
+        # before failing on an inaccessible one (e.g. unplugged /dev/video0)
+        devices = _parse_v4l2_list_devices(result.stdout or "")
 
         for device in devices:
             if device.primary_path:

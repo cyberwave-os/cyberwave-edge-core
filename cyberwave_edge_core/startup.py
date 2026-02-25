@@ -127,10 +127,16 @@ def _discover_and_prompt_camera_selection(
         return existing_video_device or str(idx0)
 
     console.print(f"\n[bold]Select camera for twin '{twin_name}'[/bold]")
+    card_names = [c.card for c in cameras]
+    has_duplicates = len(card_names) != len(set(card_names))
     options = []
     for i, cam in enumerate(cameras):
         idx = cam.index if cam.index is not None else i
-        label = f"{cam.card} ({cam.primary_path or f'/dev/video{idx}'})"
+        path = cam.primary_path or f"/dev/video{idx}"
+        if has_duplicates and cam.bus_info:
+            label = f"{cam.card} [{cam.bus_info}] ({path})"
+        else:
+            label = f"{cam.card} ({path})"
         options.append((str(idx), label))
 
     for i, (idx, label) in enumerate(options, 1):
