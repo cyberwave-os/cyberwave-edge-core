@@ -30,7 +30,39 @@ from cyberwave import Cyberwave
 from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 
+
+def _bootstrap_runtime_env_vars() -> None:
+    """Load persisted runtime env vars into process env for child imports."""
+    config_dir = Path(os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "/etc/cyberwave"))
+    credentials_file = config_dir / "credentials.json"
+    if not credentials_file.exists():
+        return
+
+    try:
+        with open(credentials_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    if not isinstance(data, dict):
+        return
+
+    envs: dict[str, str] = {}
+    raw_envs = data.get("envs")
+    if isinstance(raw_envs, dict):
+        for key, value in raw_envs.items():
+            if isinstance(key, str) and isinstance(value, str) and value.strip():
+                envs[key] = value.strip()
+
+    for key, value in envs.items():
+        os.environ.setdefault(key, value)
+
+
+_bootstrap_runtime_env_vars()
+
 logger = logging.getLogger(__name__)
+_edge_log_level_name = os.getenv("CYBERWAVE_EDGE_LOG_LEVEL", "info").strip().upper()
+logger.setLevel(getattr(logging, _edge_log_level_name, logging.INFO))
 console = Console()
 
 # Track active log streaming threads per container to avoid duplicates.
@@ -138,17 +170,6 @@ def load_credentials_envs() -> dict[str, str]:
                 and value.strip()
             ):
                 envs[key] = value.strip()
-
-    # Also support a subset of top-level keys when no "envs" map is present.
-    for key in (
-        "CYBERWAVE_ENVIRONMENT",
-        "CYBERWAVE_EDGE_LOG_LEVEL",
-        "CYBERWAVE_BASE_URL",
-        "CYBERWAVE_MQTT_HOST",
-    ):
-        value = data.get(key)
-        if key not in envs and isinstance(value, str) and value.strip():
-            envs[key] = value.strip()
     return envs
 
 
@@ -553,9 +574,7 @@ def _follow_container_logs(
         if mqtt_client:
             prefix = mqtt_client.mqtt.topic_prefix
             mqtt_topic = f"{prefix}cyberwave/twin/{twin_uuid}/telemetry"
-            logger.info(
-                "Driver logs for %s will be published to %s", container_name, mqtt_topic
-            )
+            logger.info("Driver logs for %s will be published to %s", container_name, mqtt_topic)
 
     try:
         process = subprocess.Popen(
