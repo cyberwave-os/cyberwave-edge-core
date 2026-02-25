@@ -600,17 +600,43 @@ def fetch_and_run_twin_drivers(
             drivers = asset.metadata.get("drivers")
             if not drivers:
                 # Skip if this twin is attached to another that has a driver (e.g. camera on SO101)
-                attach_to = (
-                    getattr(twin._data, "attach_to_twin_uuid", None)
-                    if hasattr(twin, "_data")
-                    else None
-                )
-                if not attach_to and isinstance(getattr(twin, "_data", None), dict):
-                    attach_to = twin._data.get("attach_to_twin_uuid")
+                attach_to = None
+                if hasattr(twin, "attach_to_twin_uuid") and twin.attach_to_twin_uuid:
+                    attach_to = twin.attach_to_twin_uuid
+                elif hasattr(twin, "_data"):
+                    d = twin._data
+                    attach_to = (
+                        getattr(d, "attach_to_twin_uuid", None)
+                        if not isinstance(d, dict)
+                        else d.get("attach_to_twin_uuid")
+                    )
+                if not attach_to:
+                    attach_to = twin_metadata.get("attach_to_twin_uuid")
+                if not attach_to:
+                    # List may omit attach_to_twin_uuid; fetch full twin
+                    try:
+                        full = client.twins.get_raw(twin_uuid)
+                        if hasattr(full, "attach_to_twin_uuid"):
+                            attach_to = full.attach_to_twin_uuid
+                        elif isinstance(full, dict):
+                            attach_to = full.get("attach_to_twin_uuid")
+                    except Exception:
+                        pass
                 if attach_to:
-                    parent = next((t for t in twins if str(t.uuid) == str(attach_to)), None)
+                    attach_str = str(attach_to).lower()
+                    parent = next(
+                        (t for t in twins if str(t.uuid).lower() == attach_str),
+                        None,
+                    )
                     if parent:
-                        pm = parent.metadata if isinstance(parent.metadata, dict) else {}
+                        pm = (
+                            parent.metadata
+                            if hasattr(parent, "metadata") and isinstance(parent.metadata, dict)
+                            else {}
+                        )
+                        if not pm and hasattr(parent, "_data"):
+                            raw = getattr(parent._data, "metadata", None)
+                            pm = raw if isinstance(raw, dict) else {}
                         pd = pm.get("drivers")
                         if not pd:
                             try:
