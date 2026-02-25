@@ -582,12 +582,13 @@ def fetch_and_run_twin_drivers(
         )
 
         # Get the asset to check for driver_docker_image
+        asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
         try:
-            asset = client.assets.get(twin.asset_uuid)
+            asset = client.assets.get(asset_uuid)
         except Exception as exc:
             logger.warning(
                 "Failed to get asset %s for twin %s: %s",
-                twin.asset_uuid,
+                asset_uuid,
                 twin_uuid,
                 exc,
             )
