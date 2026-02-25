@@ -7,6 +7,7 @@ Future: Add support for macOS (AVFoundation), Windows (DirectShow), etc.
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -139,6 +140,27 @@ def _get_v4l2_device_info(device_path: str) -> dict:
         return {}
 
 
+def _ensure_video_device_permissions() -> None:
+    """Set read/write permissions on /dev/video* so v4l2-ctl and camera drivers can access them.
+
+    When a USB camera is plugged in, device nodes may be created with restrictive
+    permissions. This attempts chmod 666 on each /dev/video* device. Requires root
+    (e.g. edge-core running as systemd service). On failure, logs a hint and continues.
+    """
+    dev = Path("/dev")
+    if not dev.exists():
+        return
+    try:
+        for path in dev.glob("video*"):
+            if path.is_char_device():
+                os.chmod(path, 0o666)
+    except PermissionError:
+        logger.warning(
+            "Cannot set permissions on /dev/video* (need root). "
+            "Run: sudo chmod 666 /dev/video* to allow camera access."
+        )
+
+
 def discover_usb_cameras_v4l2() -> list[CameraDevice]:
     """Discover USB cameras using v4l2-ctl (Linux only).
 
@@ -151,6 +173,8 @@ def discover_usb_cameras_v4l2() -> list[CameraDevice]:
     if not shutil.which("v4l2-ctl"):
         logger.warning("v4l2-ctl not found; cannot enumerate cameras (install v4l-utils)")
         return []
+
+    _ensure_video_device_permissions()
 
     try:
         result = subprocess.run(
