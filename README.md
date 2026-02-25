@@ -101,10 +101,16 @@ cyberwave-edge-core --version
 
 ### Other env vars
 
-To run against dev:
+To run against another env:
 
 ```bash
-export CYBERWAVE_ENVIRONMENT="dev"
-export CYBERWAVE_BASE_URL="https://api-dev.cyberwave.com"
+export CYBERWAVE_ENVIRONMENT="yourenv"
+export CYBERWAVE_BASE_URL="https://yourbaseurl"
 cyberwave-edge-core
+```
+
+Or from the CLI
+
+```bash
+sudo CYBERWAVE_ENVIRONMENT="yourenv" CYBERWAVE_BASE_URL="https://yourbaseurl" cyberwave edge install
 ```
