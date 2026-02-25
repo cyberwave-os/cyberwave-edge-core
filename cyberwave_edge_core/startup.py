@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -29,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from cyberwave import Cyberwave
 from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
+from rich.prompt import Prompt
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -50,6 +52,114 @@ DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
+
+# Sensor types that require camera device selection (RGB cameras)
+RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera", "rgbd"})
+
+
+def _twin_has_rgb_sensor(asset: Any) -> bool:
+    """Return True if the asset has an RGB sensor (camera).
+
+    Checks universal_schema.sensors, metadata.capabilities.sensors, or
+    registry_id for known camera assets.
+    """
+    schema = None
+    metadata = getattr(asset, "metadata", None) or {}
+    if isinstance(metadata, dict):
+        schema = metadata.get("universal_schema")
+    if not schema:
+        schema = getattr(asset, "universal_schema", None)
+    if schema and isinstance(schema, dict):
+        sensors = schema.get("sensors", [])
+        if isinstance(sensors, list):
+            for s in sensors:
+                if isinstance(s, dict):
+                    stype = (s.get("type") or "").lower()
+                    if stype in RGB_SENSOR_TYPES:
+                        return True
+
+    # Fallback: check capabilities.sensors from metadata
+    caps = metadata.get("capabilities", {}) if isinstance(metadata, dict) else {}
+    if isinstance(caps, dict):
+        sensors = caps.get("sensors", [])
+        if isinstance(sensors, list):
+            for s in sensors:
+                if isinstance(s, dict) and (s.get("type") or "").lower() in RGB_SENSOR_TYPES:
+                    return True
+
+    # Fallback: known camera registry IDs
+    rid = (getattr(asset, "registry_id", None) or metadata.get("registry_id") or "").lower()
+    if "standard-cam" in rid or "realsense" in rid or "camera" in rid:
+        return True
+    return False
+
+
+def _discover_and_prompt_camera_selection(
+    twin_name: str,
+    twin_uuid: str,
+    existing_video_device: Optional[str],
+) -> Optional[str]:
+    """Discover USB cameras and prompt user to select one for the twin.
+
+    Runs discovery, writes cameras.json, and if running interactively (TTY),
+    prompts the user to select a device. Returns the selected device (index or
+    path) or existing_video_device if no prompt / non-interactive.
+
+    Returns:
+        Selected video device (e.g. "0", "2", "/dev/video2") or None to use default.
+    """
+    from .device_utils import discover_usb_cameras, write_cameras_json
+
+    cameras = discover_usb_cameras()
+    write_cameras_json(cameras, CONFIG_DIR)
+
+    if not cameras:
+        logger.warning("No cameras discovered; twin '%s' will use default device", twin_name)
+        return existing_video_device or "0"
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        logger.info(
+            "Non-interactive mode: using existing video_device=%s for twin '%s'",
+            existing_video_device or "0",
+            twin_name,
+        )
+        idx0 = cameras[0].index if cameras[0].index is not None else 0
+        return existing_video_device or str(idx0)
+
+    console.print(f"\n[bold]Select camera for twin '{twin_name}'[/bold]")
+    options = []
+    for i, cam in enumerate(cameras):
+        idx = cam.index if cam.index is not None else i
+        label = f"{cam.card} ({cam.primary_path or f'/dev/video{idx}'})"
+        options.append((str(idx), label))
+
+    for i, (idx, label) in enumerate(options, 1):
+        console.print(f"  [cyan]{i}[/cyan]. {label}")
+
+    default = "1"
+    if existing_video_device:
+        ev = str(existing_video_device).strip()
+        for i, (idx, _) in enumerate(options, 1):
+            if idx == ev:
+                default = str(i)
+                break
+            prim = cameras[i - 1].primary_path if i <= len(cameras) else None
+            if prim and ev in str(prim):
+                default = str(i)
+                break
+
+    choice = Prompt.ask(
+        f"Select device for twin '{twin_name}' (1-{len(options)})",
+        default=default,
+    )
+    try:
+        num = int(choice)
+        if 1 <= num <= len(options):
+            selected_idx, _ = options[num - 1]
+            return selected_idx
+    except ValueError:
+        pass
+    return existing_video_device or options[0][0]
 
 
 def load_devices() -> List[str]:
@@ -633,7 +743,26 @@ def fetch_and_run_twin_drivers(
                         twin.name,
                         attach_to,
                     )
-                    write_or_update_twin_json_file(twin_uuid, twin.to_dict(), asset.to_dict())
+                    twin_data = (
+                        twin.to_dict()
+                        if hasattr(twin, "to_dict")
+                        else {"uuid": twin_uuid, "name": twin.name}
+                    )
+                    asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
+                    if _twin_has_rgb_sensor(asset):
+                        existing = (twin_metadata.get("video_device") or "").strip() or None
+                        selected = _discover_and_prompt_camera_selection(
+                            twin.name or f"twin-{twin_uuid[:8]}",
+                            twin_uuid,
+                            existing,
+                        )
+                        if selected:
+                            meta = twin_data.get("metadata") or {}
+                            if not isinstance(meta, dict):
+                                meta = {}
+                            meta["video_device"] = selected
+                            twin_data["metadata"] = meta
+                    write_or_update_twin_json_file(twin_uuid, twin_data, asset_data)
                     continue
 
                 # No drivers and not attached to anything - this is an error
@@ -657,7 +786,29 @@ def fetch_and_run_twin_drivers(
                 )
         driver_image, driver_params = _get_best_driver_image_and_params(drivers)
 
-        write_or_update_twin_json_file(twin_uuid, twin.to_dict(), asset.to_dict())
+        # For twins with RGB sensors: discover cameras and prompt user to select
+        # device BEFORE pulling/running the driver container.
+        twin_data = (
+            twin.to_dict()
+            if hasattr(twin, "to_dict")
+            else {"uuid": twin_uuid, "name": twin.name}
+        )
+        asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
+        if _twin_has_rgb_sensor(asset):
+            existing = (twin_metadata.get("video_device") or "").strip() or None
+            selected = _discover_and_prompt_camera_selection(
+                twin.name or f"twin-{twin_uuid[:8]}",
+                twin_uuid,
+                existing,
+            )
+            if selected:
+                meta = twin_data.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["video_device"] = selected
+                twin_data["metadata"] = meta
+
+        write_or_update_twin_json_file(twin_uuid, twin_data, asset_data)
 
         if not driver_image:
             logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
