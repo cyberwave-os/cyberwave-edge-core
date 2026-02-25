@@ -344,6 +344,9 @@ def _run_docker_image(
         if key.startswith("CYBERWAVE_"):
             container_env.setdefault(key, value)
 
+    # Driver reads setup.json from so101_lib under this dir (mounted CONFIG_DIR)
+    container_env["CYBERWAVE_EDGE_CONFIG_DIR"] = "/app/.cyberwave"
+
     env_vars: List[str] = []
     for key, value in container_env.items():
         env_vars += ["-e", f"{key}={value}"]
