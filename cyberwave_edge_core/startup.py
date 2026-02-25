@@ -36,6 +36,13 @@ console = Console()
 # Track active log streaming threads per container to avoid duplicates.
 _CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
 
+# Map container names to twin UUIDs so log threads can publish telemetry.
+_CONTAINER_TWIN_MAP: dict[str, str] = {}
+
+# Shared MQTT client for publishing driver log telemetry.
+_shared_mqtt_client: Optional[Any] = None
+_shared_mqtt_lock = threading.Lock()
+
 # ---- constants ---------------------------------------------------------------
 
 # System-wide edge config directory.  The systemd unit sets
@@ -50,6 +57,24 @@ DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
+
+
+def _get_shared_mqtt_client(token: str) -> Any:
+    """Return a shared MQTT client, creating and connecting it on first call."""
+    global _shared_mqtt_client
+    with _shared_mqtt_lock:
+        if _shared_mqtt_client is not None and _shared_mqtt_client.mqtt.connected:
+            return _shared_mqtt_client
+        base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+        try:
+            client = Cyberwave(base_url=base_url, token=token)
+            client.mqtt.connect()
+            _shared_mqtt_client = client
+            logger.info("Shared MQTT client connected for log forwarding")
+            return client
+        except Exception as exc:
+            logger.warning("Failed to create shared MQTT client: %s", exc)
+            return None
 
 
 def load_devices() -> List[str]:
@@ -408,7 +433,8 @@ def _run_docker_image(
             text=True,
             timeout=60,
         )
-        _stream_container_logs(container_name)
+        _CONTAINER_TWIN_MAP[container_name] = twin_uuid
+        _stream_container_logs(container_name, twin_uuid=twin_uuid, token=token)
         return True
     except subprocess.CalledProcessError as exc:
         logger.error("Failed to start container %s: %s", container_name, exc.stderr)
@@ -418,7 +444,12 @@ def _run_docker_image(
         return False
 
 
-def _stream_container_logs(container_name: str) -> None:
+def _stream_container_logs(
+    container_name: str,
+    *,
+    twin_uuid: Optional[str] = None,
+    token: Optional[str] = None,
+) -> None:
     """Stream container logs into this service logger in the background."""
     existing = _CONTAINER_LOG_THREADS.get(container_name)
     if existing and existing.is_alive():
@@ -427,6 +458,7 @@ def _stream_container_logs(container_name: str) -> None:
     thread = threading.Thread(
         target=_follow_container_logs,
         args=(container_name,),
+        kwargs={"twin_uuid": twin_uuid, "token": token},
         name=f"docker-logs-{container_name}",
         daemon=True,
     )
@@ -475,17 +507,37 @@ def reconcile_driver_log_streams() -> int:
     for name in stale:
         _CONTAINER_LOG_THREADS.pop(name, None)
 
+    token = load_token()
     attached = 0
     for container_name in running_containers:
-        _stream_container_logs(container_name)
+        twin_uuid = _CONTAINER_TWIN_MAP.get(container_name)
+        _stream_container_logs(container_name, twin_uuid=twin_uuid, token=token)
         thread = _CONTAINER_LOG_THREADS.get(container_name)
         if thread and thread.is_alive():
             attached += 1
     return attached
 
 
-def _follow_container_logs(container_name: str) -> None:
-    """Follow `docker logs -f` and forward lines to the service logger."""
+def _parse_log_level(message: str) -> str:
+    """Best-effort extraction of log level from a driver log line."""
+    upper = message[:80].upper()
+    for level in ("ERROR", "CRITICAL", "WARNING", "WARN", "DEBUG", "INFO"):
+        if level in upper:
+            return "WARNING" if level == "WARN" else level
+    return "INFO"
+
+
+def _follow_container_logs(
+    container_name: str,
+    *,
+    twin_uuid: Optional[str] = None,
+    token: Optional[str] = None,
+) -> None:
+    """Follow `docker logs -f` and forward lines to the service logger.
+
+    When *twin_uuid* and *token* are provided, each log line is also
+    published to the backend via MQTT as a ``driver_log`` telemetry event.
+    """
     if not shutil.which("docker"):
         logger.warning("Cannot stream logs: Docker is not installed")
         return
@@ -493,6 +545,18 @@ def _follow_container_logs(container_name: str) -> None:
     logger.info("Forwarding logs for container %s to service logs", container_name)
     debug_log_stream = logger.isEnabledFor(logging.DEBUG)
     received_lines = 0
+
+    mqtt_client: Optional[Any] = None
+    mqtt_topic: Optional[str] = None
+    if twin_uuid and token:
+        mqtt_client = _get_shared_mqtt_client(token)
+        if mqtt_client:
+            prefix = mqtt_client.mqtt.topic_prefix
+            mqtt_topic = f"{prefix}cyberwave/twin/{twin_uuid}/telemetry"
+            logger.info(
+                "Driver logs for %s will be published to %s", container_name, mqtt_topic
+            )
+
     try:
         process = subprocess.Popen(
             ["docker", "logs", "-f", container_name],
@@ -514,8 +578,28 @@ def _follow_container_logs(container_name: str) -> None:
             if message:
                 received_lines += 1
                 logger.info("[driver:%s] %s", container_name, message)
+
+                if mqtt_client and mqtt_topic:
+                    try:
+                        mqtt_client.mqtt.publish(
+                            mqtt_topic,
+                            {
+                                "type": "driver_log",
+                                "message": message,
+                                "level": _parse_log_level(message),
+                                "container_name": container_name,
+                                "source": "edge",
+                                "timestamp": time.time(),
+                            },
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to publish driver log to MQTT for %s",
+                            container_name,
+                            exc_info=True,
+                        )
+
                 if debug_log_stream:
-                    # Extra local trace to confirm the edge core receives lines.
                     logger.debug(
                         "Container log line received (container=%s, line=%d, chars=%d)",
                         container_name,
