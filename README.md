@@ -76,6 +76,8 @@ The driver object in the metadata looks like this:
 }
 ```
 
+For an example, check how the camera driver handles the TWIN JSON file.
+
 ### `metadata["edge_configs"]` format (for edge <-> twin binding)
 
 Drivers and edge services should treat `metadata["edge_configs"]` as the source of truth for per-device runtime configuration.
