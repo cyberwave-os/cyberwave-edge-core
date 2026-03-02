@@ -37,8 +37,10 @@ Once it's started (either via CLI or via service) the core does the following:
 1. Checks if the credentials stored in `credentials.json` are valid
 2. Connects to the backend MQTT and checks if the connection is up and running
 3. Registers the `edge` device is running on, or updates its registration record. Each `edge` device is defined by a unique hardware fingerprint
-4. Downloads the latest environment from the backend and downloads the list of devices connected to the edge
-5. For each `twin`, present in the environment, and connected to the edge: It starts the twin's docker driver image
+4. Downloads the latest environment from the backend and resolves the twins linked to this edge fingerprint
+5. Starts drivers for linked twins, with one special case for attached camera twins:
+   - if a linked twin is a camera child twin (`attach_to_twin_uuid`) of another linked twin, edge-core does **not** start a dedicated driver for that camera child
+   - edge-core passes camera child UUIDs to the parent driver via `CYBERWAVE_CHILD_TWIN_UUIDS`
 
 ### Remote restart (via Edge REST API)
 
@@ -62,6 +64,9 @@ A Cyberwave driver is a Docker image that is capable of interacting with the dev
 - `CYBERWAVE_TWIN_UUID`
 - `CYBERWAVE_API_KEY`
 - `CYBERWAVE_TWIN_JSON_FILE`
+- `CYBERWAVE_CHILD_TWIN_UUIDS` (optional, comma-separated)
+
+`CYBERWAVE_CHILD_TWIN_UUIDS` is present when the driver twin has attached camera child twins in the same linked set. Drivers can use this to discover and coordinate child twins without relying on extra camera selection prompts.
 
 The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
 
