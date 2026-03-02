@@ -484,7 +484,6 @@ def _run_docker_image(
         if normalized_child_uuids:
             child_uuids_csv = ",".join(dict.fromkeys(normalized_child_uuids))
             container_env["CYBERWAVE_CHILD_TWIN_UUIDS"] = child_uuids_csv
-            container_env["CYBERWAVE_CHILD_CAMERA_TWIN_UUIDS"] = child_uuids_csv
 
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL")
     if base_url:
