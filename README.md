@@ -48,8 +48,14 @@ Once it's started (either via CLI or via service) the core does the following:
 
 ### Remote restart (via Edge REST API)
 
-`POST /api/v1/edges/{uuid}/restart-core` queues a restart request in edge metadata.
-When the running edge-core polls that request, it:
+`POST /api/v1/edges/{uuid}/restart-core` publishes an MQTT command to:
+
+`edges/{edge_uuid}/command`
+
+with `{"command":"restart_edge_core", ...}` payload.
+
+The running edge-core subscribes to that topic using the Cyberwave SDK and,
+when it receives the command, it:
 
 1. Deletes cached twin JSON objects under the edge config directory
 2. Stops/removes edge-managed driver containers and prunes stopped containers

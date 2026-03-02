@@ -89,18 +89,18 @@ DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
-EDGE_CORE_RESTART_METADATA_KEY = "edge_core_restart"
-EDGE_CORE_RESTART_STATUS_REQUESTED = "requested"
-EDGE_CORE_RESTART_STATUS_IN_PROGRESS = "in_progress"
-EDGE_CORE_RESTART_STATUS_COMPLETED = "completed"
-EDGE_CORE_RESTART_STATUS_FAILED = "failed"
+EDGE_COMMAND_RESTART = "restart_edge_core"
 _PROTECTED_CONFIG_JSON_FILES = {
     "credentials.json",
     "fingerprint.json",
     "environment.json",
     "devices.json",
 }
-_HANDLED_RESTART_REQUEST_IDS: set[str] = set()
+_EDGE_COMMAND_SUBSCRIBED = False
+_EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
+_EDGE_RESTART_LOCK = threading.Lock()
+_EDGE_RESTART_IN_PROGRESS = False
+_HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 
 # Sensor types that require camera device selection (RGB cameras)
 RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera", "rgbd"})
@@ -1077,11 +1077,6 @@ def register_edge(token: str) -> bool:
         return False
 
 
-def _utc_now_iso() -> str:
-    """Return current UTC timestamp in ISO-8601 format."""
-    return f"{datetime.utcnow().isoformat()}Z"
-
-
 def _build_cyberwave_client(token: str) -> Cyberwave:
     """Create a configured SDK client using runtime environment settings."""
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
@@ -1106,27 +1101,6 @@ def _resolve_edge_for_fingerprint(client: Cyberwave, fingerprint: str) -> Option
             exc,
         )
         return None
-
-
-def _persist_edge_restart_state(
-    client: Cyberwave, edge_uuid: str, edge_fingerprint: str, restart_state: dict[str, Any]
-) -> None:
-    """Persist edge-core restart state in edge metadata."""
-    try:
-        client.edges.update(
-            edge_uuid,
-            {
-                "fingerprint": edge_fingerprint,
-                "metadata": {EDGE_CORE_RESTART_METADATA_KEY: restart_state},
-            },
-        )
-    except Exception as exc:
-        logger.warning(
-            "Failed to persist restart state for edge %s (request_id=%s): %s",
-            edge_uuid,
-            restart_state.get("request_id"),
-            exc,
-        )
 
 
 def _perform_edge_core_restart(token: str) -> dict[str, Any]:
@@ -1170,66 +1144,122 @@ def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     return summary
 
 
-def poll_and_handle_edge_core_restart_request() -> None:
-    """Poll edge metadata for restart requests and execute them."""
-    token = load_token()
-    if not token:
+def _run_edge_core_restart_worker(request_id: str) -> None:
+    """Execute restart flow in a background thread."""
+    global _EDGE_RESTART_IN_PROGRESS
+
+    with _EDGE_RESTART_LOCK:
+        if _EDGE_RESTART_IN_PROGRESS:
+            logger.info(
+                "Ignoring restart request %s: restart already in progress",
+                request_id or "no-request-id",
+            )
+            return
+        _EDGE_RESTART_IN_PROGRESS = True
+
+    try:
+        token = load_token()
+        if not token:
+            logger.warning(
+                "Ignoring restart request %s: no token available",
+                request_id or "no-request-id",
+            )
+            return
+        _perform_edge_core_restart(token)
+    except Exception:
+        logger.exception(
+            "Edge-core restart request %s failed",
+            request_id or "no-request-id",
+        )
+    finally:
+        with _EDGE_RESTART_LOCK:
+            _EDGE_RESTART_IN_PROGRESS = False
+
+
+def _handle_edge_command_message(*args: Any) -> None:
+    """Handle MQTT command message for this edge."""
+    if len(args) == 1:
+        payload = args[0]
+    elif len(args) >= 2:
+        payload = args[1]
+    else:
         return
 
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring edge command with non-dict payload: %r", payload)
+        return
+
+    command = str(payload.get("command", "")).strip().lower()
+    if command != EDGE_COMMAND_RESTART:
+        return
+
+    request_id = str(payload.get("request_id", "")).strip()
+    if request_id:
+        if request_id in _HANDLED_EDGE_COMMAND_REQUEST_IDS:
+            return
+        _HANDLED_EDGE_COMMAND_REQUEST_IDS.add(request_id)
+
+    logger.info("Received edge restart command request_id=%s", request_id or "none")
+    worker = threading.Thread(
+        target=_run_edge_core_restart_worker,
+        args=(request_id,),
+        name=f"edge-core-restart-{(request_id or 'no-id')[:12]}",
+        daemon=True,
+    )
+    worker.start()
+
+
+def _resolve_edge_command_topic(token: str) -> Optional[str]:
+    """Resolve the MQTT topic used for edge command messages."""
     fingerprint = get_or_create_fingerprint()
     if not fingerprint:
-        logger.warning("Skipping restart command poll: edge fingerprint unavailable")
-        return
+        logger.warning("Cannot subscribe to edge commands: edge fingerprint unavailable")
+        return None
 
     client = _build_cyberwave_client(token)
     edge = _resolve_edge_for_fingerprint(client, fingerprint)
     if not edge:
-        return
+        return None
 
     edge_uuid = str(getattr(edge, "uuid", "") or "")
     if not edge_uuid:
-        logger.warning("Skipping restart command poll: resolved edge has no UUID")
-        return
+        logger.warning("Cannot subscribe to edge commands: resolved edge has no UUID")
+        return None
 
-    metadata = getattr(edge, "metadata", {})
-    if not isinstance(metadata, dict):
-        return
+    mqtt_client = _get_shared_mqtt_client(token)
+    if not mqtt_client:
+        logger.warning("Cannot subscribe to edge commands: MQTT client unavailable")
+        return None
 
-    restart_state = metadata.get(EDGE_CORE_RESTART_METADATA_KEY, {})
-    if not isinstance(restart_state, dict):
-        return
+    return f"{mqtt_client.mqtt.topic_prefix}edges/{edge_uuid}/command"
 
-    request_id = str(restart_state.get("request_id", "")).strip()
-    status = str(restart_state.get("status", "")).strip().lower()
-    if not request_id or status != EDGE_CORE_RESTART_STATUS_REQUESTED:
-        return
 
-    if request_id in _HANDLED_RESTART_REQUEST_IDS:
-        return
-    _HANDLED_RESTART_REQUEST_IDS.add(request_id)
+def ensure_edge_command_subscription() -> bool:
+    """Subscribe once to this edge's MQTT command topic."""
+    global _EDGE_COMMAND_SUBSCRIBED
+    if _EDGE_COMMAND_SUBSCRIBED:
+        return True
 
-    restart_state = dict(restart_state)
-    restart_state["status"] = EDGE_CORE_RESTART_STATUS_IN_PROGRESS
-    restart_state["started_at"] = _utc_now_iso()
-    restart_state.pop("completed_at", None)
-    restart_state.pop("error", None)
-    _persist_edge_restart_state(client, edge_uuid, fingerprint, restart_state)
+    token = load_token()
+    if not token:
+        return False
 
-    try:
-        result = _perform_edge_core_restart(token)
-    except Exception as exc:
-        logger.exception("Edge-core restart request %s failed", request_id)
-        restart_state["status"] = EDGE_CORE_RESTART_STATUS_FAILED
-        restart_state["completed_at"] = _utc_now_iso()
-        restart_state["error"] = str(exc)
-        _persist_edge_restart_state(client, edge_uuid, fingerprint, restart_state)
-        return
+    with _EDGE_COMMAND_SUBSCRIPTION_LOCK:
+        if _EDGE_COMMAND_SUBSCRIBED:
+            return True
 
-    restart_state["status"] = EDGE_CORE_RESTART_STATUS_COMPLETED
-    restart_state["completed_at"] = _utc_now_iso()
-    restart_state["result"] = result
-    restart_state.pop("error", None)
-    _persist_edge_restart_state(client, edge_uuid, fingerprint, restart_state)
+        topic = _resolve_edge_command_topic(token)
+        if not topic:
+            return False
+
+        mqtt_client = _get_shared_mqtt_client(token)
+        if not mqtt_client:
+            return False
+
+        mqtt_client.mqtt.subscribe(topic, _handle_edge_command_message)
+        _EDGE_COMMAND_SUBSCRIBED = True
+        logger.info("Subscribed to edge command topic: %s", topic)
+        return True
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -1396,7 +1426,7 @@ def run_runtime_loop() -> None:
             len(_CONTAINER_LOG_THREADS),
         )
         try:
-            poll_and_handle_edge_core_restart_request()
+            ensure_edge_command_subscription()
         except Exception:
-            logger.exception("Unexpected error while polling edge restart requests")
+            logger.exception("Unexpected error while ensuring edge command subscription")
         time.sleep(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
