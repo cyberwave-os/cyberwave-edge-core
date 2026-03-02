@@ -90,6 +90,7 @@ For an example, check how the camera driver handles the TWIN JSON file.
 ### `metadata["edge_configs"]` format (for edge <-> twin binding)
 
 Drivers and edge services should treat `metadata["edge_configs"]` as the source of truth for per-device runtime configuration.
+Edge identity should be stored at `metadata["edge_fingerprint"]` (not duplicated inside `edge_configs`).
 
 - Type: object/dictionary
 - Value: binding object (`object`)
@@ -97,43 +98,23 @@ Drivers and edge services should treat `metadata["edge_configs"]` as the source 
 Canonical shape:
 
 ```json
+"edge_fingerprint": "macbook-pro-a1b2c3d4e5f6",
 "edge_configs": {
-  "edge_fingerprint": "macbook-pro-a1b2c3d4e5f6",
   "camera_config": {
     "camera_id": "front",
     "source": "rtsp://user:pass@192.168.1.20/stream",
     "fps": 10,
     "resolution": "VGA",
     "camera_type": "cv2"
-  },
-  "device_info": {
-    "hostname": "edge-macbook",
-    "platform": "Darwin-arm64"
-  },
-  "registered_at": "2026-02-24T10:11:12.000000+00:00",
-  "last_sync": "2026-02-24T10:15:00.000000+00:00",
-  "edge_uuid": "8c1f72a0-5cb5-4f85-9d57-c170b50d4dbe",
-  "last_ip_address": "192.168.1.42",
-  "status_data": {
-    "uptime_seconds": 1234,
-    "streams": {
-      "front": {
-        "fps": 9.8,
-        "frames_sent": 10000
-      }
-    }
   }
 }
 ```
 
 Field notes:
 
-- `edge_fingerprint` (recommended): fingerprint of the edge currently serving this twin.
+- `edge_fingerprint` (recommended): fingerprint of the edge currently serving this twin (top-level metadata field).
 - `camera_config` (recommended): per-device camera/runtime config consumed by edge drivers.
-- `device_info` (optional): descriptive hardware info (`hostname`, `platform`, etc.).
-- `registered_at`, `last_sync` (optional): ISO-8601 timestamps.
-- `edge_uuid` (optional): UUID of the Edge record associated with this fingerprint.
-- `last_ip_address`, `status_data` (optional): runtime heartbeat/status details.
+- Do not store `edge_uuid`, `registered_at`, `last_sync`, `last_ip_address`, or `status_data` inside `edge_configs`.
 
 Backward compatibility:
 
