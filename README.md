@@ -40,6 +40,21 @@ Once it's started (either via CLI or via service) the core does the following:
 4. Downloads the latest environment from the backend and downloads the list of devices connected to the edge
 5. For each `twin`, present in the environment, and connected to the edge: It starts the twin's docker driver image
 
+### Remote restart (via Edge REST API)
+
+`POST /api/v1/edges/{uuid}/restart-core` publishes an MQTT command to:
+
+`edges/{edge_uuid}/command`
+
+with `{"command":"restart_edge_core", ...}` payload.
+
+The running edge-core subscribes to that topic using the Cyberwave SDK and,
+when it receives the command, it:
+
+1. Deletes cached twin JSON objects under the edge config directory
+2. Stops/removes edge-managed driver containers and prunes stopped containers
+3. Re-downloads the linked environment twins and starts drivers again
+
 ## Writing compatible drivers
 
 A Cyberwave driver is a Docker image that is capable of interacting with the device's hardware, sending and getting data from the Cyberwave backend. Every time the core starts a driver Docker image, the `core` does so by defining the following environment variables:

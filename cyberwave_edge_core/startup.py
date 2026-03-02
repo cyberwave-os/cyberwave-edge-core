@@ -89,6 +89,18 @@ DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
+EDGE_COMMAND_RESTART = "restart_edge_core"
+_PROTECTED_CONFIG_JSON_FILES = {
+    "credentials.json",
+    "fingerprint.json",
+    "environment.json",
+    "devices.json",
+}
+_EDGE_COMMAND_SUBSCRIBED = False
+_EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
+_EDGE_RESTART_LOCK = threading.Lock()
+_EDGE_RESTART_IN_PROGRESS = False
+_HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 
 # Sensor types that require camera device selection (RGB cameras)
 RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera", "rgbd"})
@@ -580,21 +592,26 @@ def _stream_container_logs(
     thread.start()
 
 
-def _list_running_driver_containers() -> list[str]:
-    """Return running driver container names managed by edge-core."""
+def _list_driver_containers(*, include_stopped: bool) -> list[str]:
+    """Return edge-core managed driver container names."""
     if not shutil.which("docker"):
         return []
 
+    command = ["docker", "ps"]
+    if include_stopped:
+        command.append("-a")
+    command.extend(
+        [
+            "--format",
+            "{{.Names}}",
+            "--filter",
+            f"name=^{DRIVER_CONTAINER_PREFIX}",
+        ]
+    )
+
     try:
         result = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "--format",
-                "{{.Names}}",
-                "--filter",
-                f"name=^{DRIVER_CONTAINER_PREFIX}",
-            ],
+            command,
             check=True,
             capture_output=True,
             text=True,
@@ -605,6 +622,70 @@ def _list_running_driver_containers() -> list[str]:
         return []
 
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _list_running_driver_containers() -> list[str]:
+    """Return running driver container names managed by edge-core."""
+    return _list_driver_containers(include_stopped=False)
+
+
+def _stop_and_prune_driver_containers() -> list[str]:
+    """Force-remove edge-core driver containers and prune stopped containers."""
+    containers = _list_driver_containers(include_stopped=True)
+    removed: list[str] = []
+    for container_name in containers:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            removed.append(container_name)
+            _CONTAINER_TWIN_MAP.pop(container_name, None)
+            _CONTAINER_LOG_THREADS.pop(container_name, None)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to remove driver container %s: %s", container_name, exc)
+
+    if shutil.which("docker"):
+        try:
+            subprocess.run(
+                ["docker", "container", "prune", "--force"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to prune stopped containers: %s", exc)
+
+    return removed
+
+
+def _remove_cached_twin_json_files() -> list[str]:
+    """Remove cached twin JSON objects so they can be re-downloaded."""
+    removed: list[str] = []
+    for json_file in CONFIG_DIR.glob("*.json"):
+        if json_file.name in _PROTECTED_CONFIG_JSON_FILES:
+            continue
+
+        # Driver twin object files are UUID-based (<twin_uuid>.json). Skip any
+        # user/system JSON files that don't match that naming contract.
+        try:
+            uuid.UUID(json_file.stem)
+        except ValueError:
+            continue
+
+        try:
+            if json_file.is_file() or json_file.is_symlink():
+                json_file.unlink()
+            elif json_file.is_dir():
+                shutil.rmtree(json_file)
+            removed.append(json_file.name)
+        except OSError as exc:
+            logger.warning("Failed to remove cached twin object %s: %s", json_file, exc)
+    return removed
 
 
 def reconcile_driver_log_streams() -> int:
@@ -996,6 +1077,191 @@ def register_edge(token: str) -> bool:
         return False
 
 
+def _build_cyberwave_client(token: str) -> Cyberwave:
+    """Create a configured SDK client using runtime environment settings."""
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    return Cyberwave(base_url=base_url, token=token)
+
+
+def _resolve_edge_for_fingerprint(client: Cyberwave, fingerprint: str) -> Optional[Any]:
+    """Resolve the current edge record by fingerprint, creating it if needed."""
+    try:
+        for edge in client.edges.list():
+            if getattr(edge, "fingerprint", None) == fingerprint:
+                return edge
+    except Exception as exc:
+        logger.warning("Failed to list edges while resolving fingerprint %s: %s", fingerprint, exc)
+
+    try:
+        return client.edges.create(fingerprint=fingerprint)
+    except Exception as exc:
+        logger.warning(
+            "Failed to create edge while resolving fingerprint %s: %s",
+            fingerprint,
+            exc,
+        )
+        return None
+
+
+def _perform_edge_core_restart(token: str) -> dict[str, Any]:
+    """Execute restart workflow: cleanup local state and re-run driver startup."""
+    removed_json_files = _remove_cached_twin_json_files()
+    removed_containers = _stop_and_prune_driver_containers()
+
+    environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
+    if not environment_uuid:
+        logger.warning("No linked environment found; restart completed with cleanup only")
+        return {
+            "environment_uuid": None,
+            "removed_twin_json_files": removed_json_files,
+            "removed_driver_containers": removed_containers,
+            "drivers_started": 0,
+            "drivers_discovered": 0,
+        }
+
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        raise RuntimeError("Could not load or create edge fingerprint")
+
+    results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
+    started = sum(1 for result in results if result.get("success"))
+
+    summary = {
+        "environment_uuid": environment_uuid,
+        "removed_twin_json_files": removed_json_files,
+        "removed_driver_containers": removed_containers,
+        "drivers_started": started,
+        "drivers_discovered": len(results),
+    }
+    logger.info(
+        "Edge-core restart complete: env=%s removed_json=%d removed_containers=%d started=%d/%d",
+        environment_uuid,
+        len(removed_json_files),
+        len(removed_containers),
+        started,
+        len(results),
+    )
+    return summary
+
+
+def _run_edge_core_restart_worker(request_id: str) -> None:
+    """Execute restart flow in a background thread."""
+    global _EDGE_RESTART_IN_PROGRESS
+
+    with _EDGE_RESTART_LOCK:
+        if _EDGE_RESTART_IN_PROGRESS:
+            logger.info(
+                "Ignoring restart request %s: restart already in progress",
+                request_id or "no-request-id",
+            )
+            return
+        _EDGE_RESTART_IN_PROGRESS = True
+
+    try:
+        token = load_token()
+        if not token:
+            logger.warning(
+                "Ignoring restart request %s: no token available",
+                request_id or "no-request-id",
+            )
+            return
+        _perform_edge_core_restart(token)
+    except Exception:
+        logger.exception(
+            "Edge-core restart request %s failed",
+            request_id or "no-request-id",
+        )
+    finally:
+        with _EDGE_RESTART_LOCK:
+            _EDGE_RESTART_IN_PROGRESS = False
+
+
+def _handle_edge_command_message(*args: Any) -> None:
+    """Handle MQTT command message for this edge."""
+    if len(args) == 1:
+        payload = args[0]
+    elif len(args) >= 2:
+        payload = args[1]
+    else:
+        return
+
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring edge command with non-dict payload: %r", payload)
+        return
+
+    command = str(payload.get("command", "")).strip().lower()
+    if command != EDGE_COMMAND_RESTART:
+        return
+
+    request_id = str(payload.get("request_id", "")).strip()
+    if request_id:
+        if request_id in _HANDLED_EDGE_COMMAND_REQUEST_IDS:
+            return
+        _HANDLED_EDGE_COMMAND_REQUEST_IDS.add(request_id)
+
+    logger.info("Received edge restart command request_id=%s", request_id or "none")
+    worker = threading.Thread(
+        target=_run_edge_core_restart_worker,
+        args=(request_id,),
+        name=f"edge-core-restart-{(request_id or 'no-id')[:12]}",
+        daemon=True,
+    )
+    worker.start()
+
+
+def _resolve_edge_command_topic(token: str) -> Optional[str]:
+    """Resolve the MQTT topic used for edge command messages."""
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        logger.warning("Cannot subscribe to edge commands: edge fingerprint unavailable")
+        return None
+
+    client = _build_cyberwave_client(token)
+    edge = _resolve_edge_for_fingerprint(client, fingerprint)
+    if not edge:
+        return None
+
+    edge_uuid = str(getattr(edge, "uuid", "") or "")
+    if not edge_uuid:
+        logger.warning("Cannot subscribe to edge commands: resolved edge has no UUID")
+        return None
+
+    mqtt_client = _get_shared_mqtt_client(token)
+    if not mqtt_client:
+        logger.warning("Cannot subscribe to edge commands: MQTT client unavailable")
+        return None
+
+    return f"{mqtt_client.mqtt.topic_prefix}edges/{edge_uuid}/command"
+
+
+def ensure_edge_command_subscription() -> bool:
+    """Subscribe once to this edge's MQTT command topic."""
+    global _EDGE_COMMAND_SUBSCRIBED
+    if _EDGE_COMMAND_SUBSCRIBED:
+        return True
+
+    token = load_token()
+    if not token:
+        return False
+
+    with _EDGE_COMMAND_SUBSCRIPTION_LOCK:
+        if _EDGE_COMMAND_SUBSCRIBED:
+            return True
+
+        topic = _resolve_edge_command_topic(token)
+        if not topic:
+            return False
+
+        mqtt_client = _get_shared_mqtt_client(token)
+        if not mqtt_client:
+            return False
+
+        mqtt_client.mqtt.subscribe(topic, _handle_edge_command_message)
+        _EDGE_COMMAND_SUBSCRIBED = True
+        logger.info("Subscribed to edge command topic: %s", topic)
+        return True
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base* and return the result.
 
@@ -1159,4 +1425,8 @@ def run_runtime_loop() -> None:
             attached,
             len(_CONTAINER_LOG_THREADS),
         )
+        try:
+            ensure_edge_command_subscription()
+        except Exception:
+            logger.exception("Unexpected error while ensuring edge command subscription")
         time.sleep(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
