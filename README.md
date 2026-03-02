@@ -37,8 +37,10 @@ Once it's started (either via CLI or via service) the core does the following:
 1. Checks if the credentials stored in `credentials.json` are valid
 2. Connects to the backend MQTT and checks if the connection is up and running
 3. Registers the `edge` device is running on, or updates its registration record. Each `edge` device is defined by a unique hardware fingerprint
-4. Downloads the latest environment from the backend and downloads the list of devices connected to the edge
-5. For each `twin`, present in the environment, and connected to the edge: It starts the twin's docker driver image
+4. Downloads the latest environment from the backend and resolves the twins linked to this edge fingerprint
+5. Starts drivers for linked twins, with one special case for attached camera twins:
+   - if a linked twin is a camera child twin (`attach_to_twin_uuid`) of another linked twin, edge-core does **not** start a dedicated driver for that camera child
+   - edge-core passes camera child UUIDs to the parent driver via `CYBERWAVE_CHILD_TWIN_UUIDS`
 
 ### Remote restart (via Edge REST API)
 
@@ -62,6 +64,9 @@ A Cyberwave driver is a Docker image that is capable of interacting with the dev
 - `CYBERWAVE_TWIN_UUID`
 - `CYBERWAVE_API_KEY`
 - `CYBERWAVE_TWIN_JSON_FILE`
+- `CYBERWAVE_CHILD_TWIN_UUIDS` (optional, comma-separated)
+
+`CYBERWAVE_CHILD_TWIN_UUIDS` is present when the driver twin has attached camera child twins in the same linked set. Drivers can use this to discover and coordinate child twins without relying on extra camera selection prompts.
 
 The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
 
@@ -90,6 +95,7 @@ For an example, check how the camera driver handles the TWIN JSON file.
 ### `metadata["edge_configs"]` format (for edge <-> twin binding)
 
 Drivers and edge services should treat `metadata["edge_configs"]` as the source of truth for per-device runtime configuration.
+Edge identity should be stored at `metadata["edge_fingerprint"]` (not duplicated inside `edge_configs`).
 
 - Type: object/dictionary
 - Value: binding object (`object`)
@@ -97,43 +103,23 @@ Drivers and edge services should treat `metadata["edge_configs"]` as the source 
 Canonical shape:
 
 ```json
+"edge_fingerprint": "macbook-pro-a1b2c3d4e5f6",
 "edge_configs": {
-  "edge_fingerprint": "macbook-pro-a1b2c3d4e5f6",
   "camera_config": {
     "camera_id": "front",
     "source": "rtsp://user:pass@192.168.1.20/stream",
     "fps": 10,
     "resolution": "VGA",
     "camera_type": "cv2"
-  },
-  "device_info": {
-    "hostname": "edge-macbook",
-    "platform": "Darwin-arm64"
-  },
-  "registered_at": "2026-02-24T10:11:12.000000+00:00",
-  "last_sync": "2026-02-24T10:15:00.000000+00:00",
-  "edge_uuid": "8c1f72a0-5cb5-4f85-9d57-c170b50d4dbe",
-  "last_ip_address": "192.168.1.42",
-  "status_data": {
-    "uptime_seconds": 1234,
-    "streams": {
-      "front": {
-        "fps": 9.8,
-        "frames_sent": 10000
-      }
-    }
   }
 }
 ```
 
 Field notes:
 
-- `edge_fingerprint` (recommended): fingerprint of the edge currently serving this twin.
+- `edge_fingerprint` (recommended): fingerprint of the edge currently serving this twin (top-level metadata field).
 - `camera_config` (recommended): per-device camera/runtime config consumed by edge drivers.
-- `device_info` (optional): descriptive hardware info (`hostname`, `platform`, etc.).
-- `registered_at`, `last_sync` (optional): ISO-8601 timestamps.
-- `edge_uuid` (optional): UUID of the Edge record associated with this fingerprint.
-- `last_ip_address`, `status_data` (optional): runtime heartbeat/status details.
+- Do not store `edge_uuid`, `registered_at`, `last_sync`, `last_ip_address`, or `status_data` inside `edge_configs`.
 
 Backward compatibility:
 

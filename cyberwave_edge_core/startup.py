@@ -457,6 +457,7 @@ def _run_docker_image(
     *,
     twin_uuid: str,
     token: str,
+    child_camera_twin_uuids: Optional[list[str]] = None,
 ) -> bool:
     """Pull and run a driver Docker container for a twin.
 
@@ -511,6 +512,12 @@ def _run_docker_image(
         "CYBERWAVE_TWIN_UUID": twin_uuid,
         "CYBERWAVE_API_KEY": token,
     }
+    if child_camera_twin_uuids:
+        normalized_child_uuids = [str(child_uuid).strip() for child_uuid in child_camera_twin_uuids]
+        normalized_child_uuids = [child_uuid for child_uuid in normalized_child_uuids if child_uuid]
+        if normalized_child_uuids:
+            child_uuids_csv = ",".join(dict.fromkeys(normalized_child_uuids))
+            container_env["CYBERWAVE_CHILD_TWIN_UUIDS"] = child_uuids_csv
 
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL")
     if base_url:
@@ -847,6 +854,41 @@ def _follow_container_logs(
         )
 
 
+def _resolve_attach_to_twin_uuid(client: Any, twin: Any, twin_metadata: dict) -> Optional[str]:
+    """Resolve attach_to_twin_uuid from list payload, metadata, or raw twin fetch."""
+    attach_to = getattr(twin, "attach_to_twin_uuid", None)
+    if not attach_to and hasattr(twin, "_data"):
+        data = twin._data
+        attach_to = (
+            getattr(data, "attach_to_twin_uuid", None)
+            if not isinstance(data, dict)
+            else data.get("attach_to_twin_uuid")
+        )
+    if not attach_to:
+        attach_to = twin_metadata.get("attach_to_twin_uuid")
+    if not attach_to:
+        try:
+            full = client.twins.get_raw(str(getattr(twin, "uuid", "")))
+            if hasattr(full, "attach_to_twin_uuid"):
+                attach_to = full.attach_to_twin_uuid
+            elif isinstance(full, dict):
+                attach_to = full.get("attach_to_twin_uuid")
+        except Exception:
+            pass
+    return str(attach_to) if attach_to else None
+
+
+def _persist_twin_json_for_driver(twin: Any, twin_uuid: str, asset: Any) -> None:
+    """Persist the twin+asset JSON file consumed by edge drivers."""
+    twin_data = (
+        twin.to_dict()
+        if hasattr(twin, "to_dict")
+        else {"uuid": twin_uuid, "name": getattr(twin, "name", None)}
+    )
+    asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
+    write_or_update_twin_json_file(twin_uuid, twin_data, asset_data)
+
+
 def fetch_and_run_twin_drivers(
     token: str,
     environment_uuid: str,
@@ -871,10 +913,56 @@ def fetch_and_run_twin_drivers(
         logger.info("No twins found for environment %s", environment_uuid)
         return []
 
+    linked_twin_uuids: set[str] = set()
+    assets_by_twin_uuid: dict[str, Any] = {}
+    attach_to_by_twin_uuid: dict[str, str] = {}
+    camera_children_by_parent: dict[str, list[str]] = {}
+
+    for twin in twins:
+        twin_uuid = str(getattr(twin, "uuid", ""))
+        if not twin_uuid:
+            continue
+
+        twin_metadata = twin.metadata if isinstance(twin.metadata, dict) else {}
+        if twin_metadata.get("edge_fingerprint") != fingerprint:
+            continue
+        linked_twin_uuids.add(twin_uuid)
+
+        attach_to = _resolve_attach_to_twin_uuid(client, twin, twin_metadata)
+        if attach_to:
+            attach_to_by_twin_uuid[twin_uuid] = attach_to
+
+        asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
+        if not asset_uuid:
+            continue
+        try:
+            asset = client.assets.get(asset_uuid)
+        except Exception as exc:
+            logger.warning(
+                "Failed to get asset %s for twin %s while collecting child camera map: %s",
+                asset_uuid,
+                twin_uuid,
+                exc,
+            )
+            continue
+
+        assets_by_twin_uuid[twin_uuid] = asset
+        if attach_to and _twin_has_rgb_sensor(asset):
+            camera_children_by_parent.setdefault(attach_to, []).append(twin_uuid)
+
+    child_camera_twin_uuid_set = {
+        child_uuid
+        for parent_uuid, child_uuids in camera_children_by_parent.items()
+        if parent_uuid in linked_twin_uuids
+        for child_uuid in child_uuids
+    }
+
     results: List[Dict[str, Any]] = []
 
     for twin in twins:
-        twin_uuid = twin.uuid
+        twin_uuid = str(getattr(twin, "uuid", ""))
+        if not twin_uuid:
+            continue
 
         # The edge writes edge_fingerprint into twin metadata when the user
         # selects which twins this edge controls.  Match on that field.
@@ -890,49 +978,55 @@ def fetch_and_run_twin_drivers(
         )
 
         # Get the asset to check for driver_docker_image
-        asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
-        try:
-            asset = client.assets.get(asset_uuid)
-        except Exception as exc:
-            logger.warning(
-                "Failed to get asset %s for twin %s: %s",
-                asset_uuid,
+        asset = assets_by_twin_uuid.get(twin_uuid)
+        if asset is None:
+            asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
+            try:
+                asset = client.assets.get(asset_uuid)
+                assets_by_twin_uuid[twin_uuid] = asset
+            except Exception as exc:
+                logger.warning(
+                    "Failed to get asset %s for twin %s: %s",
+                    asset_uuid,
+                    twin_uuid,
+                    exc,
+                )
+                continue
+
+        attach_to = attach_to_by_twin_uuid.get(twin_uuid)
+        if attach_to is None:
+            attach_to = _resolve_attach_to_twin_uuid(client, twin, twin_metadata)
+            if attach_to:
+                attach_to_by_twin_uuid[twin_uuid] = attach_to
+
+        if twin_uuid in child_camera_twin_uuid_set and attach_to in linked_twin_uuids:
+            logger.info(
+                "Twin '%s' (%s) is a child camera of parent twin %s; "
+                "writing JSON and skipping dedicated driver startup",
+                twin.name,
                 twin_uuid,
-                exc,
+                attach_to,
             )
+            _check_and_alert_sensors_devices(
+                twin_uuid,
+                twin.name or f"twin-{twin_uuid[:8]}",
+                asset,
+                twin_metadata,
+            )
+            _persist_twin_json_for_driver(twin, twin_uuid, asset)
             continue
 
         drivers = twin_metadata.get("drivers")
+        asset_metadata = getattr(asset, "metadata", {}) or {}
+        if not isinstance(asset_metadata, dict):
+            asset_metadata = {}
         if not drivers:
             # try fallback to asset metadata
-            drivers = asset.metadata.get("drivers")
+            drivers = asset_metadata.get("drivers")
             if not drivers:
                 # Check if this twin is attached to another twin (e.g. camera on SO101).
                 # If so, skip running a driver but still write the JSON file so the
                 # parent driver can discover and use it.
-                attach_to = None
-                if hasattr(twin, "attach_to_twin_uuid") and twin.attach_to_twin_uuid:
-                    attach_to = twin.attach_to_twin_uuid
-                elif hasattr(twin, "_data"):
-                    d = twin._data
-                    attach_to = (
-                        getattr(d, "attach_to_twin_uuid", None)
-                        if not isinstance(d, dict)
-                        else d.get("attach_to_twin_uuid")
-                    )
-                if not attach_to:
-                    attach_to = twin_metadata.get("attach_to_twin_uuid")
-                if not attach_to:
-                    # List may omit attach_to_twin_uuid; fetch full twin
-                    try:
-                        full = client.twins.get_raw(twin_uuid)
-                        if hasattr(full, "attach_to_twin_uuid"):
-                            attach_to = full.attach_to_twin_uuid
-                        elif isinstance(full, dict):
-                            attach_to = full.get("attach_to_twin_uuid")
-                    except Exception:
-                        pass
-
                 if attach_to:
                     # Twin is attached to another - write JSON and skip (parent driver handles it)
                     logger.info(
@@ -947,13 +1041,7 @@ def fetch_and_run_twin_drivers(
                         asset,
                         twin_metadata,
                     )
-                    twin_data = (
-                        twin.to_dict()
-                        if hasattr(twin, "to_dict")
-                        else {"uuid": twin_uuid, "name": twin.name}
-                    )
-                    asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
-                    write_or_update_twin_json_file(twin_uuid, twin_data, asset_data)
+                    _persist_twin_json_for_driver(twin, twin_uuid, asset)
                     continue
 
                 # No drivers and not attached to anything - this is an error
@@ -984,13 +1072,7 @@ def fetch_and_run_twin_drivers(
             twin_metadata,
         )
 
-        twin_data = (
-            twin.to_dict()
-            if hasattr(twin, "to_dict")
-            else {"uuid": twin_uuid, "name": twin.name}
-        )
-        asset_data = asset.to_dict() if hasattr(asset, "to_dict") else {}
-        write_or_update_twin_json_file(twin_uuid, twin_data, asset_data)
+        _persist_twin_json_for_driver(twin, twin_uuid, asset)
 
         if not driver_image:
             logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
@@ -1004,10 +1086,23 @@ def fetch_and_run_twin_drivers(
                 "No drivers specified in asset metadata for paired twin '%s'", twin.name
             )
 
+        child_camera_twin_uuids = list(dict.fromkeys(camera_children_by_parent.get(twin_uuid, [])))
+        if child_camera_twin_uuids:
+            logger.info(
+                "Passing %d child camera twin UUID(s) to parent twin '%s': %s",
+                len(child_camera_twin_uuids),
+                twin.name,
+                ",".join(child_camera_twin_uuids),
+            )
+
         logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
         try:
             success = _run_docker_image(
-                driver_image, driver_params, twin_uuid=twin_uuid, token=token
+                driver_image,
+                driver_params,
+                twin_uuid=twin_uuid,
+                token=token,
+                child_camera_twin_uuids=child_camera_twin_uuids,
             )
             results.append(
                 {
