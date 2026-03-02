@@ -6,13 +6,7 @@ This Edge component acts as an orchestrator of your Cyberwave edge components.
 
 ```bash
 # Install the CLI (one time setup)
-curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-cli/gpgkey" | sudo gpg --dearmor -o /etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg
-
-# Configure the source
-echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-cli/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-cli-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-cli/any/ any main" | sudo tee /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-cli.list > /dev/null
-
-# Install the CLI
-sudo apt update && sudo apt install cyberwave-cli
+curl -fsSL https://cyberwave.com/install.sh | bash
 
 # Use the CLI to complete the edge setup
 sudo cyberwave edge install
