@@ -14,6 +14,7 @@ This module exposes each check individually (for the ``status`` command)
 and a single ``run_startup_checks()`` orchestrator for the boot path.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -101,6 +102,39 @@ _EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 _EDGE_RESTART_LOCK = threading.Lock()
 _EDGE_RESTART_IN_PROGRESS = False
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
+_TWIN_FILE_CHECKSUMS: dict[str, str] = {}
+_TWIN_UPDATE_ALLOWED_FIELDS = frozenset(
+    {
+        "name",
+        "description",
+        "asset_uuid",
+        "environment_uuid",
+        "position_x",
+        "position_y",
+        "position_z",
+        "rotation_w",
+        "rotation_x",
+        "rotation_y",
+        "rotation_z",
+        "scale_x",
+        "scale_y",
+        "scale_z",
+        "kinematics_override",
+        "joint_calibration",
+        "metadata",
+        "controller_policy_uuid",
+        "attach_to_twin_uuid",
+        "attach_to_link",
+        "attach_offset_x",
+        "attach_offset_y",
+        "attach_offset_z",
+        "attach_offset_rotation_w",
+        "attach_offset_rotation_x",
+        "attach_offset_rotation_y",
+        "attach_offset_rotation_z",
+        "fixed_base",
+    }
+)
 
 # Sensor types that require camera device selection (RGB cameras)
 RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera", "rgbd"})
@@ -1319,7 +1353,151 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
 
     with open(twin_json_file, "w") as f:
         json.dump(twin_data, f, indent=2, default=_json_default)
+    checksum = _calculate_file_checksum(twin_json_file)
+    if checksum:
+        _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
+    else:
+        _TWIN_FILE_CHECKSUMS.pop(twin_uuid, None)
     return True
+
+
+def _is_driver_twin_json_file(path: Path) -> bool:
+    """Return True when *path* is a managed twin JSON object file."""
+    if not path.is_file() or path.name in _PROTECTED_CONFIG_JSON_FILES:
+        return False
+
+    try:
+        uuid.UUID(path.stem)
+        return True
+    except ValueError:
+        return False
+
+
+def _calculate_file_checksum(path: Path) -> Optional[str]:
+    """Return SHA-256 checksum for *path* or None on read failures."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as file_handle:
+            for chunk in iter(lambda: file_handle.read(8192), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        logger.warning("Failed to read twin JSON file %s: %s", path, exc)
+        return None
+    return digest.hexdigest()
+
+
+def _extract_twin_update_payload(twin_json_data: dict[str, Any]) -> dict[str, Any]:
+    """Build safe payload for PUT /api/v1/twins/{uuid} from local twin JSON."""
+    payload = {
+        key: twin_json_data[key]
+        for key in _TWIN_UPDATE_ALLOWED_FIELDS
+        if key in twin_json_data
+    }
+
+    # Drivers receive twin + asset in one file. If the SDK payload does not
+    # include asset_uuid, infer it from the embedded asset object.
+    if "asset_uuid" not in payload:
+        asset_data = twin_json_data.get("asset")
+        if isinstance(asset_data, dict):
+            asset_uuid = asset_data.get("uuid")
+            if isinstance(asset_uuid, str) and asset_uuid.strip():
+                payload["asset_uuid"] = asset_uuid.strip()
+
+    return payload
+
+
+def _sync_twin_json_file_with_backend(
+    client: Cyberwave, twin_uuid: str, twin_json_file: Path
+) -> bool:
+    """Push one changed twin JSON file to backend using the REST twin update."""
+    try:
+        with open(twin_json_file) as file_handle:
+            twin_json_data = json.load(file_handle)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Twin JSON sync skipped for %s: invalid JSON (%s)", twin_json_file, exc)
+        return False
+
+    if not isinstance(twin_json_data, dict):
+        logger.warning(
+            "Twin JSON sync skipped for %s: expected object root",
+            twin_json_file,
+        )
+        return False
+
+    payload = _extract_twin_update_payload(twin_json_data)
+    if not payload:
+        logger.warning(
+            "Twin JSON sync skipped for %s: no updatable fields found",
+            twin_json_file,
+        )
+        return False
+
+    try:
+        client.twins.update(twin_uuid, **payload)
+        logger.info(
+            "Synced updated twin JSON for %s (fields=%s)",
+            twin_uuid,
+            sorted(payload.keys()),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Failed to sync twin JSON for %s: %s", twin_uuid, exc)
+        return False
+
+
+def reconcile_twin_json_file_sync() -> dict[str, int]:
+    """Detect and sync local twin JSON changes to the backend."""
+    changed_candidates: list[tuple[str, Path, str]] = []
+    active_twin_uuids: set[str] = set()
+
+    for json_file in sorted(CONFIG_DIR.glob("*.json")):
+        if not _is_driver_twin_json_file(json_file):
+            continue
+
+        twin_uuid = json_file.stem
+        active_twin_uuids.add(twin_uuid)
+        checksum = _calculate_file_checksum(json_file)
+        if not checksum:
+            continue
+
+        previous_checksum = _TWIN_FILE_CHECKSUMS.get(twin_uuid)
+        if previous_checksum is None:
+            _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
+            continue
+        if previous_checksum == checksum:
+            continue
+
+        changed_candidates.append((twin_uuid, json_file, checksum))
+
+    for stale_twin_uuid in set(_TWIN_FILE_CHECKSUMS) - active_twin_uuids:
+        _TWIN_FILE_CHECKSUMS.pop(stale_twin_uuid, None)
+
+    summary = {
+        "tracked": len(active_twin_uuids),
+        "changed": len(changed_candidates),
+        "synced": 0,
+    }
+    if not changed_candidates:
+        return summary
+
+    token = load_token()
+    if not token:
+        logger.warning("Cannot sync changed twin JSON files: no API token available")
+        return summary
+
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    try:
+        client = Cyberwave(base_url=base_url, token=token)
+    except Exception as exc:
+        logger.warning("Cannot sync changed twin JSON files: failed to create client (%s)", exc)
+        return summary
+
+    for twin_uuid, twin_json_file, checksum in changed_candidates:
+        if _sync_twin_json_file_with_backend(client, twin_uuid, twin_json_file):
+            _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
+            summary["synced"] += 1
+
+    return summary
 
 
 def run_startup_checks() -> bool:
@@ -1424,6 +1602,13 @@ def run_runtime_loop() -> None:
             "Driver log follower reconcile complete (active_streams=%d, tracked=%d)",
             attached,
             len(_CONTAINER_LOG_THREADS),
+        )
+        twin_sync_summary = reconcile_twin_json_file_sync()
+        logger.debug(
+            "Twin JSON sync reconcile complete (tracked=%d, changed=%d, synced=%d)",
+            twin_sync_summary["tracked"],
+            twin_sync_summary["changed"],
+            twin_sync_summary["synced"],
         )
         try:
             ensure_edge_command_subscription()
