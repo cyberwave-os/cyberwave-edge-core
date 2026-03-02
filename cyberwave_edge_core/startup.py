@@ -89,6 +89,18 @@ DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
+EDGE_CORE_RESTART_METADATA_KEY = "edge_core_restart"
+EDGE_CORE_RESTART_STATUS_REQUESTED = "requested"
+EDGE_CORE_RESTART_STATUS_IN_PROGRESS = "in_progress"
+EDGE_CORE_RESTART_STATUS_COMPLETED = "completed"
+EDGE_CORE_RESTART_STATUS_FAILED = "failed"
+_PROTECTED_CONFIG_JSON_FILES = {
+    "credentials.json",
+    "fingerprint.json",
+    "environment.json",
+    "devices.json",
+}
+_HANDLED_RESTART_REQUEST_IDS: set[str] = set()
 
 # Sensor types that require camera device selection (RGB cameras)
 RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera", "rgbd"})
@@ -580,21 +592,26 @@ def _stream_container_logs(
     thread.start()
 
 
-def _list_running_driver_containers() -> list[str]:
-    """Return running driver container names managed by edge-core."""
+def _list_driver_containers(*, include_stopped: bool) -> list[str]:
+    """Return edge-core managed driver container names."""
     if not shutil.which("docker"):
         return []
 
+    command = ["docker", "ps"]
+    if include_stopped:
+        command.append("-a")
+    command.extend(
+        [
+            "--format",
+            "{{.Names}}",
+            "--filter",
+            f"name=^{DRIVER_CONTAINER_PREFIX}",
+        ]
+    )
+
     try:
         result = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "--format",
-                "{{.Names}}",
-                "--filter",
-                f"name=^{DRIVER_CONTAINER_PREFIX}",
-            ],
+            command,
             check=True,
             capture_output=True,
             text=True,
@@ -605,6 +622,70 @@ def _list_running_driver_containers() -> list[str]:
         return []
 
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _list_running_driver_containers() -> list[str]:
+    """Return running driver container names managed by edge-core."""
+    return _list_driver_containers(include_stopped=False)
+
+
+def _stop_and_prune_driver_containers() -> list[str]:
+    """Force-remove edge-core driver containers and prune stopped containers."""
+    containers = _list_driver_containers(include_stopped=True)
+    removed: list[str] = []
+    for container_name in containers:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            removed.append(container_name)
+            _CONTAINER_TWIN_MAP.pop(container_name, None)
+            _CONTAINER_LOG_THREADS.pop(container_name, None)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to remove driver container %s: %s", container_name, exc)
+
+    if shutil.which("docker"):
+        try:
+            subprocess.run(
+                ["docker", "container", "prune", "--force"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to prune stopped containers: %s", exc)
+
+    return removed
+
+
+def _remove_cached_twin_json_files() -> list[str]:
+    """Remove cached twin JSON objects so they can be re-downloaded."""
+    removed: list[str] = []
+    for json_file in CONFIG_DIR.glob("*.json"):
+        if json_file.name in _PROTECTED_CONFIG_JSON_FILES:
+            continue
+
+        # Driver twin object files are UUID-based (<twin_uuid>.json). Skip any
+        # user/system JSON files that don't match that naming contract.
+        try:
+            uuid.UUID(json_file.stem)
+        except ValueError:
+            continue
+
+        try:
+            if json_file.is_file() or json_file.is_symlink():
+                json_file.unlink()
+            elif json_file.is_dir():
+                shutil.rmtree(json_file)
+            removed.append(json_file.name)
+        except OSError as exc:
+            logger.warning("Failed to remove cached twin object %s: %s", json_file, exc)
+    return removed
 
 
 def reconcile_driver_log_streams() -> int:
@@ -996,6 +1077,161 @@ def register_edge(token: str) -> bool:
         return False
 
 
+def _utc_now_iso() -> str:
+    """Return current UTC timestamp in ISO-8601 format."""
+    return f"{datetime.utcnow().isoformat()}Z"
+
+
+def _build_cyberwave_client(token: str) -> Cyberwave:
+    """Create a configured SDK client using runtime environment settings."""
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    return Cyberwave(base_url=base_url, token=token)
+
+
+def _resolve_edge_for_fingerprint(client: Cyberwave, fingerprint: str) -> Optional[Any]:
+    """Resolve the current edge record by fingerprint, creating it if needed."""
+    try:
+        for edge in client.edges.list():
+            if getattr(edge, "fingerprint", None) == fingerprint:
+                return edge
+    except Exception as exc:
+        logger.warning("Failed to list edges while resolving fingerprint %s: %s", fingerprint, exc)
+
+    try:
+        return client.edges.create(fingerprint=fingerprint)
+    except Exception as exc:
+        logger.warning(
+            "Failed to create edge while resolving fingerprint %s: %s",
+            fingerprint,
+            exc,
+        )
+        return None
+
+
+def _persist_edge_restart_state(
+    client: Cyberwave, edge_uuid: str, edge_fingerprint: str, restart_state: dict[str, Any]
+) -> None:
+    """Persist edge-core restart state in edge metadata."""
+    try:
+        client.edges.update(
+            edge_uuid,
+            {
+                "fingerprint": edge_fingerprint,
+                "metadata": {EDGE_CORE_RESTART_METADATA_KEY: restart_state},
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist restart state for edge %s (request_id=%s): %s",
+            edge_uuid,
+            restart_state.get("request_id"),
+            exc,
+        )
+
+
+def _perform_edge_core_restart(token: str) -> dict[str, Any]:
+    """Execute restart workflow: cleanup local state and re-run driver startup."""
+    removed_json_files = _remove_cached_twin_json_files()
+    removed_containers = _stop_and_prune_driver_containers()
+
+    environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
+    if not environment_uuid:
+        logger.warning("No linked environment found; restart completed with cleanup only")
+        return {
+            "environment_uuid": None,
+            "removed_twin_json_files": removed_json_files,
+            "removed_driver_containers": removed_containers,
+            "drivers_started": 0,
+            "drivers_discovered": 0,
+        }
+
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        raise RuntimeError("Could not load or create edge fingerprint")
+
+    results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
+    started = sum(1 for result in results if result.get("success"))
+
+    summary = {
+        "environment_uuid": environment_uuid,
+        "removed_twin_json_files": removed_json_files,
+        "removed_driver_containers": removed_containers,
+        "drivers_started": started,
+        "drivers_discovered": len(results),
+    }
+    logger.info(
+        "Edge-core restart complete: env=%s removed_json=%d removed_containers=%d started=%d/%d",
+        environment_uuid,
+        len(removed_json_files),
+        len(removed_containers),
+        started,
+        len(results),
+    )
+    return summary
+
+
+def poll_and_handle_edge_core_restart_request() -> None:
+    """Poll edge metadata for restart requests and execute them."""
+    token = load_token()
+    if not token:
+        return
+
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        logger.warning("Skipping restart command poll: edge fingerprint unavailable")
+        return
+
+    client = _build_cyberwave_client(token)
+    edge = _resolve_edge_for_fingerprint(client, fingerprint)
+    if not edge:
+        return
+
+    edge_uuid = str(getattr(edge, "uuid", "") or "")
+    if not edge_uuid:
+        logger.warning("Skipping restart command poll: resolved edge has no UUID")
+        return
+
+    metadata = getattr(edge, "metadata", {})
+    if not isinstance(metadata, dict):
+        return
+
+    restart_state = metadata.get(EDGE_CORE_RESTART_METADATA_KEY, {})
+    if not isinstance(restart_state, dict):
+        return
+
+    request_id = str(restart_state.get("request_id", "")).strip()
+    status = str(restart_state.get("status", "")).strip().lower()
+    if not request_id or status != EDGE_CORE_RESTART_STATUS_REQUESTED:
+        return
+
+    if request_id in _HANDLED_RESTART_REQUEST_IDS:
+        return
+    _HANDLED_RESTART_REQUEST_IDS.add(request_id)
+
+    restart_state = dict(restart_state)
+    restart_state["status"] = EDGE_CORE_RESTART_STATUS_IN_PROGRESS
+    restart_state["started_at"] = _utc_now_iso()
+    restart_state.pop("completed_at", None)
+    restart_state.pop("error", None)
+    _persist_edge_restart_state(client, edge_uuid, fingerprint, restart_state)
+
+    try:
+        result = _perform_edge_core_restart(token)
+    except Exception as exc:
+        logger.exception("Edge-core restart request %s failed", request_id)
+        restart_state["status"] = EDGE_CORE_RESTART_STATUS_FAILED
+        restart_state["completed_at"] = _utc_now_iso()
+        restart_state["error"] = str(exc)
+        _persist_edge_restart_state(client, edge_uuid, fingerprint, restart_state)
+        return
+
+    restart_state["status"] = EDGE_CORE_RESTART_STATUS_COMPLETED
+    restart_state["completed_at"] = _utc_now_iso()
+    restart_state["result"] = result
+    restart_state.pop("error", None)
+    _persist_edge_restart_state(client, edge_uuid, fingerprint, restart_state)
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base* and return the result.
 
@@ -1159,4 +1395,8 @@ def run_runtime_loop() -> None:
             attached,
             len(_CONTAINER_LOG_THREADS),
         )
+        try:
+            poll_and_handle_edge_core_restart_request()
+        except Exception:
+            logger.exception("Unexpected error while polling edge restart requests")
         time.sleep(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
