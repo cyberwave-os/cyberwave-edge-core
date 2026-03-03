@@ -115,6 +115,15 @@ def _twin_has_rgb_sensor(asset: Any) -> bool:
     return len(_get_device_requiring_sensor_ids(asset)) > 0
 
 
+def _get_asset_registry_id(asset: Any) -> str:
+    """Return normalized asset registry id or an empty string."""
+    metadata = getattr(asset, "metadata", None) or {}
+    registry_id = getattr(asset, "registry_id", None)
+    if not registry_id and isinstance(metadata, dict):
+        registry_id = metadata.get("registry_id")
+    return str(registry_id).strip() if registry_id else ""
+
+
 def _get_device_requiring_sensor_ids(asset: Any) -> list[str]:
     """Return sensor IDs that require a device port (e.g. /dev/video0).
 
@@ -149,9 +158,7 @@ def _get_device_requiring_sensor_ids(asset: Any) -> list[str]:
 
     # Fallback: known camera registry IDs - assume single "camera" sensor
     if not sensor_ids:
-        rid = (
-            getattr(asset, "registry_id", None) or metadata.get("registry_id") or ""
-        ).lower()
+        rid = _get_asset_registry_id(asset).lower()
         if "standard-cam" in rid or "realsense" in rid or "camera" in rid:
             sensor_ids.append("camera")
 
@@ -883,6 +890,7 @@ def fetch_and_run_twin_drivers(
     assets_by_twin_uuid: dict[str, Any] = {}
     attach_to_by_twin_uuid: dict[str, str] = {}
     camera_children_by_parent: dict[str, list[str]] = {}
+    child_registry_ids_by_parent: dict[str, set[str]] = {}
 
     for twin in twins:
         twin_uuid = str(getattr(twin, "uuid", ""))
@@ -905,7 +913,7 @@ def fetch_and_run_twin_drivers(
             asset = client.assets.get(asset_uuid)
         except Exception as exc:
             logger.warning(
-                "Failed to get asset %s for twin %s while collecting child camera map: %s",
+                "Failed to get asset %s for twin %s while collecting child twin maps: %s",
                 asset_uuid,
                 twin_uuid,
                 exc,
@@ -913,6 +921,10 @@ def fetch_and_run_twin_drivers(
             continue
 
         assets_by_twin_uuid[twin_uuid] = asset
+        if attach_to:
+            child_registry_id = _get_asset_registry_id(asset)
+            if child_registry_id:
+                child_registry_ids_by_parent.setdefault(attach_to, set()).add(child_registry_id)
         if attach_to and _twin_has_rgb_sensor(asset):
             camera_children_by_parent.setdefault(attach_to, []).append(twin_uuid)
 
@@ -1029,7 +1041,10 @@ def fetch_and_run_twin_drivers(
                     ),
                     twin.name,
                 )
-        driver_image, driver_params = _get_best_driver_image_and_params(drivers)
+        driver_image, driver_params = _get_best_driver_image_and_params(
+            drivers,
+            child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+        )
 
         _check_and_alert_sensors_devices(
             twin_uuid,
@@ -1118,14 +1133,18 @@ def _send_alert_for_twin(
     )
 
 
-def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tuple[str, list[str]]:
+def _get_best_driver_image_and_params(
+    drivers: Dict[str, Dict[str, str]],
+    child_registry_ids: Optional[set[str]] = None,
+) -> tuple[str, list[str]]:
     """
     Given a list of drivers specified in the metadata of the asset,
     and given the hardware where the edge is running,
     Returns:
     - The best driver to run.
     - A list of parameters to pass to the driver when doing docker run
-    TODO: this is missing as of now, always returning the default
+    If any non-default driver key matches one of the child asset registry IDs,
+    that driver is preferred over ``default``.
 
     "drivers": {
         "default": {
@@ -1140,13 +1159,34 @@ def _get_best_driver_image_and_params(drivers: Dict[str, Dict[str, str]]) -> tup
         },
     },
     """
-    if drivers["default"]:
-        if not drivers["default"]["docker_image"] or not isinstance(
-            drivers["default"]["docker_image"], str
-        ):
-            raise ValueError("No docker_image specified for default driver")
-        return drivers["default"]["docker_image"], drivers["default"].get("params", [])
-    raise ValueError("No default driver specified")
+    default_driver = drivers.get("default")
+    if not isinstance(default_driver, dict):
+        raise ValueError("No default driver specified")
+
+    normalized_child_registry_ids = {
+        registry_id.strip()
+        for registry_id in (child_registry_ids or set())
+        if isinstance(registry_id, str) and registry_id.strip()
+    }
+    if normalized_child_registry_ids and len(drivers) > 1:
+        for driver_name, driver_config in drivers.items():
+            if driver_name == "default":
+                continue
+            if driver_name not in normalized_child_registry_ids:
+                continue
+            if not isinstance(driver_config, dict):
+                raise ValueError(f"Invalid config for driver '{driver_name}'")
+            if not driver_config.get("docker_image") or not isinstance(
+                driver_config["docker_image"], str
+            ):
+                raise ValueError(f"No docker_image specified for driver '{driver_name}'")
+            return driver_config["docker_image"], driver_config.get("params", [])
+
+    if not default_driver.get("docker_image") or not isinstance(
+        default_driver["docker_image"], str
+    ):
+        raise ValueError("No docker_image specified for default driver")
+    return default_driver["docker_image"], default_driver.get("params", [])
 
 
 def register_edge(token: str) -> bool:

@@ -253,3 +253,160 @@ def test_non_camera_child_twin_is_not_skipped(monkeypatch) -> None:
     by_twin = {call["twin_uuid"]: call for call in run_calls}
     assert by_twin[parent_uuid]["child_camera_twin_uuids"] == []
     assert by_twin[child_uuid]["child_camera_twin_uuids"] == []
+
+
+def test_parent_driver_variant_selected_from_child_registry_id(monkeypatch) -> None:
+    fingerprint = "edge-fingerprint"
+    parent_uuid = "55555555-5555-5555-5555-555555555555"
+    child_uuid = "66666666-6666-6666-6666-666666666666"
+
+    parent_asset_uuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    child_asset_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+    parent_twin = FakeTwin(
+        uuid=parent_uuid,
+        name="SO101 parent",
+        asset_uuid=parent_asset_uuid,
+        metadata={
+            "edge_fingerprint": fingerprint,
+            "drivers": {
+                "default": {"docker_image": "cyberwaveos/so101-driver"},
+                "intel/realsensed455": {
+                    "docker_image": "cyberwaveos/so101-driver:latest-realsense"
+                },
+            },
+        },
+    )
+    child_camera_twin = FakeTwin(
+        uuid=child_uuid,
+        name="Realsense child",
+        asset_uuid=child_asset_uuid,
+        attach_to_twin_uuid=parent_uuid,
+        metadata={
+            "edge_fingerprint": fingerprint,
+            "drivers": {"default": {"docker_image": "cyberwaveos/camera-driver"}},
+        },
+    )
+
+    assets = {
+        parent_asset_uuid: FakeAsset(
+            metadata={},
+            registry_id="the-robot-studio/so101",
+        ),
+        child_asset_uuid: FakeAsset(
+            metadata={},
+            registry_id="intel/realsensed455",
+        ),
+    }
+    fake_client = _stub_client([parent_twin, child_camera_twin], assets)
+
+    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, token: fake_client)
+    monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
+    monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
+
+    run_calls: list[dict] = []
+
+    def _fake_run(
+        image: str,
+        params: list[str],
+        *,
+        twin_uuid: str,
+        token: str,
+        child_camera_twin_uuids: list[str] | None = None,
+    ) -> bool:
+        run_calls.append(
+            {
+                "image": image,
+                "twin_uuid": twin_uuid,
+                "child_camera_twin_uuids": child_camera_twin_uuids or [],
+            }
+        )
+        return True
+
+    monkeypatch.setattr(startup, "_run_docker_image", _fake_run)
+
+    results = startup.fetch_and_run_twin_drivers("test-token", "env-uuid", fingerprint)
+
+    assert [result["twin_uuid"] for result in results] == [parent_uuid]
+    assert len(run_calls) == 1
+    assert run_calls[0]["twin_uuid"] == parent_uuid
+    assert run_calls[0]["image"] == "cyberwaveos/so101-driver:latest-realsense"
+    assert run_calls[0]["child_camera_twin_uuids"] == [child_uuid]
+
+
+def test_parent_driver_falls_back_to_default_when_child_registry_does_not_match(monkeypatch) -> None:
+    fingerprint = "edge-fingerprint"
+    parent_uuid = "77777777-7777-7777-7777-777777777777"
+    child_uuid = "88888888-8888-8888-8888-888888888888"
+
+    parent_asset_uuid = "99999999-9999-9999-9999-999999999999"
+    child_asset_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    parent_twin = FakeTwin(
+        uuid=parent_uuid,
+        name="SO101 parent",
+        asset_uuid=parent_asset_uuid,
+        metadata={
+            "edge_fingerprint": fingerprint,
+            "drivers": {
+                "default": {"docker_image": "cyberwaveos/so101-driver"},
+                "intel/realsensed455": {
+                    "docker_image": "cyberwaveos/so101-driver:latest-realsense"
+                },
+            },
+        },
+    )
+    child_twin = FakeTwin(
+        uuid=child_uuid,
+        name="Different child",
+        asset_uuid=child_asset_uuid,
+        attach_to_twin_uuid=parent_uuid,
+        metadata={
+            "edge_fingerprint": fingerprint,
+            "drivers": {"default": {"docker_image": "cyberwaveos/aux-driver"}},
+        },
+    )
+
+    assets = {
+        parent_asset_uuid: FakeAsset(
+            metadata={},
+            registry_id="the-robot-studio/so101",
+        ),
+        child_asset_uuid: FakeAsset(
+            metadata={},
+            registry_id="intel/d435",
+        ),
+    }
+    fake_client = _stub_client([parent_twin, child_twin], assets)
+
+    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, token: fake_client)
+    monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
+    monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
+
+    run_calls: list[dict] = []
+
+    def _fake_run(
+        image: str,
+        params: list[str],
+        *,
+        twin_uuid: str,
+        token: str,
+        child_camera_twin_uuids: list[str] | None = None,
+    ) -> bool:
+        run_calls.append(
+            {
+                "image": image,
+                "twin_uuid": twin_uuid,
+                "child_camera_twin_uuids": child_camera_twin_uuids or [],
+            }
+        )
+        return True
+
+    monkeypatch.setattr(startup, "_run_docker_image", _fake_run)
+
+    results = startup.fetch_and_run_twin_drivers("test-token", "env-uuid", fingerprint)
+
+    assert len(results) == 2
+    by_twin_result = {result["twin_uuid"]: result for result in results}
+    assert by_twin_result[parent_uuid]["driver_image"] == "cyberwaveos/so101-driver"
+    assert by_twin_result[child_uuid]["driver_image"] == "cyberwaveos/aux-driver"
