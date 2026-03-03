@@ -92,10 +92,29 @@ The driver object in the metadata looks like this:
 
 For an example, check how the camera driver handles the TWIN JSON file.
 
-### `metadata["edge_configs"]` format (for edge <-> twin binding)
+### Passing environment variables to drivers (`metadata["drivers"]`)
+
+To inject environment variables into a driver container, use the `params` field with Docker's `-e` flag:
+
+```json
+"drivers": {
+  "default": {
+    "docker_image": "cyberwaveos/go2-native-driver",
+    "params": ["-e", "MY_VAR=value", "-e", "ANOTHER_VAR=value2"]
+  }
+}
+```
+
+Each `-e` must be its own element in the array, followed by the `KEY=value` string as the next element. This is equivalent to passing `-e MY_VAR=value` on the `docker run` command line.
+
+This is useful for driver-specific configuration that varies per device, such as IP addresses, credentials, or feature flags that cannot be stored in the twin's `edge_configs` metadata.
+
+### Runtime configuration for drivers (`metadata["edge_configs"]`)
 
 Drivers and edge services should treat `metadata["edge_configs"]` as the source of truth for per-device runtime configuration.
 Edge identity should be stored at `metadata["edge_fingerprint"]` (not duplicated inside `edge_configs`).
+
+> **Runtime access**: The core passes the full twin JSON (including `metadata`) to every driver via the `CYBERWAVE_TWIN_JSON_FILE` environment variable. Drivers can read `edge_configs` from that file at startup to obtain per-device settings — for example, selecting the right camera source or IP address for the current machine. This is the recommended way to pass device-specific configuration to a driver without hardcoding values in the image.
 
 - Type: object/dictionary
 - Value: binding object (`object`)

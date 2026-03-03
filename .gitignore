@@ -40,4 +40,5 @@ htmlcov/
 # Misc
 *.log
 .env
+.cyberwave
 
