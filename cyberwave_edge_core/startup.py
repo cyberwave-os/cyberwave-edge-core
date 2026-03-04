@@ -203,7 +203,7 @@ def _get_shared_mqtt_client(token: str) -> Any:
             return _shared_mqtt_client
         base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
         try:
-            client = Cyberwave(base_url=base_url, token=token)
+            client = Cyberwave(base_url=base_url, api_key=token)
             client.mqtt.connect()
             _shared_mqtt_client = client
             logger.info("Shared MQTT client connected for log forwarding")
@@ -293,7 +293,7 @@ def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
     masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
     logger.info("Validating token against %s via SDK (token: %s)", base_url, masked_token)
     try:
-        client = Cyberwave(base_url=base_url, token=token)
+        client = Cyberwave(base_url=base_url, api_key=token)
         client.workspaces.list()
         logger.info("Token validated successfully (workspaces listed)")
         return True
@@ -317,7 +317,7 @@ def check_mqtt_connection(token: str) -> bool:
         mqtt_host,
     )
     try:
-        client = Cyberwave(base_url=base_url, token=token)
+        client = Cyberwave(base_url=base_url, api_key=token)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
         if connected:
@@ -868,7 +868,7 @@ def fetch_and_run_twin_drivers(
     started successfully.
     """
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-    client = Cyberwave(base_url=base_url, token=token)
+    client = Cyberwave(base_url=base_url, api_key=token)
 
     # List twins for the environment via the SDK
     twins = client.twins.list(environment_id=environment_uuid)
@@ -1111,7 +1111,7 @@ def _send_alert_for_twin(
     Send an alert to the twin.
     """
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-    client = Cyberwave(base_url=base_url, token=load_token())
+    client = Cyberwave(base_url=base_url, api_key=load_token())
     twin = client.twin(twin_id=twin_uuid)
     # Create an alert
     twin.alerts.create(
@@ -1206,7 +1206,7 @@ def register_edge(token: str) -> bool:
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     logger.info("Registering edge with fingerprint=%s at %s", fingerprint, base_url)
     try:
-        client = Cyberwave(base_url=base_url, token=token)
+        client = Cyberwave(base_url=base_url, api_key=token)
         edge = client.edges.create(
             fingerprint=fingerprint,
         )
@@ -1223,7 +1223,7 @@ def register_edge(token: str) -> bool:
 def _build_cyberwave_client(token: str) -> Cyberwave:
     """Create a configured SDK client using runtime environment settings."""
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-    return Cyberwave(base_url=base_url, token=token)
+    return Cyberwave(base_url=base_url, api_key=token)
 
 
 def _resolve_edge_for_fingerprint(client: Cyberwave, fingerprint: str) -> Optional[Any]:
