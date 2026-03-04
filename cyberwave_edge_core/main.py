@@ -9,7 +9,6 @@ from rich.console import Console
 
 from .startup import (
     check_mqtt_connection,
-    load_devices,
     load_token,
     run_runtime_loop,
     run_startup_checks,
@@ -24,6 +23,7 @@ def _resolve_log_level() -> int:
     """Resolve logger level from env var with INFO fallback."""
     raw_level = os.getenv(LOG_LEVEL_ENV_VAR, "INFO").upper()
     return getattr(logging, raw_level, logging.INFO)
+
 
 # Configure logging so info/warning/error messages appear in journald.
 # The systemd journal captures stderr; use a clear format so log lines
@@ -89,14 +89,6 @@ def status() -> None:
         console.print("  MQTT:        [green]connected[/green]")
     else:
         console.print("  MQTT:        [red]unreachable[/red]")
-
-    devices = load_devices()
-    if devices:
-        console.print(f"  Devices:     [green]{len(devices)} configured[/green]")
-        for dev in devices:
-            console.print(f"               {dev.name} [dim]({dev.type})[/dim] @ {dev.port}")
-    else:
-        console.print("  Devices:     [yellow]none[/yellow]")
 
     console.print()
 
