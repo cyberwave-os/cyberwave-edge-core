@@ -4,6 +4,8 @@ This Edge component acts as an orchestrator of your Cyberwave edge components.
 
 ## Quickstart (Linux machines)
 
+SSH into the device where you want to install the edge.
+
 ```bash
 # Install the CLI (one time setup)
 curl -fsSL https://cyberwave.com/install.sh | bash
