@@ -321,7 +321,6 @@ class TestStatusCommand:
         _write_config(tmp_path)
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup, "CREDENTIALS_FILE", tmp_path / "credentials.json")
-        monkeypatch.setattr(startup, "DEVICES_FILE", tmp_path / "devices.json")
         monkeypatch.setattr(startup, "Cyberwave", FakeCyberwave.factory())
 
         runner = CliRunner()
@@ -335,7 +334,6 @@ class TestStatusCommand:
     def test_status_shows_red_cross_when_credentials_missing(self, tmp_path, monkeypatch):
         """``status`` must report missing credentials clearly and exit cleanly."""
         monkeypatch.setattr(startup, "CREDENTIALS_FILE", tmp_path / "credentials.json")
-        monkeypatch.setattr(startup, "DEVICES_FILE", tmp_path / "devices.json")
 
         runner = CliRunner()
         result = runner.invoke(cli, ["status"])
@@ -343,23 +341,6 @@ class TestStatusCommand:
         assert result.exit_code == 0
         # Rich strips markup in plain output; check for the text marker only
         assert "Credentials" in result.output
-
-    def test_status_lists_configured_devices(self, tmp_path, monkeypatch):
-        """``status`` must enumerate devices when devices.json is present."""
-        _write_config(tmp_path)
-        devices = [{"name": "arm", "type": "robot", "port": "/dev/ttyUSB0"}]
-        (tmp_path / "devices.json").write_text(json.dumps(devices))
-
-        monkeypatch.setattr(startup, "CREDENTIALS_FILE", tmp_path / "credentials.json")
-        monkeypatch.setattr(startup, "DEVICES_FILE", tmp_path / "devices.json")
-        monkeypatch.setattr(startup, "Cyberwave", FakeCyberwave.factory())
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["status"])
-
-        assert result.exit_code == 0
-        assert "arm" in result.output
-        assert "/dev/ttyUSB0" in result.output
 
     def test_version_flag_returns_version_string(self):
         """``--version`` must emit a non-empty version string and exit 0."""
