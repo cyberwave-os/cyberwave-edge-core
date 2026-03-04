@@ -119,7 +119,7 @@ def test_camera_child_twin_driver_is_skipped_and_passed_to_parent(monkeypatch) -
     }
     fake_client = _stub_client([parent_twin, child_camera_twin], assets)
 
-    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, token: fake_client)
+    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
 
     written_twins: list[str] = []
@@ -206,7 +206,7 @@ def test_non_camera_child_twin_is_not_skipped(monkeypatch) -> None:
     }
     fake_client = _stub_client([parent_twin, child_non_camera_twin], assets)
 
-    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, token: fake_client)
+    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
     monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
 
@@ -286,7 +286,7 @@ def test_parent_driver_variant_selected_from_child_registry_id(monkeypatch) -> N
     }
     fake_client = _stub_client([parent_twin, child_camera_twin], assets)
 
-    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, token: fake_client)
+    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
     monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
 
@@ -365,7 +365,7 @@ def test_non_camera_child_with_unmatched_registry_id_runs_independently(monkeypa
     }
     fake_client = _stub_client([parent_twin, child_twin], assets)
 
-    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, token: fake_client)
+    monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
     monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
 
