@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import time
 
 import click
 from rich.console import Console
@@ -65,30 +66,35 @@ def cli(ctx: click.Context) -> None:
 @cli.command()
 def status() -> None:
     """Show current credential, token, and MQTT status."""
-    console.print("\n[bold]Cyberwave Edge Core — status[/bold]\n")
+    console.print("\n[bold]Cyberwave Edge Core — Status[/bold]\n")
 
+    _t0 = time.perf_counter()
     token = load_token()
     if not token:
-        console.print("  Credentials: [red]not found[/red]")
-        console.print("  Token:       [dim]—[/dim]")
-        console.print("  MQTT:        [dim]—[/dim]")
+        console.print(f"  [red]✗[/red] Credentials [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
+        console.print("  [dim]—[/dim] Token")
+        console.print("  [dim]—[/dim] MQTT broker")
         console.print()
         return
 
-    console.print("  Credentials: [green]found[/green]")
+    console.print(f"  [green]✓[/green] Credentials [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
 
-    if validate_token(token):
-        console.print("  Token:       [green]valid[/green]")
+    _t0 = time.perf_counter()
+    token_ok = validate_token(token)
+    if token_ok:
+        console.print(f"  [green]✓[/green] Token [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
     else:
-        console.print("  Token:       [red]invalid / unreachable[/red]")
-        console.print("  MQTT:        [dim]—[/dim]")
+        console.print(f"  [red]✗[/red] Token [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
+        console.print("  [dim]—[/dim] MQTT broker")
         console.print()
         return
 
-    if check_mqtt_connection(token):
-        console.print("  MQTT:        [green]connected[/green]")
+    _t0 = time.perf_counter()
+    mqtt_ok = check_mqtt_connection(token)
+    if mqtt_ok:
+        console.print(f"  [green]✓[/green] MQTT broker [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
     else:
-        console.print("  MQTT:        [red]unreachable[/red]")
+        console.print(f"  [red]✗[/red] MQTT broker [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
 
     console.print()
 
