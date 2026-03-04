@@ -1649,7 +1649,7 @@ def run_startup_checks() -> bool:
     Prints a Rich-formatted report to the console.
     Returns ``True`` only when **all** checks pass.
     """
-    console.print("\n[bold]Cyberwave Edge Core — startup checks[/bold]\n")
+    console.print("\n[bold]Cyberwave Edge Core — Startup Checks[/bold]\n")
 
     # Log resolved configuration for troubleshooting
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
@@ -1662,71 +1662,74 @@ def run_startup_checks() -> bool:
     console.print()
 
     # 1 — credentials file
-    console.print("  Checking credentials …", end=" ")
+    _t0 = time.perf_counter()
     token = load_token()
     if not token:
-        console.print("[red]FAIL[/red]")
-        console.print(f"\n  [red]No credentials found at {CREDENTIALS_FILE}[/red]")
+        console.print(f"  [red]✗[/red] Credentials [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(f"  [red]No credentials found at {CREDENTIALS_FILE}[/red]")
         console.print("  [dim]Run 'cyberwave login' on this device first.[/dim]")
         return False
-    console.print("[green]OK[/green]")
+    console.print(f"  [green]✓[/green] Credentials [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
 
     # 2 — token validity
-    console.print("  Validating token …     ", end=" ")
-    if validate_token(token):
-        console.print("[green]OK[/green]")
+    _t0 = time.perf_counter()
+    token_valid = validate_token(token)
+    if token_valid:
+        console.print(f"  [green]✓[/green] Token [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
     else:
-        console.print("[red]FAIL[/red]")
-        console.print(f"\n  [red]Token validation failed against {base_url}[/red]")
+        console.print(f"  [red]✗[/red] Token [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(f"  [red]Token validation failed against {base_url}[/red]")
         console.print("  [dim]Check 'journalctl -u cyberwave-edge-core' for details.[/dim]")
         console.print("  [dim]Run 'cyberwave login' to refresh your credentials.[/dim]")
         return False
 
     # 3 — MQTT broker
-    console.print("  Connecting to MQTT …   ", end=" ")
-    if check_mqtt_connection(token):
-        console.print("[green]OK[/green]")
+    _t0 = time.perf_counter()
+    mqtt_ok = check_mqtt_connection(token)
+    if mqtt_ok:
+        console.print(f"  [green]✓[/green] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
     else:
-        console.print("[red]FAIL[/red]")
-        console.print("\n  [red]Could not connect to the MQTT broker.[/red]")
+        console.print(f"  [red]✗[/red] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print("  [red]Could not connect to the MQTT broker.[/red]")
         console.print("  [dim]Check network connectivity and MQTT configuration.[/dim]")
 
     # 4: Edge registering
-    console.print("  Registering edge …     ", end=" ")
-    if register_edge(token):
-        console.print("[green]OK[/green]")
+    _t0 = time.perf_counter()
+    edge_ok = register_edge(token)
+    if edge_ok:
+        console.print(f"  [green]✓[/green] Edge registration [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
     else:
-        console.print("[red]FAIL[/red]")
-        console.print("\n  [red]Could not register the edge.[/red]")
+        console.print(f"  [red]✗[/red] Edge registration [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print("  [red]Could not register the edge.[/red]")
         return False
 
     # 5 — linked environment
-    console.print("  Checking environment … ", end=" ")
+    _t0 = time.perf_counter()
     environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
     if environment_uuid:
-        console.print(f"[green]OK[/green] [dim]({environment_uuid})[/dim]")
+        console.print(f"  [green]✓[/green] Environment [dim]({environment_uuid}, {time.perf_counter() - _t0:.3f}s)[/dim]")
     else:
-        console.print("[yellow]NONE[/yellow]")
-        console.print(f"\n  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]")
+        console.print(f"  [yellow]⚠[/yellow] Environment [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(f"  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]")
         console.print("  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]")
 
     # 6 — fetch twins, match by fingerprint, write JSON file, run drivers
     if environment_uuid:
-        console.print("  Fetching twin drivers …", end=" ")
         fingerprint = get_or_create_fingerprint()
         if not fingerprint:
-            console.print("[red]FAIL[/red]")
-            console.print("\n  [red]Could not determine edge fingerprint.[/red]")
+            console.print("  [red]✗[/red] Edge fingerprint")
+            console.print("  [red]Could not determine edge fingerprint.[/red]")
         else:
+            _t0 = time.perf_counter()
             results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
             if not results:
-                console.print("[yellow]NONE[/yellow]")
+                console.print(f"  [yellow]⚠[/yellow] Twin drivers [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
                 console.print("  [dim]No twins with driver images matched this edge.[/dim]")
             else:
                 started = sum(1 for r in results if r["success"])
-                console.print(f"[green]{started}/{len(results)} driver(s) started[/green]")
+                console.print(f"  [green]✓[/green] Twin drivers [dim]({started}/{len(results)}, {time.perf_counter() - _t0:.3f}s)[/dim]")
                 for r in results:
-                    status = "[green]OK[/green]" if r["success"] else "[red]FAIL[/red]"
+                    status = "[green]✓[/green]" if r["success"] else "[red]✗[/red]"
                     console.print(f"    {r['twin_name']} → {r['driver_image']} {status}")
 
     console.print("\n[green]All startup checks passed.[/green]\n")

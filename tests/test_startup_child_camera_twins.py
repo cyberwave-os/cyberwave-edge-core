@@ -1,20 +1,6 @@
 from __future__ import annotations
 
-import sys
-import types
 from types import SimpleNamespace
-
-fake_cyberwave_module = types.ModuleType("cyberwave")
-fake_cyberwave_module.__path__ = []  # type: ignore[attr-defined]
-fake_cyberwave_module.Cyberwave = object  # type: ignore[attr-defined]
-fake_fingerprint_module = types.ModuleType("cyberwave.fingerprint")
-fake_fingerprint_module.generate_fingerprint = (  # type: ignore[attr-defined]
-    lambda: "test-fingerprint"
-)
-fake_cyberwave_module.fingerprint = fake_fingerprint_module  # type: ignore[attr-defined]
-
-sys.modules.setdefault("cyberwave", fake_cyberwave_module)
-sys.modules.setdefault("cyberwave.fingerprint", fake_fingerprint_module)
 
 import cyberwave_edge_core.startup as startup
 
@@ -334,7 +320,7 @@ def test_parent_driver_variant_selected_from_child_registry_id(monkeypatch) -> N
     assert run_calls[0]["child_camera_twin_uuids"] == [child_uuid]
 
 
-def test_parent_driver_falls_back_to_default_when_child_registry_does_not_match(monkeypatch) -> None:
+def test_non_camera_child_with_unmatched_registry_id_runs_independently(monkeypatch) -> None:
     fingerprint = "edge-fingerprint"
     parent_uuid = "77777777-7777-7777-7777-777777777777"
     child_uuid = "88888888-8888-8888-8888-888888888888"
