@@ -4,8 +4,7 @@ On every boot the edge core must:
   1. Read the API token from ``/etc/cyberwave/credentials.json``
   2. Validate the token against the Cyberwave REST API
   3. Verify that it can connect to the MQTT broker
-  4. Load configured devices from ``/etc/cyberwave/devices.json``
-  5. Check whether an environment is linked via ``/etc/cyberwave/environment.json``
+  4. Check whether an environment is linked via ``/etc/cyberwave/environment.json``
 
 The config directory defaults to ``/etc/cyberwave`` and can be overridden with
 the ``CYBERWAVE_EDGE_CONFIG_DIR`` environment variable (set in the systemd unit).
@@ -83,7 +82,6 @@ _shared_mqtt_lock = threading.Lock()
 # if the env var is absent (e.g. manual invocation).
 CONFIG_DIR = Path(os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "/etc/cyberwave"))
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
-DEVICES_FILE = CONFIG_DIR / "devices.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 DEFAULT_API_URL = "https://api.cyberwave.com"
@@ -95,7 +93,6 @@ _PROTECTED_CONFIG_JSON_FILES = {
     "credentials.json",
     "fingerprint.json",
     "environment.json",
-    "devices.json",
 }
 _EDGE_COMMAND_SUBSCRIBED = False
 _EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
@@ -199,9 +196,7 @@ def _get_device_requiring_sensor_ids(asset: Any) -> list[str]:
     return sensor_ids
 
 
-def _get_unassigned_sensor_ids(
-    twin_metadata: dict, sensor_ids: list[str]
-) -> list[str]:
+def _get_unassigned_sensor_ids(twin_metadata: dict, sensor_ids: list[str]) -> list[str]:
     """Return sensor IDs that need a device port but have none in metadata.sensors_devices."""
     sensors_devices = twin_metadata.get("sensors_devices") or {}
     if not isinstance(sensors_devices, dict):
@@ -250,11 +245,6 @@ def _get_shared_mqtt_client(token: str) -> Any:
         except Exception as exc:
             logger.warning("Failed to create shared MQTT client: %s", exc)
             return None
-
-
-def load_devices() -> List[str]:
-    """Load the list of devices from the environment.json file."""
-    raise NotImplementedError("Not implemented")
 
 
 def load_token() -> Optional[str]:
@@ -1168,7 +1158,7 @@ def _send_alert_for_twin(
 
 
 def _get_best_driver_image_and_params(
-    drivers: Dict[str, Dict[str, str]],
+    drivers: Dict[str, Dict[str, Any]],
     child_registry_ids: Optional[set[str]] = None,
 ) -> tuple[str, list[str]]:
     """
@@ -1214,13 +1204,31 @@ def _get_best_driver_image_and_params(
                 driver_config["docker_image"], str
             ):
                 raise ValueError(f"No docker_image specified for driver '{driver_name}'")
-            return driver_config["docker_image"], driver_config.get("params", [])
+            raw_params = driver_config.get("params")
+            if raw_params is None:
+                params: list[str] = []
+            elif isinstance(raw_params, list) and all(
+                isinstance(param, str) for param in raw_params
+            ):
+                params = raw_params
+            else:
+                raise ValueError(f"Invalid params for driver '{driver_name}'")
+            return driver_config["docker_image"], params
 
     if not default_driver.get("docker_image") or not isinstance(
         default_driver["docker_image"], str
     ):
         raise ValueError("No docker_image specified for default driver")
-    return default_driver["docker_image"], default_driver.get("params", [])
+    raw_default_params = default_driver.get("params")
+    if raw_default_params is None:
+        default_params: list[str] = []
+    elif isinstance(raw_default_params, list) and all(
+        isinstance(param, str) for param in raw_default_params
+    ):
+        default_params = raw_default_params
+    else:
+        raise ValueError("Invalid params for default driver")
+    return default_driver["docker_image"], default_params
 
 
 def register_edge(token: str) -> bool:
