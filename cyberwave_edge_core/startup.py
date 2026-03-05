@@ -1009,12 +1009,12 @@ def fetch_and_run_twin_drivers(
                 twin_uuid,
                 attach_to,
             )
-            _check_and_alert_sensors_devices(
-                twin_uuid,
-                twin.name or f"twin-{twin_uuid[:8]}",
-                asset,
-                twin_metadata,
-            )
+            # _check_and_alert_sensors_devices(
+            #     twin_uuid,
+            #     twin.name or f"twin-{twin_uuid[:8]}",
+            #     asset,
+            #     twin_metadata,
+            # )
             _persist_twin_json_for_driver(twin, twin_uuid, asset)
             continue
 
@@ -1532,9 +1532,7 @@ def _calculate_file_checksum(path: Path) -> Optional[str]:
 def _extract_twin_update_payload(twin_json_data: dict[str, Any]) -> dict[str, Any]:
     """Build safe payload for PUT /api/v1/twins/{uuid} from local twin JSON."""
     payload = {
-        key: twin_json_data[key]
-        for key in _TWIN_UPDATE_ALLOWED_FIELDS
-        if key in twin_json_data
+        key: twin_json_data[key] for key in _TWIN_UPDATE_ALLOWED_FIELDS if key in twin_json_data
     }
 
     # Drivers receive twin + asset in one file. If the SDK payload does not
@@ -1687,7 +1685,9 @@ def run_startup_checks() -> bool:
     _t0 = time.perf_counter()
     mqtt_ok = check_mqtt_connection(token)
     if mqtt_ok:
-        console.print(f"  [green]✓[/green] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(
+            f"  [green]✓[/green] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+        )
     else:
         console.print(f"  [red]✗[/red] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
         console.print("  [red]Could not connect to the MQTT broker.[/red]")
@@ -1697,9 +1697,13 @@ def run_startup_checks() -> bool:
     _t0 = time.perf_counter()
     edge_ok = register_edge(token)
     if edge_ok:
-        console.print(f"  [green]✓[/green] Edge registration [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(
+            f"  [green]✓[/green] Edge registration [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+        )
     else:
-        console.print(f"  [red]✗[/red] Edge registration [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(
+            f"  [red]✗[/red] Edge registration [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+        )
         console.print("  [red]Could not register the edge.[/red]")
         return False
 
@@ -1707,9 +1711,13 @@ def run_startup_checks() -> bool:
     _t0 = time.perf_counter()
     environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
     if environment_uuid:
-        console.print(f"  [green]✓[/green] Environment [dim]({environment_uuid}, {time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(
+            f"  [green]✓[/green] Environment [dim]({environment_uuid}, {time.perf_counter() - _t0:.3f}s)[/dim]"
+        )
     else:
-        console.print(f"  [yellow]⚠[/yellow] Environment [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+        console.print(
+            f"  [yellow]⚠[/yellow] Environment [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+        )
         console.print(f"  [yellow]No linked environment found in {ENVIRONMENT_FILE}[/yellow]")
         console.print("  [dim]Expected format: {'uuid': 'unique-uuid-of-the-environment'}[/dim]")
 
@@ -1723,11 +1731,15 @@ def run_startup_checks() -> bool:
             _t0 = time.perf_counter()
             results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
             if not results:
-                console.print(f"  [yellow]⚠[/yellow] Twin drivers [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+                console.print(
+                    f"  [yellow]⚠[/yellow] Twin drivers [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+                )
                 console.print("  [dim]No twins with driver images matched this edge.[/dim]")
             else:
                 started = sum(1 for r in results if r["success"])
-                console.print(f"  [green]✓[/green] Twin drivers [dim]({started}/{len(results)}, {time.perf_counter() - _t0:.3f}s)[/dim]")
+                console.print(
+                    f"  [green]✓[/green] Twin drivers [dim]({started}/{len(results)}, {time.perf_counter() - _t0:.3f}s)[/dim]"
+                )
                 for r in results:
                     status = "[green]✓[/green]" if r["success"] else "[red]✗[/red]"
                     console.print(f"    {r['twin_name']} → {r['driver_image']} {status}")
