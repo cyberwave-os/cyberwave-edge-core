@@ -334,8 +334,9 @@ def _get_shared_mqtt_client(token: str) -> Any:
         if _shared_mqtt_client is not None and _shared_mqtt_client.mqtt.connected:
             return _shared_mqtt_client
         base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+        mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
         try:
-            client = Cyberwave(base_url=base_url, api_key=token)
+            client = Cyberwave(base_url=base_url, api_key=token, mqtt_host=mqtt_host)
             client.mqtt.connect()
             _shared_mqtt_client = client
             logger.info("Shared MQTT client connected for log forwarding")
@@ -441,7 +442,7 @@ def check_mqtt_connection(token: str) -> bool:
     variables (``CYBERWAVE_MQTT_HOST``, etc.) and falls back to sensible
     defaults.  Returns ``True`` if the connection succeeds.
     """
-    mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST", "(default)")
+    mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     logger.info(
         "Attempting MQTT connection (base_url=%s, mqtt_host=%s)",
@@ -449,7 +450,7 @@ def check_mqtt_connection(token: str) -> bool:
         mqtt_host,
     )
     try:
-        client = Cyberwave(base_url=base_url, api_key=token)
+        client = Cyberwave(base_url=base_url, api_key=token, mqtt_host=mqtt_host)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
         if connected:

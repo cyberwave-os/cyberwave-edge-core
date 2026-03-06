@@ -2,7 +2,7 @@
 
 This Edge component acts as an orchestrator of your Cyberwave edge components.
 
-## Quickstart (Linux machines)
+## Quickstart
 
 SSH into the device where you want to install the edge.
 
