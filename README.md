@@ -20,7 +20,7 @@ The cyberwave-cli will ask you to log in with your Cyberwave credentials and the
 
 ### Configuration
 
-The edge core reads configuration from `/etc/cyberwave/` (overridable via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable, which is set in the systemd unit):
+The edge core reads configuration from `/etc/cyberwave/` on Linux and `~/.cyberwave/` on macOS (overridable via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable, which is set in the systemd unit):
 
 | File               | Description               |
 | ------------------ | ------------------------- |
@@ -28,7 +28,7 @@ The edge core reads configuration from `/etc/cyberwave/` (overridable via the `C
 | `fingerprint.json` | Device fingerprint        |
 | `environment.json` | Linked environment UUID   |
 
-Of the files above, the `core` needs only the `credentials.json` file. You can easily populate it with the `cyberwave-cli` as described in the quickstart.
+Of the files above, the `core` needs only `credentials.json`. You can easily populate it with the `cyberwave-cli` as described in the quickstart.
 
 The `fingerprint.json` is populated by the core itself.
 
@@ -38,7 +38,7 @@ Once it's started (either via CLI or via service) the core does the following:
 
 1. Checks if the credentials stored in `credentials.json` are valid
 2. Connects to the backend MQTT and checks if the connection is up and running
-3. Registers the `edge` device is running on, or updates its registration record. Each `edge` device is defined by a unique hardware fingerprint
+3. Registers the `edge` device it's running on, and updates its registration record. Each `edge` device is defined by a unique hardware fingerprint
 4. Downloads the latest environment from the backend and resolves the twins linked to this edge fingerprint
 5. Starts drivers for linked twins, with one special case for attached camera twins:
    - if a linked twin is a camera child twin (`attach_to_twin_uuid`) of another linked twin, edge-core does **not** start a dedicated driver for that camera child
@@ -61,7 +61,7 @@ when it receives the command, it:
 
 ## Writing compatible drivers
 
-A Cyberwave driver is a Docker image that is capable of interacting with the device's hardware, sending and getting data from the Cyberwave backend. Every time the core starts a driver Docker image, the `core` does so by defining the following environment variables:
+A Cyberwave `driver` is a Docker image that is capable of interacting with the device's hardware, sending and receiving data from the Cyberwave backend. Every time the core starts a driver Docker image, the `core` does so by defining the following environment variables:
 
 - `CYBERWAVE_TWIN_UUID`
 - `CYBERWAVE_API_KEY`
@@ -72,7 +72,7 @@ A Cyberwave driver is a Docker image that is capable of interacting with the dev
 
 ### Driver failure handling contract
 
-Drivers must exit with a **non-zero** code when they cannot access required hardware (for example, missing `/dev/video*` device or disconnected USB peripheral). This lets edge-core reliably detect startup failures and restart loops.
+Drivers must exit with a **non-zero** code when they cannot access required hardware (for example, missing `/dev/video*` device or because of a disconnected USB peripheral). This lets the edge-core reliably detect startup failures and restart loops.
 
 Runtime behavior in edge-core:
 
@@ -85,13 +85,17 @@ Optional edge-core env vars:
 - `CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS` (default: `60`)
 - `CYBERWAVE_DRIVER_TROUBLESHOOTING_URL` (default: `https://docs.cyberwave.com`)
 
+### Twin JSON file
+
 The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
 
-As a driver, you can change the JSON file. The core will, when connectivity is present, sync it with the one in the backend.
+A driver can change the twin JSON file. The core will, when connectivity is present, sync it with the one in the backend.
 
 When writing drivers, use the official Cyberwave SDK to communicate with the backend, as it will abstract a bunch of complexity in the MQTT handshake, REST API authentication, and more.
 
-Once you wrote a driver, you can add its details in the twin's metadata (or the asset's metadata if you own it). Right now the edit is manual and directly in the metadata. To edit the metadata, you can switch to Advanced editing in the environment or in the asset editing.
+### Twin metadata
+
+Once you've written a driver, you can register it by adding its details to the twin's metadata, or to the asset's metadata if you own it. Metadata editing is currently manual — switch to **Advanced editing** in the environment view or the asset editor.
 
 > Note: If you change the metadata on the asset, every twin created out of that asset from that moment on will have the same metadata as the asset, as the starting point
 
@@ -177,10 +181,10 @@ curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey"
 
 echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main" > /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list
 
-# Run all startup checks (validate token, MQTT, devices, environment)
+# Run the edge core (startup checks + full runtime loop: starts drivers, etc.)
 cyberwave-edge-core
 
-# Show current credential, token, MQTT, and device status
+# Show current credential, token, and MQTT status (read-only)
 cyberwave-edge-core status
 
 # Show version
@@ -194,6 +198,13 @@ To run against another env:
 ```bash
 export CYBERWAVE_ENVIRONMENT="yourenv"
 export CYBERWAVE_BASE_URL="https://yourbaseurl"
+cyberwave-edge-core
+```
+
+To control log verbosity (default: `INFO`):
+
+```bash
+export CYBERWAVE_EDGE_LOG_LEVEL="DEBUG"
 cyberwave-edge-core
 ```
 
