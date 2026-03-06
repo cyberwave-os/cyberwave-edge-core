@@ -162,6 +162,42 @@ class TestBootstrapRuntimeEnvVars:
 
         assert os.getenv("CYBERWAVE_BASE_URL") == "https://already-set.example.com"
 
+    def test_bootstrap_ignores_blank_and_non_string_env_values(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.delenv("CW_BOOTSTRAP_VALID", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_VALID_2", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_BLANK", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_NON_STRING", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_LIST", raising=False)
+
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text(
+            json.dumps(
+                {
+                    "envs": {
+                        "CW_BOOTSTRAP_VALID": "  value-one  ",
+                        "CW_BOOTSTRAP_VALID_2": "\tvalue-two\n",
+                        "CW_BOOTSTRAP_BLANK": "   ",
+                        "CW_BOOTSTRAP_NON_STRING": 123,
+                        "CW_BOOTSTRAP_LIST": ["x"],
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
+
+        startup._bootstrap_runtime_env_vars()
+
+        assert os.getenv("CW_BOOTSTRAP_VALID") == "value-one"
+        assert os.getenv("CW_BOOTSTRAP_VALID_2") == "value-two"
+        assert os.getenv("CW_BOOTSTRAP_BLANK") is None
+        assert os.getenv("CW_BOOTSTRAP_NON_STRING") is None
+        assert os.getenv("CW_BOOTSTRAP_LIST") is None
+
 
 # ===========================================================================
 # 1. load_token
