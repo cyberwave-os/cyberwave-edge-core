@@ -1128,7 +1128,7 @@ def _follow_container_logs(
     """Follow `docker logs -f` and forward lines to the service logger.
 
     When *twin_uuid* and *token* are provided, each log line is also
-    published to the backend via MQTT as a ``driver_log`` telemetry event.
+    published to the backend via MQTT as a ``driver_log`` event.
     """
     if not shutil.which("docker"):
         logger.warning("Cannot stream logs: Docker is not installed")
@@ -1144,7 +1144,7 @@ def _follow_container_logs(
         mqtt_client = _get_shared_mqtt_client(token)
         if mqtt_client:
             prefix = mqtt_client.mqtt.topic_prefix
-            mqtt_topic = f"{prefix}cyberwave/twin/{twin_uuid}/telemetry"
+            mqtt_topic = f"{prefix}cyberwave/twin/{twin_uuid}/driverlog"
             logger.info("Driver logs for %s will be published to %s", container_name, mqtt_topic)
 
     try:
