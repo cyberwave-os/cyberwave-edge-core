@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import subprocess
 import uuid as _uuid_module
 
 import cyberwave_edge_core.startup as startup
@@ -350,3 +351,87 @@ class TestReconcileDriverRestartFailures:
 
         assert stopped == []
         assert alerts == []
+
+
+# ===========================================================================
+# 7. _run_docker_image pull behavior with local fallback
+# ===========================================================================
+
+
+class TestRunDockerImagePullFallback:
+    _TWIN_UUID = "99999999-9999-9999-9999-999999999999"
+
+    def _patch_common(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.shutil, "which", lambda name: "/usr/bin/docker")
+        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda *args, **kwargs: None)
+        monkeypatch.setattr(startup.time, "sleep", lambda _: None)
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda _name: {"State": {"Status": "running", "Error": ""}},
+        )
+        monkeypatch.setattr(startup, "_stream_container_logs", lambda *args, **kwargs: None)
+
+    def test_uses_local_image_when_pull_fails(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            if cmd[:2] == ["docker", "pull"]:
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=cmd,
+                    stderr="pull access denied",
+                )
+            if cmd[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        assert any(cmd[:3] == ["docker", "image", "inspect"] for cmd in commands)
+        assert any(cmd[:2] == ["docker", "run"] for cmd in commands)
+
+    def test_fails_when_pull_fails_and_image_missing_locally(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            if cmd[:2] == ["docker", "pull"]:
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=cmd,
+                    stderr="pull access denied",
+                )
+            if cmd[:3] == ["docker", "image", "inspect"]:
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=cmd,
+                    stderr="No such image",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is False
+        assert any(cmd[:2] == ["docker", "pull"] for cmd in commands)
+        assert not any(cmd[:2] == ["docker", "run"] for cmd in commands)

@@ -510,11 +510,24 @@ def _run_docker_image(
             timeout=600,
         )
     except subprocess.CalledProcessError as exc:
-        logger.error("Failed to pull docker image %s: %s", image, exc.stderr)
-        return False
+        if _docker_image_exists_locally(image):
+            logger.warning(
+                "Failed to pull docker image %s (%s); using local image copy",
+                image,
+                (exc.stderr or "").strip() or "unknown error",
+            )
+        else:
+            logger.error("Failed to pull docker image %s: %s", image, exc.stderr)
+            return False
     except subprocess.TimeoutExpired:
-        logger.error("Docker pull timed out for image: %s", image)
-        return False
+        if _docker_image_exists_locally(image):
+            logger.warning(
+                "Docker pull timed out for image %s; using local image copy",
+                image,
+            )
+        else:
+            logger.error("Docker pull timed out for image: %s", image)
+            return False
 
     # Build env vars for the container
     container_env: dict[str, str] = {
@@ -704,6 +717,23 @@ def _list_driver_containers(*, include_stopped: bool) -> list[str]:
 def _list_running_driver_containers() -> list[str]:
     """Return running driver container names managed by edge-core."""
     return _list_driver_containers(include_stopped=False)
+
+
+def _docker_image_exists_locally(image: str) -> bool:
+    """Return True when Docker already has *image* locally."""
+    if not shutil.which("docker"):
+        return False
+    try:
+        subprocess.run(
+            ["docker", "image", "inspect", image],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def _inspect_driver_container(container_name: str) -> Optional[dict[str, Any]]:
