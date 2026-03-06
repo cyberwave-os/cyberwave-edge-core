@@ -70,6 +70,44 @@ class TestResolveConfigDir:
 
         assert not (target_dir / "credentials.json").exists()
 
+    def test_migrate_legacy_macos_config_skips_when_new_credentials_already_exist(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        target_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text('{"token":"legacy"}')
+        (legacy_dir / "environment.json").write_text('{"uuid":"legacy-env"}')
+        (target_dir / "credentials.json").write_text('{"token":"new"}')
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+
+        startup._migrate_legacy_macos_config(target_dir)
+
+        assert (target_dir / "credentials.json").read_text() == '{"token":"new"}'
+        assert not (target_dir / "environment.json").exists()
+
+    def test_migrate_legacy_macos_config_does_not_overwrite_existing_target_json(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        target_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text('{"token":"legacy"}')
+        (legacy_dir / "environment.json").write_text('{"uuid":"legacy-env"}')
+        (target_dir / "environment.json").write_text('{"uuid":"new-env"}')
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+
+        startup._migrate_legacy_macos_config(target_dir)
+
+        assert (target_dir / "credentials.json").exists()
+        assert (target_dir / "environment.json").read_text() == '{"uuid":"new-env"}'
+
 
 # ===========================================================================
 # 1. load_token
