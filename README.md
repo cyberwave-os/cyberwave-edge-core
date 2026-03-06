@@ -1,10 +1,10 @@
-# Cyberwave Edge Core
+# Cyberwave Edge-Core
 
-This Edge component acts as an orchestrator of your Cyberwave edge components.
+The edge core component acts as an orchestrator of the Cyberwave edge drivers.
 
 ## Quickstart (Linux machines)
 
-SSH into the device where you want to install the edge.
+SSH into the device where you want to install the edge-core.
 
 ```bash
 # Install the CLI (one time setup)
@@ -14,13 +14,13 @@ curl -fsSL https://cyberwave.com/install.sh | bash
 sudo cyberwave edge install
 ```
 
-The cyberwave-cli will ask you to log in with your Cyberwave credentials and then will proceed installing the `cyberwave-edge-core` on your edge device.
+The cyberwave-cli will ask you to log in with your Cyberwave credentials and will then proceed with installing `cyberwave-edge-core` on your edge device.
 
 > Don't have a Cyberwave account? Get one at [cyberwave.com](https://cyberwave.com)
 
 ### Configuration
 
-The edge core reads configuration from `/etc/cyberwave/` on Linux and `~/.cyberwave/` on macOS (overridable via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable, which is set in the systemd unit):
+`cyberwave-edge-core` reads the edge configuration from `/etc/cyberwave/` on Linux and `~/.cyberwave/` on macOS (overridable via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable, which is set in the systemd unit):
 
 | File               | Description               |
 | ------------------ | ------------------------- |
@@ -28,19 +28,19 @@ The edge core reads configuration from `/etc/cyberwave/` on Linux and `~/.cyberw
 | `fingerprint.json` | Device fingerprint        |
 | `environment.json` | Linked environment UUID   |
 
-Of the files above, the `core` needs only `credentials.json`. You can easily populate it with the `cyberwave-cli` as described in the quickstart.
+Of the files above, `cyberwave-edge-core` needs only `credentials.json`. You can easily populate it with the `cyberwave` command line tool (CLI) as described in the quickstart.
 
-The `fingerprint.json` is populated by the core itself.
+The file `fingerprint.json` is populated by `cyberwave-edge-core` itself.
 
-## How the edge works
+## How the edge-core works
 
-Once it's started (either via CLI or via service) the core does the following:
+Once its started (either via `cyberwave-edge-core` or via service) the edge-core does the following:
 
-1. Checks if the credentials stored in `credentials.json` are valid
-2. Connects to the backend MQTT and checks if the connection is up and running
-3. Registers the `edge` device it's running on, and updates its registration record. Each `edge` device is defined by a unique hardware fingerprint
-4. Downloads the latest environment from the backend and resolves the twins linked to this edge fingerprint
-5. Starts drivers for linked twins, with one special case for attached camera twins:
+1. It checks if the credentials stored in `credentials.json` are valid
+2. It connects to the backend MQTT and checks if the connection is up and running
+3. It registers the `edge` device it's running on, and updates its registration record (each `edge` device being identified by a unique edge fingerprint)
+4. It downloads the latest environment from the backend and resolves the twins linked to the edge fingerprint
+5. It starts drivers for linked twins, with one special case for attached camera twins:
    - if a linked twin is a camera child twin (`attach_to_twin_uuid`) of another linked twin, edge-core does **not** start a dedicated driver for that camera child
    - edge-core passes camera child UUIDs to the parent driver via `CYBERWAVE_CHILD_TWIN_UUIDS`
 
@@ -61,7 +61,7 @@ when it receives the command, it:
 
 ## Writing compatible drivers
 
-A Cyberwave `driver` is a Docker image that is capable of interacting with the device's hardware, sending and receiving data from the Cyberwave backend. Every time the core starts a driver Docker image, the `core` does so by defining the following environment variables:
+A Cyberwave `driver` is a Docker image that is capable of interacting with the device's hardware, sending and receiving data from the Cyberwave backend. Every time the edge-core starts a driver Docker image, it does so by defining the following environment variables:
 
 - `CYBERWAVE_TWIN_UUID`
 - `CYBERWAVE_API_KEY`
@@ -72,12 +72,12 @@ A Cyberwave `driver` is a Docker image that is capable of interacting with the d
 
 ### Driver failure handling contract
 
-Drivers must exit with a **non-zero** code when they cannot access required hardware (for example, missing `/dev/video*` device or because of a disconnected USB peripheral). This lets the edge-core reliably detect startup failures and restart loops.
+Drivers must exit with a **non-zero** code when they cannot access the required hardware (e.g. due to a missing `/dev/video*` device or because of a disconnected USB peripheral). This lets the edge-core reliably detect startup failures and restart loops.
 
-Runtime behavior in edge-core:
+Runtime behavior of the edge-core:
 
-- If a driver container fails to enter a stable running state, edge-core raises a `driver_start_failure` alert.
-- If a driver restarts more than `4` times in `60` seconds, edge-core marks it as flapping, stops the container, and raises a `driver_restart_loop` alert with a troubleshooting link.
+- If a driver container fails to enter a stable running state, the edge-core raises a `driver_start_failure` alert.
+- If a driver restarts more than `4` times in `60` seconds, the edge-core marks it as flapping, stops the container, and raises a `driver_restart_loop` alert with a troubleshooting link.
 
 Optional edge-core env vars:
 
@@ -87,13 +87,13 @@ Optional edge-core env vars:
 
 ### Twin JSON file
 
-The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
+`CYBERWAVE_TWIN_JSON_FILE` is an absolute path to a JSON file, which is writable by the driver. The JSON represents a complete digital twin object (instance) as well as its complete catalog twin object (asset). It is represented in the same way as in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
 
-A driver can change the twin JSON file. The core will, when connectivity is present, sync it with the one in the backend.
-
-When writing drivers, use the official Cyberwave SDK to communicate with the backend, as it will abstract a bunch of complexity in the MQTT handshake, REST API authentication, and more.
+A driver can change the twin JSON file. The edge-core will, when connectivity is present, sync it with the one in the backend.
 
 ### Twin metadata
+
+When writing drivers, use the official Cyberwave SDK to communicate with the backend, as it will abstract a bunch of complexity in the MQTT handshake, REST API authentication, and more.
 
 Once you've written a driver, you can register it by adding its details to the twin's metadata, or to the asset's metadata if you own it. Metadata editing is currently manual — switch to **Advanced editing** in the environment view or the asset editor.
 
@@ -181,7 +181,7 @@ curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey"
 
 echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main" > /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list
 
-# Run the edge core (startup checks + full runtime loop: starts drivers, etc.)
+# Run the edge-core (startup checks + full runtime loop: starts drivers, etc.)
 cyberwave-edge-core
 
 # Show current credential, token, and MQTT status (read-only)
