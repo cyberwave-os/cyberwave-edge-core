@@ -6,8 +6,10 @@ On every boot the edge core must:
   3. Verify that it can connect to the MQTT broker
   4. Check whether an environment is linked via ``/etc/cyberwave/environment.json``
 
-The config directory defaults to ``/etc/cyberwave`` and can be overridden with
-the ``CYBERWAVE_EDGE_CONFIG_DIR`` environment variable (set in the systemd unit).
+The config directory defaults to:
+  - ``/etc/cyberwave`` on Linux
+  - ``~/.cyberwave`` on macOS
+and can be overridden with the ``CYBERWAVE_EDGE_CONFIG_DIR`` environment variable.
 
 This module exposes each check individually (for the ``status`` command)
 and a single ``run_startup_checks()`` orchestrator for the boot path.
@@ -17,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import threading
@@ -32,9 +35,92 @@ from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 
 
+def _resolve_sudo_user_home() -> Optional[Path]:
+    """Return invoking user's home when running via sudo (best effort)."""
+    sudo_user = os.getenv("SUDO_USER", "").strip()
+    if not sudo_user:
+        return None
+
+    try:
+        import pwd
+
+        home = pwd.getpwnam(sudo_user).pw_dir
+    except Exception:
+        return None
+    if not home:
+        return None
+    return Path(home)
+
+
+def _resolve_default_config_dir() -> Path:
+    """Return default edge config directory for this platform."""
+    if platform.system() == "Darwin":
+        # Docker Desktop cannot reliably bind-mount /etc paths on macOS.
+        sudo_home = _resolve_sudo_user_home()
+        base_home = sudo_home or Path.home()
+        return base_home / ".cyberwave"
+    return Path("/etc/cyberwave")
+
+
+def _resolve_config_dir() -> Path:
+    """Resolve config dir honoring explicit environment override first."""
+    override = os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "").strip()
+    if override:
+        return Path(override)
+    return _resolve_default_config_dir()
+
+
+_LEGACY_MACOS_CONFIG_DIR = Path("/etc/cyberwave")
+
+
+def _migrate_legacy_macos_config(config_dir: Path) -> None:
+    """Best-effort migration from legacy /etc/cyberwave to macOS user config dir.
+
+    This keeps existing macOS installs working after moving defaults away from
+    /etc for Docker bind-mount compatibility.
+    """
+    if platform.system() != "Darwin":
+        return
+    if os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "").strip():
+        return
+    if config_dir == _LEGACY_MACOS_CONFIG_DIR:
+        return
+    if not _LEGACY_MACOS_CONFIG_DIR.exists():
+        return
+    if (config_dir / "credentials.json").exists():
+        return
+
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    bootstrap_logger = logging.getLogger(__name__)
+    copied_files = 0
+    for json_file in _LEGACY_MACOS_CONFIG_DIR.glob("*.json"):
+        if not json_file.is_file():
+            continue
+        target_file = config_dir / json_file.name
+        if target_file.exists():
+            continue
+        try:
+            shutil.copy2(json_file, target_file)
+            copied_files += 1
+        except OSError:
+            continue
+    if copied_files:
+        bootstrap_logger.info(
+            "Migrated %d legacy macOS edge config file(s) from %s to %s",
+            copied_files,
+            _LEGACY_MACOS_CONFIG_DIR,
+            config_dir,
+        )
+
+
 def _bootstrap_runtime_env_vars() -> None:
     """Load persisted runtime env vars into process env for child imports."""
-    config_dir = Path(os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "/etc/cyberwave"))
+    config_dir = _resolve_config_dir()
+    _migrate_legacy_macos_config(config_dir)
     credentials_file = config_dir / "credentials.json"
     if not credentials_file.exists():
         return
@@ -78,10 +164,10 @@ _shared_mqtt_lock = threading.Lock()
 
 # ---- constants ---------------------------------------------------------------
 
-# System-wide edge config directory.  The systemd unit sets
-# CYBERWAVE_EDGE_CONFIG_DIR=/etc/cyberwave; fall back to the same path
-# if the env var is absent (e.g. manual invocation).
-CONFIG_DIR = Path(os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "/etc/cyberwave"))
+# Edge config directory. The systemd unit sets CYBERWAVE_EDGE_CONFIG_DIR on
+# Linux. For manual invocation, defaults to /etc/cyberwave on Linux and to the
+# invoking user's ~/.cyberwave on macOS for Docker bind-mount compatibility.
+CONFIG_DIR = _resolve_config_dir()
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
