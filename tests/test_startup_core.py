@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import subprocess
 import uuid as _uuid_module
 
@@ -107,6 +108,59 @@ class TestResolveConfigDir:
 
         assert (target_dir / "credentials.json").exists()
         assert (target_dir / "environment.json").read_text() == '{"uuid":"new-env"}'
+
+
+# ===========================================================================
+# 0b. startup env bootstrap
+# ===========================================================================
+
+
+class TestBootstrapRuntimeEnvVars:
+    def test_bootstrap_loads_envs_from_migrated_macos_credentials(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.delenv("CYBERWAVE_BASE_URL", raising=False)
+        monkeypatch.delenv("CYBERWAVE_MQTT_HOST", raising=False)
+
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text(
+            json.dumps(
+                {
+                    "envs": {
+                        "CYBERWAVE_BASE_URL": " https://api.example.com ",
+                        "CYBERWAVE_MQTT_HOST": " mqtt.example.com ",
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
+
+        startup._bootstrap_runtime_env_vars()
+
+        assert os.getenv("CYBERWAVE_BASE_URL") == "https://api.example.com"
+        assert os.getenv("CYBERWAVE_MQTT_HOST") == "mqtt.example.com"
+        assert (target_dir / "credentials.json").exists()
+
+    def test_bootstrap_does_not_overwrite_existing_process_env(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setenv("CYBERWAVE_BASE_URL", "https://already-set.example.com")
+
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text(
+            json.dumps({"envs": {"CYBERWAVE_BASE_URL": "https://from-file.example.com"}})
+        )
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
+
+        startup._bootstrap_runtime_env_vars()
+
+        assert os.getenv("CYBERWAVE_BASE_URL") == "https://already-set.example.com"
 
 
 # ===========================================================================
