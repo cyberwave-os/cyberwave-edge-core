@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -89,6 +90,15 @@ DEFAULT_ENVIRONMENT = "production"
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
 EDGE_COMMAND_RESTART = "restart_edge_core"
+DRIVER_RESTART_LOOP_THRESHOLD = int(os.getenv("CYBERWAVE_DRIVER_RESTART_LOOP_THRESHOLD", "4"))
+DRIVER_RESTART_LOOP_WINDOW_SECONDS = float(
+    os.getenv("CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS", "60")
+)
+DEFAULT_DRIVER_TROUBLESHOOTING_URL = "https://docs.cyberwave.com"
+DRIVER_TROUBLESHOOTING_URL = (
+    os.getenv("CYBERWAVE_DRIVER_TROUBLESHOOTING_URL", DEFAULT_DRIVER_TROUBLESHOOTING_URL).strip()
+    or DEFAULT_DRIVER_TROUBLESHOOTING_URL
+)
 _PROTECTED_CONFIG_JSON_FILES = {
     "credentials.json",
     "fingerprint.json",
@@ -100,6 +110,8 @@ _EDGE_RESTART_LOCK = threading.Lock()
 _EDGE_RESTART_IN_PROGRESS = False
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 _TWIN_FILE_CHECKSUMS: dict[str, str] = {}
+_CONTAINER_LAST_RESTART_COUNT: dict[str, int] = {}
+_CONTAINER_RESTART_HISTORY: dict[str, deque[float]] = {}
 _TWIN_UPDATE_ALLOWED_FIELDS = frozenset(
     {
         "name",
@@ -599,6 +611,33 @@ def _run_docker_image(
         )
         _CONTAINER_TWIN_MAP[container_name] = twin_uuid
         _stream_container_logs(container_name, twin_uuid=twin_uuid, token=token)
+
+        # A detached `docker run` can still fail immediately (e.g. missing USB
+        # hardware causes rapid crashes). Verify that the container reaches and
+        # stays in a running state for a brief window.
+        for _ in range(5):
+            inspect_data = _inspect_driver_container(container_name)
+            if not inspect_data:
+                time.sleep(1.0)
+                continue
+            state = inspect_data.get("State") if isinstance(inspect_data.get("State"), dict) else {}
+            status = str(state.get("Status", "")).lower()
+            if status == "running":
+                return True
+            if status in {"restarting", "exited", "dead"}:
+                logger.error(
+                    "Driver container %s failed to start cleanly (status=%s error=%s)",
+                    container_name,
+                    status,
+                    str(state.get("Error", "")).strip() or "none",
+                )
+                return False
+            time.sleep(1.0)
+
+        logger.warning(
+            "Driver container %s did not reach a stable running state within startup probe window",
+            container_name,
+        )
         return True
     except subprocess.CalledProcessError as exc:
         logger.error("Failed to start container %s: %s", container_name, exc.stderr)
@@ -667,6 +706,208 @@ def _list_running_driver_containers() -> list[str]:
     return _list_driver_containers(include_stopped=False)
 
 
+def _inspect_driver_container(container_name: str) -> Optional[dict[str, Any]]:
+    """Return raw ``docker inspect`` payload for one driver container."""
+    if not shutil.which("docker"):
+        return None
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", container_name],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.warning("Invalid docker inspect JSON for container %s", container_name)
+        return None
+    if not isinstance(payload, list) or not payload:
+        return None
+    inspect_data = payload[0]
+    return inspect_data if isinstance(inspect_data, dict) else None
+
+
+def _resolve_container_twin_uuid(
+    container_name: str, inspect_data: Optional[dict[str, Any]] = None
+) -> Optional[str]:
+    """Resolve twin UUID for a driver container from cache or inspect env vars."""
+    cached = _CONTAINER_TWIN_MAP.get(container_name)
+    if cached:
+        return cached
+
+    config = (inspect_data or {}).get("Config")
+    envs = config.get("Env") if isinstance(config, dict) else None
+    if not isinstance(envs, list):
+        return None
+    for env in envs:
+        if not isinstance(env, str):
+            continue
+        if not env.startswith("CYBERWAVE_TWIN_UUID="):
+            continue
+        twin_uuid = env.split("=", 1)[1].strip()
+        if twin_uuid:
+            _CONTAINER_TWIN_MAP[container_name] = twin_uuid
+            return twin_uuid
+    return None
+
+
+def _track_container_restarts(container_name: str, restart_count: int) -> tuple[int, int]:
+    """Track per-container restart events and return (new_restarts, restarts_in_window)."""
+    now = time.time()
+    window_start = now - DRIVER_RESTART_LOOP_WINDOW_SECONDS
+    history = _CONTAINER_RESTART_HISTORY.setdefault(container_name, deque())
+    while history and history[0] < window_start:
+        history.popleft()
+
+    previous_count = _CONTAINER_LAST_RESTART_COUNT.get(container_name)
+    _CONTAINER_LAST_RESTART_COUNT[container_name] = restart_count
+    if previous_count is None:
+        return 0, len(history)
+
+    if restart_count < previous_count:
+        # Container was recreated; reset local restart tracking baseline.
+        history.clear()
+        return 0, 0
+
+    new_restarts = restart_count - previous_count
+    if new_restarts > 0:
+        for _ in range(min(new_restarts, DRIVER_RESTART_LOOP_THRESHOLD + 1)):
+            history.append(now)
+        while history and history[0] < window_start:
+            history.popleft()
+    return new_restarts, len(history)
+
+
+def _stop_driver_container(container_name: str) -> bool:
+    """Stop one flapping driver container and disable its restart policy."""
+    try:
+        subprocess.run(
+            ["docker", "update", "--restart=no", container_name],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        # Best-effort: continue with stop even if update is not available.
+        logger.debug("Could not set restart=no for %s", container_name, exc_info=True)
+
+    try:
+        subprocess.run(
+            ["docker", "stop", container_name],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        _CONTAINER_LOG_THREADS.pop(container_name, None)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to stop flapping driver container %s: %s", container_name, exc)
+        return False
+
+
+def _build_driver_restart_loop_message(
+    *,
+    twin_name: str,
+    container_name: str,
+    restart_count: int,
+    restart_window_count: int,
+) -> str:
+    return (
+        f"Driver container '{container_name}' for twin '{twin_name}' restarted "
+        f"{restart_window_count} times in the last "
+        f"{int(DRIVER_RESTART_LOOP_WINDOW_SECONDS)} seconds "
+        f"(total restarts reported by Docker: {restart_count}). "
+        f"The container was stopped automatically to prevent continuous rebooting. "
+        f"Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}"
+    )
+
+
+def reconcile_driver_restart_failures() -> dict[str, int]:
+    """Detect flapping drivers and stop them after too many restarts."""
+    all_containers = _list_driver_containers(include_stopped=True)
+    active_names = set(all_containers)
+
+    for stale in set(_CONTAINER_LAST_RESTART_COUNT) - active_names:
+        _CONTAINER_LAST_RESTART_COUNT.pop(stale, None)
+    for stale in set(_CONTAINER_RESTART_HISTORY) - active_names:
+        _CONTAINER_RESTART_HISTORY.pop(stale, None)
+
+    summary = {"inspected": 0, "flapping": 0, "stopped": 0, "alerts_sent": 0}
+    for container_name in all_containers:
+        inspect_data = _inspect_driver_container(container_name)
+        if not inspect_data:
+            continue
+        summary["inspected"] += 1
+
+        try:
+            restart_count = int(inspect_data.get("RestartCount") or 0)
+        except (TypeError, ValueError):
+            restart_count = 0
+        new_restarts, restarts_in_window = _track_container_restarts(container_name, restart_count)
+        if new_restarts <= 0:
+            continue
+        if restarts_in_window <= DRIVER_RESTART_LOOP_THRESHOLD:
+            continue
+
+        state = inspect_data.get("State") if isinstance(inspect_data.get("State"), dict) else {}
+        state_status = str(state.get("Status", "")).lower()
+        state_error = str(state.get("Error", "")).strip()
+        twin_uuid = _resolve_container_twin_uuid(container_name, inspect_data)
+        twin_name = f"twin-{(twin_uuid or 'unknown')[:8]}"
+        summary["flapping"] += 1
+
+        stopped = _stop_driver_container(container_name)
+        if stopped:
+            summary["stopped"] += 1
+
+        _CONTAINER_RESTART_HISTORY.pop(container_name, None)
+        logger.error(
+            (
+                "Driver container %s exceeded restart threshold (%d > %d in %ss). "
+                "status=%s docker_error=%s stopped=%s"
+            ),
+            container_name,
+            restarts_in_window,
+            DRIVER_RESTART_LOOP_THRESHOLD,
+            int(DRIVER_RESTART_LOOP_WINDOW_SECONDS),
+            state_status or "unknown",
+            state_error or "none",
+            stopped,
+        )
+
+        if not twin_uuid:
+            continue
+        try:
+            _send_alert_for_twin(
+                twin_uuid,
+                "Driver restart loop detected",
+                _build_driver_restart_loop_message(
+                    twin_name=twin_name,
+                    container_name=container_name,
+                    restart_count=restart_count,
+                    restart_window_count=restarts_in_window,
+                ),
+                "driver_restart_loop",
+                severity="error",
+            )
+            summary["alerts_sent"] += 1
+        except Exception as exc:
+            logger.warning(
+                "Failed to send restart-loop alert for twin %s (container=%s): %s",
+                twin_uuid,
+                container_name,
+                exc,
+            )
+    return summary
+
+
 def _stop_and_prune_driver_containers() -> list[str]:
     """Force-remove edge-core driver containers and prune stopped containers."""
     containers = _list_driver_containers(include_stopped=True)
@@ -683,6 +924,8 @@ def _stop_and_prune_driver_containers() -> list[str]:
             removed.append(container_name)
             _CONTAINER_TWIN_MAP.pop(container_name, None)
             _CONTAINER_LOG_THREADS.pop(container_name, None)
+            _CONTAINER_LAST_RESTART_COUNT.pop(container_name, None)
+            _CONTAINER_RESTART_HISTORY.pop(container_name, None)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
             logger.warning("Failed to remove driver container %s: %s", container_name, exc)
 
@@ -1117,6 +1360,26 @@ def fetch_and_run_twin_drivers(
                     "success": success,
                 }
             )
+            if not success:
+                try:
+                    startup_failure_message = (
+                        f"Driver image '{driver_image}' for twin '{twin.name}' failed to start "
+                        "on this edge. Check that required hardware is connected and accessible. "
+                        f"Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}"
+                    )
+                    _send_alert_for_twin(
+                        twin_uuid,
+                        "Driver failed to start",
+                        startup_failure_message,
+                        "driver_start_failure",
+                        severity="error",
+                    )
+                except Exception as alert_exc:
+                    logger.warning(
+                        "Could not send startup-failure alert for twin %s: %s",
+                        twin_uuid,
+                        alert_exc,
+                    )
         except Exception as exc:
             _send_alert_for_twin(
                 twin_uuid,
@@ -1760,6 +2023,17 @@ def run_runtime_loop() -> None:
             "Driver log follower reconcile complete (active_streams=%d, tracked=%d)",
             attached,
             len(_CONTAINER_LOG_THREADS),
+        )
+        restart_summary = reconcile_driver_restart_failures()
+        logger.debug(
+            (
+                "Driver restart reconcile complete "
+                "(inspected=%d, flapping=%d, stopped=%d, alerts_sent=%d)"
+            ),
+            restart_summary["inspected"],
+            restart_summary["flapping"],
+            restart_summary["stopped"],
+            restart_summary["alerts_sent"],
         )
         twin_sync_summary = reconcile_twin_json_file_sync()
         logger.debug(

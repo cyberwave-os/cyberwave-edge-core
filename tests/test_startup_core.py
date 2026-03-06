@@ -9,13 +9,11 @@ Covers the highest-priority untested areas:
 """
 from __future__ import annotations
 
+import itertools
 import json
 import uuid as _uuid_module
-from pathlib import Path
-from unittest.mock import patch
 
 import cyberwave_edge_core.startup as startup
-
 
 # ===========================================================================
 # 1. load_token
@@ -174,7 +172,6 @@ class TestLoadEnvironmentUuid:
         monkeypatch.setattr(startup, "ENVIRONMENT_FILE", env_file)
 
         call_count = 0
-        real_sleep = startup.time.sleep
 
         def _side_effect_sleep(seconds: float) -> None:
             nonlocal call_count
@@ -252,3 +249,104 @@ class TestRemoveCachedTwinJsonFiles:
 
         assert set(removed) == {f"{uuid1}.json", f"{uuid2}.json"}
         assert (tmp_path / "credentials.json").exists()
+
+
+# ===========================================================================
+# 6. reconcile_driver_restart_failures — flapping driver detection
+# ===========================================================================
+
+
+class TestReconcileDriverRestartFailures:
+    def test_stops_and_alerts_when_restart_threshold_is_exceeded(self, monkeypatch):
+        container_name = "cyberwave-driver-1234abcd"
+        twin_uuid = "11111111-1111-1111-1111-111111111111"
+        restart_counts = iter([0, 1, 2, 3, 4, 5])
+        timestamps = itertools.count(start=0, step=10)
+
+        startup._CONTAINER_LAST_RESTART_COUNT.clear()
+        startup._CONTAINER_RESTART_HISTORY.clear()
+        startup._CONTAINER_TWIN_MAP.clear()
+        monkeypatch.setattr(startup, "DRIVER_RESTART_LOOP_THRESHOLD", 4)
+        monkeypatch.setattr(startup, "DRIVER_RESTART_LOOP_WINDOW_SECONDS", 60.0)
+        monkeypatch.setattr(
+            startup,
+            "_list_driver_containers",
+            lambda include_stopped: [container_name],
+        )
+        monkeypatch.setattr(startup.time, "time", lambda: float(next(timestamps)))
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda _name: {
+                "RestartCount": next(restart_counts),
+                "State": {"Status": "restarting", "Error": "camera unavailable"},
+                "Config": {"Env": [f"CYBERWAVE_TWIN_UUID={twin_uuid}"]},
+            },
+        )
+
+        stopped: list[str] = []
+        alerts: list[tuple] = []
+        monkeypatch.setattr(
+            startup,
+            "_stop_driver_container",
+            lambda name: stopped.append(name) or True,
+        )
+        monkeypatch.setattr(
+            startup,
+            "_send_alert_for_twin",
+            lambda *args, **kwargs: alerts.append((args, kwargs)),
+        )
+
+        for _ in range(6):
+            startup.reconcile_driver_restart_failures()
+
+        assert stopped == [container_name]
+        assert len(alerts) == 1
+        assert alerts[0][0][0] == twin_uuid
+        assert alerts[0][0][3] == "driver_restart_loop"
+
+    def test_does_not_alert_for_sparse_restarts_outside_window(self, monkeypatch):
+        container_name = "cyberwave-driver-1234abcd"
+        twin_uuid = "22222222-2222-2222-2222-222222222222"
+        restart_counts = iter([0, 1, 2, 3, 4, 5])
+        timestamps = itertools.count(start=0, step=70)
+
+        startup._CONTAINER_LAST_RESTART_COUNT.clear()
+        startup._CONTAINER_RESTART_HISTORY.clear()
+        startup._CONTAINER_TWIN_MAP.clear()
+        monkeypatch.setattr(startup, "DRIVER_RESTART_LOOP_THRESHOLD", 4)
+        monkeypatch.setattr(startup, "DRIVER_RESTART_LOOP_WINDOW_SECONDS", 60.0)
+        monkeypatch.setattr(
+            startup,
+            "_list_driver_containers",
+            lambda include_stopped: [container_name],
+        )
+        monkeypatch.setattr(startup.time, "time", lambda: float(next(timestamps)))
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda _name: {
+                "RestartCount": next(restart_counts),
+                "State": {"Status": "restarting", "Error": ""},
+                "Config": {"Env": [f"CYBERWAVE_TWIN_UUID={twin_uuid}"]},
+            },
+        )
+
+        stopped: list[str] = []
+        alerts: list[tuple] = []
+        monkeypatch.setattr(
+            startup,
+            "_stop_driver_container",
+            lambda name: stopped.append(name) or True,
+        )
+        monkeypatch.setattr(
+            startup,
+            "_send_alert_for_twin",
+            lambda *args, **kwargs: alerts.append((args, kwargs)),
+        )
+
+        for _ in range(6):
+            startup.reconcile_driver_restart_failures()
+
+        assert stopped == []
+        assert alerts == []

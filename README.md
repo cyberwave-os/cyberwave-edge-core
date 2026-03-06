@@ -70,6 +70,21 @@ A Cyberwave driver is a Docker image that is capable of interacting with the dev
 
 `CYBERWAVE_CHILD_TWIN_UUIDS` is present when the driver twin has attached camera child twins in the same linked set. Drivers can use this to discover and coordinate child twins without relying on extra camera selection prompts.
 
+### Driver failure handling contract
+
+Drivers must exit with a **non-zero** code when they cannot access required hardware (for example, missing `/dev/video*` device or disconnected USB peripheral). This lets edge-core reliably detect startup failures and restart loops.
+
+Runtime behavior in edge-core:
+
+- If a driver container fails to enter a stable running state, edge-core raises a `driver_start_failure` alert.
+- If a driver restarts more than `4` times in `60` seconds, edge-core marks it as flapping, stops the container, and raises a `driver_restart_loop` alert with a troubleshooting link.
+
+Optional edge-core env vars:
+
+- `CYBERWAVE_DRIVER_RESTART_LOOP_THRESHOLD` (default: `4`)
+- `CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS` (default: `60`)
+- `CYBERWAVE_DRIVER_TROUBLESHOOTING_URL` (default: `https://docs.cyberwave.com`)
+
 The Cyberwave twin JSON file is an absolute path to a JSON file. The JSON file is writable by the driver. It represents a complete twin object as well as its complete asset object. It represented in the same way that is it in the API, including the whole metadata field, schema and abilities. [Twin reference here](https://docs.cyberwave.com/api-reference/rest/TwinSchema), [Asset reference here](https://docs.cyberwave.com/api-reference/rest/AssetSchema).
 
 As a driver, you can change the JSON file. The core will, when connectivity is present, sync it with the one in the backend.
