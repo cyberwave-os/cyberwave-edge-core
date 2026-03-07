@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import subprocess
 import uuid as _uuid_module
 
@@ -69,6 +70,133 @@ class TestResolveConfigDir:
         startup._migrate_legacy_macos_config(target_dir)
 
         assert not (target_dir / "credentials.json").exists()
+
+    def test_migrate_legacy_macos_config_skips_when_new_credentials_already_exist(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        target_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text('{"token":"legacy"}')
+        (legacy_dir / "environment.json").write_text('{"uuid":"legacy-env"}')
+        (target_dir / "credentials.json").write_text('{"token":"new"}')
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+
+        startup._migrate_legacy_macos_config(target_dir)
+
+        assert (target_dir / "credentials.json").read_text() == '{"token":"new"}'
+        assert not (target_dir / "environment.json").exists()
+
+    def test_migrate_legacy_macos_config_does_not_overwrite_existing_target_json(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        target_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text('{"token":"legacy"}')
+        (legacy_dir / "environment.json").write_text('{"uuid":"legacy-env"}')
+        (target_dir / "environment.json").write_text('{"uuid":"new-env"}')
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+
+        startup._migrate_legacy_macos_config(target_dir)
+
+        assert (target_dir / "credentials.json").exists()
+        assert (target_dir / "environment.json").read_text() == '{"uuid":"new-env"}'
+
+
+# ===========================================================================
+# 0b. startup env bootstrap
+# ===========================================================================
+
+
+class TestBootstrapRuntimeEnvVars:
+    def test_bootstrap_loads_envs_from_migrated_macos_credentials(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.delenv("CYBERWAVE_BASE_URL", raising=False)
+        monkeypatch.delenv("CYBERWAVE_MQTT_HOST", raising=False)
+
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text(
+            json.dumps(
+                {
+                    "envs": {
+                        "CYBERWAVE_BASE_URL": " https://api.example.com ",
+                        "CYBERWAVE_MQTT_HOST": " mqtt.example.com ",
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
+
+        startup._bootstrap_runtime_env_vars()
+
+        assert os.getenv("CYBERWAVE_BASE_URL") == "https://api.example.com"
+        assert os.getenv("CYBERWAVE_MQTT_HOST") == "mqtt.example.com"
+        assert (target_dir / "credentials.json").exists()
+
+    def test_bootstrap_does_not_overwrite_existing_process_env(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setenv("CYBERWAVE_BASE_URL", "https://already-set.example.com")
+
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text(
+            json.dumps({"envs": {"CYBERWAVE_BASE_URL": "https://from-file.example.com"}})
+        )
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
+
+        startup._bootstrap_runtime_env_vars()
+
+        assert os.getenv("CYBERWAVE_BASE_URL") == "https://already-set.example.com"
+
+    def test_bootstrap_ignores_blank_and_non_string_env_values(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.delenv("CW_BOOTSTRAP_VALID", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_VALID_2", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_BLANK", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_NON_STRING", raising=False)
+        monkeypatch.delenv("CW_BOOTSTRAP_LIST", raising=False)
+
+        legacy_dir = tmp_path / "legacy"
+        target_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        (legacy_dir / "credentials.json").write_text(
+            json.dumps(
+                {
+                    "envs": {
+                        "CW_BOOTSTRAP_VALID": "  value-one  ",
+                        "CW_BOOTSTRAP_VALID_2": "\tvalue-two\n",
+                        "CW_BOOTSTRAP_BLANK": "   ",
+                        "CW_BOOTSTRAP_NON_STRING": 123,
+                        "CW_BOOTSTRAP_LIST": ["x"],
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
+
+        startup._bootstrap_runtime_env_vars()
+
+        assert os.getenv("CW_BOOTSTRAP_VALID") == "value-one"
+        assert os.getenv("CW_BOOTSTRAP_VALID_2") == "value-two"
+        assert os.getenv("CW_BOOTSTRAP_BLANK") is None
+        assert os.getenv("CW_BOOTSTRAP_NON_STRING") is None
+        assert os.getenv("CW_BOOTSTRAP_LIST") is None
 
 
 # ===========================================================================
