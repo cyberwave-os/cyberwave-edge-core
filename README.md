@@ -1,6 +1,21 @@
-# Cyberwave Edge-Core
+<p align="center">
+  <a href="https://cyberwave.com">
+    <img src="https://cyberwave.com/cyberwave-logo-black.svg" alt="Cyberwave logo" width="240" />
+  </a>
+</p>
 
-Cyberwave Edge Core acts as the orchestrator of the Cyberwave edge drivers.
+# Cyberwave Edge Core
+
+This module is part of **Cyberwave: Making the physical world programmable**.
+
+Cyberwave Edge Core acts as the orchestrator of Cyberwave edge drivers.
+
+[![License](https://img.shields.io/badge/License-MIT-orange.svg)](https://github.com/cyberwave-os/cyberwave-edge-core/blob/main/LICENSE)
+[![Documentation](https://img.shields.io/badge/Documentation-docs.cyberwave.com-orange)](https://docs.cyberwave.com)
+[![Discord](https://badgen.net/badge/icon/discord?icon=discord&label&color=orange)](https://discord.gg/dfGhNrawyF)
+[![PyPI version](https://img.shields.io/pypi/v/cyberwave-edge-core.svg)](https://pypi.org/project/cyberwave-edge-core/)
+[![PyPI Python versions](https://img.shields.io/pypi/pyversions/cyberwave-edge-core.svg)](https://pypi.org/project/cyberwave-edge-core/)
+[![Release to PyPI](https://github.com/cyberwave-os/cyberwave-edge-core/actions/workflows/release-pypi.yml/badge.svg)](https://github.com/cyberwave-os/cyberwave-edge-core/actions/workflows/release-pypi.yml)
 
 ## Quickstart
 
@@ -224,3 +239,13 @@ Or pass env vars to the CLI installer:
 ```bash
 sudo CYBERWAVE_ENVIRONMENT="yourenv" CYBERWAVE_BASE_URL="https://yourbaseurl" cyberwave edge install
 ```
+
+## Contributing
+
+Contributions are welcome. Please open an issue to discuss bugs or feature requests, and submit a pull request when you are ready.
+
+## Community and Documentation
+
+- Documentation: https://docs.cyberwave.com
+- Community (Discord): https://discord.gg/dfGhNrawyF
+- Issues: https://github.com/cyberwave-os/cyberwave-edge-core/issues
