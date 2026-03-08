@@ -1397,12 +1397,12 @@ def fetch_and_run_twin_drivers(
                         twin.name,
                         attach_to,
                     )
-                    _check_and_alert_sensors_devices(
-                        twin_uuid,
-                        twin.name or f"twin-{twin_uuid[:8]}",
-                        asset,
-                        twin_metadata,
-                    )
+                    # _check_and_alert_sensors_devices(
+                    #     twin_uuid,
+                    #     twin.name or f"twin-{twin_uuid[:8]}",
+                    #     asset,
+                    #     twin_metadata,
+                    # )
                     _persist_twin_json_for_driver(twin, twin_uuid, asset)
                     continue
 
@@ -1430,12 +1430,12 @@ def fetch_and_run_twin_drivers(
             child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
         )
 
-        _check_and_alert_sensors_devices(
-            twin_uuid,
-            twin.name or f"twin-{twin_uuid[:8]}",
-            asset,
-            twin_metadata,
-        )
+        # _check_and_alert_sensors_devices(
+        #     twin_uuid,
+        #     twin.name or f"twin-{twin_uuid[:8]}",
+        #     asset,
+        #     twin_metadata,
+        # )
 
         _persist_twin_json_for_driver(twin, twin_uuid, asset)
 
