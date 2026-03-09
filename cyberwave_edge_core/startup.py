@@ -16,6 +16,7 @@ and a single ``run_startup_checks()`` orchestrator for the boot path.
 """
 
 import hashlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -33,6 +34,8 @@ from typing import Any, Dict, List, Optional
 from cyberwave import Cyberwave
 from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
+
+from . import __version__ as PACKAGE_EDGE_CORE_VERSION
 
 
 def _resolve_sudo_user_home() -> Optional[Path]:
@@ -151,6 +154,32 @@ logger = logging.getLogger(__name__)
 _edge_log_level_name = os.getenv("CYBERWAVE_EDGE_LOG_LEVEL", "info").strip().upper()
 logger.setLevel(getattr(logging, _edge_log_level_name, logging.INFO))
 console = Console()
+
+
+def _resolve_package_version(package_name: str, fallback: str | None = None) -> str | None:
+    """Resolve an installed package version with an optional fallback."""
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return fallback
+    except Exception:
+        return fallback
+
+
+try:
+    from cyberwave import __version__ as PACKAGE_CYBERWAVE_SDK_VERSION
+except Exception:
+    PACKAGE_CYBERWAVE_SDK_VERSION = None
+
+
+EDGE_CORE_VERSION = _resolve_package_version(
+    "cyberwave-edge-core",
+    fallback=PACKAGE_EDGE_CORE_VERSION,
+)
+CYBERWAVE_SDK_VERSION = _resolve_package_version(
+    "cyberwave",
+    fallback=PACKAGE_CYBERWAVE_SDK_VERSION,
+)
 
 # Track active log streaming threads per container to avoid duplicates.
 _CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
@@ -1120,6 +1149,22 @@ def _parse_log_level(message: str) -> str:
     return "INFO"
 
 
+def _build_driver_log_payload(message: str, container_name: str) -> dict[str, Any]:
+    """Build the MQTT payload for a forwarded driver log line."""
+    payload: dict[str, Any] = {
+        "type": "driver_log",
+        "message": message,
+        "level": _parse_log_level(message),
+        "container_name": container_name,
+        "source": "edge",
+        "timestamp": time.time(),
+        "edge_core_version": EDGE_CORE_VERSION,
+    }
+    if CYBERWAVE_SDK_VERSION:
+        payload["sdk_version"] = CYBERWAVE_SDK_VERSION
+    return payload
+
+
 def _follow_container_logs(
     container_name: str,
     *,
@@ -1174,14 +1219,7 @@ def _follow_container_logs(
                     try:
                         mqtt_client.mqtt.publish(
                             mqtt_topic,
-                            {
-                                "type": "driver_log",
-                                "message": message,
-                                "level": _parse_log_level(message),
-                                "container_name": container_name,
-                                "source": "edge",
-                                "timestamp": time.time(),
-                            },
+                            _build_driver_log_payload(message, container_name),
                         )
                     except Exception:
                         logger.debug(

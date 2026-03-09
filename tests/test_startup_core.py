@@ -618,3 +618,40 @@ class TestRunDockerImagePullFallback:
         assert success is False
         assert any(cmd[:2] == ["docker", "pull"] for cmd in commands)
         assert not any(cmd[:2] == ["docker", "run"] for cmd in commands)
+
+
+class TestBuildDriverLogPayload:
+    def test_includes_edge_core_and_sdk_versions(self, monkeypatch):
+        monkeypatch.setattr(startup, "EDGE_CORE_VERSION", "0.0.18-test")
+        monkeypatch.setattr(startup, "CYBERWAVE_SDK_VERSION", "0.3.20-test")
+        monkeypatch.setattr(startup.time, "time", lambda: 1234.5)
+
+        payload = startup._build_driver_log_payload(
+            "2026-03-09 12:00:00 ERROR driver failed",
+            "cyberwave-driver-test",
+        )
+
+        assert payload == {
+            "type": "driver_log",
+            "message": "2026-03-09 12:00:00 ERROR driver failed",
+            "level": "ERROR",
+            "container_name": "cyberwave-driver-test",
+            "source": "edge",
+            "timestamp": 1234.5,
+            "edge_core_version": "0.0.18-test",
+            "sdk_version": "0.3.20-test",
+        }
+
+    def test_omits_sdk_version_when_unavailable(self, monkeypatch):
+        monkeypatch.setattr(startup, "EDGE_CORE_VERSION", "0.0.18-test")
+        monkeypatch.setattr(startup, "CYBERWAVE_SDK_VERSION", None)
+        monkeypatch.setattr(startup.time, "time", lambda: 99.0)
+
+        payload = startup._build_driver_log_payload(
+            "informational startup message",
+            "cyberwave-driver-test",
+        )
+
+        assert payload["edge_core_version"] == "0.0.18-test"
+        assert payload["level"] == "INFO"
+        assert "sdk_version" not in payload
