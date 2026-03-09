@@ -1911,6 +1911,8 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
 
     If the JSON file already exists on disk, the new data is deep-merged on top
     of the existing content so that any locally-written keys are preserved.
+    Existing files are rewritten in place so bind-mounted driver containers keep
+    seeing the same inode.
     """
     twin_data["asset"] = asset_data
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
@@ -1943,28 +1945,42 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
             return obj.isoformat()
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
+    rendered_json = json.dumps(twin_data, indent=2, default=_json_default) + "\n"
+
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    temp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=CONFIG_DIR,
-            prefix=f"{twin_uuid}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            json.dump(twin_data, temp_file, indent=2, default=_json_default)
-            temp_file.write("\n")
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-            temp_path = temp_file.name
-        os.replace(temp_path, twin_json_file)
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                logger.debug("Failed to remove temp twin JSON file %s", temp_path, exc_info=True)
+    if twin_json_file.exists():
+        with open(twin_json_file, "r+", encoding="utf-8") as file_handle:
+            file_handle.seek(0)
+            file_handle.write(rendered_json)
+            file_handle.truncate()
+            file_handle.flush()
+            os.fsync(file_handle.fileno())
+    else:
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=CONFIG_DIR,
+                prefix=f"{twin_uuid}.",
+                suffix=".tmp",
+                delete=False,
+                encoding="utf-8",
+            ) as temp_file:
+                temp_file.write(rendered_json)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+                temp_path = temp_file.name
+            os.replace(temp_path, twin_json_file)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    logger.debug(
+                        "Failed to remove temp twin JSON file %s",
+                        temp_path,
+                        exc_info=True,
+                    )
 
     checksum = _calculate_file_checksum(twin_json_file)
     if checksum:
