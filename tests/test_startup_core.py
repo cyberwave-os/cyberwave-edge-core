@@ -290,6 +290,36 @@ class TestWriteOrUpdateTwinJsonFileDeepMerge:
         # "b" existed in existing nested dict and was not in override → preserved
         assert written["nested"]["b"] == 2
 
+    def test_existing_file_remains_valid_when_atomic_write_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        twin_json_path = tmp_path / f"{self._TWIN_UUID}.json"
+        twin_json_path.write_text(json.dumps({"name": "stable", "asset": {"model": "x1"}}))
+
+        original_json_dump = startup.json.dump
+
+        def _failing_dump(data, file_obj, **kwargs):  # type: ignore[no-untyped-def]
+            file_obj.write('{"partial": ')
+            raise TypeError("boom")
+
+        monkeypatch.setattr(startup.json, "dump", _failing_dump)
+
+        try:
+            startup.write_or_update_twin_json_file(
+                self._TWIN_UUID,
+                {"name": "new-name"},
+                {"model": "x2"},
+            )
+        except TypeError as exc:
+            assert str(exc) == "boom"
+        else:
+            raise AssertionError("Expected write_or_update_twin_json_file to propagate TypeError")
+        finally:
+            monkeypatch.setattr(startup.json, "dump", original_json_dump)
+
+        written = json.loads(twin_json_path.read_text())
+        assert written == {"name": "stable", "asset": {"model": "x1"}}
+        assert not list(tmp_path.glob(f"{self._TWIN_UUID}.*.tmp"))
+
 
 # ===========================================================================
 # 3. write_or_update_twin_json_file — directory at path replaced by file

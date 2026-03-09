@@ -23,6 +23,7 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -1942,8 +1943,29 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
             return obj.isoformat()
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-    with open(twin_json_file, "w") as f:
-        json.dump(twin_data, f, indent=2, default=_json_default)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=CONFIG_DIR,
+            prefix=f"{twin_uuid}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            json.dump(twin_data, temp_file, indent=2, default=_json_default)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_path = temp_file.name
+        os.replace(temp_path, twin_json_file)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.debug("Failed to remove temp twin JSON file %s", temp_path, exc_info=True)
+
     checksum = _calculate_file_checksum(twin_json_file)
     if checksum:
         _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
