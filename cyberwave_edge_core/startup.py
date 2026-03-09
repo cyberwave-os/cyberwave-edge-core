@@ -902,6 +902,21 @@ def _resolve_container_twin_uuid(
     return None
 
 
+def _resolve_container_driver_image(
+    inspect_data: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve the configured driver image for a container from inspect data."""
+    config = (inspect_data or {}).get("Config")
+    config_image = config.get("Image") if isinstance(config, dict) else None
+    if isinstance(config_image, str) and config_image.strip():
+        return config_image.strip()
+
+    image_id = (inspect_data or {}).get("Image")
+    if isinstance(image_id, str) and image_id.strip():
+        return image_id.strip()
+    return None
+
+
 def _track_container_restarts(container_name: str, restart_count: int) -> tuple[int, int]:
     """Track per-container restart events and return (new_restarts, restarts_in_window)."""
     now = time.time()
@@ -1149,7 +1164,12 @@ def _parse_log_level(message: str) -> str:
     return "INFO"
 
 
-def _build_driver_log_payload(message: str, container_name: str) -> dict[str, Any]:
+def _build_driver_log_payload(
+    message: str,
+    container_name: str,
+    *,
+    driver_image: str | None = None,
+) -> dict[str, Any]:
     """Build the MQTT payload for a forwarded driver log line."""
     payload: dict[str, Any] = {
         "type": "driver_log",
@@ -1162,6 +1182,8 @@ def _build_driver_log_payload(message: str, container_name: str) -> dict[str, An
     }
     if CYBERWAVE_SDK_VERSION:
         payload["sdk_version"] = CYBERWAVE_SDK_VERSION
+    if driver_image:
+        payload["driver_image"] = driver_image
     return payload
 
 
@@ -1186,12 +1208,16 @@ def _follow_container_logs(
 
     mqtt_client: Optional[Any] = None
     mqtt_topic: Optional[str] = None
+    driver_image: Optional[str] = None
     if twin_uuid and token:
         mqtt_client = _get_shared_mqtt_client(token)
         if mqtt_client:
             prefix = mqtt_client.mqtt.topic_prefix
             mqtt_topic = f"{prefix}cyberwave/twin/{twin_uuid}/driverlog"
             logger.info("Driver logs for %s will be published to %s", container_name, mqtt_topic)
+            driver_image = _resolve_container_driver_image(
+                _inspect_driver_container(container_name)
+            )
 
     try:
         process = subprocess.Popen(
@@ -1219,7 +1245,11 @@ def _follow_container_logs(
                     try:
                         mqtt_client.mqtt.publish(
                             mqtt_topic,
-                            _build_driver_log_payload(message, container_name),
+                            _build_driver_log_payload(
+                                message,
+                                container_name,
+                                driver_image=driver_image,
+                            ),
                         )
                     except Exception:
                         logger.debug(

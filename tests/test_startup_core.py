@@ -621,6 +621,17 @@ class TestRunDockerImagePullFallback:
 
 
 class TestBuildDriverLogPayload:
+    def test_resolve_container_driver_image_prefers_config_image(self):
+        assert (
+            startup._resolve_container_driver_image(
+                {
+                    "Config": {"Image": "ghcr.io/cyberwave/driver:1.2.3"},
+                    "Image": "sha256:abc123",
+                }
+            )
+            == "ghcr.io/cyberwave/driver:1.2.3"
+        )
+
     def test_includes_edge_core_and_sdk_versions(self, monkeypatch):
         monkeypatch.setattr(startup, "EDGE_CORE_VERSION", "0.0.18-test")
         monkeypatch.setattr(startup, "CYBERWAVE_SDK_VERSION", "0.3.20-test")
@@ -629,6 +640,7 @@ class TestBuildDriverLogPayload:
         payload = startup._build_driver_log_payload(
             "2026-03-09 12:00:00 ERROR driver failed",
             "cyberwave-driver-test",
+            driver_image="ghcr.io/cyberwave/driver:1.2.3",
         )
 
         assert payload == {
@@ -640,9 +652,10 @@ class TestBuildDriverLogPayload:
             "timestamp": 1234.5,
             "edge_core_version": "0.0.18-test",
             "sdk_version": "0.3.20-test",
+            "driver_image": "ghcr.io/cyberwave/driver:1.2.3",
         }
 
-    def test_omits_sdk_version_when_unavailable(self, monkeypatch):
+    def test_omits_optional_fields_when_unavailable(self, monkeypatch):
         monkeypatch.setattr(startup, "EDGE_CORE_VERSION", "0.0.18-test")
         monkeypatch.setattr(startup, "CYBERWAVE_SDK_VERSION", None)
         monkeypatch.setattr(startup.time, "time", lambda: 99.0)
@@ -655,3 +668,4 @@ class TestBuildDriverLogPayload:
         assert payload["edge_core_version"] == "0.0.18-test"
         assert payload["level"] == "INFO"
         assert "sdk_version" not in payload
+        assert "driver_image" not in payload
