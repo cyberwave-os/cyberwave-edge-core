@@ -672,6 +672,14 @@ def _run_docker_image(
         if key.startswith("CYBERWAVE_"):
             container_env.setdefault(key, value)
 
+    # Forward CYBERWAVE_* from the edge core process environment so that
+    # host-set vars (e.g. systemd Environment=, /etc/environment) reach
+    # the driver container. E.g. CYBERWAVE_GO2_IP_ADDR for the Go2 driver.
+    # setdefault avoids overwriting vars we or credentials already set.
+    for key, value in os.environ.items():
+        if key.startswith("CYBERWAVE_") and isinstance(value, str) and value.strip():
+            container_env.setdefault(key, value.strip())
+
     # Driver reads setup.json from so101_lib under this dir (mounted CONFIG_DIR)
     container_env["CYBERWAVE_EDGE_CONFIG_DIR"] = "/app/.cyberwave"
 
