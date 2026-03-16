@@ -602,6 +602,17 @@ class TestRunDockerImagePullFallback:
         )
         monkeypatch.setattr(startup, "_stream_container_logs", lambda *args, **kwargs: None)
 
+    @staticmethod
+    def _extract_env_map(docker_run_cmd: list[str]) -> dict[str, str]:
+        env_map: dict[str, str] = {}
+        for idx, arg in enumerate(docker_run_cmd):
+            if arg != "-e" or idx + 1 >= len(docker_run_cmd):
+                continue
+            key, sep, value = docker_run_cmd[idx + 1].partition("=")
+            if sep:
+                env_map[key] = value
+        return env_map
+
     def test_uses_local_image_when_pull_fails(self, tmp_path, monkeypatch):
         self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
@@ -663,6 +674,68 @@ class TestRunDockerImagePullFallback:
         assert success is False
         assert any(cmd[:2] == ["docker", "pull"] for cmd in commands)
         assert not any(cmd[:2] == ["docker", "run"] for cmd in commands)
+
+    def test_forwards_process_cyberwave_env_vars_to_driver_container(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        monkeypatch.setenv("CYBERWAVE_GO2_IP_ADDR", " 192.168.0.10 ")
+        monkeypatch.setenv("CYBERWAVE_EMPTY", "   ")
+        monkeypatch.setenv("GO2_IP_ADDR", "192.168.0.10")
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+        env_map = self._extract_env_map(docker_run_cmd)
+        assert env_map["CYBERWAVE_GO2_IP_ADDR"] == "192.168.0.10"
+        assert "CYBERWAVE_EMPTY" not in env_map
+        assert "GO2_IP_ADDR" not in env_map
+
+    def test_process_env_does_not_override_credentials_env_values(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        monkeypatch.setattr(
+            startup,
+            "load_credentials_envs",
+            lambda: {
+                "CYBERWAVE_GO2_IP_ADDR": "10.0.0.2",
+                "CYBERWAVE_REGION": "eu-west-1",
+            },
+        )
+        monkeypatch.setenv("CYBERWAVE_GO2_IP_ADDR", "192.168.0.10")
+        monkeypatch.setenv("CYBERWAVE_REGION", "us-east-1")
+        monkeypatch.setenv("CYBERWAVE_EXTRA", "enabled")
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+        env_map = self._extract_env_map(docker_run_cmd)
+        assert env_map["CYBERWAVE_GO2_IP_ADDR"] == "10.0.0.2"
+        assert env_map["CYBERWAVE_REGION"] == "eu-west-1"
+        assert env_map["CYBERWAVE_EXTRA"] == "enabled"
 
 
 class TestBuildDriverLogPayload:
