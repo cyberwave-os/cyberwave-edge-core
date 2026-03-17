@@ -228,6 +228,8 @@ _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 _TWIN_FILE_CHECKSUMS: dict[str, str] = {}
 _CONTAINER_LAST_RESTART_COUNT: dict[str, int] = {}
 _CONTAINER_RESTART_HISTORY: dict[str, deque[float]] = {}
+_EDGE_HEALTH_CHECK: Optional[Any] = None
+_EDGE_HEALTH_CHECK_LOCK = threading.Lock()
 _TWIN_UPDATE_ALLOWED_FIELDS = frozenset(
     {
         "name",
@@ -263,6 +265,10 @@ _TWIN_UPDATE_ALLOWED_FIELDS = frozenset(
 
 # Sensor types that require camera device selection (RGB cameras)
 RGB_SENSOR_TYPES = frozenset({"rgb", "camera", "rgb_camera", "rgbd"})
+EDGE_HEALTH_PUBLISH_INTERVAL_SECONDS = max(
+    1,
+    int(os.getenv("CYBERWAVE_EDGE_HEALTH_PUBLISH_INTERVAL_SECONDS", "5")),
+)
 
 
 def _twin_has_rgb_sensor(asset: Any) -> bool:
@@ -1323,6 +1329,110 @@ def _persist_twin_json_for_driver(twin: Any, twin_uuid: str, asset: Any) -> None
     write_or_update_twin_json_file(twin_uuid, twin_data, asset_data)
 
 
+def _is_legacy_edge_configs_map(edge_configs: dict[str, Any]) -> bool:
+    """Return True for legacy edge_configs maps keyed by fingerprint."""
+    if not edge_configs:
+        return False
+    if "edge_fingerprint" in edge_configs or "camera_config" in edge_configs:
+        return False
+    return all(isinstance(entry, dict) for entry in edge_configs.values())
+
+
+def _is_twin_linked_to_fingerprint(twin_metadata: dict[str, Any], fingerprint: str) -> bool:
+    """Return True when twin metadata indicates linkage to *fingerprint*."""
+    candidate = str(twin_metadata.get("edge_fingerprint", "")).strip()
+    if candidate and candidate == fingerprint:
+        return True
+
+    edge_configs = twin_metadata.get("edge_configs")
+    if not isinstance(edge_configs, dict):
+        return False
+
+    nested_fingerprint = str(edge_configs.get("edge_fingerprint", "")).strip()
+    if nested_fingerprint and nested_fingerprint == fingerprint:
+        return True
+
+    if _is_legacy_edge_configs_map(edge_configs):
+        return fingerprint in edge_configs
+    return False
+
+
+def _list_linked_twin_uuids_for_fingerprint(
+    token: str,
+    environment_uuid: str,
+    fingerprint: str,
+) -> list[str]:
+    """Resolve linked twin UUIDs for one edge fingerprint."""
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    client = Cyberwave(base_url=base_url, api_key=token)
+    twins = client.twins.list(environment_id=environment_uuid)
+    if not twins:
+        return []
+
+    linked: list[str] = []
+    for twin in twins:
+        twin_uuid = str(getattr(twin, "uuid", "")).strip()
+        if not twin_uuid:
+            continue
+        twin_metadata = twin.metadata if isinstance(twin.metadata, dict) else {}
+        if _is_twin_linked_to_fingerprint(twin_metadata, fingerprint):
+            linked.append(twin_uuid)
+    return list(dict.fromkeys(linked))
+
+
+def _start_bootstrap_edge_health_publisher(
+    token: str,
+    twin_uuids: list[str],
+    *,
+    edge_id: str,
+) -> bool:
+    """Start (or refresh) a lightweight edge_health publisher for linked twins."""
+    global _EDGE_HEALTH_CHECK
+    if not twin_uuids:
+        return False
+
+    try:
+        from cyberwave.edge.health import EdgeHealthCheck
+    except Exception as exc:
+        logger.warning("Cannot start edge health publisher: %s", exc)
+        return False
+
+    mqtt_client = _get_shared_mqtt_client(token)
+    if not mqtt_client or not getattr(mqtt_client, "mqtt", None):
+        logger.warning("Cannot start edge health publisher: shared MQTT client unavailable")
+        return False
+
+    normalized_twin_uuids = list(
+        dict.fromkeys(
+            [str(twin_uuid).strip() for twin_uuid in twin_uuids if str(twin_uuid).strip()]
+        )
+    )
+    if not normalized_twin_uuids:
+        return False
+
+    with _EDGE_HEALTH_CHECK_LOCK:
+        if _EDGE_HEALTH_CHECK is not None:
+            existing = list(getattr(_EDGE_HEALTH_CHECK, "twin_uuids", []) or [])
+            _EDGE_HEALTH_CHECK.twin_uuids = list(dict.fromkeys(existing + normalized_twin_uuids))
+            _EDGE_HEALTH_CHECK.edge_id = edge_id
+            _EDGE_HEALTH_CHECK.start()
+            return True
+
+        _EDGE_HEALTH_CHECK = EdgeHealthCheck(
+            mqtt_client=mqtt_client.mqtt,
+            twin_uuids=normalized_twin_uuids,
+            edge_id=edge_id,
+            interval=EDGE_HEALTH_PUBLISH_INTERVAL_SECONDS,
+        )
+        _EDGE_HEALTH_CHECK.start()
+        logger.info(
+            "Started bootstrap edge health publisher for %d twin(s) (edge_id=%s)",
+            len(normalized_twin_uuids),
+            edge_id,
+        )
+        return True
+
+
 def fetch_and_run_twin_drivers(
     token: str,
     environment_uuid: str,
@@ -2222,6 +2332,35 @@ def run_startup_checks() -> bool:
             console.print("  [red]✗[/red] Edge fingerprint")
             console.print("  [red]Could not determine edge fingerprint.[/red]")
         else:
+            _t0 = time.perf_counter()
+            heartbeat_ok = False
+            linked_twin_uuids: list[str] = []
+            try:
+                linked_twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+                    token, environment_uuid, fingerprint
+                )
+                heartbeat_ok = _start_bootstrap_edge_health_publisher(
+                    token,
+                    linked_twin_uuids,
+                    edge_id=fingerprint,
+                )
+            except Exception as exc:
+                logger.warning("Early edge heartbeat bootstrap failed: %s", exc)
+
+            elapsed = time.perf_counter() - _t0
+            if heartbeat_ok:
+                console.print(
+                    (
+                        "  [green]✓[/green] Edge heartbeat "
+                        f"[dim]({len(linked_twin_uuids)} twin(s), {elapsed:.3f}s)[/dim]"
+                    )
+                )
+            else:
+                console.print(f"  [yellow]⚠[/yellow] Edge heartbeat [dim]({elapsed:.3f}s)[/dim]")
+                console.print(
+                    "  [dim]Could not start early edge heartbeat; continuing startup.[/dim]"
+                )
+
             _t0 = time.perf_counter()
             results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
             if not results:

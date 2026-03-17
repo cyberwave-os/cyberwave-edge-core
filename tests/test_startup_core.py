@@ -714,3 +714,44 @@ class TestBuildDriverLogPayload:
         assert payload["level"] == "INFO"
         assert "sdk_version" not in payload
         assert "driver_image" not in payload
+
+
+class TestStartupHeartbeatOrdering:
+    def test_starts_edge_heartbeat_before_fetching_drivers(self, monkeypatch):
+        call_order: list[str] = []
+
+        monkeypatch.setattr(startup, "load_token", lambda: "token-123")
+        monkeypatch.setattr(startup, "validate_token", lambda token: True)
+        monkeypatch.setattr(startup, "check_mqtt_connection", lambda token: True)
+        monkeypatch.setattr(startup, "register_edge", lambda token: True)
+        monkeypatch.setattr(
+            startup,
+            "load_environment_uuid",
+            lambda retries=0, retry_delay_seconds=0.2: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+        monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: "edge-fingerprint")
+        monkeypatch.setattr(
+            startup,
+            "_list_linked_twin_uuids_for_fingerprint",
+            lambda token, env_uuid, fingerprint: call_order.append("list_linked_twins")
+            or ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"],
+        )
+        monkeypatch.setattr(
+            startup,
+            "_start_bootstrap_edge_health_publisher",
+            lambda token, twin_uuids, edge_id: call_order.append("start_edge_heartbeat") or True,
+        )
+        monkeypatch.setattr(
+            startup,
+            "fetch_and_run_twin_drivers",
+            lambda token, env_uuid, fingerprint: call_order.append("fetch_drivers") or [],
+        )
+
+        result = startup.run_startup_checks()
+
+        assert result is True
+        assert call_order == [
+            "list_linked_twins",
+            "start_edge_heartbeat",
+            "fetch_drivers",
+        ]
