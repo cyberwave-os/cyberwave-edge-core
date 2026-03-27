@@ -2242,11 +2242,11 @@ def fetch_and_run_twin_drivers(
                 _send_alert_for_twin(
                     twin_uuid,
                     "No drivers specified",
-                    "No drivers specified in asset metadata for twin '%s'",
+                    f"No drivers specified in asset metadata for twin '{twin.name}'",
                     "error",
                 )
                 raise ValueError(
-                    "No drivers specified in asset metadata for paired twin '%s'", twin.name
+                    f"No drivers specified in asset metadata for paired twin '{twin.name}'"
                 )
             else:
                 logger.warning(
@@ -2275,11 +2275,11 @@ def fetch_and_run_twin_drivers(
             _send_alert_for_twin(
                 twin_uuid,
                 "No driver_docker_image in asset metadata",
-                "No driver_docker_image in asset metadata for twin '%s'",
+                f"No driver_docker_image in asset metadata for twin '{twin.name}'",
                 "error",
             )
             raise ValueError(
-                "No drivers specified in asset metadata for paired twin '%s'", twin.name
+                f"No drivers specified in asset metadata for paired twin '{twin.name}'"
             )
 
         child_camera_twin_uuids = list(dict.fromkeys(camera_children_by_parent.get(twin_uuid, [])))
@@ -2344,7 +2344,7 @@ def fetch_and_run_twin_drivers(
             _send_alert_for_twin(
                 twin_uuid,
                 "Failed to run driver docker image",
-                "Failed to run driver docker image for twin '%s': %s",
+                f"Failed to run driver docker image for twin '{twin.name}': {exc}",
                 "error",
             )
             logger.error(
