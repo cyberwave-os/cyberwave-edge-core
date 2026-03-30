@@ -28,11 +28,13 @@ jobs:
           - arch: amd64
             runner: ubuntu-latest
             variant: amd64
-            docker_image: ""
+            docker_image: "ubuntu:22.04" # Ubuntu 22.04 / glibc 2.35 baseline
+            docker_platform: "linux/amd64"
           - arch: arm64
             runner: ubuntu-24.04-arm
             variant: arm64
             docker_image: "ubuntu:22.04" # Raspberry Pi OS Bookworm (glibc 2.35)
+            docker_platform: "linux/arm64"
           # - arch: arm64
           #   runner: ubuntu-24.04-arm
           #   variant: arm64-jetson
@@ -53,29 +55,10 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "📦 Building version: $VERSION"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies (native)
-        if: matrix.docker_image == ''
-        run: |
-          pip install --upgrade pip
-          pip install -e ".[build]"
-
-      - name: Build binary with PyInstaller (native)
-        if: matrix.docker_image == ''
-        run: |
-          chmod +x build.sh
-          ./build.sh
-          echo "✅ Binary built successfully"
-          ls -la dist/
-
       - name: Build binary in Docker (pinned glibc)
-        if: matrix.docker_image != ''
         run: |
           docker run --rm \
+            --platform "${{ matrix.docker_platform }}" \
             -v "$PWD:/workspace" \
             -w /workspace \
             ${{ matrix.docker_image }} \
