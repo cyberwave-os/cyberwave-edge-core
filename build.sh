@@ -32,6 +32,7 @@ pyinstaller \
     --onefile \
     --name cyberwave-edge-core \
     --hidden-import cyberwave_edge_core \
+    --hidden-import cyberwave_edge_core._build_version \
     --hidden-import click \
     --hidden-import rich \
     --hidden-import httpx \

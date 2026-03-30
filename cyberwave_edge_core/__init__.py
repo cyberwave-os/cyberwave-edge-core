@@ -1,3 +1,5 @@
 """Cyberwave Edge Core - The core component of the Cyberwave Edge."""
 
-__version__ = "0.0.42"
+from ._version import get_version
+
+__version__ = get_version()
