@@ -466,7 +466,7 @@ class TestWorkerWatcherCooldown:
     ) -> tuple[WorkerWatcher, MagicMock, MagicMock]:
         worker_manager = MagicMock()
         model_manager = MagicMock()
-        model_manager.scan_worker_model_requirements.return_value = []
+        model_manager.scan_worker_model_ids.return_value = []
         watcher = WorkerWatcher(
             workers_dir=workers_dir,
             worker_manager=worker_manager,

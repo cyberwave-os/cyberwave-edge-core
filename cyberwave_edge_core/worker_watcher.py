@@ -180,7 +180,7 @@ class WorkerWatcher:
     def _ensure_models(self) -> None:
         """Pre-download any models referenced by updated worker files."""
         try:
-            model_ids = self._model_manager.scan_worker_model_requirements(self._workers_dir)
+            model_ids = self._model_manager.scan_worker_model_ids(self._workers_dir)
             if not model_ids:
                 return
             logger.info("Ensuring models before worker restart: %s", model_ids)

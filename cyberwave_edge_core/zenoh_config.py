@@ -379,11 +379,22 @@ def start_zenoh_router(config: ZenohConfig, env_uuid: str) -> bool:
     )
 
     # Determine network args — match the same logic used for driver containers.
+    # On Linux --network host gives the container access to all host ports without
+    # explicit -p publish flags (which are ignored by Docker when host networking
+    # is active and generate a harmless but noisy warning).
     network_args: list[str]
+    port_args: list[str]
     if platform.system() == "Darwin":
         network_args = ["--add-host", "host.docker.internal:host-gateway"]
+        port_args = [
+            "-p",
+            f"{config.router_port}:{config.router_port}/tcp",
+            "-p",
+            f"{config.router_port}:{config.router_port}/udp",
+        ]
     else:
         network_args = ["--network", "host"]
+        port_args = []  # redundant with --network host; omit to avoid Docker warning
 
     cmd = [
         "docker",
@@ -393,10 +404,7 @@ def start_zenoh_router(config: ZenohConfig, env_uuid: str) -> bool:
         "unless-stopped",
         "--name",
         container_name,
-        "-p",
-        f"{config.router_port}:{config.router_port}/tcp",
-        "-p",
-        f"{config.router_port}:{config.router_port}/udp",
+        *port_args,
         *network_args,
         config.router_image,
     ]
