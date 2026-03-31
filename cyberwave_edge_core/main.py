@@ -10,7 +10,11 @@ from rich.console import Console
 
 from . import __version__
 from .startup import (
+    CONFIG_DIR,
+    DEFAULT_API_URL,
     check_mqtt_connection,
+    get_runtime_env_var,
+    load_environment_uuid,
     load_token,
     run_runtime_loop,
     run_startup_checks,
@@ -35,6 +39,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     stream=sys.stderr,
 )
+
 
 @click.group(invoke_without_command=True)
 @click.version_option(version=__version__, prog_name="cyberwave-edge-core")
@@ -79,12 +84,226 @@ def status() -> None:
 
     _t0 = time.perf_counter()
     mqtt_ok = check_mqtt_connection(token)
+    elapsed = time.perf_counter() - _t0
     if mqtt_ok:
-        console.print(f"  [green]✓[/green] MQTT broker [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
+        console.print(f"  [green]✓[/green] MQTT broker [dim]({elapsed:.3f}s)[/dim]")
     else:
-        console.print(f"  [red]✗[/red] MQTT broker [dim]({(time.perf_counter() - _t0):.3f}s)[/dim]")
+        console.print(f"  [red]✗[/red] MQTT broker [dim]({elapsed:.3f}s)[/dim]")
 
     console.print()
+
+
+# ---------------------------------------------------------------------------
+# Worker subcommand group
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def worker() -> None:
+    """Manage the edge worker container."""
+
+
+def _get_worker_manager() -> "WorkerManager":  # type: ignore[name-defined]  # noqa: F821
+    """Build a WorkerManager from the current edge configuration."""
+    from .worker_manager import WorkerManager
+
+    token = load_token()
+    if not token:
+        console.print("[red]No credentials found. Run 'cyberwave login' first.[/red]")
+        sys.exit(1)
+
+    environment_uuid = load_environment_uuid()
+    if not environment_uuid:
+        console.print(
+            "[yellow]No linked environment found. "
+            "Run 'cyberwave link' to associate this edge with an environment.[/yellow]"
+        )
+        environment_uuid = ""
+
+    return WorkerManager(
+        config_dir=CONFIG_DIR,
+        environment_uuid=environment_uuid or "",
+        token=token,
+    )
+
+
+@worker.command(name="start")
+def worker_start() -> None:
+    """Start the worker container (ensures models are cached first)."""
+    wm = _get_worker_manager()
+    ok = wm.start()
+    if ok:
+        console.print(
+            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] started"
+        )
+    else:
+        console.print(
+            f"[red]✗[/red] Failed to start worker container [bold]{wm._container_name}[/bold]"
+        )
+        sys.exit(1)
+
+
+@worker.command(name="stop")
+def worker_stop() -> None:
+    """Stop the worker container."""
+    wm = _get_worker_manager()
+    ok = wm.stop()
+    if ok:
+        console.print(
+            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] stopped"
+        )
+    else:
+        console.print("[red]✗[/red] Failed to stop worker container")
+        sys.exit(1)
+
+
+@worker.command(name="restart")
+def worker_restart() -> None:
+    """Restart the worker container (re-scans workers, re-ensures models)."""
+    wm = _get_worker_manager()
+    ok = wm.restart()
+    if ok:
+        console.print(
+            f"[green]✓[/green] Worker container [bold]{wm._container_name}[/bold] restarted"
+        )
+    else:
+        console.print("[red]✗[/red] Failed to restart worker container")
+        sys.exit(1)
+
+
+@worker.command(name="status")
+def worker_status() -> None:
+    """Show worker container state, loaded workers, cached models, and health."""
+    from .model_manager import ModelManager
+    from .worker_health import WorkerHealthMonitor
+
+    wm = _get_worker_manager()
+    # Attach a health monitor so status() includes restart / health data.
+    health_monitor = WorkerHealthMonitor(container_name=wm._container_name)
+    wm.set_health_monitor(health_monitor)
+    ws = wm.status()
+
+    status_color = (
+        "green"
+        if ws.status == "running"
+        else ("yellow" if ws.status in {"restarting", "created"} else "red")
+    )
+    cb_suffix = (
+        " [bold red][circuit-breaker tripped][/bold red]" if ws.circuit_breaker_tripped else ""
+    )
+    console.print(
+        f"\n[bold]Worker container:[/bold] {ws.container_name} "
+        f"([{status_color}]{ws.status}[/{status_color}]){cb_suffix}\n"
+    )
+
+    if ws.worker_files:
+        console.print("[bold]  Workers:[/bold]")
+        for wf in ws.worker_files:
+            console.print(f"    {wf}")
+    else:
+        console.print("  [dim]No worker files found in workers directory[/dim]")
+
+    models_dir = wm._models_dir()
+    mm = ModelManager(
+        cache_dir=models_dir,
+        api_token=load_token() or "",
+        base_url=get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL,
+    )
+    cached = mm.list_cached_models()
+    if cached:
+        console.print("\n[bold]  Models:[/bold]")
+        for model in cached:
+            console.print(f"    {model.model_id:<30} {model.size_mb():.1f} MB")
+    else:
+        console.print("\n  [dim]No cached models[/dim]")
+
+    gpu_label = "[green]enabled[/green]" if ws.gpu_enabled else "[dim]not detected[/dim]"
+    console.print(f"\n  GPU: {gpu_label}")
+    console.print(f"  Workers dir: {ws.workers_dir}")
+    console.print(f"  Models dir:  {ws.models_dir}")
+
+    # Health / restart summary.
+    console.print("\n[bold]  Health:[/bold]")
+    console.print(f"    Total restarts:  {ws.restart_count}")
+    console.print(f"    Recent restarts: {ws.recent_restarts} (5-min window)")
+    if ws.circuit_breaker_tripped:
+        console.print("    [red]Circuit-breaker: TRIPPED — automatic restarts suppressed[/red]")
+    else:
+        console.print("    Circuit-breaker: [green]closed[/green]")
+    if ws.health_state and ws.health_state.uptime_seconds is not None:
+        uptime = ws.health_state.uptime_seconds
+        console.print(f"    Uptime:          {uptime:.0f}s")
+    console.print()
+
+
+@worker.command(name="health")
+def worker_health() -> None:
+    """Show detailed worker health: restart history and circuit-breaker state."""
+    from .worker_health import WorkerHealthMonitor
+
+    wm = _get_worker_manager()
+    health_monitor = WorkerHealthMonitor(container_name=wm._container_name)
+    wm.set_health_monitor(health_monitor)
+    ws = wm.status()
+    hs = ws.health_state
+
+    console.print(f"\n[bold]Worker Health — {wm._container_name}[/bold]\n")
+
+    status_color = (
+        "green"
+        if ws.status == "running"
+        else ("yellow" if ws.status in {"restarting", "created"} else "red")
+    )
+    console.print(f"  Container status: [{status_color}]{ws.status}[/{status_color}]")
+
+    if hs is not None:
+        healthy_label = "[green]healthy[/green]" if hs.is_healthy else "[red]unhealthy[/red]"
+        ready_label = "[green]ready[/green]" if hs.is_ready else "[yellow]not ready[/yellow]"
+        console.print(f"  Health:           {healthy_label}")
+        console.print(f"  Readiness:        {ready_label}")
+
+        if hs.uptime_seconds is not None:
+            console.print(f"  Uptime:           {hs.uptime_seconds:.0f}s")
+
+        console.print("\n  [bold]Restart accounting:[/bold]")
+        console.print(f"    Total:    {hs.restart_count}")
+        console.print(f"    Recent:   {hs.recent_restarts} (5-min window)")
+
+        if hs.circuit_breaker_tripped:
+            import datetime
+
+            tripped_ts = (
+                datetime.datetime.fromtimestamp(hs.circuit_breaker_tripped_at).isoformat()
+                if hs.circuit_breaker_tripped_at
+                else "unknown"
+            )
+            console.print(f"\n  [bold red]Circuit-breaker: TRIPPED[/bold red] at {tripped_ts}")
+            console.print("  Automatic restarts are suppressed until the 5-minute window clears.")
+        else:
+            console.print("\n  Circuit-breaker: [green]closed[/green]")
+
+        if hs.restart_records:
+            console.print(f"\n  [bold]Restart history ({len(hs.restart_records)} events):[/bold]")
+            import datetime
+
+            for rec in hs.restart_records[-10:]:
+                ts = datetime.datetime.fromtimestamp(rec.timestamp).strftime("%H:%M:%S")
+                ok_label = "[green]ok[/green]" if rec.success else "[red]failed[/red]"
+                console.print(f"    {ts}  {rec.reason:<30} {ok_label}")
+        else:
+            console.print("\n  [dim]No restarts recorded in this session[/dim]")
+    else:
+        console.print("\n  [dim]Health monitor not available[/dim]")
+
+    console.print()
+
+
+@worker.command(name="logs")
+@click.option("--no-follow", is_flag=True, default=False, help="Print logs without following.")
+def worker_logs(no_follow: bool) -> None:
+    """Stream worker container logs."""
+    wm = _get_worker_manager()
+    wm.logs(follow=not no_follow)
 
 
 def main() -> None:
