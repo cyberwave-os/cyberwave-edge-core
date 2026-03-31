@@ -3074,8 +3074,9 @@ def run_startup_checks() -> bool:
     _t0 = time.perf_counter()
     environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
     if environment_uuid:
+        _elapsed = time.perf_counter() - _t0
         console.print(
-            f"  [green]✓[/green] Environment [dim]({environment_uuid}, {time.perf_counter() - _t0:.3f}s)[/dim]"
+            f"  [green]✓[/green] Environment [dim]({environment_uuid}, {_elapsed:.3f}s)[/dim]"
         )
     else:
         console.print(
@@ -3136,11 +3137,13 @@ def run_startup_checks() -> bool:
                 if router_ok:
                     container_name = zenoh_cfg.router_container_name(environment_uuid)
                     console.print(
-                        f"  [green]✓[/green] Zenoh router [dim]({container_name}, {elapsed:.3f}s)[/dim]"
+                        f"  [green]✓[/green] Zenoh router "
+                        f"[dim]({container_name}, {elapsed:.3f}s)[/dim]"
                     )
                 else:
                     console.print(
-                        f"  [yellow]⚠[/yellow] Zenoh router [dim](failed to start, {elapsed:.3f}s)[/dim]"
+                        f"  [yellow]⚠[/yellow] Zenoh router "
+                        f"[dim](failed to start, {elapsed:.3f}s)[/dim]"
                     )
                     console.print(
                         "  [dim]Driver containers will still start; "
@@ -3149,15 +3152,17 @@ def run_startup_checks() -> bool:
 
             _t0 = time.perf_counter()
             results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
+            _elapsed = time.perf_counter() - _t0
             if not results:
                 console.print(
-                    f"  [yellow]⚠[/yellow] Twin drivers [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+                    f"  [yellow]⚠[/yellow] Twin drivers [dim]({_elapsed:.3f}s)[/dim]"
                 )
                 console.print("  [dim]No twins with driver images matched this edge.[/dim]")
             else:
                 started = sum(1 for r in results if r["success"])
                 console.print(
-                    f"  [green]✓[/green] Twin drivers [dim]({started}/{len(results)}, {time.perf_counter() - _t0:.3f}s)[/dim]"
+                    f"  [green]✓[/green] Twin drivers "
+                    f"[dim]({started}/{len(results)}, {_elapsed:.3f}s)[/dim]"
                 )
                 for r in results:
                     status = "[green]✓[/green]" if r["success"] else "[red]✗[/red]"
