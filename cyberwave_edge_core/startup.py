@@ -39,6 +39,13 @@ from rich.console import Console
 
 from . import __version__ as PACKAGE_EDGE_CORE_VERSION
 from .utils import DriverStartingAlertContext
+from .zenoh_config import (
+    ZenohConfig,
+    build_zenoh_env_vars,
+    log_zenoh_diagnostics,
+    start_zenoh_router,
+    stop_zenoh_router,
+)
 
 
 def _resolve_sudo_user_home() -> Optional[Path]:
@@ -237,6 +244,10 @@ _CONTAINER_LAST_RESTART_COUNT: dict[str, int] = {}
 _CONTAINER_RESTART_HISTORY: dict[str, deque[float]] = {}
 _EDGE_HEALTH_CHECK: Optional[Any] = None
 _EDGE_HEALTH_CHECK_LOCK = threading.Lock()
+
+# Resolved once per process at first use; shared by all container launches.
+_ZENOH_CONFIG: Optional[ZenohConfig] = None
+_ZENOH_CONFIG_LOCK = threading.Lock()
 _TWIN_UPDATE_ALLOWED_FIELDS = frozenset(
     {
         "name",
@@ -917,6 +928,17 @@ def _run_macos_device_bridge_commands(
     return True, resolved_device_map
 
 
+def _get_zenoh_config() -> ZenohConfig:
+    """Return the process-wide Zenoh configuration, resolved once on first call."""
+    global _ZENOH_CONFIG
+    if _ZENOH_CONFIG is not None:
+        return _ZENOH_CONFIG
+    with _ZENOH_CONFIG_LOCK:
+        if _ZENOH_CONFIG is None:
+            _ZENOH_CONFIG = ZenohConfig()
+    return _ZENOH_CONFIG
+
+
 def _run_docker_image(
     image: str,
     params: list[str],
@@ -1111,14 +1133,15 @@ def _run_docker_image(
     # Driver reads setup.json from so101_lib under this dir (mounted CONFIG_DIR)
     container_env["CYBERWAVE_EDGE_CONFIG_DIR"] = "/app/.cyberwave"
 
-    # Inject Zenoh transport env vars so drivers that adopt the SDK data layer
-    # (cw.data.publish) pick them up automatically.  Drivers that don't use the
-    # data layer simply ignore these vars — fully backwards-compatible.
-    from .worker_manager import get_zenoh_env_vars
-
-    for zenoh_key, zenoh_value in get_zenoh_env_vars().items():
-        if zenoh_key not in explicit_params_env:
-            container_env.setdefault(zenoh_key, zenoh_value)
+    # Inject Zenoh transport configuration so drivers that use cw.data.publish()
+    # automatically pick up the correct backend and router settings.  Drivers
+    # that do not use the SDK data layer simply ignore these variables.
+    # Use setdefault so that any per-driver override in explicit_params_env takes
+    # precedence (driver metadata can always override with -e KEY=val in params).
+    zenoh_env = build_zenoh_env_vars(_get_zenoh_config())
+    for key, value in zenoh_env.items():
+        if key not in explicit_params_env:
+            container_env.setdefault(key, value)
 
     env_vars: List[str] = []
     for key, value in container_env.items():
@@ -2573,6 +2596,12 @@ def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     removed_containers = _stop_and_prune_driver_containers()
 
     environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
+
+    # Stop the Zenoh router container so it is restarted cleanly alongside
+    # the driver containers.  Best-effort: failure does not block the restart.
+    if environment_uuid:
+        stop_zenoh_router(environment_uuid)
+
     if not environment_uuid:
         logger.warning("No linked environment found; restart completed with cleanup only")
         return {
@@ -2586,6 +2615,16 @@ def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     fingerprint = get_or_create_fingerprint()
     if not fingerprint:
         raise RuntimeError("Could not load or create edge fingerprint")
+
+    # Re-start Zenoh router before driver containers if configured.
+    zenoh_cfg = _get_zenoh_config()
+    if zenoh_cfg.router_enabled:
+        router_ok = start_zenoh_router(zenoh_cfg, environment_uuid)
+        if not router_ok:
+            logger.warning(
+                "Zenoh router failed to start during restart; "
+                "driver containers will use peer-to-peer discovery"
+            )
 
     results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
     started = sum(1 for result in results if result.get("success"))
@@ -3080,6 +3119,33 @@ def run_startup_checks() -> bool:
                 console.print(
                     "  [dim]Could not start early edge heartbeat; continuing startup.[/dim]"
                 )
+
+            # 6b — Zenoh infrastructure diagnostics
+            zenoh_cfg = _get_zenoh_config()
+            zenoh_diag = log_zenoh_diagnostics(zenoh_cfg)
+            zenoh_icon = "[green]✓[/green]" if zenoh_cfg.is_zenoh else "[yellow]⚠[/yellow]"
+            console.print(f"  {zenoh_icon} Zenoh [dim]({zenoh_diag.mode})[/dim]")
+            for w in zenoh_diag.warnings:
+                console.print(f"  [yellow]  ↳ {w}[/yellow]")
+
+            # 6c — optional Zenoh router container (must start before drivers)
+            if zenoh_cfg.router_enabled:
+                _t0 = time.perf_counter()
+                router_ok = start_zenoh_router(zenoh_cfg, environment_uuid)
+                elapsed = time.perf_counter() - _t0
+                if router_ok:
+                    container_name = zenoh_cfg.router_container_name(environment_uuid)
+                    console.print(
+                        f"  [green]✓[/green] Zenoh router [dim]({container_name}, {elapsed:.3f}s)[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"  [yellow]⚠[/yellow] Zenoh router [dim](failed to start, {elapsed:.3f}s)[/dim]"
+                    )
+                    console.print(
+                        "  [dim]Driver containers will still start; "
+                        "peer-to-peer discovery will be used as fallback.[/dim]"
+                    )
 
             _t0 = time.perf_counter()
             results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
