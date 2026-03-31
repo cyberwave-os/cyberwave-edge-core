@@ -56,6 +56,7 @@ On startup (service or direct run), Edge Core performs the following steps:
 5. Start drivers for linked twins. Special handling for attached camera child twins:
    - If a twin is a camera child (has `attach_to_twin_uuid`), Edge Core does not start a separate driver for it.
    - Camera child UUIDs are passed to the parent driver via `CYBERWAVE_CHILD_TWIN_UUIDS`.
+6. Start the worker container (if worker files exist in `{config_dir}/workers/`).
 
 During driver startup, Docker image pull progress is mirrored into the edge-core service logs and forwarded through the same MQTT-backed driver log stream used for runtime container logs, so users can follow image download progress remotely.
 
@@ -79,11 +80,67 @@ Example payload:
 
 When Edge Core receives this command it performs a graceful restart consisting of:
 
-1. Removing cached twin JSON files from the edge config directory.
-2. Stopping and removing any edge-managed driver containers, then pruning stopped containers.
-3. Re-downloading the selected environment and restarting drivers.
+1. Stopping the worker container (if running).
+2. Removing cached twin JSON files from the edge config directory.
+3. Stopping and removing any edge-managed driver containers, then pruning stopped containers.
+4. Re-downloading the selected environment and restarting drivers.
+5. Restarting the worker container (if worker files exist).
 
 The restart is intended to preserve durable state where possible. If connectivity is available before shutdown, Edge Core will attempt to sync any twin JSON changes back to the backend.
+
+## Worker container
+
+Edge Core manages one ML worker container per edge device (container name: `cyberwave-worker-{env_uuid[:8]}`). The worker container runs Python worker scripts from the local workers directory and has access to cached model weights.
+
+### Worker directory layout
+
+Place worker scripts in `{config_dir}/workers/` (default: `/etc/cyberwave/workers/` on Linux):
+
+```
+/etc/cyberwave/
+├── workers/
+│   ├── detect_people.py        # Custom worker
+│   └── cyberwave.yml           # Optional: list model requirements
+└── models/                     # Auto-managed model cache
+    ├── manifest.json
+    └── yolov8n/
+        └── yolov8n.pt
+```
+
+### cyberwave.yml
+
+Optionally declare model requirements so Edge Core can pre-download them before starting the worker container:
+
+```yaml
+models:
+  - yolov8n
+  - background-subtraction
+```
+
+Edge Core also auto-detects models by scanning `cw.models.load("...")` calls in worker Python files.
+
+### Worker container environment variables
+
+| Variable | Value |
+|---|---|
+| `CYBERWAVE_API_KEY` | Injected from credentials |
+| `CYBERWAVE_ENVIRONMENT_UUID` | Active environment UUID |
+| `CYBERWAVE_TWIN_UUIDS` | Comma-separated twin UUIDs in environment |
+| `CYBERWAVE_DATA_BACKEND` | `zenoh` |
+| `ZENOH_CONNECT` | Set when a Zenoh router is configured |
+| `ZENOH_SHM_ENABLED` | `true` on Linux (shared memory transport) |
+
+### File watching
+
+Edge Core monitors `{config_dir}/workers/` every reconcile cycle (~15 seconds). When `.py` files are added, removed, or modified, Edge Core automatically:
+
+1. Re-scans model requirements.
+2. Pre-downloads any missing models.
+3. Restarts the worker container.
+
+### GPU support
+
+When an NVIDIA container runtime is detected (`docker info` reports `nvidia` runtime), Edge Core adds `--gpus all` to the worker container's `docker run` command.
 
 ## Writing compatible drivers
 
@@ -93,6 +150,8 @@ A Cyberwave driver is a Docker image that interacts with device hardware and the
 - `CYBERWAVE_API_KEY`
 - `CYBERWAVE_TWIN_JSON_FILE` (writable file path)
 - `CYBERWAVE_CHILD_TWIN_UUIDS` (optional, comma-separated)
+- `CYBERWAVE_DATA_BACKEND` (always `zenoh` — Zenoh transport is available for SDK data layer)
+- `ZENOH_CONNECT` (optional — set when a Zenoh router is configured)
 
 `CYBERWAVE_CHILD_TWIN_UUIDS` is present when child camera twins are attached to the driver twin; drivers can use this to coordinate cameras without additional prompts.
 
@@ -285,7 +344,7 @@ curl -fsSL "https://packages.buildkite.com/cyberwave/cyberwave-edge-core/gpgkey"
 echo -e "deb [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main\ndeb-src [signed-by=/etc/apt/keyrings/cyberwave_cyberwave-edge-core-archive-keyring.gpg] https://packages.buildkite.com/cyberwave/cyberwave-edge-core/any/ any main" \
   > /etc/apt/sources.list.d/buildkite-cyberwave-cyberwave-edge-core.list
 
-# Run Edge Core (performs startup checks and starts drivers)
+# Run Edge Core (performs startup checks and starts drivers + worker container)
 cyberwave-edge-core
 
 # Show status, credentials and MQTT connectivity (read-only)
@@ -293,6 +352,14 @@ cyberwave-edge-core status
 
 # Show version
 cyberwave-edge-core --version
+
+# Worker container management
+cyberwave-edge-core worker start      # Start the worker container
+cyberwave-edge-core worker stop       # Stop the worker container
+cyberwave-edge-core worker restart    # Restart the worker container
+cyberwave-edge-core worker status     # Show container state, workers, and cached models
+cyberwave-edge-core worker logs       # Stream worker container logs
+cyberwave-edge-core worker logs --no-follow  # Print recent logs without following
 ```
 
 ### Environment variables

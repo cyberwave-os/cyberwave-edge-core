@@ -1111,6 +1111,15 @@ def _run_docker_image(
     # Driver reads setup.json from so101_lib under this dir (mounted CONFIG_DIR)
     container_env["CYBERWAVE_EDGE_CONFIG_DIR"] = "/app/.cyberwave"
 
+    # Inject Zenoh transport env vars so drivers that adopt the SDK data layer
+    # (cw.data.publish) pick them up automatically.  Drivers that don't use the
+    # data layer simply ignore these vars — fully backwards-compatible.
+    from .worker_manager import get_zenoh_env_vars
+
+    for zenoh_key, zenoh_value in get_zenoh_env_vars().items():
+        if zenoh_key not in explicit_params_env:
+            container_env.setdefault(zenoh_key, zenoh_value)
+
     env_vars: List[str] = []
     for key, value in container_env.items():
         env_vars += ["-e", f"{key}={value}"]
@@ -2354,7 +2363,28 @@ def fetch_and_run_twin_drivers(
                 exc,
             )
 
+    _start_worker_after_drivers(token, environment_uuid, list(linked_twin_uuids))
     return results
+
+
+def _start_worker_after_drivers(
+    token: str,
+    environment_uuid: str,
+    twin_uuids: list[str],
+) -> None:
+    """Start the worker container after driver startup (best-effort, non-blocking)."""
+    try:
+        from .worker_manager import WorkerManager
+
+        worker_manager = WorkerManager(
+            config_dir=CONFIG_DIR,
+            environment_uuid=environment_uuid,
+            token=token,
+            twin_uuids=twin_uuids,
+        )
+        worker_manager.start()
+    except Exception as exc:
+        logger.warning("Failed to start worker container after driver startup: %s", exc)
 
 
 def _send_alert_for_twin(
@@ -2515,8 +2545,30 @@ def _resolve_edge_for_fingerprint(client: Cyberwave, fingerprint: str) -> Option
         return None
 
 
+def _stop_worker_container_for_restart() -> None:
+    """Best-effort stop of the worker container before a full edge restart."""
+    try:
+        from .worker_manager import WorkerManager
+
+        environment_uuid = load_environment_uuid() or ""
+        if not environment_uuid:
+            return
+        token = load_token()
+        if not token:
+            return
+        worker_manager = WorkerManager(
+            config_dir=CONFIG_DIR,
+            environment_uuid=environment_uuid,
+            token=token,
+        )
+        worker_manager.stop()
+    except Exception as exc:
+        logger.warning("Failed to stop worker container before restart: %s", exc)
+
+
 def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     """Execute restart workflow: cleanup local state and re-run driver startup."""
+    _stop_worker_container_for_restart()
     removed_json_files = _remove_cached_twin_json_files()
     removed_containers = _stop_and_prune_driver_containers()
 
@@ -3055,6 +3107,9 @@ def run_runtime_loop() -> None:
         "Entering edge-core runtime loop (interval=%.1fs)",
         LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS,
     )
+
+    worker_watcher: Optional[Any] = None
+
     while True:
         attached = reconcile_driver_log_streams()
         logger.debug(
@@ -3080,8 +3135,56 @@ def run_runtime_loop() -> None:
             twin_sync_summary["changed"],
             twin_sync_summary["synced"],
         )
+
+        # Reconcile worker file changes — restart worker container if workers
+        # have been added, removed, or modified since the last cycle.
+        try:
+            worker_watcher = _reconcile_worker_watcher(worker_watcher)
+        except Exception:
+            logger.exception("Unexpected error in worker file reconciliation")
+
         try:
             ensure_edge_command_subscription()
         except Exception:
             logger.exception("Unexpected error while ensuring edge command subscription")
         time.sleep(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
+
+
+def _reconcile_worker_watcher(
+    existing_watcher: Optional[Any],
+) -> Optional[Any]:
+    """Lazily create and run the worker file watcher each reconcile cycle."""
+    from .model_manager import ModelManager
+    from .worker_manager import WorkerManager
+    from .worker_watcher import WorkerWatcher
+
+    environment_uuid = load_environment_uuid()
+    if not environment_uuid:
+        return existing_watcher
+
+    token = load_token()
+    if not token:
+        return existing_watcher
+
+    workers_dir = CONFIG_DIR / "workers"
+
+    if existing_watcher is None:
+        worker_manager = WorkerManager(
+            config_dir=CONFIG_DIR,
+            environment_uuid=environment_uuid,
+            token=token,
+        )
+        model_manager = ModelManager(
+            cache_dir=CONFIG_DIR / "models",
+            api_token=token,
+            base_url=get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL,
+        )
+        existing_watcher = WorkerWatcher(
+            workers_dir=workers_dir,
+            worker_manager=worker_manager,
+            model_manager=model_manager,
+        )
+        logger.debug("Worker file watcher initialised for %s", workers_dir)
+
+    existing_watcher.reconcile_worker_files()
+    return existing_watcher
