@@ -85,6 +85,35 @@ When Edge Core receives this command it performs a graceful restart consisting o
 
 The restart is intended to preserve durable state where possible. If connectivity is available before shutdown, Edge Core will attempt to sync any twin JSON changes back to the backend.
 
+## Model Manager (ML model cache)
+
+Edge Core includes a `ModelManager` that pre-downloads ML model weights from the Cyberwave catalog API into a local cache before starting the worker container.
+
+**Cache location:**
+
+| Platform | Default path |
+|---|---|
+| Linux | `/etc/cyberwave/models/` |
+| macOS | `~/.cyberwave/models/` |
+
+Override with `CYBERWAVE_EDGE_CONFIG_DIR`.
+
+**Cache layout:**
+
+```
+<cache_dir>/
+├── manifest.json            # index of all cached models
+├── yolov8n/
+│   ├── yolov8n.pt           # weight file
+│   └── metadata.json        # checksum, runtime, download URL
+└── background-subtraction/
+    └── ...
+```
+
+**Model requirements discovery:** Edge Core scans `*.py` files in `~/.cyberwave/workers/` for `cw.models.load(...)` calls to determine which weights to pre-download.
+
+**Cache integrity:** SHA-256 checksums are verified on every cache hit. A checksum mismatch or missing file triggers an automatic re-download.
+
 ## Writing compatible drivers
 
 A Cyberwave driver is a Docker image that interacts with device hardware and the Cyberwave backend. When Edge Core starts a driver container it sets the following environment variables (provided to the container):
