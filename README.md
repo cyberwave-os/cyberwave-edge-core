@@ -130,13 +130,31 @@ Edge Core also auto-detects models by scanning `cw.models.load("...")` calls in 
 | `ZENOH_CONNECT` | Set when a Zenoh router is configured |
 | `ZENOH_SHM_ENABLED` | `true` on Linux (shared memory transport) |
 
-### File watching
+### File watching and hot-reload
 
 Edge Core monitors `{config_dir}/workers/` every reconcile cycle (~15 seconds). When `.py` files are added, removed, or modified, Edge Core automatically:
 
 1. Re-scans model requirements.
 2. Pre-downloads any missing models.
-3. Restarts the worker container.
+3. Restarts the worker container with the updated files.
+
+A minimum cool-down of 10 seconds between successive automatic restarts prevents rapid churn when files are written incrementally (e.g. by `rsync` or `scp`).
+
+### Worker health monitoring
+
+Edge Core continuously monitors the worker container for spontaneous exits and crash loops:
+
+- **Restart accounting**: every restart is recorded with a timestamp and reason.
+- **Sliding-window rate limiting**: if more than 5 restarts occur within 5 minutes, the circuit-breaker trips and automatic restarts are suppressed. The breaker resets automatically once the window clears.
+- **Spontaneous exit detection**: if the container exits without a deliberate restart, a warning is logged so operators can investigate.
+
+Use `cyberwave-edge-core worker health` to inspect the full restart history and circuit-breaker state.
+
+### Resource limits
+
+You can constrain the worker container's CPU and memory usage by setting `CYBERWAVE_WORKER_CPU_QUOTA_PERCENT` and `CYBERWAVE_WORKER_MEMORY_MB` environment variables on the edge host (both optional). When set, Edge Core passes the corresponding `--cpu-quota`, `--cpu-period`, and `--memory` flags to `docker run`.
+
+GPU memory fraction can be limited via `CYBERWAVE_GPU_MEM_FRACTION` (a float between 0 and 1); this is passed as an env var into the worker container.
 
 ### GPU support
 
@@ -357,7 +375,8 @@ cyberwave-edge-core --version
 cyberwave-edge-core worker start      # Start the worker container
 cyberwave-edge-core worker stop       # Stop the worker container
 cyberwave-edge-core worker restart    # Restart the worker container
-cyberwave-edge-core worker status     # Show container state, workers, and cached models
+cyberwave-edge-core worker status     # Show container state, workers, cached models, and health
+cyberwave-edge-core worker health     # Show detailed restart history and circuit-breaker state
 cyberwave-edge-core worker logs       # Stream worker container logs
 cyberwave-edge-core worker logs --no-follow  # Print recent logs without following
 ```

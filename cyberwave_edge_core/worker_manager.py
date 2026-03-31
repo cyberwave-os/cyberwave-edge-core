@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .docker_helpers import (
     docker_available,
@@ -29,6 +29,9 @@ from .docker_helpers import (
     docker_rm,
 )
 
+if TYPE_CHECKING:
+    from .worker_health import WorkerHealthMonitor, WorkerHealthState
+
 logger = logging.getLogger(__name__)
 
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
@@ -37,6 +40,42 @@ DEFAULT_WORKER_IMAGE = "cyberwaveos/ml-worker:latest"
 # Thread registry for worker log streaming to avoid duplicates.
 _WORKER_LOG_THREAD: Optional[threading.Thread] = None
 _WORKER_LOG_THREAD_LOCK = threading.Lock()
+
+
+@dataclass
+class ResourceLimits:
+    """Optional resource constraints for the worker container.
+
+    Set any field to a non-None value to pass the corresponding ``docker run``
+    flag.  Fields that remain None are omitted (Docker defaults apply).
+
+    Examples::
+
+        ResourceLimits(cpu_quota_percent=50, memory_mb=2048)
+        ResourceLimits(memory_mb=4096, gpu_memory_fraction=0.5)
+    """
+
+    cpu_quota_percent: Optional[float] = None  # 0–100; maps to --cpu-quota / --cpu-period
+    memory_mb: Optional[int] = None  # --memory
+    gpu_memory_fraction: Optional[float] = None  # passed as CYBERWAVE_GPU_MEM_FRACTION env var
+
+    def to_docker_args(self) -> list[str]:
+        """Return the docker run flags corresponding to these limits."""
+        args: list[str] = []
+        if self.cpu_quota_percent is not None:
+            period = 100_000  # 100 ms in microseconds
+            quota = int(period * self.cpu_quota_percent / 100)
+            args += ["--cpu-period", str(period), "--cpu-quota", str(quota)]
+        if self.memory_mb is not None:
+            args += ["--memory", f"{self.memory_mb}m"]
+        return args
+
+    def to_env_args(self) -> list[str]:
+        """Return extra -e flags for soft limits that live in env vars."""
+        args: list[str] = []
+        if self.gpu_memory_fraction is not None:
+            args += ["-e", f"CYBERWAVE_GPU_MEM_FRACTION={self.gpu_memory_fraction:.4f}"]
+        return args
 
 
 @dataclass
@@ -50,6 +89,11 @@ class WorkerStatus:
     worker_files: list[str] = field(default_factory=list)
     gpu_enabled: bool = False
     image: str = DEFAULT_WORKER_IMAGE
+    # Health / restart fields populated when a WorkerHealthMonitor is attached.
+    restart_count: int = 0
+    recent_restarts: int = 0
+    circuit_breaker_tripped: bool = False
+    health_state: Optional["WorkerHealthState"] = None
 
 
 class WorkerManager:
@@ -61,6 +105,10 @@ class WorkerManager:
 
     The manager is intentionally stateless (reads config on every call) so
     it works correctly after a process restart without persisting extra state.
+
+    An optional ``WorkerHealthMonitor`` can be attached via
+    ``set_health_monitor()``.  When attached, ``restart()`` records restart
+    events and respects circuit-breaker state to prevent crash loops.
     """
 
     def __init__(
@@ -71,13 +119,26 @@ class WorkerManager:
         token: str,
         twin_uuids: Optional[list[str]] = None,
         image: str = DEFAULT_WORKER_IMAGE,
+        resource_limits: Optional[ResourceLimits] = None,
     ) -> None:
         self._config_dir = config_dir
         self._environment_uuid = environment_uuid
         self._token = token
         self._twin_uuids: list[str] = list(twin_uuids or [])
         self._image = image
+        self._resource_limits = resource_limits
         self._container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
+        self._health_monitor: Optional["WorkerHealthMonitor"] = None
+
+    def set_health_monitor(self, monitor: "WorkerHealthMonitor") -> None:
+        """Attach a WorkerHealthMonitor to this manager.
+
+        Once attached, ``restart()`` will:
+        - Check ``monitor.is_restart_allowed()`` before proceeding.
+        - Record each restart attempt via ``monitor.record_restart()``.
+        - Record successful starts via ``monitor.record_start()``.
+        """
+        self._health_monitor = monitor
 
     # ------------------------------------------------------------------
     # Public interface
@@ -107,7 +168,10 @@ class WorkerManager:
             return True
 
         logger.info("Starting worker container %s (image=%s)", self._container_name, self._image)
-        return self._run_container()
+        ok = self._run_container()
+        if ok and self._health_monitor is not None:
+            self._health_monitor.record_start()
+        return ok
 
     def stop(self) -> bool:
         """Stop and remove the worker container.
@@ -125,29 +189,63 @@ class WorkerManager:
         logger.info("Stopping worker container %s", self._container_name)
         return docker_rm(self._container_name)
 
-    def restart(self) -> bool:
+    def restart(self, *, reason: str = "requested") -> bool:
         """Stop and re-start the worker container.
 
         Model re-download is handled by callers (WorkerWatcher) before calling
-        this method.  Returns True on successful restart.
+        this method.
+
+        When a ``WorkerHealthMonitor`` is attached:
+        - The restart is blocked if the circuit-breaker is tripped.
+        - The restart event is recorded (with *reason*) regardless of outcome.
+
+        Returns True on successful restart.
         """
-        logger.info("Restarting worker container %s", self._container_name)
+        if self._health_monitor is not None and not self._health_monitor.is_restart_allowed():
+            logger.warning(
+                "Worker restart blocked for %s: circuit-breaker is tripped (reason=%r)",
+                self._container_name,
+                reason,
+            )
+            return False
+
+        logger.info("Restarting worker container %s (reason=%r)", self._container_name, reason)
         if not self.stop():
-            logger.warning("Failed to stop worker container %s; attempting fresh start anyway",
-                           self._container_name)
-        return self.start()
+            logger.warning(
+                "Failed to stop worker container %s; attempting fresh start anyway",
+                self._container_name,
+            )
+        ok = self.start()
+
+        if self._health_monitor is not None:
+            self._health_monitor.record_restart(reason=reason, success=ok)
+
+        return ok
 
     def status(self) -> WorkerStatus:
         """Return a snapshot of the current worker container state."""
         workers_dir = self._workers_dir()
         models_dir = self._models_dir()
 
-        worker_files = sorted(
-            p.name for p in workers_dir.glob("*.py") if p.is_file()
-        ) if workers_dir.exists() else []
+        worker_files = (
+            sorted(p.name for p in workers_dir.glob("*.py") if p.is_file())
+            if workers_dir.exists()
+            else []
+        )
 
         container_status = docker_container_status(self._container_name)
         gpu_enabled = docker_has_nvidia_runtime()
+
+        health_state = None
+        restart_count = 0
+        recent_restarts = 0
+        circuit_breaker_tripped = False
+
+        if self._health_monitor is not None:
+            health_state = self._health_monitor.check(container_status)
+            restart_count = health_state.restart_count
+            recent_restarts = health_state.recent_restarts
+            circuit_breaker_tripped = health_state.circuit_breaker_tripped
 
         return WorkerStatus(
             container_name=self._container_name,
@@ -157,6 +255,10 @@ class WorkerManager:
             worker_files=worker_files,
             gpu_enabled=gpu_enabled,
             image=self._image,
+            restart_count=restart_count,
+            recent_restarts=recent_restarts,
+            circuit_breaker_tripped=circuit_breaker_tripped,
+            health_state=health_state,
         )
 
     def logs(self, *, follow: bool = True) -> None:
@@ -226,8 +328,7 @@ class WorkerManager:
             env["CYBERWAVE_MQTT_HOST"] = mqtt_host
 
         runtime_environment = (
-            get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT)
-            or DEFAULT_ENVIRONMENT
+            get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
         ).lower()
         if runtime_environment != "production":
             env["CYBERWAVE_ENVIRONMENT"] = runtime_environment
@@ -260,9 +361,12 @@ class WorkerManager:
         models_dir.mkdir(parents=True, exist_ok=True)
 
         return [
-            "-v", f"{config_dir}:/app/.cyberwave",
-            "-v", f"{workers_dir}:/app/workers:ro",
-            "-v", f"{models_dir}:/app/models:ro",
+            "-v",
+            f"{config_dir}:/app/.cyberwave",
+            "-v",
+            f"{workers_dir}:/app/workers:ro",
+            "-v",
+            f"{models_dir}:/app/models:ro",
         ]
 
     def _build_network_args(self) -> list[str]:
@@ -277,8 +381,7 @@ class WorkerManager:
 
         image = self._image
         runtime_environment = (
-            get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT)
-            or DEFAULT_ENVIRONMENT
+            get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
         ).lower()
 
         if ":" not in image and runtime_environment != "production":
@@ -299,21 +402,36 @@ class WorkerManager:
             gpu_args = ["--gpus", "all"]
             logger.info("NVIDIA runtime detected; adding --gpus all to worker container")
 
+        resource_args: list[str] = []
+        resource_env_args: list[str] = []
+        if self._resource_limits is not None:
+            resource_args = self._resource_limits.to_docker_args()
+            resource_env_args = self._resource_limits.to_env_args()
+            if resource_args or resource_env_args:
+                logger.info(
+                    "Applying resource limits to worker container %s: %s",
+                    self._container_name,
+                    self._resource_limits,
+                )
+
         cmd = [
-            "docker", "run",
+            "docker",
+            "run",
             "--detach",
-            "--restart", "unless-stopped",
+            "--restart",
+            "unless-stopped",
             *network_args,
-            "--name", self._container_name,
+            "--name",
+            self._container_name,
             *gpu_args,
+            *resource_args,
             *volume_args,
             *env_args,
+            *resource_env_args,
             image,
         ]
 
-        logger.info(
-            "Starting worker container %s from image %s", self._container_name, image
-        )
+        logger.info("Starting worker container %s from image %s", self._container_name, image)
         try:
             subprocess.run(
                 cmd,

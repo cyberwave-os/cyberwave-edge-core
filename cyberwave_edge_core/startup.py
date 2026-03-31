@@ -3136,8 +3136,7 @@ def run_runtime_loop() -> None:
             twin_sync_summary["synced"],
         )
 
-        # Reconcile worker file changes — restart worker container if workers
-        # have been added, removed, or modified since the last cycle.
+        # Reconcile worker file changes and health probes each cycle.
         try:
             worker_watcher = _reconcile_worker_watcher(worker_watcher)
         except Exception:
@@ -3153,8 +3152,9 @@ def run_runtime_loop() -> None:
 def _reconcile_worker_watcher(
     existing_watcher: Optional[Any],
 ) -> Optional[Any]:
-    """Lazily create and run the worker file watcher each reconcile cycle."""
+    """Lazily create and run the worker file watcher + health monitor each reconcile cycle."""
     from .model_manager import ModelManager
+    from .worker_health import WorkerHealthMonitor
     from .worker_manager import WorkerManager
     from .worker_watcher import WorkerWatcher
 
@@ -3174,6 +3174,12 @@ def _reconcile_worker_watcher(
             environment_uuid=environment_uuid,
             token=token,
         )
+        # Attach health monitor so that restarts are accounted and rate-limited.
+        health_monitor = WorkerHealthMonitor(
+            container_name=worker_manager._container_name,
+        )
+        worker_manager.set_health_monitor(health_monitor)
+
         model_manager = ModelManager(
             cache_dir=CONFIG_DIR / "models",
             api_token=token,
@@ -3184,7 +3190,10 @@ def _reconcile_worker_watcher(
             worker_manager=worker_manager,
             model_manager=model_manager,
         )
-        logger.debug("Worker file watcher initialised for %s", workers_dir)
+        logger.debug("Worker file watcher + health monitor initialised for %s", workers_dir)
+
+    # Run health probe each cycle to detect spontaneous exits / crash loops.
+    existing_watcher.check_health()
 
     existing_watcher.reconcile_worker_files()
     return existing_watcher
