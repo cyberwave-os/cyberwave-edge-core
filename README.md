@@ -93,8 +93,36 @@ A Cyberwave driver is a Docker image that interacts with device hardware and the
 - `CYBERWAVE_API_KEY`
 - `CYBERWAVE_TWIN_JSON_FILE` (writable file path)
 - `CYBERWAVE_CHILD_TWIN_UUIDS` (optional, comma-separated)
+- `CYBERWAVE_DATA_BACKEND` — data transport backend (`zenoh` by default)
+- `ZENOH_SHARED_MEMORY` — `true`/`false`; enables zero-copy Zenoh SHM transport
+- `ZENOH_CONNECT` — (optional) comma-separated Zenoh router endpoint URLs
 
 `CYBERWAVE_CHILD_TWIN_UUIDS` is present when child camera twins are attached to the driver twin; drivers can use this to coordinate cameras without additional prompts.
+
+### Zenoh data bus
+
+Edge Core automatically injects Zenoh transport configuration into every driver container so that drivers using `cw.data.publish()` work without any extra configuration. The data-bus variables are:
+
+| Variable | Default | Description |
+|---|---|---|
+| `CYBERWAVE_DATA_BACKEND` | `zenoh` | Data transport: `zenoh` or `filesystem` |
+| `ZENOH_SHARED_MEMORY` | `false` | Enable Zenoh shared-memory for same-host zero-copy delivery |
+| `ZENOH_CONNECT` | (empty) | Router endpoints, e.g. `tcp/10.0.0.1:7447` |
+
+All variables can be overridden per-driver with `-e KEY=VALUE` in driver params.
+
+**Peer-to-peer mode (default):** when `ZENOH_CONNECT` is empty, Zenoh uses multicast discovery. On Linux with `--network host` (the default), all driver containers on the same machine discover each other automatically.
+
+**Router mode (optional):** set `ZENOH_ROUTER_ENABLED=true` to have Edge Core start an `eclipse/zenoh:latest` router container before the driver containers. This is required for MQTT bridge or multi-hop topologies.
+
+Environment variables for Zenoh infrastructure:
+
+| Variable | Default | Description |
+|---|---|---|
+| `ZENOH_ROUTER_ENABLED` | `false` | Start a Zenoh router container before drivers |
+| `ZENOH_ROUTER_IMAGE` | `eclipse/zenoh:latest` | Docker image for the router |
+| `ZENOH_ROUTER_PORT` | `7447` | Host port for the router |
+| `ZENOH_SHARED_MEMORY` | `false` | Enable shared-memory transport (Linux only) |
 
 ### Driver failure handling
 
