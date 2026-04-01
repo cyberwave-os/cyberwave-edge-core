@@ -436,6 +436,8 @@ cyberwave-edge-core worker logs       # Stream worker container logs
 cyberwave-edge-core worker logs --no-follow  # Print recent logs without following
 ```
 
+Preview builds from `dev` / `staging` CI are published as **separate Debian packages** in the same apt repo: `cyberwave-edge-core-dev` and `cyberwave-edge-core-staging`. `apt install cyberwave-edge-core` only pulls tagged releases; use one of the channel packages explicitly when you want those binaries (the packages conflict because they ship the same `/usr/bin/cyberwave-edge-core`).
+
 ### Environment variables
 
 Run against a different environment/base URL:

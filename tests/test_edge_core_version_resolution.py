@@ -9,10 +9,10 @@ import cyberwave_edge_core._version as version_module
 
 
 def test_get_version_prefers_build_override(monkeypatch):
-    monkeypatch.setattr(version_module, "BUILD_VERSION", "0.0.42~dev9")
+    monkeypatch.setattr(version_module, "BUILD_VERSION", "0.0.42.9")
     monkeypatch.setattr(version_module, "metadata_version", lambda _name: "0.0.42")
 
-    assert version_module.get_version() == "0.0.42~dev9"
+    assert version_module.get_version() == "0.0.42.9"
 
 
 def test_get_version_falls_back_to_package_metadata(monkeypatch):
