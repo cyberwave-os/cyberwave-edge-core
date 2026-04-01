@@ -31,7 +31,7 @@ if python3 -m venv "${VENV_DIR}"; then
         "click>=8.1.0" \
         "httpx>=0.25.0" \
         "rich>=13.0.0" \
-        "cyberwave>=0.3.31" \
+        "cyberwave>=0.4.0" \
         "pyinstaller>=6.0.0"
     export PATH="${VENV_DIR}/bin:${PATH}"
 else
@@ -41,7 +41,7 @@ else
         "click>=8.1.0" \
         "httpx>=0.25.0" \
         "rich>=13.0.0" \
-        "cyberwave>=0.3.31" \
+        "cyberwave>=0.4.0" \
         "pyinstaller>=6.0.0"
 fi
 
