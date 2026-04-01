@@ -102,6 +102,8 @@ jobs:
           Architecture: ${ARCH}
           Maintainer: Cyberwave <info@cyberwave.com>
           Homepage: https://cyberwave.com
+          Conflicts: cyberwave-edge-core-dev, cyberwave-edge-core-staging
+          Replaces: cyberwave-edge-core-dev, cyberwave-edge-core-staging
           Description: The official command-line interface for Cyberwave
            Authenticate and bootstrap robotics projects from your terminal.
            .
