@@ -3045,12 +3045,129 @@ def run_startup_checks() -> bool:
                     status = "[green]✓[/green]" if r["success"] else "[red]✗[/red]"
                     console.print(f"    {r['twin_name']} → {r['driver_image']} {status}")
 
+            # 7 — workflow worker sync (pull generated wf_*.py files from backend)
+            if linked_twin_uuids:
+                _t0 = time.perf_counter()
+                base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+                sync_summary = _sync_workers_for_twins(
+                    token=token,
+                    twin_uuids=linked_twin_uuids,
+                    base_url=base_url,
+                )
+                total_written = sum(r["written"] for r in sync_summary.values())
+                total_removed = sum(r["removed"] for r in sync_summary.values())
+                total_errors = sum(r["errors"] for r in sync_summary.values())
+                elapsed = time.perf_counter() - _t0
+                if total_errors:
+                    console.print(
+                        f"  [yellow]⚠[/yellow] Worker sync "
+                        f"[dim](written={total_written}, removed={total_removed}, errors={total_errors}, {elapsed:.3f}s)[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"  [green]✓[/green] Worker sync "
+                        f"[dim](written={total_written}, removed={total_removed}, {elapsed:.3f}s)[/dim]"
+                    )
+
     console.print("\n[green]All startup checks passed.[/green]\n")
     return True
 
 
+def _sync_workers_for_twins(
+    *,
+    token: str,
+    twin_uuids: list[str],
+    base_url: str,
+) -> dict[str, dict[str, int]]:
+    """Pull generated wf_*.py files from the backend for each linked twin.
+
+    Returns a dict mapping twin_uuid → {written, removed, unchanged, errors}.
+    """
+    from cyberwave_edge_core.edge_sync_client import EdgeSyncClient
+
+    workers_dir = CONFIG_DIR / "workers"
+    client = EdgeSyncClient(
+        workers_dir=workers_dir,
+        base_url=base_url,
+        token=token,
+    )
+
+    summary: dict[str, dict[str, int]] = {}
+    for twin_uuid in twin_uuids:
+        try:
+            result = client.sync(twin_uuid)
+            summary[twin_uuid] = {
+                "written": len(result.written),
+                "removed": len(result.removed),
+                "unchanged": len(result.unchanged),
+                "errors": len(result.errors),
+            }
+        except Exception:
+            logger.exception("Worker sync failed for twin %s", twin_uuid)
+            summary[twin_uuid] = {
+                "written": 0,
+                "removed": 0,
+                "unchanged": 0,
+                "errors": 1,
+            }
+    return summary
+
+
+def reconcile_worker_sync() -> dict[str, int]:
+    """Periodic reconciliation: pull updated wf_*.py files for all linked twins.
+
+    Called from the runtime loop alongside other reconcile functions.
+    Returns a summary dict: {written, removed, unchanged, errors}.
+    """
+    token = load_token()
+    if not token:
+        return {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
+
+    environment_uuid = load_environment_uuid()
+    if not environment_uuid:
+        return {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
+
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        return {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
+
+    try:
+        twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+            token, environment_uuid, fingerprint
+        )
+    except Exception:
+        logger.exception("Could not list linked twins for worker sync reconcile")
+        return {"written": 0, "removed": 0, "unchanged": 0, "errors": 1}
+
+    if not twin_uuids:
+        return {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
+
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    per_twin = _sync_workers_for_twins(
+        token=token,
+        twin_uuids=twin_uuids,
+        base_url=base_url,
+    )
+
+    totals: dict[str, int] = {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
+    for stats in per_twin.values():
+        for key in totals:
+            totals[key] += stats.get(key, 0)
+    return totals
+
+
+# Interval at which worker sync reconciliation runs (every N runtime loops).
+# At 15 s per loop this defaults to ~5 minutes.
+_WORKER_SYNC_INTERVAL_LOOPS = int(
+    os.getenv("CYBERWAVE_WORKER_SYNC_INTERVAL_LOOPS", "20")
+)
+_worker_sync_loop_counter = 0
+
+
 def run_runtime_loop() -> None:
     """Keep edge-core alive and continuously reconcile driver log forwarding."""
+    global _worker_sync_loop_counter
+
     logger.info(
         "Entering edge-core runtime loop (interval=%.1fs)",
         LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS,
@@ -3084,4 +3201,28 @@ def run_runtime_loop() -> None:
             ensure_edge_command_subscription()
         except Exception:
             logger.exception("Unexpected error while ensuring edge command subscription")
+
+        # Periodically pull updated generated worker files from the backend.
+        _worker_sync_loop_counter += 1
+        if _worker_sync_loop_counter >= _WORKER_SYNC_INTERVAL_LOOPS:
+            _worker_sync_loop_counter = 0
+            try:
+                worker_sync_summary = reconcile_worker_sync()
+                if worker_sync_summary.get("written") or worker_sync_summary.get("removed"):
+                    logger.info(
+                        "Worker sync reconcile: written=%d removed=%d unchanged=%d errors=%d",
+                        worker_sync_summary["written"],
+                        worker_sync_summary["removed"],
+                        worker_sync_summary["unchanged"],
+                        worker_sync_summary["errors"],
+                    )
+                else:
+                    logger.debug(
+                        "Worker sync reconcile: no changes (unchanged=%d, errors=%d)",
+                        worker_sync_summary["unchanged"],
+                        worker_sync_summary["errors"],
+                    )
+            except Exception:
+                logger.exception("Unexpected error during worker sync reconcile")
+
         time.sleep(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
