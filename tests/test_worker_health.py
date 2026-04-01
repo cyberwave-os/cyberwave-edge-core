@@ -545,6 +545,65 @@ class TestWorkerWatcherCooldown:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# WorkerHealthState.summary_line
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerhealthStateSummaryLine:
+    def test_summary_healthy(self, monitor: WorkerHealthMonitor) -> None:
+        state = monitor.check(container_status="running")
+        line = state.summary_line()
+        assert "running" in line
+        assert "restarts=0" in line
+
+    def test_summary_unhealthy_shows_cross(self, monitor: WorkerHealthMonitor) -> None:
+        state = monitor.check(container_status="exited")
+        line = state.summary_line()
+        assert "✗" in line
+
+    def test_summary_circuit_breaker_tripped(self, monitor: WorkerHealthMonitor) -> None:
+        for _ in range(3):
+            monitor.record_restart(reason="crash", success=True)
+        state = monitor.check(container_status="running")
+        line = state.summary_line()
+        assert "circuit-breaker tripped" in line
+        assert "3" in line
+
+
+# ---------------------------------------------------------------------------
+# WorkerHealthMonitor._query_container_status (via check() without status arg)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerhealthMonitorQueryContainerStatus:
+    def test_check_without_status_queries_docker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.worker_health as wh_module
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_container_status",
+            lambda name: "running",
+        )
+        monitor = WorkerHealthMonitor(container_name="cyberwave-worker-test")
+        state = monitor.check()  # no container_status supplied
+        assert state.container_status == "running"
+        assert state.is_healthy is True
+
+    def test_query_returns_unknown_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.worker_health as wh_module
+
+        def raise_exc(name: str) -> str:
+            raise RuntimeError("docker gone")
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_container_status",
+            raise_exc,
+        )
+        monitor = WorkerHealthMonitor(container_name="cyberwave-worker-test")
+        state = monitor.check()
+        assert state.container_status == "unknown"
+
+
 class TestWorkerWatcherCheckHealth:
     def test_check_health_returns_none_without_monitor(self, tmp_path: Path) -> None:
         workers_dir = tmp_path / "workers"

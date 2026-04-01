@@ -321,3 +321,371 @@ class TestGetZenohEnvVars:
         )
         env = get_zenoh_env_vars()
         assert "ZENOH_CONNECT" not in env
+
+
+# ---------------------------------------------------------------------------
+# WorkerManager.stop
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerManagerStop:
+    def test_returns_true_when_docker_unavailable(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: False)
+        assert worker_manager.stop() is True
+
+    def test_returns_true_when_container_not_found(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
+        assert worker_manager.stop() is True
+
+    def test_calls_docker_rm_when_container_exists(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        removed: list[str] = []
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+        monkeypatch.setattr(
+            wm_module, "docker_rm", lambda name, **kw: removed.append(name) or True
+        )
+        result = worker_manager.stop()
+        assert result is True
+        assert removed == [worker_manager._container_name]
+
+    def test_returns_false_when_docker_rm_fails(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "exited")
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: False)
+        assert worker_manager.stop() is False
+
+
+# ---------------------------------------------------------------------------
+# WorkerManager.status
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerManagerStatus:
+    def test_returns_worker_status_object(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cyberwave_edge_core.worker_manager import WorkerStatus
+
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        s = worker_manager.status()
+        assert isinstance(s, WorkerStatus)
+
+    def test_container_name_in_status(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        s = worker_manager.status()
+        assert s.container_name == worker_manager._container_name
+
+    def test_worker_files_listed(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True)
+        (workers_dir / "alpha.py").write_text("pass")
+        (workers_dir / "beta.py").write_text("pass")
+        (workers_dir / "readme.md").write_text("docs")
+
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        s = worker_manager.status()
+        assert s.worker_files == ["alpha.py", "beta.py"]
+
+    def test_worker_files_empty_when_dir_absent(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        s = worker_manager.status()
+        assert s.worker_files == []
+
+    def test_gpu_enabled_reflects_nvidia_runtime(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        s = worker_manager.status()
+        assert s.gpu_enabled is True
+
+    def test_health_fields_populated_when_monitor_attached(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cyberwave_edge_core.worker_health import WorkerHealthMonitor
+
+        monitor = WorkerHealthMonitor(container_name=worker_manager._container_name)
+        worker_manager.set_health_monitor(monitor)
+
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        s = worker_manager.status()
+        assert s.health_state is not None
+        assert s.circuit_breaker_tripped is False
+
+    def test_health_fields_zero_when_no_monitor(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        s = worker_manager.status()
+        assert s.health_state is None
+        assert s.restart_count == 0
+
+
+# ---------------------------------------------------------------------------
+# WorkerManager.logs
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerManagerLogs:
+    def test_logs_returns_early_when_docker_unavailable(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: False)
+        run_calls: list[object] = []
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: run_calls.append(a))
+        worker_manager.logs()
+        assert run_calls == []
+
+    def test_logs_follow_calls_subprocess(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            wm_module.subprocess, "run", lambda cmd, **kw: captured.append(cmd)
+        )
+        worker_manager.logs(follow=True)
+        assert any("-f" in cmd for cmd in captured)
+
+    def test_logs_no_follow_calls_subprocess_without_f(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            wm_module.subprocess, "run", lambda cmd, **kw: captured.append(cmd)
+        )
+        worker_manager.logs(follow=False)
+        assert captured
+        assert "-f" not in captured[0]
+
+    def test_logs_follow_swallows_keyboard_interrupt(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+
+        def raise_ki(*a: object, **kw: object) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_ki)
+        worker_manager.logs(follow=True)  # should not propagate
+
+    def test_logs_no_follow_swallows_os_error(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+
+        def raise_os(*a: object, **kw: object) -> None:
+            raise OSError("docker not found")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_os)
+        worker_manager.logs(follow=False)  # should not propagate
+
+
+# ---------------------------------------------------------------------------
+# WorkerManager._build_network_args
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerManagerNetworkArgs:
+    def test_darwin_uses_add_host(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module.platform, "system", lambda: "Darwin")
+        args = worker_manager._build_network_args()
+        assert "--add-host" in args
+
+    def test_linux_uses_host_network(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module.platform, "system", lambda: "Linux")
+        args = worker_manager._build_network_args()
+        assert "--network" in args
+        assert "host" in args
+
+
+# ---------------------------------------------------------------------------
+# WorkerManager._run_container failure paths
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerManagerRunContainerFailures:
+    def _setup_run(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "worker.py").write_text("pass")
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: default,
+        )
+        monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+        monkeypatch.setattr("os.environ", {})
+
+    def test_returns_false_on_called_process_error(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import subprocess as _sp
+
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+
+        def raise_cpe(*a: object, **kw: object) -> None:
+            raise _sp.CalledProcessError(1, "docker", stderr="image pull failed")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_cpe)
+        assert worker_manager._run_container() is False
+
+    def test_returns_false_on_timeout(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import subprocess as _sp
+
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+
+        def raise_timeout(*a: object, **kw: object) -> None:
+            raise _sp.TimeoutExpired("docker", 60)
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_timeout)
+        assert worker_manager._run_container() is False
+
+    def test_returns_false_when_container_exits_immediately(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+        # Probe always returns "exited"
+        with patch.object(wm_module, "docker_container_status", return_value="exited"):
+            assert worker_manager._run_container() is False
+
+    def test_returns_true_when_probe_window_exhausted_without_running(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+        # Container never reaches "running" or "exited" within the probe window.
+        with patch.object(wm_module, "docker_container_status", return_value="unknown"):
+            assert worker_manager._run_container() is True
+
+
+# ---------------------------------------------------------------------------
+# WorkerManager.start — health monitor record_start integration
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerManagerStartHealthIntegration:
+    def test_start_calls_record_start_on_success(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cyberwave_edge_core.worker_health import WorkerHealthMonitor
+
+        monitor = WorkerHealthMonitor(container_name=worker_manager._container_name)
+        worker_manager.set_health_monitor(monitor)
+
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "worker.py").write_text("pass")
+
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: default,
+        )
+        monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+        monkeypatch.setattr("os.environ", {})
+
+        with patch.object(
+            wm_module, "docker_container_status", side_effect=["none", "running"]
+        ):
+            result = worker_manager.start()
+
+        assert result is True
+        # record_start sets _last_start_time; uptime will be non-None in check()
+        state = monitor.check(container_status="running")
+        assert state.uptime_seconds is not None
+
+
+# ---------------------------------------------------------------------------
+# _follow_worker_logs free function
+# ---------------------------------------------------------------------------
+
+
+class TestFollowWorkerLogs:
+    def test_streams_lines_to_logger(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        from cyberwave_edge_core.worker_manager import _follow_worker_logs
+
+        fake_proc = MagicMock()
+        fake_proc.stdout = iter(["line one\n", "line two\n"])
+        fake_proc.wait.return_value = 0
+
+        with patch.object(wm_module, "docker_logs_follow", return_value=fake_proc):
+            with caplog.at_level(logging.INFO):
+                _follow_worker_logs("my_container")
+
+        messages = " ".join(caplog.messages)
+        assert "line one" in messages
+        assert "line two" in messages
+
+    def test_returns_early_when_process_is_none(self) -> None:
+        from cyberwave_edge_core.worker_manager import _follow_worker_logs
+
+        with patch.object(wm_module, "docker_logs_follow", return_value=None):
+            _follow_worker_logs("my_container")  # should not raise
+
+    def test_handles_exception_in_stdout_iteration(self) -> None:
+        from cyberwave_edge_core.worker_manager import _follow_worker_logs
+
+        fake_proc = MagicMock()
+        # stdout is truthy but raises when iterated
+        fake_proc.stdout = MagicMock()
+        fake_proc.stdout.__iter__ = MagicMock(side_effect=RuntimeError("pipe broken"))
+        fake_proc.wait.return_value = 0
+
+        with patch.object(wm_module, "docker_logs_follow", return_value=fake_proc):
+            _follow_worker_logs("my_container")  # should not raise
