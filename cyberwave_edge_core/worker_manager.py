@@ -37,10 +37,6 @@ logger = logging.getLogger(__name__)
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
 DEFAULT_WORKER_IMAGE = "cyberwaveos/ml-worker:latest"
 
-# Thread registry for worker log streaming to avoid duplicates.
-_WORKER_LOG_THREAD: Optional[threading.Thread] = None
-_WORKER_LOG_THREAD_LOCK = threading.Lock()
-
 
 @dataclass
 class ResourceLimits:
@@ -129,6 +125,8 @@ class WorkerManager:
         self._resource_limits = resource_limits
         self._container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
         self._health_monitor: Optional["WorkerHealthMonitor"] = None
+        self._log_thread: Optional[threading.Thread] = None
+        self._log_thread_lock = threading.Lock()
 
     def set_health_monitor(self, monitor: "WorkerHealthMonitor") -> None:
         """Attach a WorkerHealthMonitor to this manager.
@@ -139,6 +137,11 @@ class WorkerManager:
         - Record successful starts via ``monitor.record_start()``.
         """
         self._health_monitor = monitor
+
+    @property
+    def health_monitor(self) -> Optional["WorkerHealthMonitor"]:
+        """Return the attached WorkerHealthMonitor, or None if not set."""
+        return self._health_monitor
 
     # ------------------------------------------------------------------
     # Public interface
@@ -465,18 +468,16 @@ class WorkerManager:
                 return False
             time.sleep(1.0)
 
-        logger.warning(
+        logger.error(
             "Worker container %s did not reach running state within startup probe window",
             self._container_name,
         )
-        return True
+        return False
 
     def _ensure_log_stream(self) -> None:
         """Attach a background log-streaming thread if not already running."""
-        global _WORKER_LOG_THREAD
-
-        with _WORKER_LOG_THREAD_LOCK:
-            if _WORKER_LOG_THREAD and _WORKER_LOG_THREAD.is_alive():
+        with self._log_thread_lock:
+            if self._log_thread and self._log_thread.is_alive():
                 return
 
             thread = threading.Thread(
@@ -485,7 +486,7 @@ class WorkerManager:
                 name=f"worker-logs-{self._container_name}",
                 daemon=True,
             )
-            _WORKER_LOG_THREAD = thread
+            self._log_thread = thread
             thread.start()
 
 

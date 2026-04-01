@@ -610,7 +610,7 @@ class TestWorkerWatcherCheckHealth:
         workers_dir.mkdir()
 
         worker_manager = MagicMock()
-        worker_manager._health_monitor = None
+        worker_manager.health_monitor = None
         model_manager = MagicMock()
         watcher = WorkerWatcher(
             workers_dir=workers_dir,
@@ -629,7 +629,7 @@ class TestWorkerWatcherCheckHealth:
         monitor.check.return_value = mock_state
 
         worker_manager = MagicMock()
-        worker_manager._health_monitor = monitor
+        worker_manager.health_monitor = monitor
         model_manager = MagicMock()
 
         watcher = WorkerWatcher(

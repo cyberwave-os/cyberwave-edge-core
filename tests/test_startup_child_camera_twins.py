@@ -139,6 +139,7 @@ def test_camera_child_twin_driver_is_skipped_and_passed_to_parent(monkeypatch) -
         twin_uuid: str,
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
+        macos_bridge_device_candidates: list[str] | None = None,
     ) -> bool:
         run_calls.append(
             {
@@ -219,6 +220,7 @@ def test_non_camera_child_twin_is_not_skipped(monkeypatch) -> None:
         twin_uuid: str,
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
+        macos_bridge_device_candidates: list[str] | None = None,
     ) -> bool:
         run_calls.append(
             {
@@ -299,6 +301,7 @@ def test_parent_driver_variant_selected_from_child_registry_id(monkeypatch) -> N
         twin_uuid: str,
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
+        macos_bridge_device_candidates: list[str] | None = None,
     ) -> bool:
         run_calls.append(
             {
@@ -378,6 +381,7 @@ def test_non_camera_child_with_unmatched_registry_id_runs_independently(monkeypa
         twin_uuid: str,
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
+        macos_bridge_device_candidates: list[str] | None = None,
     ) -> bool:
         run_calls.append(
             {

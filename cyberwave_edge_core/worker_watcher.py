@@ -89,7 +89,7 @@ class WorkerWatcher:
         Returns None when no ``WorkerHealthMonitor`` is attached to the manager.
         Intended to be called each reconcile cycle to detect spontaneous exits.
         """
-        hm = self._worker_manager._health_monitor
+        hm = self._worker_manager.health_monitor
         if hm is None:
             return None
         state = hm.check()

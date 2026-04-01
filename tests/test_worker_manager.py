@@ -593,7 +593,7 @@ class TestWorkerManagerRunContainerFailures:
         with patch.object(wm_module, "docker_container_status", return_value="exited"):
             assert worker_manager._run_container() is False
 
-    def test_returns_true_when_probe_window_exhausted_without_running(
+    def test_returns_false_when_probe_window_exhausted_without_running(
         self,
         worker_manager: WorkerManager,
         tmp_config: Path,
@@ -604,7 +604,7 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
         # Container never reaches "running" or "exited" within the probe window.
         with patch.object(wm_module, "docker_container_status", return_value="unknown"):
-            assert worker_manager._run_container() is True
+            assert worker_manager._run_container() is False
 
 
 # ---------------------------------------------------------------------------

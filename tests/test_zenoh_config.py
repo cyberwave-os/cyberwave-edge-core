@@ -17,6 +17,9 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import MagicMock
 
+import pytest
+
+import cyberwave_edge_core.zenoh_config as zc_module
 from cyberwave_edge_core.zenoh_config import (
     ZenohConfig,
     ZenohDiagnostics,
@@ -220,11 +223,14 @@ class TestValidateZenohConfig:
         assert diag.shared_memory_active is False
         assert any("not 'zenoh'" in w or "disabled" in w for w in diag.warnings)
 
-    def test_zenoh_p2p_no_warnings_by_default(self):
+    def test_zenoh_p2p_no_warnings_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Run as Linux to avoid the macOS-specific SHM warning that would fire
+        # when shared_memory=True on Darwin.
+        monkeypatch.setattr(zc_module.platform, "system", lambda: "Linux")
         cfg = _config(data_backend="zenoh", shared_memory=True, connect_endpoints=[])
         diag = validate_zenoh_config(cfg)
         assert "peer-to-peer" in diag.mode
-        # No SHM warning when shared_memory is enabled
+        # No SHM warning when shared_memory is enabled on Linux
         shm_warnings = [w for w in diag.warnings if "ZENOH_SHARED_MEMORY" in w]
         assert not shm_warnings
 
