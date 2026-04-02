@@ -353,7 +353,7 @@ class TestWorkerManagerStop:
         )
         result = worker_manager.stop()
         assert result is True
-        assert removed == [worker_manager._container_name]
+        assert removed == [worker_manager.container_name]
 
     def test_returns_false_when_docker_rm_fails(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
@@ -386,7 +386,7 @@ class TestWorkerManagerStatus:
         monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
         monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
         s = worker_manager.status()
-        assert s.container_name == worker_manager._container_name
+        assert s.container_name == worker_manager.container_name
 
     def test_worker_files_listed(
         self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
@@ -423,7 +423,7 @@ class TestWorkerManagerStatus:
     ) -> None:
         from cyberwave_edge_core.worker_health import WorkerHealthMonitor
 
-        monitor = WorkerHealthMonitor(container_name=worker_manager._container_name)
+        monitor = WorkerHealthMonitor(container_name=worker_manager.container_name)
         worker_manager.set_health_monitor(monitor)
 
         monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
@@ -618,7 +618,7 @@ class TestWorkerManagerStartHealthIntegration:
     ) -> None:
         from cyberwave_edge_core.worker_health import WorkerHealthMonitor
 
-        monitor = WorkerHealthMonitor(container_name=worker_manager._container_name)
+        monitor = WorkerHealthMonitor(container_name=worker_manager.container_name)
         worker_manager.set_health_monitor(monitor)
 
         workers_dir = tmp_config / "workers"

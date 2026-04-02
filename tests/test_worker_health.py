@@ -360,7 +360,7 @@ class TestWorkermanagerCircuitBreaker:
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monitor = WorkerHealthMonitor(
-            container_name=worker_manager._container_name,
+            container_name=worker_manager.container_name,
             max_restarts_in_window=2,
             restart_window_seconds=60,
         )
@@ -388,7 +388,7 @@ class TestWorkermanagerCircuitBreaker:
         self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monitor = WorkerHealthMonitor(
-            container_name=worker_manager._container_name,
+            container_name=worker_manager.container_name,
             max_restarts_in_window=5,
         )
         worker_manager.set_health_monitor(monitor)
@@ -427,7 +427,7 @@ class TestWorkermanagerCircuitBreaker:
     def test_restart_records_reason_in_health_monitor(
         self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monitor = WorkerHealthMonitor(container_name=worker_manager._container_name)
+        monitor = WorkerHealthMonitor(container_name=worker_manager.container_name)
         worker_manager.set_health_monitor(monitor)
 
         workers_dir = tmp_config / "workers"

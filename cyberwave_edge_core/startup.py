@@ -3388,7 +3388,7 @@ def _reconcile_worker_watcher(
         )
         # Attach health monitor so that restarts are accounted and rate-limited.
         health_monitor = WorkerHealthMonitor(
-            container_name=worker_manager._container_name,
+            container_name=worker_manager.container_name,
         )
         worker_manager.set_health_monitor(health_monitor)
 

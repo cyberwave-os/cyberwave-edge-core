@@ -139,6 +139,11 @@ class WorkerManager:
         self._health_monitor = monitor
 
     @property
+    def container_name(self) -> str:
+        """Return the Docker container name used by this manager."""
+        return self._container_name
+
+    @property
     def health_monitor(self) -> Optional["WorkerHealthMonitor"]:
         """Return the attached WorkerHealthMonitor, or None if not set."""
         return self._health_monitor

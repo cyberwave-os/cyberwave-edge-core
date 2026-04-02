@@ -137,6 +137,9 @@ class WorkerWatcher:
             if elapsed < self._min_restart_interval:
                 remaining = self._min_restart_interval - elapsed
                 logger.debug("Worker restart deferred: cool-down %.1fs remaining", remaining)
+                # Returns False here too — callers cannot distinguish "no change" from
+                # "change detected but deferred".  _pending_restart stays True so the
+                # restart fires on the next reconcile call after cool-down expires.
                 return False
 
         self._pending_restart = False
