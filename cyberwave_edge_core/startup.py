@@ -135,10 +135,9 @@ def _bootstrap_runtime_env_vars() -> None:
     config_dir = _resolve_config_dir()
     _migrate_legacy_macos_config(config_dir)
     credentials_file = config_dir / "credentials.json"
-    if not credentials_file.exists():
-        return
-
     try:
+        if not credentials_file.exists():
+            return
         with open(credentials_file) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
