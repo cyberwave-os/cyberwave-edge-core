@@ -777,6 +777,7 @@ class TestRunDockerImagePullFallback:
         self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
         def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
             if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
@@ -817,6 +818,7 @@ class TestRunDockerImagePullFallback:
         self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
         def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
             if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
@@ -850,6 +852,7 @@ class TestRunDockerImagePullFallback:
         self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
         def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
             if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
@@ -896,6 +899,7 @@ class TestRunDockerImagePullFallback:
         self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
         def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
             if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
@@ -940,6 +944,7 @@ class TestRunDockerImagePullFallback:
         self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
         def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
             if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
@@ -986,6 +991,118 @@ class TestRunDockerImagePullFallback:
             ("/dev/video2", "/dev/video0"),
             ("/dev/video5", "/dev/video5"),
         ]
+
+    def test_usbip_active_skips_bridge_for_video_devices(self, tmp_path, monkeypatch):
+        """When USB/IP is active, video device mappings bypass the bridge command."""
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: True)
+
+        bridge_calls: list[str] = []
+
+        def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
+            if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
+                return "/bin/echo resolved_device=rtsp://host.docker.internal:8554/cam0"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _runtime_env)
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            if cmd and cmd[0] == "/bin/echo":
+                bridge_calls.append("bridge")
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="resolved_device=rtsp://host.docker.internal:8554/cam0\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            ["--device", "/dev/video0:/dev/video0"],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        assert bridge_calls == [], "bridge command must NOT run for video devices when USB/IP is active"
+        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+        assert "--pid=host" in docker_run_cmd
+        env_map = self._extract_env_map(docker_run_cmd)
+        assert env_map.get("CYBERWAVE_USBIP_ENABLED") == "1"
+        assert env_map.get("CYBERWAVE_METADATA_VIDEO_DEVICE") == "/dev/video0"
+
+    def test_usbip_active_preserves_device_params_for_video(self, tmp_path, monkeypatch):
+        """When USB/IP handles video, --device /dev/video* is NOT stripped."""
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: True)
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **kw: None)
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            ["--device", "/dev/video0:/dev/video0"],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+        assert "--device" in docker_run_cmd
+        device_idx = docker_run_cmd.index("--device")
+        assert docker_run_cmd[device_idx + 1] == "/dev/video0:/dev/video0"
+
+    def test_usbip_active_still_bridges_non_video_devices(self, tmp_path, monkeypatch):
+        """USB/IP only skips video devices; serial devices still use the bridge command."""
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: True)
+
+        def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
+            if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
+                return "/bin/echo bridged {host_device}"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _runtime_env)
+
+        bridge_calls: list[list[str]] = []
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            if cmd and cmd[0] == "/bin/echo":
+                bridge_calls.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [
+                "--device", "/dev/ttyACM0:/dev/ttyACM0",
+                "--device", "/dev/video0:/dev/video0",
+            ],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        assert len(bridge_calls) == 1, "only non-video device should trigger bridge"
+        assert "/dev/ttyACM0" in bridge_calls[0]
 
 
 class TestDriverSelection:

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cyberwave import Cyberwave
+from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
 from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 
@@ -839,6 +840,7 @@ def _run_macos_device_bridge_commands(
     twin_uuid: str,
     container_name: str,
     additional_device_mappings: Optional[list[tuple[str, str]]] = None,
+    usbip_active: bool = False,
 ) -> tuple[bool, dict[str, str]]:
     """Best-effort macOS host-bridge hook for linux-only ``--device`` mappings.
 
@@ -849,20 +851,36 @@ def _run_macos_device_bridge_commands(
       - ``{twin_uuid}``
       - ``{container_name}``
       - ``{config_dir}``
+
+    When *usbip_active* is True, ``/dev/video*`` mappings are skipped because
+    USB/IP handles them transparently via the container entrypoint.
     """
     if platform.system() != "Darwin":
         return True, {}
 
     explicit_device_mappings = _extract_docker_device_mappings(params)
     device_mappings: list[tuple[str, str]] = []
+    usbip_handled_video_devices: dict[str, str] = {}
     seen_mappings: set[tuple[str, str]] = set()
     for mapping in explicit_device_mappings + (additional_device_mappings or []):
         if mapping in seen_mappings:
             continue
         seen_mappings.add(mapping)
+        host_device, container_device = mapping
+        if usbip_active and (
+            _is_video_device_path(host_device) or _is_video_device_path(container_device)
+        ):
+            logger.info(
+                "USB/IP active — skipping bridge command for video device %s:%s "
+                "(will be attached via USB/IP in container entrypoint)",
+                host_device,
+                container_device,
+            )
+            usbip_handled_video_devices[container_device] = container_device
+            continue
         device_mappings.append(mapping)
     if not device_mappings:
-        return True, {}
+        return True, usbip_handled_video_devices
 
     bridge_command_template = (
         get_runtime_env_var("CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND", "") or ""
@@ -872,9 +890,11 @@ def _run_macos_device_bridge_commands(
             "Driver uses --device mappings on macOS but CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND "
             "is not configured; hardware access will likely fail"
         )
-        return True, {container: container for _, container in device_mappings}
+        resolved = {container: container for _, container in device_mappings}
+        resolved.update(usbip_handled_video_devices)
+        return True, resolved
 
-    resolved_device_map: dict[str, str] = {}
+    resolved_device_map: dict[str, str] = dict(usbip_handled_video_devices)
 
     for host_device, container_device in device_mappings:
         try:
@@ -1066,11 +1086,16 @@ def _run_docker_image(
     explicit_params_env = _extract_docker_env_map(params)
     macos_bridge_mappings = _normalize_macos_bridge_candidates(macos_bridge_device_candidates)
 
+    # Determine USB/IP state early so the bridge function can skip video
+    # devices that USB/IP will handle transparently inside the container.
+    usbip_active = platform.system() == "Darwin" and _is_usbip_server_running()
+
     macos_bridge_ok, macos_resolved_devices = _run_macos_device_bridge_commands(
         params=params,
         twin_uuid=twin_uuid,
         container_name=container_name,
         additional_device_mappings=macos_bridge_mappings,
+        usbip_active=usbip_active,
     )
     if not macos_bridge_ok:
         return False
@@ -1093,15 +1118,19 @@ def _run_docker_image(
                     first_resolved_video_device,
                 )
 
-            should_strip_video_devices = _resolve_bool_env_var(
-                "CYBERWAVE_MACOS_STRIP_VIDEO_DEVICE_PARAMS",
-                default=True,
-            )
-            if should_strip_video_devices and any(
-                resolved != container_device
-                for container_device, resolved in video_device_map.items()
-            ):
-                params = _strip_video_device_mappings(params)
+            # When USB/IP handles video devices, the container will see
+            # /dev/video* natively after entrypoint attachment — don't strip
+            # --device params and don't rewrite paths to RTSP URLs.
+            if not usbip_active:
+                should_strip_video_devices = _resolve_bool_env_var(
+                    "CYBERWAVE_MACOS_STRIP_VIDEO_DEVICE_PARAMS",
+                    default=True,
+                )
+                if should_strip_video_devices and any(
+                    resolved != container_device
+                    for container_device, resolved in video_device_map.items()
+                ):
+                    params = _strip_video_device_mappings(params)
 
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL")
     if base_url:
@@ -1142,6 +1171,37 @@ def _run_docker_image(
         if key not in explicit_params_env:
             container_env.setdefault(key, value)
 
+    # On macOS, enable USB/IP passthrough when the host server is running.
+    # --pid=host lets the container use nsenter to access Docker Desktop's
+    # pre-installed usbip tools; CYBERWAVE_USBIP_ENABLED tells the entrypoint
+    # to auto-attach devices (serial + video).
+    pid_args: list[str] = []
+    if usbip_active:
+        pid_args = ["--pid=host"]
+        container_env.setdefault("CYBERWAVE_USBIP_ENABLED", "1")
+        has_video_devices = any(
+            _is_video_device_path(d) for d in macos_resolved_devices
+        )
+        if has_video_devices:
+            container_env.setdefault("CYBERWAVE_USBIP_VIDEO_TIMEOUT_SECS", "8")
+
+    # Optional MJPEG camera stream fallback for macOS. When the user has
+    # configured a stream URL (e.g. because USB/IP bandwidth is too low
+    # for video), pass it to the container so cv2.VideoCapture uses the
+    # HTTP stream instead of a /dev/video* device.
+    if platform.system() == "Darwin":
+        camera_stream_url = get_runtime_env_var("CYBERWAVE_MACOS_CAMERA_STREAM_URL")
+        if camera_stream_url and camera_stream_url.strip():
+            camera_stream_url = camera_stream_url.strip()
+            if "CYBERWAVE_METADATA_VIDEO_DEVICE" not in explicit_params_env:
+                container_env.setdefault(
+                    "CYBERWAVE_METADATA_VIDEO_DEVICE", camera_stream_url
+                )
+            logger.info(
+                "macOS camera stream URL configured: %s",
+                camera_stream_url,
+            )
+
     env_vars: List[str] = []
     for key, value in container_env.items():
         env_vars += ["-e", f"{key}={value}"]
@@ -1155,14 +1215,21 @@ def _run_docker_image(
 
     network_args = _build_driver_network_args(params)
 
-    # Run the container
+    # Run the container.  --init injects tini as PID 1 so signals are
+    # forwarded properly even if the driver blocks on serial/USB I/O.
+    # --stop-timeout limits the SIGTERM grace period so Docker escalates
+    # to SIGKILL faster when USB devices cause unresponsive I/O.
     cmd = [
         "docker",
         "run",
         "--detach",
+        "--init",
+        "--stop-timeout",
+        "5",
         "--restart",
         "unless-stopped",
         "--privileged",
+        *pid_args,
         *network_args,
         "--name",
         container_name,
