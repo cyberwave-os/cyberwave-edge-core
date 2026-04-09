@@ -814,6 +814,68 @@ class TestRunDockerImagePullFallback:
         env_map = self._extract_env_map(docker_run_cmd)
         assert env_map["CYBERWAVE_EDGE_HOST_PLATFORM"] == "darwin"
 
+    def test_macos_driver_container_rewrites_localhost_base_url(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+
+        def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
+            if name == "CYBERWAVE_BASE_URL":
+                return "http://localhost:8000"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _runtime_env)
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+        env_map = self._extract_env_map(docker_run_cmd)
+        assert env_map["CYBERWAVE_BASE_URL"] == "http://host.docker.internal:8000"
+
+    def test_macos_driver_container_rewrites_localhost_mqtt_host(self, tmp_path, monkeypatch):
+        self._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+
+        def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
+            if name == "CYBERWAVE_MQTT_HOST":
+                return "localhost"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _runtime_env)
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+        env_map = self._extract_env_map(docker_run_cmd)
+        assert env_map["CYBERWAVE_MQTT_HOST"] == "host.docker.internal"
+
     def test_macos_bridge_command_failure_aborts_driver_start(self, tmp_path, monkeypatch):
         self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []

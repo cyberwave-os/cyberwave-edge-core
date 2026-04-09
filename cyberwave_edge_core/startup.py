@@ -32,6 +32,7 @@ from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from cyberwave import Cyberwave
 from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
@@ -834,6 +835,38 @@ def _build_driver_network_args(params: list[str]) -> list[str]:
     return ["--network", "host"]
 
 
+def _rewrite_macos_container_hostname(hostname: str) -> str:
+    """Rewrite host-local names for Docker Desktop containers on macOS."""
+    normalized = hostname.strip()
+    if platform.system() != "Darwin":
+        return normalized
+    if normalized.lower() in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+        return "host.docker.internal"
+    return normalized
+
+
+def _rewrite_macos_container_base_url(base_url: str) -> str:
+    """Rewrite host-local backend URLs for Docker Desktop containers on macOS."""
+    if platform.system() != "Darwin":
+        return base_url
+
+    try:
+        parsed = urlsplit(base_url.strip())
+    except ValueError:
+        return base_url
+
+    rewritten_hostname = _rewrite_macos_container_hostname(parsed.hostname or "")
+    if rewritten_hostname == (parsed.hostname or "").strip():
+        return base_url
+
+    netloc = rewritten_hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
 def _run_macos_device_bridge_commands(
     *,
     params: list[str],
@@ -1134,10 +1167,12 @@ def _run_docker_image(
 
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL")
     if base_url:
-        container_env["CYBERWAVE_BASE_URL"] = base_url
+        container_env["CYBERWAVE_BASE_URL"] = _rewrite_macos_container_base_url(base_url)
     mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
-        container_env["CYBERWAVE_MQTT_HOST"] = mqtt_host
+        container_env["CYBERWAVE_MQTT_HOST"] = _rewrite_macos_container_hostname(
+            mqtt_host
+        )
     if runtime_environment != "production":
         container_env["CYBERWAVE_ENVIRONMENT"] = runtime_environment
 
