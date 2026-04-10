@@ -51,12 +51,14 @@ On startup (service or direct run), Edge Core performs the following steps:
 
 1. Validate credentials from `credentials.json`.
 2. Connect to the backend MQTT broker and verify connectivity.
-3. Register the edge device and record a unique `edge_fingerprint`.
-4. Download the selected environment and resolve twins linked to the fingerprint.
-5. Start drivers for linked twins. Special handling for attached camera child twins:
+3. Start a **bootstrap health publisher** that sends periodic edge health messages while drivers are starting up.
+4. Register the edge device and record a unique `edge_fingerprint`.
+5. Download the selected environment and resolve twins linked to the fingerprint.
+6. Start drivers for linked twins. Special handling for attached camera child twins:
    - If a twin is a camera child (has `attach_to_twin_uuid`), Edge Core does not start a separate driver for it.
    - Camera child UUIDs are passed to the parent driver via `CYBERWAVE_CHILD_TWIN_UUIDS`.
-6. Start the worker container (if worker files exist in `{config_dir}/workers/`).
+7. **Stop the bootstrap health publisher** once drivers are running (drivers publish their own health messages; keeping both would produce duplicate signals in the UI).
+8. Start the worker container (if worker files exist in `{config_dir}/workers/`).
 
 During driver startup, Docker image pull progress is mirrored into the edge-core service logs and forwarded through the same MQTT-backed driver log stream used for runtime container logs, so users can follow image download progress remotely.
 
