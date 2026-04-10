@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
-DEFAULT_WORKER_IMAGE = "cyberwaveos/ml-worker:latest"
+DEFAULT_WORKER_IMAGE = "cyberwaveos/edge-ml-worker:latest"
 
 
 @dataclass
@@ -408,7 +408,11 @@ class WorkerManager:
         gpu_args: list[str] = []
         if docker_has_nvidia_runtime():
             gpu_args = ["--gpus", "all"]
-            logger.info("NVIDIA runtime detected; adding --gpus all to worker container")
+            if image.startswith("cyberwaveos/edge-ml-worker:") and not image.endswith("-gpu"):
+                image = f"{image}-gpu"
+                logger.info("NVIDIA runtime detected; using GPU image %s", image)
+            else:
+                logger.info("NVIDIA runtime detected; adding --gpus all to worker container")
 
         resource_args: list[str] = []
         resource_env_args: list[str] = []

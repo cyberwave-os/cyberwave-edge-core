@@ -195,6 +195,9 @@ CYBERWAVE_SDK_VERSION = _resolve_package_version(
 # Track active log streaming threads per container to avoid duplicates.
 _CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
 
+# Track when log streaming last ended per container so reattach uses --since.
+_CONTAINER_LOG_LAST_SEEN: dict[str, str] = {}
+
 # Map container names to twin UUIDs so log threads can publish telemetry.
 _CONTAINER_TWIN_MAP: dict[str, str] = {}
 
@@ -240,6 +243,9 @@ _EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 _EDGE_RESTART_LOCK = threading.Lock()
 _EDGE_RESTART_IN_PROGRESS = False
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
+_TWIN_COMMAND_SUBSCRIBED = False
+_TWIN_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
+TWIN_COMMAND_SYNC_WORKFLOWS = "sync_workflows"
 _TWIN_FILE_CHECKSUMS: dict[str, str] = {}
 _CONTAINER_LAST_RESTART_COUNT: dict[str, int] = {}
 _CONTAINER_RESTART_HISTORY: dict[str, deque[float]] = {}
@@ -409,6 +415,37 @@ def _resolve_macos_camera_bridge_candidates(asset: Any, twin_metadata: dict[str,
     return list(dict.fromkeys(candidate_devices))
 
 
+def _resolve_mqtt_kwargs() -> dict[str, Any]:
+    """Derive MQTT connection kwargs from runtime config.
+
+    When the backend base URL is a local or private-network address the MQTT
+    broker is assumed to be co-located on the same host at port 1883 (no TLS),
+    matching the standard ``local.yml`` Docker Compose layout.  Otherwise the
+    persisted ``CYBERWAVE_MQTT_HOST`` value is forwarded.
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
+
+    is_local = hostname in ("localhost", "0.0.0.0")
+    if not is_local:
+        try:
+            is_local = ipaddress.ip_address(hostname).is_private
+        except ValueError:
+            pass
+
+    if is_local:
+        return {"mqtt_host": parsed.hostname, "mqtt_port": 1883}
+
+    mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
+    if mqtt_host:
+        return {"mqtt_host": mqtt_host}
+    return {}
+
+
 def _get_shared_mqtt_client(token: str) -> Any:
     """Return a shared MQTT client, creating and connecting it on first call."""
     global _shared_mqtt_client
@@ -416,9 +453,9 @@ def _get_shared_mqtt_client(token: str) -> Any:
         if _shared_mqtt_client is not None and _shared_mqtt_client.mqtt.connected:
             return _shared_mqtt_client
         base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-        mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
+        mqtt_kwargs = _resolve_mqtt_kwargs()
         try:
-            client = Cyberwave(base_url=base_url, api_key=token, mqtt_host=mqtt_host)
+            client = Cyberwave(base_url=base_url, api_key=token, **mqtt_kwargs)
             client.mqtt.connect()
             _shared_mqtt_client = client
             logger.info("Shared MQTT client connected for log forwarding")
@@ -550,15 +587,15 @@ def check_mqtt_connection(token: str) -> bool:
     variables (``CYBERWAVE_MQTT_HOST``, etc.) and falls back to sensible
     defaults.  Returns ``True`` if the connection succeeds.
     """
-    mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    mqtt_kwargs = _resolve_mqtt_kwargs()
     logger.info(
-        "Attempting MQTT connection (base_url=%s, mqtt_host=%s)",
+        "Attempting MQTT connection (base_url=%s, mqtt_kwargs=%s)",
         base_url,
-        mqtt_host,
+        mqtt_kwargs,
     )
     try:
-        client = Cyberwave(base_url=base_url, api_key=token, mqtt_host=mqtt_host)
+        client = Cyberwave(base_url=base_url, api_key=token, **mqtt_kwargs)
         client.mqtt.connect()
         connected: bool = client.mqtt.connected
         if connected:
@@ -1542,6 +1579,7 @@ def _stop_driver_container(container_name: str) -> bool:
             timeout=30,
         )
         _CONTAINER_LOG_THREADS.pop(container_name, None)
+        _CONTAINER_LOG_LAST_SEEN.pop(container_name, None)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         logger.warning("Failed to stop flapping driver container %s: %s", container_name, exc)
@@ -1660,6 +1698,7 @@ def _stop_and_prune_driver_containers() -> list[str]:
             removed.append(container_name)
             _CONTAINER_TWIN_MAP.pop(container_name, None)
             _CONTAINER_LOG_THREADS.pop(container_name, None)
+            _CONTAINER_LOG_LAST_SEEN.pop(container_name, None)
             _CONTAINER_LAST_RESTART_COUNT.pop(container_name, None)
             _CONTAINER_RESTART_HISTORY.pop(container_name, None)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
@@ -2026,9 +2065,15 @@ def _follow_container_logs(
             _inspect_driver_container(container_name)
         )
 
+    cmd = ["docker", "logs", "-f"]
+    since_ts = _CONTAINER_LOG_LAST_SEEN.get(container_name)
+    if since_ts:
+        cmd += ["--since", since_ts]
+    cmd.append(container_name)
+
     try:
         process = subprocess.Popen(
-            ["docker", "logs", "-f", container_name],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -2064,6 +2109,9 @@ def _follow_container_logs(
     except Exception as exc:
         logger.warning("Error while streaming logs for %s: %s", container_name, exc)
     finally:
+        _CONTAINER_LOG_LAST_SEEN[container_name] = datetime.utcnow().strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -2891,6 +2939,104 @@ def ensure_edge_command_subscription() -> bool:
         return True
 
 
+# ---------------------------------------------------------------------------
+# Twin command subscription (handles sync_workflows from CLI)
+# ---------------------------------------------------------------------------
+
+
+def _handle_twin_command_message(*args: Any) -> None:
+    """Handle MQTT command message received on a twin command topic."""
+    if len(args) == 1:
+        payload = args[0]
+    elif len(args) >= 2:
+        payload = args[1]
+    else:
+        return
+
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring twin command with non-dict payload: %r", payload)
+        return
+
+    command = str(payload.get("command", "")).strip().lower()
+    if command != TWIN_COMMAND_SYNC_WORKFLOWS:
+        logger.debug("Ignoring unknown twin command: %s", command)
+        return
+
+    logger.info("Received %s command via MQTT — triggering immediate worker sync", command)
+    worker = threading.Thread(
+        target=_run_immediate_worker_sync,
+        name="twin-cmd-sync-workflows",
+        daemon=True,
+    )
+    worker.start()
+
+
+def _run_immediate_worker_sync() -> None:
+    """Run an immediate worker sync in a background thread."""
+    try:
+        summary = reconcile_worker_sync()
+        logger.info(
+            "Immediate worker sync complete: written=%d removed=%d unchanged=%d errors=%d",
+            summary["written"],
+            summary["removed"],
+            summary["unchanged"],
+            summary["errors"],
+        )
+    except Exception:
+        logger.exception("Immediate worker sync failed")
+
+
+def ensure_twin_command_subscriptions() -> bool:
+    """Subscribe once to MQTT command topics for all linked twins.
+
+    Listens for ``sync_workflows`` commands published by the CLI
+    (``cyberwave workflow sync`` / ``cyberwave edge sync-workflows``).
+    """
+    global _TWIN_COMMAND_SUBSCRIBED
+    if _TWIN_COMMAND_SUBSCRIBED:
+        return True
+
+    token = load_token()
+    if not token:
+        return False
+
+    with _TWIN_COMMAND_SUBSCRIPTION_LOCK:
+        if _TWIN_COMMAND_SUBSCRIBED:
+            return True
+
+        environment_uuid = load_environment_uuid()
+        if not environment_uuid:
+            return False
+
+        fingerprint = get_or_create_fingerprint()
+        if not fingerprint:
+            return False
+
+        try:
+            twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+                token, environment_uuid, fingerprint
+            )
+        except Exception:
+            logger.exception("Could not list linked twins for command subscription")
+            return False
+
+        if not twin_uuids:
+            return False
+
+        mqtt_client = _get_shared_mqtt_client(token)
+        if not mqtt_client:
+            return False
+
+        prefix = mqtt_client.mqtt.topic_prefix
+        for twin_uuid in twin_uuids:
+            topic = f"{prefix}cyberwave/twin/{twin_uuid}/command"
+            mqtt_client.mqtt.subscribe(topic, _handle_twin_command_message)
+            logger.info("Subscribed to twin command topic: %s", topic)
+
+        _TWIN_COMMAND_SUBSCRIBED = True
+        return True
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base* and return the result.
 
@@ -3468,6 +3614,11 @@ def run_runtime_loop() -> None:
             ensure_edge_command_subscription()
         except Exception:
             logger.exception("Unexpected error while ensuring edge command subscription")
+
+        try:
+            ensure_twin_command_subscriptions()
+        except Exception:
+            logger.exception("Unexpected error while ensuring twin command subscriptions")
 
         # Periodically pull updated generated worker files from the backend.
         _worker_sync_loop_counter += 1
