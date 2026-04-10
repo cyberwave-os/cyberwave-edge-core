@@ -1123,6 +1123,15 @@ def _run_docker_image(
     # devices that USB/IP will handle transparently inside the container.
     usbip_active = platform.system() == "Darwin" and _is_usbip_server_running()
 
+    # Check for an explicit MJPEG camera stream URL early.  When the user has
+    # configured one, video device bridge resolution is pointless because the
+    # driver will consume the HTTP stream instead of /dev/video*.
+    _macos_camera_stream_url: Optional[str] = None
+    if platform.system() == "Darwin":
+        _raw = get_runtime_env_var("CYBERWAVE_MACOS_CAMERA_STREAM_URL")
+        if _raw and _raw.strip():
+            _macos_camera_stream_url = _raw.strip()
+
     macos_bridge_ok, macos_resolved_devices = _run_macos_device_bridge_commands(
         params=params,
         twin_uuid=twin_uuid,
@@ -1133,7 +1142,7 @@ def _run_docker_image(
     if not macos_bridge_ok:
         return False
 
-    if platform.system() == "Darwin":
+    if platform.system() == "Darwin" and not _macos_camera_stream_url:
         video_device_map = {
             container_device: resolved_device
             for container_device, resolved_device in macos_resolved_devices.items()
@@ -1217,25 +1226,20 @@ def _run_docker_image(
         has_video_devices = any(
             _is_video_device_path(d) for d in macos_resolved_devices
         )
-        if has_video_devices:
+        if has_video_devices and not _macos_camera_stream_url:
             container_env.setdefault("CYBERWAVE_USBIP_VIDEO_TIMEOUT_SECS", "8")
 
-    # Optional MJPEG camera stream fallback for macOS. When the user has
-    # configured a stream URL (e.g. because USB/IP bandwidth is too low
-    # for video), pass it to the container so cv2.VideoCapture uses the
-    # HTTP stream instead of a /dev/video* device.
-    if platform.system() == "Darwin":
-        camera_stream_url = get_runtime_env_var("CYBERWAVE_MACOS_CAMERA_STREAM_URL")
-        if camera_stream_url and camera_stream_url.strip():
-            camera_stream_url = camera_stream_url.strip()
-            if "CYBERWAVE_METADATA_VIDEO_DEVICE" not in explicit_params_env:
-                container_env.setdefault(
-                    "CYBERWAVE_METADATA_VIDEO_DEVICE", camera_stream_url
-                )
-            logger.info(
-                "macOS camera stream URL configured: %s",
-                camera_stream_url,
-            )
+    # When the user has configured a macOS MJPEG camera stream URL, force
+    # it as the video device.  This takes priority over bridge-resolved
+    # /dev/video* paths and USB/IP video passthrough (which is often
+    # unreliable for high-bandwidth video).
+    if _macos_camera_stream_url:
+        container_env["CYBERWAVE_METADATA_VIDEO_DEVICE"] = _macos_camera_stream_url
+        logger.info(
+            "macOS camera stream URL override: %s (usbip_active=%s)",
+            _macos_camera_stream_url,
+            usbip_active,
+        )
 
     env_vars: List[str] = []
     for key, value in container_env.items():
@@ -2210,6 +2214,24 @@ def _start_bootstrap_edge_health_publisher(
         return True
 
 
+def _stop_bootstrap_edge_health_publisher() -> None:
+    """Stop the bootstrap edge_health publisher.
+
+    Called once driver containers are running because drivers publish their
+    own health — keeping the bootstrap publisher alive produces a duplicate
+    ``edge_id`` that confuses the frontend.
+    """
+    global _EDGE_HEALTH_CHECK
+    with _EDGE_HEALTH_CHECK_LOCK:
+        if _EDGE_HEALTH_CHECK is not None:
+            try:
+                _EDGE_HEALTH_CHECK.stop()
+            except Exception:
+                pass
+            _EDGE_HEALTH_CHECK = None
+            logger.info("Stopped bootstrap edge health publisher (drivers running)")
+
+
 def fetch_and_run_twin_drivers(
     token: str,
     environment_uuid: str,
@@ -2729,6 +2751,9 @@ def _perform_edge_core_restart(token: str) -> dict[str, Any]:
 
     results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
     started = sum(1 for result in results if result.get("success"))
+
+    if started > 0:
+        _stop_bootstrap_edge_health_publisher()
 
     summary = {
         "environment_uuid": environment_uuid,
@@ -3268,6 +3293,9 @@ def run_startup_checks() -> bool:
                 for r in results:
                     status = "[green]✓[/green]" if r["success"] else "[red]✗[/red]"
                     console.print(f"    {r['twin_name']} → {r['driver_image']} {status}")
+
+                if started > 0:
+                    _stop_bootstrap_edge_health_publisher()
 
             # 7 — workflow worker sync (pull generated wf_*.py files from backend)
             if linked_twin_uuids:

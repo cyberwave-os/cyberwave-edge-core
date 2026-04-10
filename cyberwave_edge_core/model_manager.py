@@ -405,18 +405,44 @@ class ModelManager:
         return dest_path
 
     def _fetch_catalog_entry(self, model_id: str) -> dict[str, Any]:
-        """Call the Cyberwave catalog API and return the model metadata dict."""
+        """Call the Cyberwave catalog API and return the model metadata dict.
+
+        If *model_id* looks like a UUID, fetch directly via
+        ``GET /api/v1/ml-models/{uuid}``.  Otherwise fall back to the list
+        endpoint filtered by ``model_external_id`` (e.g. ``yolov8n.pt``).
+        """
         import httpx
 
-        url = f"{self._base_url}{ML_MODELS_ENDPOINT}/{model_id}"
         headers = {"Authorization": f"Token {self._api_token}"}
+
+        if _looks_like_uuid(model_id):
+            url = f"{self._base_url}{ML_MODELS_ENDPOINT}/{model_id}"
+            try:
+                resp = httpx.get(url, headers=headers, timeout=30.0)
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"Unexpected catalog response type: {type(data)}")
+                return data
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to fetch catalog entry for model '{model_id}' from {url}: {exc}"
+                ) from exc
+
+        url = f"{self._base_url}{ML_MODELS_ENDPOINT}?model_external_id={model_id}"
         try:
             resp = httpx.get(url, headers=headers, timeout=30.0)
             resp.raise_for_status()
             data = resp.json()
-            if not isinstance(data, dict):
-                raise RuntimeError(f"Unexpected catalog response type: {type(data)}")
-            return data
+            if isinstance(data, list):
+                if not data:
+                    raise RuntimeError(f"No model found with model_external_id='{model_id}'")
+                return data[0]
+            if isinstance(data, dict):
+                return data
+            raise RuntimeError(f"Unexpected catalog response type: {type(data)}")
+        except RuntimeError:
+            raise
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to fetch catalog entry for model '{model_id}' from {url}: {exc}"
@@ -475,6 +501,16 @@ class ModelManager:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_uuid(value: str) -> bool:
+    """Return True if *value* matches the canonical UUID format."""
+    return bool(_UUID_RE.match(value))
 
 
 def _sha256_file(path: Path) -> str:
