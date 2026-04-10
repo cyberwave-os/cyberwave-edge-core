@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -2109,7 +2109,7 @@ def _follow_container_logs(
     except Exception as exc:
         logger.warning("Error while streaming logs for %s: %s", container_name, exc)
     finally:
-        _CONTAINER_LOG_LAST_SEEN[container_name] = datetime.utcnow().strftime(
+        _CONTAINER_LOG_LAST_SEEN[container_name] = datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         try:
