@@ -413,7 +413,7 @@ class ModelManager:
         """
         import httpx
 
-        headers = {"Authorization": f"Token {self._api_token}"}
+        headers = {"Authorization": f"Bearer {self._api_token}"}
 
         if _looks_like_uuid(model_id):
             url = f"{self._base_url}{ML_MODELS_ENDPOINT}/{model_id}"
@@ -478,7 +478,7 @@ class ModelManager:
         """Stream *url* directly to *dest* via a temp file."""
         import httpx
 
-        headers = {"Authorization": f"Token {self._api_token}"}
+        headers = {"Authorization": f"Bearer {self._api_token}"}
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp_fd, tmp_path_str = tempfile.mkstemp(dir=dest.parent, prefix=".dl_")
         tmp_path = Path(tmp_path_str)

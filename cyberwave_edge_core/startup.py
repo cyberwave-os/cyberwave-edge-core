@@ -3270,6 +3270,10 @@ def _sync_workers_for_twins(
 ) -> dict[str, dict[str, int]]:
     """Pull generated wf_*.py files from the backend for each linked twin.
 
+    Uses ``sync_all`` so that stale-file cleanup happens only after every
+    twin's payload has been fetched — preventing twin A's sync from
+    deleting twin B's workers.
+
     Returns a dict mapping twin_uuid → {written, removed, unchanged, errors}.
     """
     from cyberwave_edge_core.edge_sync_client import EdgeSyncClient
@@ -3282,17 +3286,18 @@ def _sync_workers_for_twins(
     )
 
     summary: dict[str, dict[str, int]] = {}
-    for twin_uuid in twin_uuids:
-        try:
-            result = client.sync(twin_uuid)
-            summary[twin_uuid] = {
+    try:
+        results = client.sync_all(twin_uuids)
+        for result in results:
+            summary[result.twin_uuid] = {
                 "written": len(result.written),
                 "removed": len(result.removed),
                 "unchanged": len(result.unchanged),
                 "errors": len(result.errors),
             }
-        except Exception:
-            logger.exception("Worker sync failed for twin %s", twin_uuid)
+    except Exception:
+        logger.exception("Worker sync_all failed for twins %s", twin_uuids)
+        for twin_uuid in twin_uuids:
             summary[twin_uuid] = {
                 "written": 0,
                 "removed": 0,
@@ -3447,10 +3452,21 @@ def _reconcile_worker_watcher(
     workers_dir = CONFIG_DIR / "workers"
 
     if existing_watcher is None:
+        twin_uuids: list[str] = []
+        try:
+            fingerprint = get_or_create_fingerprint()
+            if fingerprint:
+                twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+                    token, environment_uuid, fingerprint
+                )
+        except Exception:
+            logger.debug("Could not resolve twin_uuids for worker watcher")
+
         worker_manager = WorkerManager(
             config_dir=CONFIG_DIR,
             environment_uuid=environment_uuid,
             token=token,
+            twin_uuids=twin_uuids,
         )
         # Attach health monitor so that restarts are accounted and rate-limited.
         health_monitor = WorkerHealthMonitor(

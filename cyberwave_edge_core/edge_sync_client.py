@@ -90,23 +90,73 @@ class EdgeSyncClient:
     # ------------------------------------------------------------------
 
     def sync(self, twin_uuid: str) -> EdgeSyncResult:
-        """Fetch the edge-sync payload and reconcile worker files on disk.
+        """Fetch the edge-sync payload and write worker files for one twin.
+
+        This only writes/updates files — it does **not** delete stale files.
+        Use :meth:`sync_all` when syncing multiple twins to get correct
+        cleanup, or call :meth:`cleanup_stale` after all per-twin syncs.
 
         Returns an :class:`EdgeSyncResult` describing what changed.
         """
         result = EdgeSyncResult(twin_uuid=twin_uuid)
+        self._sync_one(twin_uuid, result)
+        return result
 
+    def sync_all(self, twin_uuids: list[str]) -> list[EdgeSyncResult]:
+        """Sync worker files for all *twin_uuids* and remove stale files.
+
+        This is the preferred entry-point when multiple twins share the same
+        ``workers_dir``.  Files are only deleted after **every** twin's
+        payload has been fetched, preventing twin A's sync from removing
+        twin B's workers.
+        """
+        all_expected: dict[str, str] = {}
+        results: list[EdgeSyncResult] = []
+
+        for twin_uuid in twin_uuids:
+            result = EdgeSyncResult(twin_uuid=twin_uuid)
+            expected = self._sync_one(twin_uuid, result)
+            all_expected.update(expected)
+            results.append(result)
+
+        # Remove stale wf_*.py files not claimed by any twin.
+        cleanup_result = EdgeSyncResult(twin_uuid="__cleanup__")
+        self._cleanup_stale(all_expected, cleanup_result)
+        if cleanup_result.removed or cleanup_result.errors:
+            for r in results:
+                r.removed.extend(cleanup_result.removed)
+                r.errors.extend(cleanup_result.errors)
+                break  # attribute removals to the first twin result
+
+        return results
+
+    def cleanup_stale(self, expected_filenames: set[str]) -> list[str]:
+        """Remove wf_*.py files not in *expected_filenames*. Returns removed names."""
+        result = EdgeSyncResult(twin_uuid="__cleanup__")
+        self._cleanup_stale(
+            {f: "" for f in expected_filenames},
+            result,
+        )
+        return result.removed
+
+    # ------------------------------------------------------------------
+    # Internal sync helpers
+    # ------------------------------------------------------------------
+
+    def _sync_one(
+        self, twin_uuid: str, result: EdgeSyncResult
+    ) -> dict[str, str]:
+        """Fetch payload for *twin_uuid*, write files, return expected map."""
         try:
             payload = self._fetch_sync_payload(twin_uuid)
         except Exception as exc:
             msg = f"Failed to fetch edge-sync payload for twin {twin_uuid}: {exc}"
             logger.warning(msg)
             result.errors.append(msg)
-            return result
+            return {}
 
         workflows: list[dict[str, Any]] = payload.get("workflows", [])
 
-        # Build index of expected generated workers: filename → source.
         expected: dict[str, str] = {}
         for wf in workflows:
             filename: str | None = wf.get("worker_filename")
@@ -116,7 +166,6 @@ class EdgeSyncClient:
 
         self._workers_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write new/updated files.
         for filename, source in expected.items():
             dest = self._workers_dir / filename
             if dest.exists():
@@ -137,7 +186,14 @@ class EdgeSyncClient:
                 logger.error(msg)
                 result.errors.append(msg)
 
-        # Remove stale wf_*.py files that are no longer expected.
+        logger.info("Edge sync complete for twin %s: %s", twin_uuid, result)
+        return expected
+
+    def _cleanup_stale(
+        self, expected: dict[str, str], result: EdgeSyncResult
+    ) -> None:
+        """Remove wf_*.py files that are not in *expected*."""
+        self._workers_dir.mkdir(parents=True, exist_ok=True)
         for existing_file in sorted(self._workers_dir.glob(f"{_WF_PREFIX}*.py")):
             if existing_file.name not in expected:
                 try:
@@ -148,13 +204,6 @@ class EdgeSyncClient:
                     msg = f"Failed to remove {existing_file.name}: {exc}"
                     logger.error(msg)
                     result.errors.append(msg)
-
-        logger.info(
-            "Edge sync complete for twin %s: %s",
-            twin_uuid,
-            result,
-        )
-        return result
 
     # ------------------------------------------------------------------
     # Private helpers
