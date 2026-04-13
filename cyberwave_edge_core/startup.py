@@ -24,6 +24,7 @@ import platform
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -259,8 +260,6 @@ _TWIN_UPDATE_ALLOWED_FIELDS = frozenset(
     {
         "name",
         "description",
-        "asset_uuid",
-        "environment_uuid",
         "position_x",
         "position_y",
         "position_z",
@@ -548,6 +547,71 @@ def load_credentials_envs() -> dict[str, str]:
             ):
                 envs[key] = value.strip()
     return envs
+
+
+def load_driver_overrides() -> dict[str, str]:
+    """Load local driver image overrides from credentials.json.
+
+    Allows overriding the cloud-configured driver image for a specific twin
+    without needing cloud write access.  Useful when the asset's driver in the
+    cloud cannot be updated (e.g. permission denied) but a different local image
+    should be used instead.
+
+    Expected schema:
+        {"driver_overrides": {"<twin_uuid>": "<docker_image>"}}
+    """
+    if not CREDENTIALS_FILE.exists():
+        return {}
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    overrides: dict[str, str] = {}
+    raw = data.get("driver_overrides")
+    if isinstance(raw, dict):
+        for twin_uuid, image in raw.items():
+            if isinstance(twin_uuid, str) and isinstance(image, str) and image.strip():
+                overrides[twin_uuid.strip()] = image.strip()
+    return overrides
+
+
+def load_worker_resource_limits() -> "Optional[Any]":
+    """Build ResourceLimits for the worker container from credentials envs.
+
+    Reads ``CYBERWAVE_WORKER_CPU_PERCENT`` (float, percent of one CPU; e.g.
+    ``100`` = 1 CPU core, ``200`` = 2 cores) and
+    ``CYBERWAVE_WORKER_MEMORY_MB`` (int, MiB) from the resolved env.
+    Returns None when neither is set (Docker defaults apply).
+    """
+    from .worker_manager import ResourceLimits
+
+    cpu_str = get_runtime_env_var("CYBERWAVE_WORKER_CPU_PERCENT")
+    mem_str = get_runtime_env_var("CYBERWAVE_WORKER_MEMORY_MB")
+
+    cpu: Optional[float] = None
+    mem: Optional[int] = None
+
+    if cpu_str:
+        try:
+            cpu = float(cpu_str)
+        except ValueError:
+            logger.warning("Invalid CYBERWAVE_WORKER_CPU_PERCENT=%r; ignoring", cpu_str)
+
+    if mem_str:
+        try:
+            mem = int(mem_str)
+        except ValueError:
+            logger.warning("Invalid CYBERWAVE_WORKER_MEMORY_MB=%r; ignoring", mem_str)
+
+    if cpu is None and mem is None:
+        return None
+
+    return ResourceLimits(cpu_quota_percent=cpu, memory_mb=mem)
 
 
 def get_runtime_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -1862,8 +1926,14 @@ def _log_and_publish_driver_message(
     mqtt_topic: Optional[str] = None,
     driver_image: str | None = None,
 ) -> None:
-    """Mirror a driver log line into local service logs and MQTT."""
-    logger.info("[driver:%s] %s", container_name, message)
+    """Mirror a driver log line to stderr and publish via MQTT.
+
+    The container already emits fully formatted log lines (timestamp, level,
+    module).  Writing them directly to stderr avoids the double-timestamp
+    problem that occurs when ``logger.info()`` wraps the line with
+    edge-core's own formatter.
+    """
+    print(message, file=sys.stderr)
     _publish_driver_log_message(
         message,
         container_name,
@@ -2464,6 +2534,20 @@ def fetch_and_run_twin_drivers(
             child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
         )
 
+        # Apply local driver image override from credentials.json (takes precedence
+        # over the cloud-configured image, useful when cloud asset can't be updated).
+        _driver_overrides = load_driver_overrides()
+        if twin_uuid in _driver_overrides:
+            override_image = _driver_overrides[twin_uuid]
+            logger.info(
+                "Applying local driver override for twin '%s': %s -> %s",
+                twin.name,
+                driver_image,
+                override_image,
+            )
+            driver_image = override_image
+            driver_params = []
+
         # _check_and_alert_sensors_devices(
         #     twin_uuid,
         #     twin.name or f"twin-{twin_uuid[:8]}",
@@ -2575,6 +2659,7 @@ def _start_worker_after_drivers(
             environment_uuid=environment_uuid,
             token=token,
             twin_uuids=twin_uuids,
+            resource_limits=load_worker_resource_limits(),
         )
         worker_manager.start()
     except Exception as exc:
@@ -3165,21 +3250,14 @@ def _calculate_file_checksum(path: Path) -> Optional[str]:
 
 
 def _extract_twin_update_payload(twin_json_data: dict[str, Any]) -> dict[str, Any]:
-    """Build safe payload for PUT /api/v1/twins/{uuid} from local twin JSON."""
-    payload = {
+    """Build safe payload for PUT /api/v1/twins/{uuid} from local twin JSON.
+
+    Only fields the edge legitimately owns are included.  Asset and
+    environment assignments are managed via the UI/API, not the edge.
+    """
+    return {
         key: twin_json_data[key] for key in _TWIN_UPDATE_ALLOWED_FIELDS if key in twin_json_data
     }
-
-    # Drivers receive twin + asset in one file. If the SDK payload does not
-    # include asset_uuid, infer it from the embedded asset object.
-    if "asset_uuid" not in payload:
-        asset_data = twin_json_data.get("asset")
-        if isinstance(asset_data, dict):
-            asset_uuid = asset_data.get("uuid")
-            if isinstance(asset_uuid, str) and asset_uuid.strip():
-                payload["asset_uuid"] = asset_uuid.strip()
-
-    return payload
 
 
 def _sync_twin_json_file_with_backend(
@@ -3681,6 +3759,7 @@ def _reconcile_worker_watcher(
             environment_uuid=environment_uuid,
             token=token,
             twin_uuids=twin_uuids,
+            resource_limits=load_worker_resource_limits(),
         )
         # Attach health monitor so that restarts are accounted and rate-limited.
         health_monitor = WorkerHealthMonitor(

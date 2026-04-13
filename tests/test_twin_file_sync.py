@@ -15,12 +15,14 @@ sys.modules["cyberwave.fingerprint"] = cyberwave_fingerprint_stub
 startup = importlib.import_module("cyberwave_edge_core.startup")
 
 
-def test_extract_twin_update_payload_filters_unknown_fields_and_infers_asset_uuid() -> None:
+def test_extract_twin_update_payload_filters_unknown_fields() -> None:
     payload = startup._extract_twin_update_payload(
         {
             "name": "edge twin",
             "metadata": {"camera_id": "front"},
             "asset": {"uuid": "asset-123"},
+            "asset_uuid": "asset-123",
+            "environment_uuid": "env-456",
             "local_only": {"do_not_sync": True},
         }
     )
@@ -28,8 +30,10 @@ def test_extract_twin_update_payload_filters_unknown_fields_and_infers_asset_uui
     assert payload == {
         "name": "edge twin",
         "metadata": {"camera_id": "front"},
-        "asset_uuid": "asset-123",
     }
+    assert "asset_uuid" not in payload
+    assert "environment_uuid" not in payload
+    assert "local_only" not in payload
 
 
 def test_reconcile_twin_json_file_sync_tracks_then_syncs_changed_file(
@@ -91,6 +95,6 @@ def test_reconcile_twin_json_file_sync_tracks_then_syncs_changed_file(
     sent_twin_uuid, payload = calls[0]
     assert sent_twin_uuid == twin_uuid
     assert payload["metadata"] == {"edge_value": 2}
-    assert payload["asset_uuid"] == "asset-abc"
+    assert "asset_uuid" not in payload
     assert "local_only" not in payload
 

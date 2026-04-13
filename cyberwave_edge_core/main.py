@@ -31,14 +31,17 @@ def _resolve_log_level() -> int:
     return getattr(logging, raw_level, logging.INFO)
 
 
-# Configure logging so info/warning/error messages appear in journald.
-# The systemd journal captures stderr; use a clear format so log lines
-# are easy to filter with journalctl.
+# Configure logging so info/warning/error messages appear in journald / log files.
+# Include timestamps so macOS LaunchAgent log files are readable; on Linux
+# journalctl adds its own but the ISO prefix is still harmless.
 logging.basicConfig(
     level=_resolve_log_level(),
-    format="%(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stderr,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @click.group(invoke_without_command=True)
@@ -105,6 +108,7 @@ def worker() -> None:
 
 def _get_worker_manager() -> "WorkerManager":  # type: ignore[name-defined]  # noqa: F821
     """Build a WorkerManager from the current edge configuration."""
+    from .startup import _list_linked_twin_uuids_for_fingerprint, get_or_create_fingerprint
     from .worker_manager import WorkerManager
 
     token = load_token()
@@ -120,10 +124,22 @@ def _get_worker_manager() -> "WorkerManager":  # type: ignore[name-defined]  # n
         )
         environment_uuid = ""
 
+    twin_uuids: list[str] = []
+    if environment_uuid:
+        try:
+            fingerprint = get_or_create_fingerprint()
+            if fingerprint:
+                twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+                    token, environment_uuid, fingerprint
+                )
+        except Exception:
+            logger.debug("Failed to resolve twin UUIDs for environment", exc_info=True)
+
     return WorkerManager(
         config_dir=CONFIG_DIR,
         environment_uuid=environment_uuid or "",
         token=token,
+        twin_uuids=twin_uuids,
     )
 
 

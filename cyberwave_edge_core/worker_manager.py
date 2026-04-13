@@ -14,8 +14,9 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import subprocess
-import threading
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +26,6 @@ from .docker_helpers import (
     docker_available,
     docker_container_status,
     docker_has_nvidia_runtime,
-    docker_logs_follow,
     docker_rm,
 )
 
@@ -36,6 +36,33 @@ logger = logging.getLogger(__name__)
 
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
 DEFAULT_WORKER_IMAGE = "cyberwaveos/edge-ml-worker:latest"
+
+_LEVEL_COLORS = {
+    "DEBUG": "\033[36m",
+    "INFO": "\033[32m",
+    "WARNING": "\033[33m",
+    "ERROR": "\033[31m",
+    "CRITICAL": "\033[1;31m",
+}
+_RESET = "\033[0m"
+_DIM = "\033[2m"
+_LOG_RE = re.compile(
+    r"(\[(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\])"
+    r"(\s+\[[^\]]+\])"
+)
+
+
+def _colorize_log_line(line: str) -> str:
+    """Add ANSI colors to a plain log line at display time."""
+    m = _LOG_RE.search(line)
+    if not m:
+        return line
+    level_tag = m.group(1)
+    name_tag = m.group(2)
+    level = level_tag[1:-1]
+    color = _LEVEL_COLORS.get(level, "")
+    colored = f"{color}{level_tag}{_RESET}{_DIM}{name_tag}{_RESET}"
+    return line[: m.start()] + colored + line[m.end() :]
 
 
 @dataclass
@@ -125,8 +152,6 @@ class WorkerManager:
         self._resource_limits = resource_limits
         self._container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
         self._health_monitor: Optional["WorkerHealthMonitor"] = None
-        self._log_thread: Optional[threading.Thread] = None
-        self._log_thread_lock = threading.Lock()
 
     def set_health_monitor(self, monitor: "WorkerHealthMonitor") -> None:
         """Attach a WorkerHealthMonitor to this manager.
@@ -172,7 +197,6 @@ class WorkerManager:
         current_status = docker_container_status(self._container_name)
         if current_status == "running":
             logger.info("Worker container %s is already running", self._container_name)
-            self._ensure_log_stream()
             return True
 
         logger.info("Starting worker container %s (image=%s)", self._container_name, self._image)
@@ -275,22 +299,24 @@ class WorkerManager:
             logger.error("Docker is not available")
             return
 
+        cmd = ["docker", "logs", "--tail", "100"]
         if follow:
-            try:
-                subprocess.run(
-                    ["docker", "logs", "-f", "--tail", "100", self._container_name],
-                    check=False,
-                )
-            except (OSError, KeyboardInterrupt):
-                pass
-        else:
-            try:
-                subprocess.run(
-                    ["docker", "logs", "--tail", "100", self._container_name],
-                    check=False,
-                )
-            except OSError as exc:
-                logger.error("Failed to fetch container logs: %s", exc)
+            cmd.append("-f")
+        cmd.append(self._container_name)
+
+        use_color = sys.stdout.isatty()
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            if proc.stdout:
+                for line in proc.stdout:
+                    text = line.rstrip()
+                    if text:
+                        print(_colorize_log_line(text) if use_color else text)
+            proc.wait()
+        except (OSError, KeyboardInterrupt):
+            pass
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -327,13 +353,27 @@ class WorkerManager:
 
         if self._twin_uuids:
             env["CYBERWAVE_TWIN_UUIDS"] = ",".join(self._twin_uuids)
+            env.setdefault("CYBERWAVE_TWIN_UUID", self._twin_uuids[0])
 
         base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
         env["CYBERWAVE_BASE_URL"] = base_url
 
-        mqtt_host = get_runtime_env_var("CYBERWAVE_MQTT_HOST")
-        if mqtt_host:
-            env["CYBERWAVE_MQTT_HOST"] = mqtt_host
+        for mqtt_key in (
+            "CYBERWAVE_MQTT_HOST",
+            "CYBERWAVE_MQTT_PORT",
+            "CYBERWAVE_MQTT_USERNAME",
+            "CYBERWAVE_MQTT_USE_TLS",
+        ):
+            mqtt_val = get_runtime_env_var(mqtt_key)
+            if mqtt_val:
+                env[mqtt_key] = mqtt_val
+
+        # The Python SDK uses CYBERWAVE_API_KEY as the MQTT password.
+        # Workers only need MQTT (no REST), so when a dedicated MQTT
+        # password is configured, inject it as the API key.
+        mqtt_password = get_runtime_env_var("CYBERWAVE_MQTT_PASSWORD")
+        if mqtt_password:
+            env["CYBERWAVE_API_KEY"] = mqtt_password
 
         runtime_environment = (
             get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
@@ -344,6 +384,10 @@ class WorkerManager:
         zenoh_connect = get_runtime_env_var("ZENOH_CONNECT")
         if zenoh_connect:
             env["ZENOH_CONNECT"] = zenoh_connect
+
+        # Expose a TCP listener so the CLI monitor can connect from the host.
+        zenoh_listen = get_runtime_env_var("ZENOH_LISTEN")
+        env["ZENOH_LISTEN"] = zenoh_listen or "tcp/0.0.0.0:7447"
 
         if platform.system() == "Linux":
             env["ZENOH_SHM_ENABLED"] = "true"
@@ -380,7 +424,10 @@ class WorkerManager:
     def _build_network_args(self) -> list[str]:
         """Build network args; mirrors driver container networking."""
         if platform.system() == "Darwin":
-            return ["--add-host", "host.docker.internal:host-gateway"]
+            return [
+                "--add-host", "host.docker.internal:host-gateway",
+                "-p", "7447:7447/tcp",
+            ]
         return ["--network", "host"]
 
     def _run_container(self) -> bool:
@@ -461,8 +508,6 @@ class WorkerManager:
             logger.error("Docker run timed out for worker container %s", self._container_name)
             return False
 
-        self._ensure_log_stream()
-
         for _ in range(5):
             status = docker_container_status(self._container_name)
             if status == "running":
@@ -483,40 +528,6 @@ class WorkerManager:
         )
         return False
 
-    def _ensure_log_stream(self) -> None:
-        """Attach a background log-streaming thread if not already running."""
-        with self._log_thread_lock:
-            if self._log_thread and self._log_thread.is_alive():
-                return
-
-            thread = threading.Thread(
-                target=_follow_worker_logs,
-                args=(self._container_name,),
-                name=f"worker-logs-{self._container_name}",
-                daemon=True,
-            )
-            self._log_thread = thread
-            thread.start()
-
-
-def _follow_worker_logs(container_name: str) -> None:
-    """Background thread: stream worker container logs into the service logger."""
-    process = docker_logs_follow(container_name)
-    if process is None:
-        return
-    try:
-        if process.stdout:
-            for line in process.stdout:
-                message = line.rstrip()
-                if message:
-                    logger.info("[worker:%s] %s", container_name, message)
-    except Exception:
-        pass
-    finally:
-        try:
-            process.wait(timeout=2)
-        except Exception:
-            pass
 
 
 def get_zenoh_env_vars() -> dict[str, str]:
