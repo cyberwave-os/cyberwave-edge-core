@@ -440,6 +440,8 @@ cyberwave-edge-core worker logs --no-follow  # Print recent logs without followi
 
 Preview builds from `dev` / `staging` CI are published as **separate Debian packages** in the same apt repo: `cyberwave-edge-core-dev` and `cyberwave-edge-core-staging`. `apt install cyberwave-edge-core` only pulls tagged releases; use one of the channel packages explicitly when you want those binaries (the packages conflict because they ship the same `/usr/bin/cyberwave-edge-core`).
 
+On non-apt platforms, prerelease Python wheels are published to the Buildkite Python registry and consumed automatically by `cyberwave edge install --channel dev|staging`. Stable pip installs continue to use the public PyPI release.
+
 ### Environment variables
 
 Run against a different environment/base URL:
