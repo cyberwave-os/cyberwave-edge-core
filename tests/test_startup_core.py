@@ -14,8 +14,11 @@ import itertools
 import json
 import logging
 import os
+import stat
 import subprocess
 import uuid as _uuid_module
+from pathlib import Path
+from unittest.mock import patch
 
 import cyberwave_edge_core.startup as startup
 
@@ -1379,3 +1382,187 @@ class TestStartupHeartbeatOrdering:
             "start_edge_heartbeat",
             "fetch_drivers",
         ]
+
+
+# ===========================================================================
+# _fix_config_dir_ownership
+# ===========================================================================
+
+
+class TestFixConfigDirOwnership:
+    def test_noop_on_macos(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+        monkeypatch.setenv("SUDO_UID", "1000")
+        monkeypatch.setenv("SUDO_GID", "1000")
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        lchown_calls: list[tuple] = []
+        monkeypatch.setattr(startup.os, "lchown", lambda p, u, g: lchown_calls.append((p, u, g)))
+        startup._fix_config_dir_ownership()
+        assert lchown_calls == []
+
+    def test_noop_when_not_root(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 1000)
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        lchown_calls: list[tuple] = []
+        monkeypatch.setattr(startup.os, "lchown", lambda p, u, g: lchown_calls.append((p, u, g)))
+        startup._fix_config_dir_ownership()
+        assert lchown_calls == []
+
+    def test_noop_when_root_without_sudo(self, tmp_path: Path, monkeypatch) -> None:
+        """systemd runs as root with no SUDO_UID — should be a no-op."""
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+        monkeypatch.delenv("SUDO_UID", raising=False)
+        monkeypatch.delenv("SUDO_GID", raising=False)
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        lchown_calls: list[tuple] = []
+        monkeypatch.setattr(startup.os, "lchown", lambda p, u, g: lchown_calls.append((p, u, g)))
+        startup._fix_config_dir_ownership()
+        assert lchown_calls == []
+
+    def test_chowns_misowned_files_via_sudo(self, tmp_path: Path, monkeypatch) -> None:
+        """sudo cyberwave edge start: root process with SUDO_UID/SUDO_GID."""
+        target_uid, target_gid = 1000, 1000
+        (tmp_path / "credentials.json").write_text("{}")
+        (tmp_path / "subdir").mkdir()
+        (tmp_path / "subdir" / "nested.json").write_text("{}")
+
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+        monkeypatch.setenv("SUDO_UID", str(target_uid))
+        monkeypatch.setenv("SUDO_GID", str(target_gid))
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+
+        original_lstat = os.lstat
+        root_owned_paths = {
+            str(tmp_path),
+            str(tmp_path / "credentials.json"),
+            str(tmp_path / "subdir"),
+        }
+
+        def fake_lstat(path):
+            result = original_lstat(path)
+            if str(path) in root_owned_paths:
+                return os.stat_result(
+                    (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                     0, 0,
+                     result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                )
+            return result
+
+        monkeypatch.setattr(startup.os, "lstat", fake_lstat)
+
+        lchown_calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup.os, "lchown",
+            lambda p, u, g: lchown_calls.append((p, u, g)),
+        )
+
+        startup._fix_config_dir_ownership()
+
+        chowned_paths = {call[0] for call in lchown_calls}
+        assert str(tmp_path) in chowned_paths
+        assert str(tmp_path / "credentials.json") in chowned_paths
+        assert str(tmp_path / "subdir") in chowned_paths
+        # nested.json is owned by uid 1000 (matches target), should NOT be chowned
+        assert str(tmp_path / "subdir" / "nested.json") not in chowned_paths
+        for _, uid, gid in lchown_calls:
+            assert uid == target_uid
+            assert gid == target_gid
+
+    def test_no_duplicate_chown_for_subdirectories(self, tmp_path: Path, monkeypatch) -> None:
+        """Each path should be chowned at most once (no double-processing via dirnames)."""
+        (tmp_path / "subdir").mkdir()
+        (tmp_path / "subdir" / "file.txt").write_text("data")
+
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+        monkeypatch.setenv("SUDO_UID", "1000")
+        monkeypatch.setenv("SUDO_GID", "1000")
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+
+        original_lstat = os.lstat
+
+        def fake_lstat(path):
+            result = original_lstat(path)
+            return os.stat_result(
+                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                 0, 0, result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+            )
+
+        monkeypatch.setattr(startup.os, "lstat", fake_lstat)
+
+        lchown_calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup.os, "lchown",
+            lambda p, u, g: lchown_calls.append((p, u, g)),
+        )
+
+        startup._fix_config_dir_ownership()
+
+        all_paths = [call[0] for call in lchown_calls]
+        assert len(all_paths) == len(set(all_paths)), f"Duplicate chown calls: {all_paths}"
+
+    def test_handles_permission_error_gracefully(self, tmp_path: Path, monkeypatch) -> None:
+        (tmp_path / "file.json").write_text("{}")
+
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+        monkeypatch.setenv("SUDO_UID", "1000")
+        monkeypatch.setenv("SUDO_GID", "1000")
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+
+        original_lstat = os.lstat
+
+        def fake_lstat(path):
+            result = original_lstat(path)
+            return os.stat_result(
+                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                 0, 0, result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+            )
+
+        monkeypatch.setattr(startup.os, "lstat", fake_lstat)
+        monkeypatch.setattr(
+            startup.os, "lchown",
+            lambda p, u, g: (_ for _ in ()).throw(PermissionError("Operation not permitted")),
+        )
+
+        # Should not raise
+        startup._fix_config_dir_ownership()
+
+    def test_sudo_gid_defaults_to_sudo_uid_when_absent(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        (tmp_path / "file.json").write_text("{}")
+
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+        monkeypatch.setenv("SUDO_UID", "1000")
+        monkeypatch.delenv("SUDO_GID", raising=False)
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+
+        original_lstat = os.lstat
+
+        def fake_lstat(path):
+            result = original_lstat(path)
+            return os.stat_result(
+                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                 0, 0, result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+            )
+
+        monkeypatch.setattr(startup.os, "lstat", fake_lstat)
+
+        lchown_calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup.os, "lchown",
+            lambda p, u, g: lchown_calls.append((p, u, g)),
+        )
+
+        startup._fix_config_dir_ownership()
+
+        assert lchown_calls
+        for _, uid, gid in lchown_calls:
+            assert uid == 1000
+            assert gid == 1000

@@ -9,11 +9,23 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import platform
 import shutil
 import subprocess
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def build_user_args() -> list[str]:
+    """Return ``--user uid:gid`` flags on Linux so container writes match the host user.
+
+    On macOS, Docker Desktop transparently maps UIDs, so no flags are needed.
+    """
+    if platform.system() != "Linux":
+        return []
+    return ["--user", f"{os.getuid()}:{os.getgid()}"]
 
 
 def docker_available() -> bool:

@@ -3596,12 +3596,61 @@ def reconcile_twin_json_file_sync() -> dict[str, int]:
     return summary
 
 
+def _fix_config_dir_ownership() -> None:
+    """Re-chown CONFIG_DIR entries that were written as root back to the invoking user.
+
+    Only runs on Linux when the process is root *and* ``SUDO_UID`` is set (i.e.
+    invoked via ``sudo``).  Under the systemd unit (root, no ``SUDO_UID``) this
+    is a no-op.  Non-root processes cannot chown files they don't own, so they
+    skip the fix as well — the ``--user`` flag on new containers prevents future
+    mismatches.
+    """
+    if platform.system() != "Linux" or os.getuid() != 0:
+        return
+
+    sudo_uid = os.environ.get("SUDO_UID", "").strip()
+    sudo_gid = os.environ.get("SUDO_GID", "").strip()
+    if not sudo_uid:
+        return
+
+    target_uid = int(sudo_uid)
+    target_gid = int(sudo_gid) if sudo_gid else target_uid
+    fixed = 0
+
+    try:
+        for dirpath, _dirnames, filenames in os.walk(CONFIG_DIR):
+            for name in [dirpath] + [os.path.join(dirpath, f) for f in filenames]:
+                try:
+                    st = os.lstat(name)
+                except OSError:
+                    continue
+                if st.st_uid != target_uid:
+                    try:
+                        os.lchown(name, target_uid, target_gid)
+                        fixed += 1
+                    except OSError as exc:
+                        logger.debug("Cannot chown %s: %s", name, exc)
+    except OSError as exc:
+        logger.debug("Cannot walk %s for ownership fix: %s", CONFIG_DIR, exc)
+
+    if fixed:
+        logger.info(
+            "Fixed ownership on %d file(s) in %s (uid=%d, gid=%d)",
+            fixed,
+            CONFIG_DIR,
+            target_uid,
+            target_gid,
+        )
+
+
 def run_startup_checks() -> bool:
     """Execute every boot-time check in sequence.
 
     Prints a Rich-formatted report to the console.
     Returns ``True`` only when **all** checks pass.
     """
+    _fix_config_dir_ownership()
+
     console.print("\n[bold]Cyberwave Edge Core — Startup Checks[/bold]\n")
 
     # Log resolved configuration for troubleshooting
@@ -3991,11 +4040,19 @@ def _graceful_shutdown(worker_watcher: Optional[Any]) -> None:
         for name in driver_containers:
             try:
                 logger.info("Stopping driver container: %s", name)
-                _sp.run(
+                result = _sp.run(
                     ["docker", "stop", name],
                     timeout=15,
                     capture_output=True,
+                    text=True,
                 )
+                if result.returncode != 0:
+                    logger.debug(
+                        "docker stop %s exited with %d: %s",
+                        name,
+                        result.returncode,
+                        result.stderr.strip(),
+                    )
             except Exception:
                 logger.debug("Error stopping driver container %s", name, exc_info=True)
 

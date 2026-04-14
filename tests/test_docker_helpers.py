@@ -1,6 +1,7 @@
 """Unit tests for cyberwave_edge_core.docker_helpers.
 
 Covers:
+- build_user_args: returns --user on Linux, empty on macOS
 - docker_available: binary present / absent
 - docker_rm: success, CalledProcessError treated as success, timeout/OSError
 - docker_stop: success, CalledProcessError treated as success, timeout/OSError
@@ -34,6 +35,33 @@ def _make_completed(stdout: str = "", returncode: int = 0) -> MagicMock:
     m.stdout = stdout
     m.returncode = returncode
     return m
+
+
+# ---------------------------------------------------------------------------
+# build_user_args
+# ---------------------------------------------------------------------------
+
+
+class TestBuildUserArgs:
+    def test_returns_user_flag_on_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(dh.os, "getuid", lambda: 1000)
+        monkeypatch.setattr(dh.os, "getgid", lambda: 1000)
+        assert dh.build_user_args() == ["--user", "1000:1000"]
+
+    def test_returns_empty_on_macos(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Darwin")
+        assert dh.build_user_args() == []
+
+    def test_returns_empty_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Windows")
+        assert dh.build_user_args() == []
+
+    def test_uses_actual_uid_gid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(dh.os, "getuid", lambda: 501)
+        monkeypatch.setattr(dh.os, "getgid", lambda: 20)
+        assert dh.build_user_args() == ["--user", "501:20"]
 
 
 # ---------------------------------------------------------------------------

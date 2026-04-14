@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from .docker_helpers import (
+    build_user_args,
     docker_available,
     docker_container_status,
     docker_has_nvidia_runtime,
@@ -530,6 +531,8 @@ class WorkerManager:
                     self._resource_limits,
                 )
 
+        user_args = build_user_args()
+
         cmd = [
             "docker",
             "run",
@@ -537,6 +540,7 @@ class WorkerManager:
             "--restart",
             "unless-stopped",
             *network_args,
+            *user_args,
             "--name",
             self._container_name,
             *gpu_args,
