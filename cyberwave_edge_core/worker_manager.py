@@ -35,7 +35,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
-DEFAULT_WORKER_IMAGE = "cyberwaveos/edge-ml-worker:latest"
+_WORKER_IMAGE_BASE = "cyberwaveos/edge-ml-worker"
+DEFAULT_WORKER_IMAGE = f"{_WORKER_IMAGE_BASE}:latest"
+
+
+def resolve_worker_image() -> str:
+    """Return the worker image reference for the current environment.
+
+    Non-production environments (dev, staging, …) use the environment name
+    as the Docker tag.  Production and unknown environments use ``:latest``.
+    """
+    from .startup import get_runtime_env_var
+
+    env_name = (get_runtime_env_var("CYBERWAVE_ENVIRONMENT") or "").strip().lower()
+    if env_name and env_name != "production":
+        return f"{_WORKER_IMAGE_BASE}:{env_name}"
+    return DEFAULT_WORKER_IMAGE
 
 _LEVEL_COLORS = {
     "DEBUG": "\033[36m",
@@ -401,6 +416,12 @@ class WorkerManager:
                 env.setdefault(key, value.strip())
 
         env["CYBERWAVE_EDGE_HOST_PLATFORM"] = platform.system().lower()
+
+        # Auto-infer MQTT TLS when port 8883 is configured but USE_TLS is absent.
+        if "CYBERWAVE_MQTT_USE_TLS" not in env:
+            if env.get("CYBERWAVE_MQTT_PORT") == "8883":
+                env["CYBERWAVE_MQTT_USE_TLS"] = "true"
+
         return env
 
     def _build_volume_args(self) -> list[str]:
@@ -430,6 +451,40 @@ class WorkerManager:
             ]
         return ["--network", "host"]
 
+    @staticmethod
+    def _ensure_image_pulled(image: str, timeout: int = 600) -> bool:
+        """Pull *image* if it is not available locally.
+
+        Uses a generous timeout (default 10 min) to accommodate large GPU
+        images on slow connections.  Returns True when the image is available.
+        """
+        check = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+        )
+        if check.returncode == 0:
+            logger.debug("Image %s already present locally", image)
+            return True
+
+        logger.info("Pulling worker image %s (timeout=%ds)...", image, timeout)
+        try:
+            subprocess.run(
+                ["docker", "pull", image],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            logger.info("Successfully pulled %s", image)
+            return True
+        except subprocess.CalledProcessError as exc:
+            logger.error("Failed to pull worker image %s: %s", image, exc.stderr)
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error("Timed out pulling worker image %s after %ds", image, timeout)
+            return False
+
     def _run_container(self) -> bool:
         """Pull (if needed) and run the worker container. Returns True on success."""
         from .startup import DEFAULT_ENVIRONMENT, get_runtime_env_var
@@ -453,9 +508,11 @@ class WorkerManager:
         network_args = self._build_network_args()
 
         gpu_args: list[str] = []
+        non_gpu_image: str | None = None
         if docker_has_nvidia_runtime():
             gpu_args = ["--gpus", "all"]
             if image.startswith("cyberwaveos/edge-ml-worker:") and not image.endswith("-gpu"):
+                non_gpu_image = image
                 image = f"{image}-gpu"
                 logger.info("NVIDIA runtime detected; using GPU image %s", image)
             else:
@@ -491,6 +548,19 @@ class WorkerManager:
         ]
 
         logger.info("Starting worker container %s from image %s", self._container_name, image)
+
+        if not self._ensure_image_pulled(image):
+            if non_gpu_image:
+                logger.warning(
+                    "GPU image %s unavailable; falling back to %s", image, non_gpu_image
+                )
+                image = non_gpu_image
+                cmd[-1] = image
+                if not self._ensure_image_pulled(image):
+                    return False
+            else:
+                return False
+
         try:
             subprocess.run(
                 cmd,

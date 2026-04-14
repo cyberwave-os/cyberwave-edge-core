@@ -1,15 +1,15 @@
 """Boot-time startup checks for the Cyberwave Edge Core.
 
 On every boot the edge core must:
-  1. Read the API token from ``/etc/cyberwave/credentials.json``
+  1. Read the API token from ``~/.cyberwave/credentials.json``
   2. Validate the token against the Cyberwave REST API
   3. Verify that it can connect to the MQTT broker
-  4. Check whether an environment is linked via ``/etc/cyberwave/environment.json``
+  4. Check whether an environment is linked via ``~/.cyberwave/environment.json``
 
-The config directory defaults to:
-  - ``/etc/cyberwave`` on Linux
-  - ``~/.cyberwave`` on macOS
-and can be overridden with the ``CYBERWAVE_EDGE_CONFIG_DIR`` environment variable.
+The config directory defaults to ``~/.cyberwave`` on all platforms
+(under the invoking user's home, even when running via ``sudo``).
+It can be overridden with the ``CYBERWAVE_EDGE_CONFIG_DIR`` environment variable.
+Legacy installs using ``/etc/cyberwave`` are migrated automatically.
 
 This module exposes each check individually (for the ``status`` command)
 and a single ``run_startup_checks()`` orchestrator for the boot path.
@@ -30,6 +30,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -69,13 +70,15 @@ def _resolve_sudo_user_home() -> Optional[Path]:
 
 
 def _resolve_default_config_dir() -> Path:
-    """Return default edge config directory for this platform."""
-    if platform.system() == "Darwin":
-        # Docker Desktop cannot reliably bind-mount /etc paths on macOS.
-        sudo_home = _resolve_sudo_user_home()
-        base_home = sudo_home or Path.home()
-        return base_home / ".cyberwave"
-    return Path("/etc/cyberwave")
+    """Return default edge config directory for this platform.
+
+    All platforms now resolve to ``~/.cyberwave`` (under the invoking
+    user's home, even when running via ``sudo``).  The legacy Linux
+    path ``/etc/cyberwave`` is handled by migration.
+    """
+    sudo_home = _resolve_sudo_user_home()
+    base_home = sudo_home or Path.home()
+    return base_home / ".cyberwave"
 
 
 def _resolve_config_dir() -> Path:
@@ -86,24 +89,22 @@ def _resolve_config_dir() -> Path:
     return _resolve_default_config_dir()
 
 
-_LEGACY_MACOS_CONFIG_DIR = Path("/etc/cyberwave")
+_LEGACY_SYSTEM_CONFIG_DIR = Path("/etc/cyberwave")
 
 
-def _migrate_legacy_macos_config(config_dir: Path) -> None:
-    """Best-effort migration from legacy /etc/cyberwave to macOS user config dir.
+def _migrate_legacy_config(config_dir: Path) -> None:
+    """Best-effort migration from legacy /etc/cyberwave to user config dir.
 
-    This keeps existing macOS installs working after moving defaults away from
-    /etc for Docker bind-mount compatibility.
+    Older versions stored config under ``/etc/cyberwave`` on Linux (and
+    briefly on macOS).  Now all platforms use ``~/.cyberwave``.  This
+    copies JSON files from the legacy path so users don't lose their
+    configuration after an upgrade.  Existing files are never overwritten.
     """
-    if platform.system() != "Darwin":
-        return
     if os.getenv("CYBERWAVE_EDGE_CONFIG_DIR", "").strip():
         return
-    if config_dir == _LEGACY_MACOS_CONFIG_DIR:
+    if config_dir == _LEGACY_SYSTEM_CONFIG_DIR:
         return
-    if not _LEGACY_MACOS_CONFIG_DIR.exists():
-        return
-    if (config_dir / "credentials.json").exists():
+    if not _LEGACY_SYSTEM_CONFIG_DIR.exists():
         return
 
     try:
@@ -113,7 +114,7 @@ def _migrate_legacy_macos_config(config_dir: Path) -> None:
 
     bootstrap_logger = logging.getLogger(__name__)
     copied_files = 0
-    for json_file in _LEGACY_MACOS_CONFIG_DIR.glob("*.json"):
+    for json_file in _LEGACY_SYSTEM_CONFIG_DIR.glob("*.json"):
         if not json_file.is_file():
             continue
         target_file = config_dir / json_file.name
@@ -121,22 +122,26 @@ def _migrate_legacy_macos_config(config_dir: Path) -> None:
             continue
         try:
             shutil.copy2(json_file, target_file)
+            if os.name != "nt":
+                os.chmod(target_file, 0o600)
             copied_files += 1
         except OSError:
             continue
     if copied_files:
         bootstrap_logger.info(
-            "Migrated %d legacy macOS edge config file(s) from %s to %s",
+            "Migrated %d legacy edge config file(s) from %s to %s",
             copied_files,
-            _LEGACY_MACOS_CONFIG_DIR,
+            _LEGACY_SYSTEM_CONFIG_DIR,
             config_dir,
         )
 
 
 def _bootstrap_runtime_env_vars() -> None:
     """Load persisted runtime env vars into process env for child imports."""
+    if os.name != "nt":
+        os.umask(0o077)
     config_dir = _resolve_config_dir()
-    _migrate_legacy_macos_config(config_dir)
+    _migrate_legacy_config(config_dir)
     credentials_file = config_dir / "credentials.json"
     try:
         if not credentials_file.exists():
@@ -214,8 +219,7 @@ _token_log_lock = threading.Lock()
 # ---- constants ---------------------------------------------------------------
 
 # Edge config directory. The systemd unit sets CYBERWAVE_EDGE_CONFIG_DIR on
-# Linux. For manual invocation, defaults to /etc/cyberwave on Linux and to the
-# invoking user's ~/.cyberwave on macOS for Docker bind-mount compatibility.
+# Linux. For manual invocation, defaults to ~/.cyberwave on all platforms.
 CONFIG_DIR = _resolve_config_dir()
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
@@ -229,6 +233,35 @@ DRIVER_RESTART_LOOP_THRESHOLD = int(os.getenv("CYBERWAVE_DRIVER_RESTART_LOOP_THR
 DRIVER_RESTART_LOOP_WINDOW_SECONDS = float(
     os.getenv("CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS", "60")
 )
+
+
+def _atomic_write_json(path: Path, data: Any, *, mode: int = 0o600) -> None:
+    """Atomically write *data* as JSON to *path* with restrictive permissions.
+
+    Uses a sibling temp file + ``os.replace`` so readers never see a
+    half-written file.  On POSIX the file is ``chmod``-ed to *mode*
+    **before** the rename.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 DEFAULT_DRIVER_TROUBLESHOOTING_URL = "https://docs.cyberwave.com"
 DRIVER_TROUBLESHOOTING_URL = (
     os.getenv("CYBERWAVE_DRIVER_TROUBLESHOOTING_URL", DEFAULT_DRIVER_TROUBLESHOOTING_URL).strip()
@@ -412,6 +445,31 @@ def _resolve_macos_camera_bridge_candidates(asset: Any, twin_metadata: dict[str,
         candidate_devices.append("/dev/video0")
 
     return list(dict.fromkeys(candidate_devices))
+
+
+def _load_selected_camera_device() -> Optional[str]:
+    """Read the selected video device from ``cameras.json``.
+
+    Returns the ``/dev/video<N>`` path if ``cameras.json`` exists and has a
+    valid ``selected_device`` index, otherwise ``None``.
+    """
+    cameras_file = CONFIG_DIR / "cameras.json"
+    if not cameras_file.exists():
+        return None
+    try:
+        with open(cameras_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.debug("Could not read cameras.json")
+        return None
+    selected = data.get("selected_device")
+    if selected is None:
+        return None
+    try:
+        selected_index = int(selected)
+    except (ValueError, TypeError):
+        return None
+    return f"/dev/video{selected_index}"
 
 
 def _resolve_mqtt_kwargs() -> dict[str, Any]:
@@ -735,10 +793,7 @@ def load_saved_fingerprint() -> Optional[str]:
 def save_fingerprint(fingerprint: str) -> bool:
     """Persist fingerprint to the edge config directory."""
     try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(FINGERPRINT_FILE, "w") as f:
-            json.dump({"fingerprint": fingerprint}, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(FINGERPRINT_FILE, {"fingerprint": fingerprint})
         return True
     except OSError as exc:
         logger.warning("Failed to save fingerprint file: %s", exc)
@@ -1100,8 +1155,13 @@ def _run_docker_image(
     token: str,
     child_camera_twin_uuids: Optional[list[str]] = None,
     macos_bridge_device_candidates: Optional[list[str]] = None,
+    skip_pull: bool = False,
 ) -> bool:
-    """Pull and run a driver Docker container for a twin.
+    """Run a driver Docker container for a twin.
+
+    When *skip_pull* is False (the default) the image is pulled first.
+    Set *skip_pull* to True when images have already been fetched by an
+    earlier parallel-pull phase.
 
     The container is started in detached mode with ``--restart unless-stopped``
     so it persists across reboots.  Environment variables are passed so the
@@ -1115,15 +1175,10 @@ def _run_docker_image(
         return False
 
     container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+    image = _resolve_driver_image_tag(image)
     runtime_environment = (
         get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
     ).lower()
-
-    # check if the docker image has a tag first
-    if ":" not in image:
-        if runtime_environment != "production":
-            # Example: cyberwaveos/cyberwave-edge-so101:dev
-            image = f"{image}:{runtime_environment}"
 
     # Remove any existing container with the same name (idempotent re-runs)
     subprocess.run(
@@ -1135,73 +1190,83 @@ def _run_docker_image(
     driver_alert_ctx = DriverStartingAlertContext(twin_uuid=twin_uuid, image=image)
     driver_alert_ctx.create()
 
-    try:
-        _pull_docker_image_with_progress(
-            image,
-            container_name=container_name,
-            twin_uuid=twin_uuid,
-            token=token,
-            driver_alert_ctx=driver_alert_ctx,
-        )
-    except subprocess.CalledProcessError as exc:
-        err_tail = (exc.stderr or "").strip() or "unknown error"
-        if _docker_image_exists_locally(image):
-            logger.warning(
-                "Failed to pull docker image %s (%s); using local image copy",
-                image,
-                err_tail,
-            )
-            driver_alert_ctx.update_metadata(
-                {
-                    "phase": "pull_failed_using_local",
-                    "last_error": err_tail[:500],
-                },
-                force=True,
-            )
-            driver_alert_ctx.resolve()
-        else:
-            logger.error("Failed to pull docker image %s: %s", image, exc.stderr)
+    if skip_pull:
+        if not _docker_image_exists_locally(image):
+            logger.error("Image %s not available locally (skip_pull=True)", image)
             driver_alert_ctx.fail_without_resolve(
-                f"Failed to pull driver image {image}. {err_tail[:300]}",
-                phase="pull_failed",
+                f"Driver image {image} not available locally after pull phase.",
+                phase="image_missing",
             )
             return False
-    except subprocess.TimeoutExpired:
-        if _docker_image_exists_locally(image):
-            logger.warning(
-                "Docker pull timed out for image %s; using local image copy",
-                image,
-            )
-            driver_alert_ctx.update_metadata({"phase": "pull_timeout_using_local"}, force=True)
-            driver_alert_ctx.resolve()
-        else:
-            logger.error("Docker pull timed out for image: %s", image)
-            driver_alert_ctx.fail_without_resolve(
-                f"Timed out pulling driver image {image}.",
-                phase="pull_timeout",
-            )
-            return False
-    except OSError as exc:
-        if _docker_image_exists_locally(image):
-            logger.warning(
-                "Docker pull OS error for image %s; using local image copy: %s",
-                image,
-                exc,
-            )
-            driver_alert_ctx.update_metadata(
-                {"phase": "pull_oserror_using_local", "last_error": str(exc)[:500]},
-                force=True,
-            )
-            driver_alert_ctx.resolve()
-        else:
-            logger.error("Docker pull failed for image %s: %s", image, exc)
-            driver_alert_ctx.fail_without_resolve(
-                f"Could not pull driver image {image}: {exc}",
-                phase="pull_oserror",
-            )
-            return False
+        driver_alert_ctx.update_metadata({"phase": "pull_skipped"}, force=True)
     else:
-        driver_alert_ctx.update_metadata({"phase": "pull_complete"}, force=True)
+        try:
+            _pull_docker_image_with_progress(
+                image,
+                container_name=container_name,
+                twin_uuid=twin_uuid,
+                token=token,
+                driver_alert_ctx=driver_alert_ctx,
+            )
+        except subprocess.CalledProcessError as exc:
+            err_tail = (exc.stderr or "").strip() or "unknown error"
+            if _docker_image_exists_locally(image):
+                logger.warning(
+                    "Failed to pull docker image %s (%s); using local image copy",
+                    image,
+                    err_tail,
+                )
+                driver_alert_ctx.update_metadata(
+                    {
+                        "phase": "pull_failed_using_local",
+                        "last_error": err_tail[:500],
+                    },
+                    force=True,
+                )
+                driver_alert_ctx.resolve()
+            else:
+                logger.error("Failed to pull docker image %s: %s", image, exc.stderr)
+                driver_alert_ctx.fail_without_resolve(
+                    f"Failed to pull driver image {image}. {err_tail[:300]}",
+                    phase="pull_failed",
+                )
+                return False
+        except subprocess.TimeoutExpired:
+            if _docker_image_exists_locally(image):
+                logger.warning(
+                    "Docker pull timed out for image %s; using local image copy",
+                    image,
+                )
+                driver_alert_ctx.update_metadata({"phase": "pull_timeout_using_local"}, force=True)
+                driver_alert_ctx.resolve()
+            else:
+                logger.error("Docker pull timed out for image: %s", image)
+                driver_alert_ctx.fail_without_resolve(
+                    f"Timed out pulling driver image {image}.",
+                    phase="pull_timeout",
+                )
+                return False
+        except OSError as exc:
+            if _docker_image_exists_locally(image):
+                logger.warning(
+                    "Docker pull OS error for image %s; using local image copy: %s",
+                    image,
+                    exc,
+                )
+                driver_alert_ctx.update_metadata(
+                    {"phase": "pull_oserror_using_local", "last_error": str(exc)[:500]},
+                    force=True,
+                )
+                driver_alert_ctx.resolve()
+            else:
+                logger.error("Docker pull failed for image %s: %s", image, exc)
+                driver_alert_ctx.fail_without_resolve(
+                    f"Could not pull driver image {image}: {exc}",
+                    phase="pull_oserror",
+                )
+                return False
+        else:
+            driver_alert_ctx.update_metadata({"phase": "pull_complete"}, force=True)
         driver_alert_ctx.resolve()
 
     # Build env vars for the container
@@ -1218,6 +1283,14 @@ def _run_docker_image(
             container_env["CYBERWAVE_CHILD_TWIN_UUIDS"] = child_uuids_csv
 
     explicit_params_env = _extract_docker_env_map(params)
+
+    # On Linux, read the selected camera device from cameras.json so camera
+    # drivers open the correct /dev/video* instead of defaulting to index 0.
+    if platform.system() == "Linux" and "CYBERWAVE_METADATA_VIDEO_DEVICE" not in explicit_params_env:
+        selected_video_device = _load_selected_camera_device()
+        if selected_video_device is not None:
+            container_env.setdefault("CYBERWAVE_METADATA_VIDEO_DEVICE", selected_video_device)
+
     macos_bridge_mappings = _normalize_macos_bridge_candidates(macos_bridge_device_candidates)
 
     # Determine USB/IP state early so the bridge function can skip video
@@ -1303,6 +1376,17 @@ def _run_docker_image(
                 continue
             container_env.setdefault(key, value.strip())
 
+    # Auto-infer MQTT TLS when port 8883 is configured but USE_TLS is absent.
+    # Port 8883 is the IANA-assigned MQTT-over-TLS port; C++ drivers (unlike the
+    # Python SDK) do not auto-detect this and need the explicit flag.
+    if (
+        "CYBERWAVE_MQTT_USE_TLS" not in container_env
+        and "CYBERWAVE_MQTT_USE_TLS" not in explicit_params_env
+    ):
+        mqtt_port = container_env.get("CYBERWAVE_MQTT_PORT", "")
+        if mqtt_port == "8883":
+            container_env["CYBERWAVE_MQTT_USE_TLS"] = "true"
+
     # Driver reads setup.json from so101_lib under this dir (mounted CONFIG_DIR)
     container_env["CYBERWAVE_EDGE_CONFIG_DIR"] = "/app/.cyberwave"
 
@@ -1350,8 +1434,15 @@ def _run_docker_image(
     if twin_json_file.is_file():
         env_vars += ["-v", f"{twin_json_file}:/app/{twin_uuid}.json"]
         env_vars += ["-e", f"CYBERWAVE_TWIN_JSON_FILE=/app/{twin_uuid}.json"]
-    # sync the edge config directory into the container
-    env_vars += ["-v", f"{CONFIG_DIR}:/app/.cyberwave"]
+    # Mount the edge config directory read-only so driver containers cannot
+    # tamper with credentials.json or other sensitive config files.
+    env_vars += ["-v", f"{CONFIG_DIR}:/app/.cyberwave:ro"]
+    # SO101 drivers need write access to so101_lib/ for calibrations and URDF
+    # downloads.  Mount that subdirectory read-write as an overlay.
+    so101_lib_dir = CONFIG_DIR / "so101_lib"
+    if so101_lib_dir.is_dir() or "so101" in image.lower():
+        so101_lib_dir.mkdir(parents=True, exist_ok=True)
+        env_vars += ["-v", f"{so101_lib_dir}:/app/.cyberwave/so101_lib"]
 
     network_args = _build_driver_network_args(params)
 
@@ -1526,6 +1617,110 @@ def _docker_image_exists_locally(image: str) -> bool:
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return False
+
+
+def _resolve_driver_image_tag(image: str) -> str:
+    """Append the environment tag to a driver image reference when missing."""
+    if ":" in image:
+        return image
+    runtime_environment = (
+        get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
+    ).lower()
+    if runtime_environment != "production":
+        return f"{image}:{runtime_environment}"
+    return image
+
+
+def _pull_driver_images_parallel(
+    images: list[str],
+    token: str,
+    *,
+    timeout: int = 600,
+) -> dict[str, bool]:
+    """Pull unique driver images in parallel with periodic progress logging.
+
+    Returns a mapping of image -> success boolean.  Images that are already
+    present locally are not re-pulled (but ``docker pull`` is still attempted
+    to pick up newer tags — failure with a local copy is treated as success).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    unique_images = list(dict.fromkeys(images))
+    if not unique_images:
+        return {}
+
+    results: dict[str, bool] = {}
+
+    def _pull_one(image: str) -> tuple[str, bool]:
+        try:
+            process = subprocess.Popen(
+                ["docker", "pull", image],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            process.wait(timeout=timeout)
+            return image, process.returncode == 0
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            return image, False
+        except OSError:
+            return image, False
+
+    logger.info(
+        "Pulling %d unique driver image(s) in parallel: %s",
+        len(unique_images),
+        ", ".join(unique_images),
+    )
+
+    futures_map: dict[Any, str] = {}
+    with ThreadPoolExecutor(max_workers=min(len(unique_images), 4)) as pool:
+        for img in unique_images:
+            future = pool.submit(_pull_one, img)
+            futures_map[future] = img
+
+        pending = set(futures_map.keys())
+        while pending:
+            # Log a dot-style heartbeat while pulls are in progress.
+            done_batch: set[Any] = set()
+            for future in list(pending):
+                if future.done():
+                    done_batch.add(future)
+            if done_batch:
+                for future in done_batch:
+                    pending.discard(future)
+                    img = futures_map[future]
+                    img_name, pulled = future.result()
+                    if pulled:
+                        logger.info("Pulled %s", img_name)
+                        results[img_name] = True
+                    elif _docker_image_exists_locally(img_name):
+                        logger.warning(
+                            "Pull failed for %s; using local copy", img_name
+                        )
+                        results[img_name] = True
+                    else:
+                        logger.error("Failed to pull %s and no local copy", img_name)
+                        results[img_name] = False
+            else:
+                pulling_names = [futures_map[f] for f in pending]
+                logger.info("Still pulling: %s ...", ", ".join(pulling_names))
+                time.sleep(5)
+
+    pulled_count = sum(1 for v in results.values() if v)
+    failed_count = len(results) - pulled_count
+    if failed_count:
+        logger.warning(
+            "Image pull complete: %d succeeded, %d failed", pulled_count, failed_count
+        )
+    else:
+        logger.info("All %d driver image(s) ready", pulled_count)
+
+    return results
 
 
 def _inspect_driver_container(container_name: str) -> Optional[dict[str, Any]]:
@@ -2423,15 +2618,26 @@ def fetch_and_run_twin_drivers(
         for child_uuid in child_uuids
     }
 
-    results: List[Dict[str, Any]] = []
+    # ------------------------------------------------------------------
+    # Pass 1: Resolve driver images and collect per-twin launch specs.
+    # ------------------------------------------------------------------
+
+    @dataclass
+    class _DriverSpec:
+        twin: Any
+        twin_uuid: str
+        driver_image: str
+        driver_params: list[str]
+        child_camera_twin_uuids: list[str]
+        macos_bridge_candidates: list[str]
+
+    driver_specs: list[_DriverSpec] = []
 
     for twin in twins:
         twin_uuid = str(getattr(twin, "uuid", ""))
         if not twin_uuid:
             continue
 
-        # The edge writes edge_fingerprint into twin metadata when the user
-        # selects which twins this edge controls.  Match on that field.
         twin_metadata = twin.metadata if isinstance(twin.metadata, dict) else {}
         if twin_metadata.get("edge_fingerprint") != fingerprint:
             continue
@@ -2443,7 +2649,6 @@ def fetch_and_run_twin_drivers(
             fingerprint,
         )
 
-        # Get the asset to check for driver_docker_image
         asset = assets_by_twin_uuid.get(twin_uuid)
         if asset is None:
             asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
@@ -2473,12 +2678,6 @@ def fetch_and_run_twin_drivers(
                 twin_uuid,
                 attach_to,
             )
-            # _check_and_alert_sensors_devices(
-            #     twin_uuid,
-            #     twin.name or f"twin-{twin_uuid[:8]}",
-            #     asset,
-            #     twin_metadata,
-            # )
             _persist_twin_json_for_driver(twin, twin_uuid, asset)
             continue
 
@@ -2487,30 +2686,18 @@ def fetch_and_run_twin_drivers(
         if not isinstance(asset_metadata, dict):
             asset_metadata = {}
         if not drivers:
-            # try fallback to asset metadata
             drivers = asset_metadata.get("drivers")
             if not drivers:
-                # Check if this twin is attached to another twin (e.g. camera on SO101).
-                # If so, skip running a driver but still write the JSON file so the
-                # parent driver can discover and use it.
                 if attach_to:
-                    # Twin is attached to another - write JSON and skip (parent driver handles it)
                     logger.info(
                         "Twin '%s' has no driver but is attached to %s; "
                         "writing JSON for parent driver to use",
                         twin.name,
                         attach_to,
                     )
-                    # _check_and_alert_sensors_devices(
-                    #     twin_uuid,
-                    #     twin.name or f"twin-{twin_uuid[:8]}",
-                    #     asset,
-                    #     twin_metadata,
-                    # )
                     _persist_twin_json_for_driver(twin, twin_uuid, asset)
                     continue
 
-                # No drivers and not attached to anything - this is an error
                 logger.warning("No drivers specified in asset metadata for twin '%s'", twin.name)
                 _send_alert_for_twin(
                     twin_uuid,
@@ -2534,8 +2721,6 @@ def fetch_and_run_twin_drivers(
             child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
         )
 
-        # Apply local driver image override from credentials.json (takes precedence
-        # over the cloud-configured image, useful when cloud asset can't be updated).
         _driver_overrides = load_driver_overrides()
         if twin_uuid in _driver_overrides:
             override_image = _driver_overrides[twin_uuid]
@@ -2547,13 +2732,6 @@ def fetch_and_run_twin_drivers(
             )
             driver_image = override_image
             driver_params = []
-
-        # _check_and_alert_sensors_devices(
-        #     twin_uuid,
-        #     twin.name or f"twin-{twin_uuid[:8]}",
-        #     asset,
-        #     twin_metadata,
-        # )
 
         _persist_twin_json_for_driver(twin, twin_uuid, asset)
 
@@ -2569,13 +2747,15 @@ def fetch_and_run_twin_drivers(
                 f"No drivers specified in asset metadata for paired twin '{twin.name}'"
             )
 
-        child_camera_twin_uuids = list(dict.fromkeys(camera_children_by_parent.get(twin_uuid, [])))
-        if child_camera_twin_uuids:
+        driver_image = _resolve_driver_image_tag(driver_image)
+
+        child_camera_uuids = list(dict.fromkeys(camera_children_by_parent.get(twin_uuid, [])))
+        if child_camera_uuids:
             logger.info(
                 "Passing %d child camera twin UUID(s) to parent twin '%s': %s",
-                len(child_camera_twin_uuids),
+                len(child_camera_uuids),
                 twin.name,
-                ",".join(child_camera_twin_uuids),
+                ",".join(child_camera_uuids),
             )
 
         macos_bridge_candidates: list[str] = []
@@ -2589,33 +2769,84 @@ def fetch_and_run_twin_drivers(
                     ",".join(macos_bridge_candidates),
                 )
 
-        logger.info("Running driver docker image %s for twin '%s'", driver_image, twin.name)
+        driver_specs.append(_DriverSpec(
+            twin=twin,
+            twin_uuid=twin_uuid,
+            driver_image=driver_image,
+            driver_params=driver_params,
+            child_camera_twin_uuids=child_camera_uuids,
+            macos_bridge_candidates=macos_bridge_candidates,
+        ))
+
+    # ------------------------------------------------------------------
+    # Pass 2: Pull all unique driver images in parallel.
+    # ------------------------------------------------------------------
+
+    if driver_specs:
+        images_to_pull = [spec.driver_image for spec in driver_specs]
+        pull_results = _pull_driver_images_parallel(images_to_pull, token)
+    else:
+        pull_results = {}
+
+    # ------------------------------------------------------------------
+    # Pass 3: Start containers (images are already local).
+    # ------------------------------------------------------------------
+
+    results: List[Dict[str, Any]] = []
+
+    for spec in driver_specs:
+        if not pull_results.get(spec.driver_image, False):
+            logger.error(
+                "Skipping driver for twin '%s' — image %s not available",
+                spec.twin.name,
+                spec.driver_image,
+            )
+            _send_alert_for_twin(
+                spec.twin_uuid,
+                "Driver image not available",
+                f"Driver image '{spec.driver_image}' could not be pulled for twin "
+                f"'{spec.twin.name}'. Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}",
+                "driver_start_failure",
+                severity="error",
+            )
+            results.append({
+                "twin_uuid": spec.twin_uuid,
+                "twin_name": spec.twin.name,
+                "driver_image": spec.driver_image,
+                "success": False,
+            })
+            continue
+
+        logger.info(
+            "Starting driver container %s for twin '%s'",
+            spec.driver_image,
+            spec.twin.name,
+        )
         try:
             success = _run_docker_image(
-                driver_image,
-                driver_params,
-                twin_uuid=twin_uuid,
+                spec.driver_image,
+                spec.driver_params,
+                twin_uuid=spec.twin_uuid,
                 token=token,
-                child_camera_twin_uuids=child_camera_twin_uuids,
-                macos_bridge_device_candidates=macos_bridge_candidates,
+                child_camera_twin_uuids=spec.child_camera_twin_uuids,
+                macos_bridge_device_candidates=spec.macos_bridge_candidates,
+                skip_pull=True,
             )
-            results.append(
-                {
-                    "twin_uuid": twin_uuid,
-                    "twin_name": twin.name,
-                    "driver_image": driver_image,
-                    "success": success,
-                }
-            )
+            results.append({
+                "twin_uuid": spec.twin_uuid,
+                "twin_name": spec.twin.name,
+                "driver_image": spec.driver_image,
+                "success": success,
+            })
             if not success:
                 try:
                     startup_failure_message = (
-                        f"Driver image '{driver_image}' for twin '{twin.name}' failed to start "
-                        "on this edge. Check that required hardware is connected and accessible. "
-                        f"Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}"
+                        f"Driver image '{spec.driver_image}' for twin '{spec.twin.name}' "
+                        "failed to start on this edge. Check that required hardware is "
+                        f"connected and accessible. Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}"
                     )
                     _send_alert_for_twin(
-                        twin_uuid,
+                        spec.twin_uuid,
                         "Driver failed to start",
                         startup_failure_message,
                         "driver_start_failure",
@@ -2624,20 +2855,20 @@ def fetch_and_run_twin_drivers(
                 except Exception as alert_exc:
                     logger.warning(
                         "Could not send startup-failure alert for twin %s: %s",
-                        twin_uuid,
+                        spec.twin_uuid,
                         alert_exc,
                     )
         except Exception as exc:
             _send_alert_for_twin(
-                twin_uuid,
+                spec.twin_uuid,
                 "Failed to run driver docker image",
-                f"Failed to run driver docker image for twin '{twin.name}': {exc}",
+                f"Failed to run driver docker image for twin '{spec.twin.name}': {exc}",
                 "error",
             )
             logger.error(
                 "Failed to run driver docker image %s for twin '%s': %s",
-                driver_image,
-                twin.name,
+                spec.driver_image,
+                spec.twin.name,
                 exc,
             )
 
@@ -2652,13 +2883,14 @@ def _start_worker_after_drivers(
 ) -> None:
     """Start the worker container after driver startup (best-effort, non-blocking)."""
     try:
-        from .worker_manager import WorkerManager
+        from .worker_manager import WorkerManager, resolve_worker_image
 
         worker_manager = WorkerManager(
             config_dir=CONFIG_DIR,
             environment_uuid=environment_uuid,
             token=token,
             twin_uuids=twin_uuids,
+            image=resolve_worker_image(),
             resource_limits=load_worker_resource_limits(),
         )
         worker_manager.start()
@@ -3189,6 +3421,11 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
             file_handle.truncate()
             file_handle.flush()
             os.fsync(file_handle.fileno())
+        if os.name != "nt":
+            try:
+                os.chmod(twin_json_file, 0o600)
+            except OSError:
+                pass
     else:
         temp_path: str | None = None
         try:
@@ -3204,6 +3441,8 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
                 temp_path = temp_file.name
+            if os.name != "nt":
+                os.chmod(temp_path, 0o600)
             os.replace(temp_path, twin_json_file)
         finally:
             if temp_path and os.path.exists(temp_path):
@@ -3730,7 +3969,7 @@ def _reconcile_worker_watcher(
     """Lazily create and run the worker file watcher + health monitor each reconcile cycle."""
     from .model_manager import ModelManager
     from .worker_health import WorkerHealthMonitor
-    from .worker_manager import WorkerManager
+    from .worker_manager import WorkerManager, resolve_worker_image
     from .worker_watcher import WorkerWatcher
 
     environment_uuid = load_environment_uuid()
@@ -3759,6 +3998,7 @@ def _reconcile_worker_watcher(
             environment_uuid=environment_uuid,
             token=token,
             twin_uuids=twin_uuids,
+            image=resolve_worker_image(),
             resource_limits=load_worker_resource_limits(),
         )
         # Attach health monitor so that restarts are accounted and rate-limited.

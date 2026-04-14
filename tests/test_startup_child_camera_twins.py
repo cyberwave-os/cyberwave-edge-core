@@ -121,6 +121,11 @@ def test_camera_child_twin_driver_is_skipped_and_passed_to_parent(monkeypatch) -
 
     monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        startup,
+        "_pull_driver_images_parallel",
+        lambda images, token, **kw: {img: True for img in images},
+    )
 
     written_twins: list[str] = []
 
@@ -140,6 +145,7 @@ def test_camera_child_twin_driver_is_skipped_and_passed_to_parent(monkeypatch) -
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
         macos_bridge_device_candidates: list[str] | None = None,
+        skip_pull: bool = False,
     ) -> bool:
         run_calls.append(
             {
@@ -210,6 +216,11 @@ def test_non_camera_child_twin_is_not_skipped(monkeypatch) -> None:
     monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
     monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        startup,
+        "_pull_driver_images_parallel",
+        lambda images, token, **kw: {img: True for img in images},
+    )
 
     run_calls: list[dict] = []
 
@@ -221,6 +232,7 @@ def test_non_camera_child_twin_is_not_skipped(monkeypatch) -> None:
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
         macos_bridge_device_candidates: list[str] | None = None,
+        skip_pull: bool = False,
     ) -> bool:
         run_calls.append(
             {
@@ -291,6 +303,11 @@ def test_parent_driver_variant_selected_from_child_registry_id(monkeypatch) -> N
     monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
     monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        startup,
+        "_pull_driver_images_parallel",
+        lambda images, token, **kw: {img: True for img in images},
+    )
 
     run_calls: list[dict] = []
 
@@ -302,6 +319,7 @@ def test_parent_driver_variant_selected_from_child_registry_id(monkeypatch) -> N
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
         macos_bridge_device_candidates: list[str] | None = None,
+        skip_pull: bool = False,
     ) -> bool:
         run_calls.append(
             {
@@ -371,6 +389,11 @@ def test_non_camera_child_with_unmatched_registry_id_runs_independently(monkeypa
     monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
     monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None)
     monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        startup,
+        "_pull_driver_images_parallel",
+        lambda images, token, **kw: {img: True for img in images},
+    )
 
     run_calls: list[dict] = []
 
@@ -382,6 +405,7 @@ def test_non_camera_child_with_unmatched_registry_id_runs_independently(monkeypa
         token: str,
         child_camera_twin_uuids: list[str] | None = None,
         macos_bridge_device_candidates: list[str] | None = None,
+        skip_pull: bool = False,
     ) -> bool:
         run_calls.append(
             {

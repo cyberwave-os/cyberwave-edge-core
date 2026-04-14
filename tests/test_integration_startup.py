@@ -177,6 +177,11 @@ class TestRunStartupChecksHappyPath:
             startup, "Cyberwave", FakeCyberwave.factory(twins=[twin])
         )
         monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: _FINGERPRINT)
+        monkeypatch.setattr(
+            startup,
+            "_pull_driver_images_parallel",
+            lambda images, token, **kw: {img: True for img in images},
+        )
 
         launched_images: list[str] = []
 
@@ -205,6 +210,11 @@ class TestRunStartupChecksHappyPath:
             startup, "Cyberwave", FakeCyberwave.factory(twins=[foreign_twin])
         )
         monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: _FINGERPRINT)
+        monkeypatch.setattr(
+            startup,
+            "_pull_driver_images_parallel",
+            lambda images, token, **kw: {img: True for img in images},
+        )
 
         launched_images: list[str] = []
 
@@ -364,6 +374,11 @@ class TestFetchAndRunTwinDriversIntegration:
     def _patch_common(self, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         """Patch CONFIG_DIR so twin JSON writes land in a temp directory."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(
+            startup,
+            "_pull_driver_images_parallel",
+            lambda images, token, **kw: {img: True for img in images},
+        )
 
     def test_returns_empty_list_when_no_twins(self, tmp_path, monkeypatch):
         self._patch_common(tmp_path, monkeypatch)

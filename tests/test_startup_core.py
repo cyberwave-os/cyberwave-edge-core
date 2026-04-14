@@ -41,64 +41,52 @@ class TestResolveConfigDir:
 
         assert startup._resolve_config_dir() == startup.Path("/Users/alice/.cyberwave")
 
-    def test_linux_default_remains_etc_cyberwave(self, monkeypatch):
+    def test_linux_default_uses_home_dir(self, monkeypatch):
         monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup, "_resolve_sudo_user_home", lambda: None)
+        monkeypatch.setattr(startup.Path, "home", lambda: startup.Path("/home/testuser"))
 
-        assert startup._resolve_config_dir() == startup.Path("/etc/cyberwave")
+        assert startup._resolve_config_dir() == startup.Path("/home/testuser/.cyberwave")
 
-    def test_migrate_legacy_macos_config_copies_json_files(self, tmp_path, monkeypatch):
+    def test_linux_sudo_uses_invoking_user_home(self, monkeypatch):
         monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            startup, "_resolve_sudo_user_home", lambda: startup.Path("/home/alice")
+        )
+        monkeypatch.setattr(startup.Path, "home", lambda: startup.Path("/root"))
+
+        assert startup._resolve_config_dir() == startup.Path("/home/alice/.cyberwave")
+
+    def test_migrate_legacy_config_copies_json_files(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
         legacy_dir = tmp_path / "legacy"
         target_dir = tmp_path / "new"
         legacy_dir.mkdir()
         (legacy_dir / "credentials.json").write_text('{"token":"abc"}')
         (legacy_dir / "environment.json").write_text('{"uuid":"123"}')
-        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_LEGACY_SYSTEM_CONFIG_DIR", legacy_dir)
 
-        startup._migrate_legacy_macos_config(target_dir)
+        startup._migrate_legacy_config(target_dir)
 
         assert (target_dir / "credentials.json").exists()
         assert (target_dir / "environment.json").exists()
 
-    def test_migrate_legacy_macos_config_skips_when_env_override_set(self, tmp_path, monkeypatch):
+    def test_migrate_legacy_config_skips_when_env_override_set(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CYBERWAVE_EDGE_CONFIG_DIR", str(tmp_path / "custom"))
-        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         legacy_dir = tmp_path / "legacy"
         target_dir = tmp_path / "new"
         legacy_dir.mkdir()
         (legacy_dir / "credentials.json").write_text('{"token":"abc"}')
-        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_LEGACY_SYSTEM_CONFIG_DIR", legacy_dir)
 
-        startup._migrate_legacy_macos_config(target_dir)
+        startup._migrate_legacy_config(target_dir)
 
         assert not (target_dir / "credentials.json").exists()
 
-    def test_migrate_legacy_macos_config_skips_when_new_credentials_already_exist(
+    def test_migrate_legacy_config_does_not_overwrite_existing_target_json(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
-        legacy_dir = tmp_path / "legacy"
-        target_dir = tmp_path / "new"
-        legacy_dir.mkdir()
-        target_dir.mkdir()
-        (legacy_dir / "credentials.json").write_text('{"token":"legacy"}')
-        (legacy_dir / "environment.json").write_text('{"uuid":"legacy-env"}')
-        (target_dir / "credentials.json").write_text('{"token":"new"}')
-        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
-
-        startup._migrate_legacy_macos_config(target_dir)
-
-        assert (target_dir / "credentials.json").read_text() == '{"token":"new"}'
-        assert not (target_dir / "environment.json").exists()
-
-    def test_migrate_legacy_macos_config_does_not_overwrite_existing_target_json(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         legacy_dir = tmp_path / "legacy"
         target_dir = tmp_path / "new"
         legacy_dir.mkdir()
@@ -106,9 +94,9 @@ class TestResolveConfigDir:
         (legacy_dir / "credentials.json").write_text('{"token":"legacy"}')
         (legacy_dir / "environment.json").write_text('{"uuid":"legacy-env"}')
         (target_dir / "environment.json").write_text('{"uuid":"new-env"}')
-        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_LEGACY_SYSTEM_CONFIG_DIR", legacy_dir)
 
-        startup._migrate_legacy_macos_config(target_dir)
+        startup._migrate_legacy_config(target_dir)
 
         assert (target_dir / "credentials.json").exists()
         assert (target_dir / "environment.json").read_text() == '{"uuid":"new-env"}'
@@ -120,9 +108,8 @@ class TestResolveConfigDir:
 
 
 class TestBootstrapRuntimeEnvVars:
-    def test_bootstrap_loads_envs_from_migrated_macos_credentials(self, tmp_path, monkeypatch):
+    def test_bootstrap_loads_envs_from_migrated_credentials(self, tmp_path, monkeypatch):
         monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.delenv("CYBERWAVE_BASE_URL", raising=False)
         monkeypatch.delenv("CYBERWAVE_MQTT_HOST", raising=False)
 
@@ -139,7 +126,7 @@ class TestBootstrapRuntimeEnvVars:
                 }
             )
         )
-        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_LEGACY_SYSTEM_CONFIG_DIR", legacy_dir)
         monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
 
         startup._bootstrap_runtime_env_vars()
@@ -150,7 +137,6 @@ class TestBootstrapRuntimeEnvVars:
 
     def test_bootstrap_does_not_overwrite_existing_process_env(self, tmp_path, monkeypatch):
         monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setenv("CYBERWAVE_BASE_URL", "https://already-set.example.com")
 
         legacy_dir = tmp_path / "legacy"
@@ -159,7 +145,7 @@ class TestBootstrapRuntimeEnvVars:
         (legacy_dir / "credentials.json").write_text(
             json.dumps({"envs": {"CYBERWAVE_BASE_URL": "https://from-file.example.com"}})
         )
-        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_LEGACY_SYSTEM_CONFIG_DIR", legacy_dir)
         monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
 
         startup._bootstrap_runtime_env_vars()
@@ -191,7 +177,7 @@ class TestBootstrapRuntimeEnvVars:
                 }
             )
         )
-        monkeypatch.setattr(startup, "_LEGACY_MACOS_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(startup, "_LEGACY_SYSTEM_CONFIG_DIR", legacy_dir)
         monkeypatch.setattr(startup, "_resolve_config_dir", lambda: target_dir)
 
         startup._bootstrap_runtime_env_vars()

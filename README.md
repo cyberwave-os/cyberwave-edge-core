@@ -29,7 +29,7 @@ curl -fsSL https://cyberwave.com/install.sh | bash
 sudo cyberwave edge install
 ```
 
-The installer will prompt you to log in with your Cyberwave account, select a workspace and environment, and persist configuration under `/etc/cyberwave/` (on Linux) or `~/.cyberwave/` (on macOS). You can override the config directory via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable.
+The installer will prompt you to log in with your Cyberwave account, select a workspace and environment, and persist configuration under `~/.cyberwave/` (owner-only permissions). You can override the config directory via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable. Legacy installs that used `/etc/cyberwave` are automatically migrated.
 
 > Don't have a Cyberwave account? Get one at [cyberwave.com](https://cyberwave.com)
 
@@ -98,8 +98,7 @@ Edge Core includes a `ModelManager` that pre-downloads ML model weights from the
 
 | Platform | Default path |
 |---|---|
-| Linux | `/etc/cyberwave/models/` |
-| macOS | `~/.cyberwave/models/` |
+| All | `~/.cyberwave/models/` |
 
 Override with `CYBERWAVE_EDGE_CONFIG_DIR`.
 
@@ -125,10 +124,10 @@ Edge Core manages one ML worker container per edge device (container name: `cybe
 
 ### Worker directory layout
 
-Place worker scripts in `{config_dir}/workers/` (default: `/etc/cyberwave/workers/` on Linux):
+Place worker scripts in `{config_dir}/workers/` (default: `~/.cyberwave/workers/`):
 
 ```
-/etc/cyberwave/
+~/.cyberwave/
 ├── workers/
 │   ├── detect_people.py        # Custom worker
 │   └── cyberwave.yml           # Optional: list model requirements
@@ -428,7 +427,7 @@ cyberwave-edge-core status
 # Show version
 cyberwave-edge-core --version
 
-# Worker container management
+# Worker container management (also available via `cyberwave worker …`)
 cyberwave-edge-core worker start      # Start the worker container
 cyberwave-edge-core worker stop       # Stop the worker container
 cyberwave-edge-core worker restart    # Restart the worker container

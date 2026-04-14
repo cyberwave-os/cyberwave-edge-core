@@ -109,7 +109,7 @@ def worker() -> None:
 def _get_worker_manager() -> "WorkerManager":  # type: ignore[name-defined]  # noqa: F821
     """Build a WorkerManager from the current edge configuration."""
     from .startup import _list_linked_twin_uuids_for_fingerprint, get_or_create_fingerprint
-    from .worker_manager import WorkerManager
+    from .worker_manager import WorkerManager, resolve_worker_image
 
     token = load_token()
     if not token:
@@ -140,6 +140,7 @@ def _get_worker_manager() -> "WorkerManager":  # type: ignore[name-defined]  # n
         environment_uuid=environment_uuid or "",
         token=token,
         twin_uuids=twin_uuids,
+        image=resolve_worker_image(),
     )
 
 
