@@ -199,7 +199,7 @@ class TestWorkerManagerStartSkipWhenNoWorkers:
 
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+
 
         result = worker_manager.start()
         assert result is True
@@ -234,7 +234,7 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,
@@ -274,7 +274,7 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,
@@ -448,23 +448,32 @@ class TestWorkerManagerStatus:
 
 
 class TestWorkerManagerLogs:
+    @staticmethod
+    def _fake_popen(captured: list[list[str]]):
+        """Return a Popen factory that records cmd and returns a no-op proc."""
+        def factory(cmd, **kw):
+            captured.append(cmd)
+            proc = MagicMock()
+            proc.stdout = iter([])
+            proc.wait.return_value = 0
+            return proc
+        return factory
+
     def test_logs_returns_early_when_docker_unavailable(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(wm_module, "docker_available", lambda: False)
-        run_calls: list[object] = []
-        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: run_calls.append(a))
+        captured: list[list[str]] = []
+        monkeypatch.setattr(wm_module.subprocess, "Popen", self._fake_popen(captured))
         worker_manager.logs()
-        assert run_calls == []
+        assert captured == []
 
     def test_logs_follow_calls_subprocess(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         captured: list[list[str]] = []
-        monkeypatch.setattr(
-            wm_module.subprocess, "run", lambda cmd, **kw: captured.append(cmd)
-        )
+        monkeypatch.setattr(wm_module.subprocess, "Popen", self._fake_popen(captured))
         worker_manager.logs(follow=True)
         assert any("-f" in cmd for cmd in captured)
 
@@ -473,9 +482,7 @@ class TestWorkerManagerLogs:
     ) -> None:
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         captured: list[list[str]] = []
-        monkeypatch.setattr(
-            wm_module.subprocess, "run", lambda cmd, **kw: captured.append(cmd)
-        )
+        monkeypatch.setattr(wm_module.subprocess, "Popen", self._fake_popen(captured))
         worker_manager.logs(follow=False)
         assert captured
         assert "-f" not in captured[0]
@@ -488,7 +495,7 @@ class TestWorkerManagerLogs:
         def raise_ki(*a: object, **kw: object) -> None:
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(wm_module.subprocess, "run", raise_ki)
+        monkeypatch.setattr(wm_module.subprocess, "Popen", raise_ki)
         worker_manager.logs(follow=True)  # should not propagate
 
     def test_logs_no_follow_swallows_os_error(
@@ -499,7 +506,7 @@ class TestWorkerManagerLogs:
         def raise_os(*a: object, **kw: object) -> None:
             raise OSError("docker not found")
 
-        monkeypatch.setattr(wm_module.subprocess, "run", raise_os)
+        monkeypatch.setattr(wm_module.subprocess, "Popen", raise_os)
         worker_manager.logs(follow=False)  # should not propagate
 
 
@@ -540,7 +547,8 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+        monkeypatch.setattr(WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True))
+
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,
@@ -630,7 +638,7 @@ class TestWorkerManagerStartHealthIntegration:
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,
@@ -648,44 +656,3 @@ class TestWorkerManagerStartHealthIntegration:
         state = monitor.check(container_status="running")
         assert state.uptime_seconds is not None
 
-
-# ---------------------------------------------------------------------------
-# _follow_worker_logs free function
-# ---------------------------------------------------------------------------
-
-
-class TestFollowWorkerLogs:
-    def test_streams_lines_to_logger(self, caplog: pytest.LogCaptureFixture) -> None:
-        import logging
-
-        from cyberwave_edge_core.worker_manager import _follow_worker_logs
-
-        fake_proc = MagicMock()
-        fake_proc.stdout = iter(["line one\n", "line two\n"])
-        fake_proc.wait.return_value = 0
-
-        with patch.object(wm_module, "docker_logs_follow", return_value=fake_proc):
-            with caplog.at_level(logging.INFO):
-                _follow_worker_logs("my_container")
-
-        messages = " ".join(caplog.messages)
-        assert "line one" in messages
-        assert "line two" in messages
-
-    def test_returns_early_when_process_is_none(self) -> None:
-        from cyberwave_edge_core.worker_manager import _follow_worker_logs
-
-        with patch.object(wm_module, "docker_logs_follow", return_value=None):
-            _follow_worker_logs("my_container")  # should not raise
-
-    def test_handles_exception_in_stdout_iteration(self) -> None:
-        from cyberwave_edge_core.worker_manager import _follow_worker_logs
-
-        fake_proc = MagicMock()
-        # stdout is truthy but raises when iterated
-        fake_proc.stdout = MagicMock()
-        fake_proc.stdout.__iter__ = MagicMock(side_effect=RuntimeError("pipe broken"))
-        fake_proc.wait.return_value = 0
-
-        with patch.object(wm_module, "docker_logs_follow", return_value=fake_proc):
-            _follow_worker_logs("my_container")  # should not raise

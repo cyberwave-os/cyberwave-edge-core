@@ -119,10 +119,10 @@ def _get_worker_manager() -> "WorkerManager":  # type: ignore[name-defined]  # n
     environment_uuid = load_environment_uuid()
     if not environment_uuid:
         console.print(
-            "[yellow]No linked environment found. "
-            "Run 'cyberwave link' to associate this edge with an environment.[/yellow]"
+            "[red]No linked environment found. "
+            "Run 'cyberwave link' to associate this edge with an environment.[/red]"
         )
-        environment_uuid = ""
+        sys.exit(1)
 
     twin_uuids: list[str] = []
     if environment_uuid:
@@ -137,7 +137,7 @@ def _get_worker_manager() -> "WorkerManager":  # type: ignore[name-defined]  # n
 
     return WorkerManager(
         config_dir=CONFIG_DIR,
-        environment_uuid=environment_uuid or "",
+        environment_uuid=environment_uuid,
         token=token,
         twin_uuids=twin_uuids,
         image=resolve_worker_image(),

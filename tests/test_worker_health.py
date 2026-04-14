@@ -411,7 +411,7 @@ class TestWorkermanagerCircuitBreaker:
         monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
         monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,
@@ -439,7 +439,7 @@ class TestWorkermanagerCircuitBreaker:
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(wm_module.subprocess, "run", lambda cmd, **kw: MagicMock(returncode=0))
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,

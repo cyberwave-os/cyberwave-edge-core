@@ -121,7 +121,7 @@ class TestSyncWorkersForTwins:
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
 
         fake_client = MagicMock()
-        fake_client.sync.side_effect = [
+        fake_client.sync_all.return_value = [
             _result("twin-a", written=["wf_aaa.py"]),
             _result("twin-b", unchanged=["wf_bbb.py"]),
         ]
@@ -138,17 +138,14 @@ class TestSyncWorkersForTwins:
 
         assert summary["twin-a"] == {"written": 1, "removed": 0, "unchanged": 0, "errors": 0}
         assert summary["twin-b"] == {"written": 0, "removed": 0, "unchanged": 1, "errors": 0}
-        assert fake_client.sync.call_count == 2
+        fake_client.sync_all.assert_called_once_with(["twin-a", "twin-b"])
 
     def test_isolates_per_twin_exception(self, monkeypatch, tmp_path):
-        """If sync() raises for one twin, the other twins are still processed."""
+        """If sync_all() raises, all twins get error entries."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
 
         fake_client = MagicMock()
-        fake_client.sync.side_effect = [
-            RuntimeError("network timeout"),
-            _result("twin-b", written=["wf_bbb.py"]),
-        ]
+        fake_client.sync_all.side_effect = RuntimeError("network timeout")
 
         with patch(
             "cyberwave_edge_core.edge_sync_client.EdgeSyncClient",
@@ -161,7 +158,7 @@ class TestSyncWorkersForTwins:
             )
 
         assert summary["twin-a"]["errors"] == 1
-        assert summary["twin-b"] == {"written": 1, "removed": 0, "unchanged": 0, "errors": 0}
+        assert summary["twin-b"]["errors"] == 1
 
     def test_uses_config_dir_workers_subdirectory(self, monkeypatch, tmp_path):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
@@ -174,8 +171,8 @@ class TestSyncWorkersForTwins:
                     {"workers_dir": workers_dir, "base_url": base_url, "token": token}
                 )
 
-            def sync(self, twin_uuid):
-                return _result(twin_uuid)
+            def sync_all(self, twin_uuids):
+                return [_result(t) for t in twin_uuids]
 
         with patch(
             "cyberwave_edge_core.edge_sync_client.EdgeSyncClient",

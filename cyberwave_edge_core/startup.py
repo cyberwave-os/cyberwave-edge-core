@@ -1633,7 +1633,6 @@ def _resolve_driver_image_tag(image: str) -> str:
 
 def _pull_driver_images_parallel(
     images: list[str],
-    token: str,
     *,
     timeout: int = 600,
 ) -> dict[str, bool]:
@@ -1643,7 +1642,7 @@ def _pull_driver_images_parallel(
     present locally are not re-pulled (but ``docker pull`` is still attempted
     to pick up newer tags — failure with a local copy is treated as success).
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
 
     unique_images = list(dict.fromkeys(images))
     if not unique_images:
@@ -2784,7 +2783,7 @@ def fetch_and_run_twin_drivers(
 
     if driver_specs:
         images_to_pull = [spec.driver_image for spec in driver_specs]
-        pull_results = _pull_driver_images_parallel(images_to_pull, token)
+        pull_results = _pull_driver_images_parallel(images_to_pull)
     else:
         pull_results = {}
 

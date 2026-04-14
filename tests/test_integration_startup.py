@@ -180,7 +180,7 @@ class TestRunStartupChecksHappyPath:
         monkeypatch.setattr(
             startup,
             "_pull_driver_images_parallel",
-            lambda images, token, **kw: {img: True for img in images},
+            lambda images, **kw: {img: True for img in images},
         )
 
         launched_images: list[str] = []
@@ -213,7 +213,7 @@ class TestRunStartupChecksHappyPath:
         monkeypatch.setattr(
             startup,
             "_pull_driver_images_parallel",
-            lambda images, token, **kw: {img: True for img in images},
+            lambda images, **kw: {img: True for img in images},
         )
 
         launched_images: list[str] = []
@@ -377,7 +377,7 @@ class TestFetchAndRunTwinDriversIntegration:
         monkeypatch.setattr(
             startup,
             "_pull_driver_images_parallel",
-            lambda images, token, **kw: {img: True for img in images},
+            lambda images, **kw: {img: True for img in images},
         )
 
     def test_returns_empty_list_when_no_twins(self, tmp_path, monkeypatch):

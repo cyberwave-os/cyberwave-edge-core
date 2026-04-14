@@ -106,13 +106,13 @@ class TestEdgeSyncClientSync:
         stale = workers_dir / "wf_old.py"
         stale.write_text("# stale\n")
 
-        # Payload has no entry for wf_old.py
+        # Payload has no entry for wf_old.py — cleanup only via sync_all
         payload = _make_payload(workflows=[])
 
         with patch.object(client, "_fetch_sync_payload", return_value=payload):
-            result = client.sync("twin-1")
+            results = client.sync_all(["twin-1"])
 
-        assert result.removed == ["wf_old.py"]
+        assert any("wf_old.py" in r.removed for r in results)
         assert not stale.exists()
 
     def test_does_not_remove_custom_workers(self, tmp_path):
