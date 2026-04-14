@@ -20,6 +20,7 @@ CLI surface of its own.  The ``WorkerManager`` (CYB-1546) calls into it.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -476,8 +477,6 @@ class ModelManager:
 
     def _stream_download(self, url: str, dest: Path) -> None:
         """Stream *url* directly to *dest* via a temp file."""
-        import errno
-
         import httpx
 
         headers = {"Authorization": f"Bearer {self._api_token}"}
