@@ -27,4 +27,5 @@ dpkg -i "${PACKAGE_FILE}"
 
 echo "=== Verifying installed binary ==="
 /usr/bin/cyberwave-edge-core --help
+/usr/bin/cyberwave-edge-core __selfcheck_sdk
 echo "✅ Package install works on ${DEVICE_NAME} (${DEVICE_DISTRO})"
