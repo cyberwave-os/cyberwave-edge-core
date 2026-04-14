@@ -27,6 +27,7 @@ restart history is annotated with why the restart occurred.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from pathlib import Path
@@ -62,6 +63,11 @@ class WorkerWatcher:
     min_restart_interval_seconds:
         Minimum time that must elapse between two successive automatic restarts.
         Defaults to ``DEFAULT_MIN_RESTART_INTERVAL``.
+    mqtt_publish:
+        Optional ``(topic: str, payload: bytes) -> None`` callback used
+        to publish worker health payloads via MQTT.
+    mqtt_health_topic:
+        MQTT topic to publish worker health payloads to.
     """
 
     def __init__(
@@ -72,22 +78,32 @@ class WorkerWatcher:
         *,
         on_restart: Optional[Callable[[], None]] = None,
         min_restart_interval_seconds: float = DEFAULT_MIN_RESTART_INTERVAL,
+        mqtt_publish: Optional[Callable[[str, bytes], None]] = None,
+        mqtt_health_topic: Optional[str] = None,
     ) -> None:
         self._workers_dir = workers_dir
         self._worker_manager = worker_manager
         self._model_manager = model_manager
         self._on_restart = on_restart
         self._min_restart_interval = min_restart_interval_seconds
+        self._mqtt_publish = mqtt_publish
+        self._mqtt_health_topic = mqtt_health_topic
 
         self._last_hash: Optional[str] = None
         self._last_restart_at: Optional[float] = None
         self._pending_restart: bool = False  # True when a restart was deferred
+
+    @property
+    def worker_manager(self) -> "WorkerManager":
+        """The ``WorkerManager`` used for container restarts."""
+        return self._worker_manager
 
     def check_health(self) -> Optional["WorkerHealthState"]:
         """Run a health probe and return the current health snapshot.
 
         Returns None when no ``WorkerHealthMonitor`` is attached to the manager.
         Intended to be called each reconcile cycle to detect spontaneous exits.
+        Also publishes the health state via MQTT when a publish callback is set.
         """
         hm = self._worker_manager.health_monitor
         if hm is None:
@@ -100,7 +116,18 @@ class WorkerWatcher:
                 state.container_name,
                 state.recent_restarts,
             )
+        self._publish_health_mqtt(state)
         return state
+
+    def _publish_health_mqtt(self, state: "WorkerHealthState") -> None:
+        """Best-effort publish of worker health to MQTT."""
+        if self._mqtt_publish is None or self._mqtt_health_topic is None:
+            return
+        try:
+            payload = json.dumps(state.to_mqtt_payload(), separators=(",", ":")).encode()
+            self._mqtt_publish(self._mqtt_health_topic, payload)
+        except Exception:
+            logger.debug("Failed to publish worker health via MQTT", exc_info=True)
 
     def reconcile_worker_files(self) -> bool:
         """Check for worker file changes and restart container if needed.

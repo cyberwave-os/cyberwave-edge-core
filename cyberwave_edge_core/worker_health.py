@@ -92,6 +92,20 @@ class WorkerHealthState:
             f"(restarts={self.restart_count})"
         )
 
+    def to_mqtt_payload(self) -> dict[str, object]:
+        """Serialize health state for MQTT publishing."""
+        return {
+            "container_name": self.container_name,
+            "container_status": self.container_status,
+            "is_healthy": self.is_healthy,
+            "is_ready": self.is_ready,
+            "restart_count": self.restart_count,
+            "recent_restarts": self.recent_restarts,
+            "circuit_breaker_tripped": self.circuit_breaker_tripped,
+            "uptime_seconds": self.uptime_seconds,
+            "observed_at": self.observed_at,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Monitor

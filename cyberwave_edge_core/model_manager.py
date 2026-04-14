@@ -476,6 +476,8 @@ class ModelManager:
 
     def _stream_download(self, url: str, dest: Path) -> None:
         """Stream *url* directly to *dest* via a temp file."""
+        import errno
+
         import httpx
 
         headers = {"Authorization": f"Bearer {self._api_token}"}
@@ -493,6 +495,15 @@ class ModelManager:
                 for chunk in resp.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
                     fh.write(chunk)
             tmp_path.replace(dest)
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            if exc.errno == errno.ENOSPC:
+                logger.error(
+                    "Disk full while downloading model from %s — "
+                    "free space in %s and retry",
+                    url, dest.parent,
+                )
+            raise
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise

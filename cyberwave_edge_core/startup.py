@@ -211,6 +211,10 @@ _CONTAINER_TWIN_MAP: dict[str, str] = {}
 _shared_mqtt_client: Optional[Any] = None
 _shared_mqtt_lock = threading.Lock()
 
+# Module-level shutdown event; set by SIGTERM handler or KeyboardInterrupt
+# in main.py to signal run_runtime_loop to stop.
+shutdown_event = threading.Event()
+
 # Track which token/path combination has already been announced to avoid
 # repeated "Loaded token ..." info logs during steady-state polling.
 _last_logged_token_signature: Optional[str] = None
@@ -3894,7 +3898,7 @@ def run_runtime_loop() -> None:
 
     worker_watcher: Optional[Any] = None
 
-    while True:
+    while not shutdown_event.is_set():
         attached = reconcile_driver_log_streams()
         logger.debug(
             "Driver log follower reconcile complete (active_streams=%d, tracked=%d)",
@@ -3959,7 +3963,43 @@ def run_runtime_loop() -> None:
             except Exception:
                 logger.exception("Unexpected error during worker sync reconcile")
 
-        time.sleep(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
+        shutdown_event.wait(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
+
+    # -- Ordered shutdown: worker container first, then driver containers -----
+    _graceful_shutdown(worker_watcher)
+
+
+def _graceful_shutdown(worker_watcher: Optional[Any]) -> None:
+    """Ordered shutdown: stop worker container, then driver containers."""
+    logger.info("Graceful shutdown initiated — stopping managed containers")
+
+    # 1. Stop worker container via WorkerManager (sends SIGTERM to container).
+    if worker_watcher is not None:
+        try:
+            wm = worker_watcher.worker_manager
+            logger.info("Stopping worker container: %s", wm.container_name)
+            wm.stop()
+            logger.info("Worker container stopped")
+        except Exception:
+            logger.exception("Error stopping worker container during shutdown")
+
+    # 2. Stop driver containers (they have --stop-timeout already).
+    driver_containers = list(_CONTAINER_TWIN_MAP.keys())
+    if driver_containers:
+        import subprocess as _sp
+
+        for name in driver_containers:
+            try:
+                logger.info("Stopping driver container: %s", name)
+                _sp.run(
+                    ["docker", "stop", name],
+                    timeout=15,
+                    capture_output=True,
+                )
+            except Exception:
+                logger.debug("Error stopping driver container %s", name, exc_info=True)
+
+    logger.info("Graceful shutdown complete")
 
 
 def _reconcile_worker_watcher(
@@ -4011,10 +4051,24 @@ def _reconcile_worker_watcher(
             api_token=token,
             base_url=get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL,
         )
+        mqtt_publish: Optional[Any] = None
+        mqtt_health_topic: Optional[str] = None
+        try:
+            cw_mqtt = _get_shared_mqtt_client(token)
+            if cw_mqtt and getattr(cw_mqtt, "mqtt", None):
+                prefix = cw_mqtt.mqtt.topic_prefix
+                first_twin = twin_uuids[0] if twin_uuids else environment_uuid
+                mqtt_health_topic = f"{prefix}cyberwave/twin/{first_twin}/worker_health"
+                mqtt_publish = cw_mqtt.mqtt.publish
+        except Exception:
+            logger.debug("Could not set up MQTT for worker health publishing")
+
         existing_watcher = WorkerWatcher(
             workers_dir=workers_dir,
             worker_manager=worker_manager,
             model_manager=model_manager,
+            mqtt_publish=mqtt_publish,
+            mqtt_health_topic=mqtt_health_topic,
         )
         logger.debug("Worker file watcher + health monitor initialised for %s", workers_dir)
 

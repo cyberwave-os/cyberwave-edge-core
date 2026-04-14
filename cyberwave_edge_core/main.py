@@ -2,6 +2,7 @@
 
 import logging
 import os
+import signal
 import sys
 import time
 
@@ -18,6 +19,7 @@ from .startup import (
     load_token,
     run_runtime_loop,
     run_startup_checks,
+    shutdown_event,
     validate_token,
 )
 
@@ -44,19 +46,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _sigterm_handler(signum: int, frame: object) -> None:
+    logger.info("Received SIGTERM — initiating graceful shutdown")
+    shutdown_event.set()
+
+
 @click.group(invoke_without_command=True)
 @click.version_option(version=__version__, prog_name="cyberwave-edge-core")
 @click.pass_context
 def cli(ctx: click.Context) -> None:
     """Cyberwave Edge Core — orchestrator for edge components."""
     if ctx.invoked_subcommand is None:
-        # Boot path: run all startup checks
+        signal.signal(signal.SIGTERM, _sigterm_handler)
         if not run_startup_checks():
             sys.exit(1)
         try:
             run_runtime_loop()
         except KeyboardInterrupt:
-            logging.getLogger(__name__).info("Received stop signal, shutting down edge-core")
+            logger.info("Received KeyboardInterrupt, shutting down edge-core")
+            shutdown_event.set()
 
 
 @cli.command()

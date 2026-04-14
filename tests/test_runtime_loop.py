@@ -6,12 +6,11 @@ Covers:
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import cyberwave_edge_core.startup as startup
-
 
 # ===========================================================================
 # 1. _reconcile_worker_watcher()
@@ -97,10 +96,6 @@ class TestReconcileWorkerWatcher:
 # ===========================================================================
 
 
-class _StopLoop(Exception):
-    """Raised by the fake sleep to break out of the infinite loop."""
-
-
 class TestRuntimeLoopSyncCadence:
     """Verify that run_runtime_loop() calls reconcile_worker_sync at the right cadence."""
 
@@ -131,7 +126,33 @@ class TestRuntimeLoopSyncCadence:
             "ensure_edge_command_subscription",
             lambda: None,
         )
+        monkeypatch.setattr(
+            startup,
+            "ensure_twin_command_subscriptions",
+            lambda: None,
+        )
         monkeypatch.setattr(startup, "_CONTAINER_LOG_THREADS", {})
+        monkeypatch.setattr(startup, "_graceful_shutdown", lambda w: None)
+
+    def _stop_after(self, n, monkeypatch):
+        """Make the shutdown_event stop the loop after *n* wait() calls."""
+        real_event = startup.shutdown_event
+        call_count = [0]
+
+        def fake_wait(timeout=None):
+            call_count[0] += 1
+            if call_count[0] >= n:
+                real_event.set()
+            return real_event.is_set()
+
+        monkeypatch.setattr(real_event, "wait", fake_wait)
+
+    @pytest.fixture(autouse=True)
+    def _reset_shutdown(self):
+        """Clear shutdown_event before/after every test."""
+        startup.shutdown_event.clear()
+        yield
+        startup.shutdown_event.clear()
 
     def test_sync_runs_at_interval(self, monkeypatch):
         self._patch_loop_deps(monkeypatch)
@@ -139,30 +160,17 @@ class TestRuntimeLoopSyncCadence:
         startup._worker_sync_loop_counter = 0
 
         sync_calls: list[int] = []
-        iteration = 0
-
-        original_sync = startup.reconcile_worker_sync
+        iteration = [0]
 
         def fake_sync():
-            sync_calls.append(iteration)
+            sync_calls.append(iteration[0])
             return {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
 
         monkeypatch.setattr(startup, "reconcile_worker_sync", fake_sync)
+        self._stop_after(7, monkeypatch)
 
-        def fake_sleep(seconds):
-            nonlocal iteration
-            iteration += 1
-            if iteration >= 7:
-                raise _StopLoop()
+        startup.run_runtime_loop()
 
-        monkeypatch.setattr(startup.time, "sleep", fake_sleep)
-
-        with pytest.raises(_StopLoop):
-            startup.run_runtime_loop()
-
-        # With interval=3, sync should fire at iterations where counter reaches 3:
-        # counter: 1,2,3(fire,reset),1,2,3(fire,reset),1
-        # Sync fires after iteration 3 and 6 (0-indexed: at iteration count 2 and 5)
         assert len(sync_calls) == 2
 
     def test_counter_resets_after_sync(self, monkeypatch):
@@ -170,29 +178,18 @@ class TestRuntimeLoopSyncCadence:
         monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 2)
         startup._worker_sync_loop_counter = 0
 
-        sync_count = 0
+        sync_count = [0]
 
         def fake_sync():
-            nonlocal sync_count
-            sync_count += 1
+            sync_count[0] += 1
             return {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
 
         monkeypatch.setattr(startup, "reconcile_worker_sync", fake_sync)
+        self._stop_after(4, monkeypatch)
 
-        call_count = 0
+        startup.run_runtime_loop()
 
-        def fake_sleep(seconds):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 4:
-                raise _StopLoop()
-
-        monkeypatch.setattr(startup.time, "sleep", fake_sleep)
-
-        with pytest.raises(_StopLoop):
-            startup.run_runtime_loop()
-
-        assert sync_count == 2
+        assert sync_count[0] == 2
 
     def test_sync_exception_does_not_crash_loop(self, monkeypatch):
         self._patch_loop_deps(monkeypatch)
@@ -203,22 +200,9 @@ class TestRuntimeLoopSyncCadence:
             raise RuntimeError("sync boom")
 
         monkeypatch.setattr(startup, "reconcile_worker_sync", failing_sync)
+        self._stop_after(3, monkeypatch)
 
-        call_count = 0
-
-        def fake_sleep(seconds):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 3:
-                raise _StopLoop()
-
-        monkeypatch.setattr(startup.time, "sleep", fake_sleep)
-
-        with pytest.raises(_StopLoop):
-            startup.run_runtime_loop()
-
-        # Loop survived 3 iterations despite sync raising every time
-        assert call_count == 3
+        startup.run_runtime_loop()
 
     def test_watcher_exception_does_not_crash_loop(self, monkeypatch):
         self._patch_loop_deps(monkeypatch)
@@ -234,18 +218,6 @@ class TestRuntimeLoopSyncCadence:
             "reconcile_worker_sync",
             lambda: {"written": 0, "removed": 0, "unchanged": 0, "errors": 0},
         )
+        self._stop_after(2, monkeypatch)
 
-        call_count = 0
-
-        def fake_sleep(seconds):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
-                raise _StopLoop()
-
-        monkeypatch.setattr(startup.time, "sleep", fake_sleep)
-
-        with pytest.raises(_StopLoop):
-            startup.run_runtime_loop()
-
-        assert call_count == 2
+        startup.run_runtime_loop()
