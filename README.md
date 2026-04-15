@@ -158,7 +158,7 @@ Edge Core also auto-detects models by scanning `cw.models.load("...")` calls in 
 | `CYBERWAVE_TWIN_UUIDS` | Comma-separated twin UUIDs in environment |
 | `CYBERWAVE_DATA_BACKEND` | `zenoh` |
 | `ZENOH_CONNECT` | Set when a Zenoh router is configured |
-| `ZENOH_SHM_ENABLED` | `true` on Linux (shared memory transport) |
+| `ZENOH_SHARED_MEMORY` | `true` on Linux (shared memory transport) |
 
 ### File watching and hot-reload
 

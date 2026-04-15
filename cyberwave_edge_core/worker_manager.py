@@ -434,7 +434,7 @@ class WorkerManager:
         env["ZENOH_LISTEN"] = zenoh_listen or "tcp/0.0.0.0:7447"
 
         if platform.system() == "Linux":
-            env["ZENOH_SHM_ENABLED"] = "true"
+            env["ZENOH_SHARED_MEMORY"] = "true"
 
         for key, value in load_credentials_envs().items():
             if key.startswith("CYBERWAVE_"):

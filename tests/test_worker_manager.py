@@ -98,7 +98,7 @@ class TestWorkerManagerEnvVars:
         monkeypatch.setattr(wm_module.platform, "system", lambda: "Linux")
 
         env = worker_manager._build_env_vars()
-        assert env.get("ZENOH_SHM_ENABLED") == "true"
+        assert env.get("ZENOH_SHARED_MEMORY") == "true"
 
     def test_zenoh_shm_not_set_on_macos(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
@@ -112,7 +112,7 @@ class TestWorkerManagerEnvVars:
         monkeypatch.setattr(wm_module.platform, "system", lambda: "Darwin")
 
         env = worker_manager._build_env_vars()
-        assert "ZENOH_SHM_ENABLED" not in env
+        assert "ZENOH_SHARED_MEMORY" not in env
 
     def test_non_production_environment_included(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
