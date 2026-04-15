@@ -34,8 +34,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit, urlunsplit
-
 from cyberwave import Cyberwave
 from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
 from cyberwave.fingerprint import generate_fingerprint
@@ -198,11 +196,16 @@ CYBERWAVE_SDK_VERSION = _resolve_package_version(
     fallback=PACKAGE_CYBERWAVE_SDK_VERSION,
 )
 
-# Track active log streaming threads per container to avoid duplicates.
-_CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
-
-# Track when log streaming last ended per container so reattach uses --since.
-_CONTAINER_LOG_LAST_SEEN: dict[str, str] = {}
+# Re-exported from driver_logs for backward compat and in-module use.
+from .driver_logs import (  # noqa: E402
+    _build_driver_log_payload,
+    _CONTAINER_LOG_LAST_SEEN,
+    _CONTAINER_LOG_THREADS,
+    _log_and_publish_driver_message,
+    _pull_docker_image_with_progress,
+    _stream_container_logs,
+    reconcile_driver_log_streams,
+)
 
 # Map container names to twin UUIDs so log threads can publish telemetry.
 _CONTAINER_TWIN_MAP: dict[str, str] = {}
@@ -815,216 +818,20 @@ def get_or_create_fingerprint() -> Optional[str]:
     return fingerprint
 
 
-def _extract_docker_device_mappings(params: list[str]) -> list[tuple[str, str]]:
-    """Extract ``--device`` mappings from docker run params.
-
-    Supports:
-      - ``--device /dev/ttyACM0:/dev/ttyACM0``
-      - ``--device=/dev/video0:/dev/video0``
-      - ``--device /dev/video0`` (same path in container)
-    """
-    mappings: list[tuple[str, str]] = []
-    i = 0
-    while i < len(params):
-        param = params[i]
-        raw_mapping: Optional[str] = None
-        if param == "--device" and i + 1 < len(params):
-            raw_mapping = params[i + 1]
-            i += 1
-        elif param.startswith("--device="):
-            raw_mapping = param.split("=", 1)[1]
-
-        if raw_mapping:
-            parts = [part.strip() for part in raw_mapping.split(":")]
-            if len(parts) >= 2:
-                host_device = parts[0]
-                container_device = parts[1]
-            else:
-                host_device = parts[0]
-                container_device = parts[0]
-            if host_device and container_device:
-                mappings.append((host_device, container_device))
-        i += 1
-    return mappings
-
-
-def _extract_docker_env_map(params: list[str]) -> dict[str, str]:
-    """Extract ``KEY=value`` pairs provided via docker ``-e/--env`` params."""
-    env_map: dict[str, str] = {}
-    i = 0
-    while i < len(params):
-        param = params[i]
-        raw_env: Optional[str] = None
-        if param in {"-e", "--env"} and i + 1 < len(params):
-            raw_env = params[i + 1]
-            i += 1
-        elif param.startswith("--env="):
-            raw_env = param.split("=", 1)[1]
-
-        if raw_env:
-            key, sep, value = raw_env.partition("=")
-            if sep and key:
-                env_map[key] = value
-        i += 1
-    return env_map
-
-
-def _resolve_bool_env_var(name: str, default: bool) -> bool:
-    """Parse an optional runtime env var as boolean with sensible defaults."""
-    raw_value = get_runtime_env_var(name)
-    if raw_value is None:
-        return default
-    normalized = raw_value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _parse_bridge_resolved_device(stdout: str, fallback: str) -> str:
-    """Parse resolved device/source emitted by bridge command stdout."""
-    payload = stdout.strip()
-    if not payload:
-        return fallback
-
-    # Preferred format: JSON object with explicit key.
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, dict):
-        candidate = parsed.get("resolved_device") or parsed.get("video_source")
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-
-    # Alternate format: key-value line.
-    for line in reversed(payload.splitlines()):
-        candidate_line = line.strip()
-        if not candidate_line:
-            continue
-        if candidate_line.startswith("resolved_device="):
-            _, _, candidate = candidate_line.partition("=")
-            candidate = candidate.strip()
-            if candidate:
-                return candidate
-
-        # Last fallback: accept one-token values only to avoid accidentally
-        # parsing verbose log lines as the resolved device.
-        if " " not in candidate_line and "\t" not in candidate_line:
-            return candidate_line
-
-    return fallback
-
-
-def _is_video_device_path(value: str) -> bool:
-    """Return True when *value* looks like a Linux V4L2 /dev/video path."""
-    return value.strip().startswith("/dev/video")
-
-
-def _strip_video_device_mappings(params: list[str]) -> list[str]:
-    """Remove ``--device`` mappings targeting ``/dev/video*`` from docker params."""
-    rewritten: list[str] = []
-    i = 0
-    while i < len(params):
-        param = params[i]
-
-        if param == "--device" and i + 1 < len(params):
-            mapping_value = params[i + 1]
-            host_device, _, container_device = mapping_value.partition(":")
-            if _is_video_device_path(host_device) or _is_video_device_path(container_device):
-                i += 2
-                continue
-            rewritten.extend([param, mapping_value])
-            i += 2
-            continue
-
-        if param.startswith("--device="):
-            mapping_value = param.split("=", 1)[1]
-            host_device, _, container_device = mapping_value.partition(":")
-            if _is_video_device_path(host_device) or _is_video_device_path(container_device):
-                i += 1
-                continue
-
-        rewritten.append(param)
-        i += 1
-    return rewritten
-
-
-def _normalize_macos_bridge_candidates(
-    candidates: Optional[list[str]],
-) -> list[tuple[str, str]]:
-    """Normalize additional macOS bridge candidates into host/container mappings."""
-    normalized: list[tuple[str, str]] = []
-    for candidate in candidates or []:
-        if not isinstance(candidate, str):
-            continue
-        value = candidate.strip()
-        if not value:
-            continue
-        if ":" in value:
-            host_device, _, container_device = value.partition(":")
-            host_device = host_device.strip()
-            container_device = container_device.strip() or host_device
-        else:
-            host_device = value
-            container_device = value
-        if host_device and container_device:
-            normalized.append((host_device, container_device))
-    return normalized
-
-
-def _docker_params_include_add_host(params: list[str]) -> bool:
-    """Return True when docker params already include ``--add-host``."""
-    for i, param in enumerate(params):
-        if param.startswith("--add-host="):
-            return True
-        if param == "--add-host" and i + 1 < len(params):
-            return True
-    return False
-
-
-def _build_driver_network_args(params: list[str]) -> list[str]:
-    """Build docker network-related args with platform-aware defaults."""
-    if platform.system() == "Darwin":
-        # Docker Desktop on macOS does not expose Linux host networking semantics.
-        # Ensure drivers can still reach host-side bridge services.
-        if _docker_params_include_add_host(params):
-            return []
-        return ["--add-host", "host.docker.internal:host-gateway"]
-    return ["--network", "host"]
-
-
-def _rewrite_macos_container_hostname(hostname: str) -> str:
-    """Rewrite host-local names for Docker Desktop containers on macOS."""
-    normalized = hostname.strip()
-    if platform.system() != "Darwin":
-        return normalized
-    if normalized.lower() in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
-        return "host.docker.internal"
-    return normalized
-
-
-def _rewrite_macos_container_base_url(base_url: str) -> str:
-    """Rewrite host-local backend URLs for Docker Desktop containers on macOS."""
-    if platform.system() != "Darwin":
-        return base_url
-
-    try:
-        parsed = urlsplit(base_url.strip())
-    except ValueError:
-        return base_url
-
-    rewritten_hostname = _rewrite_macos_container_hostname(parsed.hostname or "")
-    if rewritten_hostname == (parsed.hostname or "").strip():
-        return base_url
-
-    netloc = rewritten_hostname
-    if parsed.port is not None:
-        netloc = f"{netloc}:{parsed.port}"
-    return urlunsplit(
-        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
-    )
+# Re-exported from docker_args for backward compat.
+from .docker_args import (  # noqa: E402
+    _build_driver_network_args,
+    _docker_params_include_add_host,
+    _extract_docker_device_mappings,
+    _extract_docker_env_map,
+    _is_video_device_path,
+    _normalize_macos_bridge_candidates,
+    _parse_bridge_resolved_device,
+    _resolve_bool_env_var,
+    _rewrite_macos_container_base_url,
+    _rewrite_macos_container_hostname,
+    _strip_video_device_mappings,
+)
 
 
 def _run_macos_device_bridge_commands(
@@ -1547,28 +1354,6 @@ def _run_docker_image(
         return False
 
 
-def _stream_container_logs(
-    container_name: str,
-    *,
-    twin_uuid: Optional[str] = None,
-    token: Optional[str] = None,
-) -> None:
-    """Stream container logs into this service logger in the background."""
-    existing = _CONTAINER_LOG_THREADS.get(container_name)
-    if existing and existing.is_alive():
-        return
-
-    thread = threading.Thread(
-        target=_follow_container_logs,
-        args=(container_name,),
-        kwargs={"twin_uuid": twin_uuid, "token": token},
-        name=f"docker-logs-{container_name}",
-        daemon=True,
-    )
-    _CONTAINER_LOG_THREADS[container_name] = thread
-    thread.start()
-
-
 def _list_driver_containers(*, include_stopped: bool) -> list[str]:
     """Return edge-core managed driver container names."""
     if not shutil.which("docker"):
@@ -1944,6 +1729,93 @@ def reconcile_driver_restart_failures() -> dict[str, int]:
     return summary
 
 
+_cameras_json_mtime: Optional[float] = None
+
+
+def _get_container_env_var(inspect_data: dict[str, Any], key: str) -> Optional[str]:
+    """Extract a single env var value from ``docker inspect`` output."""
+    config = inspect_data.get("Config") or {}
+    for entry in config.get("Env") or []:
+        if isinstance(entry, str) and entry.startswith(f"{key}="):
+            return entry.split("=", 1)[1]
+    return None
+
+
+def reconcile_camera_config_drift() -> bool:
+    """Detect ``cameras.json`` changes and trigger a targeted driver restart.
+
+    Compares the video device in ``cameras.json`` against what each running
+    driver container was launched with.  When they diverge, the stale
+    container is removed and edge-core re-runs driver startup so the new
+    device is picked up — no full service restart required.
+
+    Returns True if a restart was triggered.
+    """
+    global _cameras_json_mtime
+
+    if platform.system() != "Linux":
+        return False
+
+    cameras_file = CONFIG_DIR / "cameras.json"
+    if not cameras_file.exists():
+        return False
+
+    try:
+        current_mtime = cameras_file.stat().st_mtime
+    except OSError:
+        return False
+
+    if _cameras_json_mtime is None:
+        _cameras_json_mtime = current_mtime
+        return False
+
+    if current_mtime == _cameras_json_mtime:
+        return False
+
+    _cameras_json_mtime = current_mtime
+
+    desired_device = _load_selected_camera_device()
+    if desired_device is None:
+        return False
+
+    containers = _list_running_driver_containers()
+    stale_containers: list[str] = []
+
+    for container_name in containers:
+        inspect_data = _inspect_driver_container(container_name)
+        if not inspect_data:
+            continue
+        current_device = _get_container_env_var(
+            inspect_data, "CYBERWAVE_METADATA_VIDEO_DEVICE"
+        )
+        if current_device is None:
+            continue
+        if current_device != desired_device:
+            logger.info(
+                "Camera config drift detected for %s: "
+                "container has %s, cameras.json wants %s",
+                container_name,
+                current_device,
+                desired_device,
+            )
+            stale_containers.append(container_name)
+
+    if not stale_containers:
+        return False
+
+    logger.info(
+        "Triggering edge restart to apply camera config change (%s)",
+        desired_device,
+    )
+    token = load_token()
+    if not token:
+        logger.warning("Cannot restart drivers for camera config change: no token")
+        return False
+
+    _perform_edge_core_restart(token)
+    return True
+
+
 def _stop_and_prune_driver_containers() -> list[str]:
     """Force-remove edge-core driver containers and prune stopped containers."""
     containers = _list_driver_containers(include_stopped=True)
@@ -2004,391 +1876,6 @@ def _remove_cached_twin_json_files() -> list[str]:
         except OSError as exc:
             logger.warning("Failed to remove cached twin object %s: %s", json_file, exc)
     return removed
-
-
-def reconcile_driver_log_streams() -> int:
-    """Ensure active driver containers have an attached log-forwarding thread."""
-    running_containers = _list_running_driver_containers()
-    running_set = set(running_containers)
-
-    # Drop finished thread handles so we can re-attach later if needed.
-    stale = [
-        name
-        for name, thread in _CONTAINER_LOG_THREADS.items()
-        if not thread.is_alive() and name not in running_set
-    ]
-    for name in stale:
-        _CONTAINER_LOG_THREADS.pop(name, None)
-
-    attached = 0
-    token: Optional[str] = None
-    for container_name in running_containers:
-        thread = _CONTAINER_LOG_THREADS.get(container_name)
-        if thread and thread.is_alive():
-            attached += 1
-            continue
-        if token is None:
-            token = load_token()
-        twin_uuid = _CONTAINER_TWIN_MAP.get(container_name)
-        _stream_container_logs(container_name, twin_uuid=twin_uuid, token=token)
-        thread = _CONTAINER_LOG_THREADS.get(container_name)
-        if thread and thread.is_alive():
-            attached += 1
-    return attached
-
-
-def _parse_log_level(message: str) -> str:
-    """Best-effort extraction of log level from a driver log line."""
-    upper = message[:80].upper()
-    for level in ("ERROR", "CRITICAL", "WARNING", "WARN", "DEBUG", "INFO"):
-        if level in upper:
-            return "WARNING" if level == "WARN" else level
-    return "INFO"
-
-
-def _build_driver_log_payload(
-    message: str,
-    container_name: str,
-    *,
-    driver_image: str | None = None,
-) -> dict[str, Any]:
-    """Build the MQTT payload for a forwarded driver log line."""
-    payload: dict[str, Any] = {
-        "type": "driver_log",
-        "message": message,
-        "level": _parse_log_level(message),
-        "container_name": container_name,
-        "source": "edge",
-        "timestamp": time.time(),
-        "edge_core_version": EDGE_CORE_VERSION,
-    }
-    if CYBERWAVE_SDK_VERSION:
-        payload["sdk_version"] = CYBERWAVE_SDK_VERSION
-    if driver_image:
-        payload["driver_image"] = driver_image
-    return payload
-
-
-def _resolve_driver_log_publish_context(
-    *,
-    twin_uuid: Optional[str],
-    token: Optional[str],
-) -> tuple[Optional[Any], Optional[str]]:
-    """Create the MQTT publish context used for driver log forwarding."""
-    if not twin_uuid or not token:
-        return None, None
-
-    mqtt_client = _get_shared_mqtt_client(token)
-    if not mqtt_client:
-        return None, None
-
-    prefix = mqtt_client.mqtt.topic_prefix
-    mqtt_topic = f"{prefix}cyberwave/twin/{twin_uuid}/driverlog"
-    return mqtt_client, mqtt_topic
-
-
-def _publish_driver_log_message(
-    message: str,
-    container_name: str,
-    *,
-    mqtt_client: Optional[Any] = None,
-    mqtt_topic: Optional[str] = None,
-    driver_image: str | None = None,
-) -> None:
-    """Publish a driver log line to MQTT when a publish context is available."""
-    if not mqtt_client or not mqtt_topic:
-        return
-
-    try:
-        mqtt_client.mqtt.publish(
-            mqtt_topic,
-            _build_driver_log_payload(
-                message,
-                container_name,
-                driver_image=driver_image,
-            ),
-        )
-    except Exception:
-        logger.debug(
-            "Failed to publish driver log to MQTT for %s",
-            container_name,
-            exc_info=True,
-        )
-
-
-def _log_and_publish_driver_message(
-    message: str,
-    container_name: str,
-    *,
-    mqtt_client: Optional[Any] = None,
-    mqtt_topic: Optional[str] = None,
-    driver_image: str | None = None,
-) -> None:
-    """Mirror a driver log line to stderr and publish via MQTT.
-
-    The container already emits fully formatted log lines (timestamp, level,
-    module).  Writing them directly to stderr avoids the double-timestamp
-    problem that occurs when ``logger.info()`` wraps the line with
-    edge-core's own formatter.
-    """
-    print(message, file=sys.stderr)
-    _publish_driver_log_message(
-        message,
-        container_name,
-        mqtt_client=mqtt_client,
-        mqtt_topic=mqtt_topic,
-        driver_image=driver_image,
-    )
-
-
-def _iter_stream_messages(stream: Any) -> Any:
-    """Yield messages delimited by newlines or carriage returns."""
-    buffer: list[str] = []
-    while True:
-        chunk = stream.read(1)
-        if chunk == "":
-            break
-        if chunk in {"\r", "\n"}:
-            message = "".join(buffer).strip()
-            if message:
-                yield message
-            buffer.clear()
-            continue
-        buffer.append(chunk)
-
-    message = "".join(buffer).strip()
-    if message:
-        yield message
-
-
-def _pull_docker_image_with_progress(
-    image: str,
-    *,
-    container_name: str,
-    twin_uuid: str,
-    token: str,
-    timeout: int = 600,
-    driver_alert_ctx: Optional[DriverStartingAlertContext] = None,
-) -> None:
-    """Pull a driver image while streaming progress to local logs and MQTT."""
-    mqtt_client, mqtt_topic = _resolve_driver_log_publish_context(
-        twin_uuid=twin_uuid,
-        token=token,
-    )
-    logger.info("Pulling docker image: %s", image)
-    if driver_alert_ctx:
-        driver_alert_ctx.update_metadata(
-            {"phase": "pulling", "last_message": f"docker pull started for {image}"},
-            force=True,
-        )
-    _log_and_publish_driver_message(
-        f"docker pull started for image {image}",
-        container_name,
-        mqtt_client=mqtt_client,
-        mqtt_topic=mqtt_topic,
-        driver_image=image,
-    )
-
-    try:
-        process = subprocess.Popen(
-            ["docker", "pull", image],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except OSError as exc:
-        if driver_alert_ctx:
-            driver_alert_ctx.update_metadata(
-                {"phase": "pull_spawn_failed", "last_error": str(exc)[:500]},
-                force=True,
-            )
-        _log_and_publish_driver_message(
-            f"docker pull failed for image {image}: {exc}",
-            container_name,
-            mqtt_client=mqtt_client,
-            mqtt_topic=mqtt_topic,
-            driver_image=image,
-        )
-        raise
-
-    recent_messages: deque[str] = deque(maxlen=20)
-    last_message: Optional[str] = None
-    try:
-        if process.stdout:
-            for message in _iter_stream_messages(process.stdout):
-                if message == last_message:
-                    continue
-                last_message = message
-                recent_messages.append(message)
-                if driver_alert_ctx:
-                    driver_alert_ctx.update_metadata(
-                        {
-                            "phase": "downloading",
-                            "last_docker_pull_line": message[:500],
-                            "recent_pull_lines": list(recent_messages)[-5:],
-                        },
-                    )
-                _log_and_publish_driver_message(
-                    f"docker pull: {message}",
-                    container_name,
-                    mqtt_client=mqtt_client,
-                    mqtt_topic=mqtt_topic,
-                    driver_image=image,
-                )
-
-        return_code = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-        if driver_alert_ctx:
-            driver_alert_ctx.update_metadata(
-                {
-                    "phase": "pull_timed_out",
-                    "last_message": f"docker pull timed out for {image}",
-                },
-                force=True,
-            )
-        _log_and_publish_driver_message(
-            f"docker pull timed out for image {image}",
-            container_name,
-            mqtt_client=mqtt_client,
-            mqtt_topic=mqtt_topic,
-            driver_image=image,
-        )
-        raise
-
-    if return_code != 0:
-        error_output = "\n".join(recent_messages) or f"docker pull exited with code {return_code}"
-        if driver_alert_ctx:
-            driver_alert_ctx.update_metadata(
-                {
-                    "phase": "pull_exit_error",
-                    "last_error": error_output[:500],
-                    "recent_pull_lines": list(recent_messages)[-5:],
-                },
-                force=True,
-            )
-        _log_and_publish_driver_message(
-            f"docker pull failed for image {image}: {error_output}",
-            container_name,
-            mqtt_client=mqtt_client,
-            mqtt_topic=mqtt_topic,
-            driver_image=image,
-        )
-        raise subprocess.CalledProcessError(
-            return_code,
-            ["docker", "pull", image],
-            stderr=error_output,
-        )
-
-    if driver_alert_ctx:
-        driver_alert_ctx.update_metadata(
-            {
-                "phase": "pull_stream_finished",
-                "last_message": f"docker pull completed for {image}",
-            },
-            force=True,
-        )
-    _log_and_publish_driver_message(
-        f"docker pull completed for image {image}",
-        container_name,
-        mqtt_client=mqtt_client,
-        mqtt_topic=mqtt_topic,
-        driver_image=image,
-    )
-
-
-def _follow_container_logs(
-    container_name: str,
-    *,
-    twin_uuid: Optional[str] = None,
-    token: Optional[str] = None,
-) -> None:
-    """Follow `docker logs -f` and forward lines to the service logger.
-
-    When *twin_uuid* and *token* are provided, each log line is also
-    published to the backend via MQTT as a ``driver_log`` event.
-    """
-    if not shutil.which("docker"):
-        logger.warning("Cannot stream logs: Docker is not installed")
-        return
-
-    logger.info("Forwarding logs for container %s to service logs", container_name)
-    debug_log_stream = logger.isEnabledFor(logging.DEBUG)
-    received_lines = 0
-
-    mqtt_client: Optional[Any] = None
-    mqtt_topic: Optional[str] = None
-    driver_image: Optional[str] = None
-    mqtt_client, mqtt_topic = _resolve_driver_log_publish_context(
-        twin_uuid=twin_uuid,
-        token=token,
-    )
-    if mqtt_topic:
-        logger.info("Driver logs for %s will be published to %s", container_name, mqtt_topic)
-        driver_image = _resolve_container_driver_image(
-            _inspect_driver_container(container_name)
-        )
-
-    cmd = ["docker", "logs", "-f"]
-    since_ts = _CONTAINER_LOG_LAST_SEEN.get(container_name)
-    if since_ts:
-        cmd += ["--since", since_ts]
-    cmd.append(container_name)
-
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except OSError as exc:
-        logger.warning("Failed to start docker log streaming for %s: %s", container_name, exc)
-        return
-
-    try:
-        if not process.stdout:
-            logger.warning("No stdout stream when following logs for %s", container_name)
-            return
-
-        for line in process.stdout:
-            message = line.rstrip()
-            if message:
-                received_lines += 1
-                _log_and_publish_driver_message(
-                    message,
-                    container_name,
-                    mqtt_client=mqtt_client,
-                    mqtt_topic=mqtt_topic,
-                    driver_image=driver_image,
-                )
-
-                if debug_log_stream:
-                    logger.debug(
-                        "Container log line received (container=%s, line=%d, chars=%d)",
-                        container_name,
-                        received_lines,
-                        len(message),
-                    )
-    except Exception as exc:
-        logger.warning("Error while streaming logs for %s: %s", container_name, exc)
-    finally:
-        _CONTAINER_LOG_LAST_SEEN[container_name] = datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        logger.info(
-            "Stopped forwarding logs for container %s (lines_received=%d)",
-            container_name,
-            received_lines,
-        )
 
 
 def _resolve_attach_to_twin_uuid(client: Any, twin: Any, twin_metadata: dict) -> Optional[str]:
@@ -2924,90 +2411,8 @@ def _send_alert_for_twin(
     )
 
 
-def _get_best_driver_image_and_params(
-    drivers: Dict[str, Dict[str, Any]],
-    child_registry_ids: Optional[set[str]] = None,
-) -> tuple[str, list[str]]:
-    """
-    Given a list of drivers specified in the metadata of the asset,
-    and given the hardware where the edge is running,
-    Returns:
-    - The best driver to run.
-    - A list of parameters to pass to the driver when doing docker run
-    If any non-default driver key matches one of the child asset registry IDs,
-    that driver is preferred over ``default``.
-
-    "drivers": {
-        "default": {
-            "docker_image": "helloworld",
-            "version": "0.1.0",
-            "params": ["--param1", "--param2"],
-        },
-        "mac": {
-            "docker_image": "helloworld",
-            "version": "0.1.0",
-            "params": ["--param1", "--param2"],
-        },
-    },
-    """
-    def _extract_driver_image_and_params(
-        driver_name: str,
-        driver_config: Any,
-    ) -> tuple[str, list[str]]:
-        if not isinstance(driver_config, dict):
-            raise ValueError(f"Invalid config for driver '{driver_name}'")
-        if not driver_config.get("docker_image") or not isinstance(
-            driver_config["docker_image"], str
-        ):
-            raise ValueError(f"No docker_image specified for driver '{driver_name}'")
-        raw_params = driver_config.get("params")
-        if raw_params is None:
-            params: list[str] = []
-        elif isinstance(raw_params, list) and all(isinstance(param, str) for param in raw_params):
-            params = raw_params
-        else:
-            raise ValueError(f"Invalid params for driver '{driver_name}'")
-        return driver_config["docker_image"], params
-
-    def _resolve_platform_driver_keys() -> list[str]:
-        system_name = platform.system().lower()
-        machine_name = platform.machine().lower()
-
-        platform_aliases: list[str]
-        if system_name == "darwin":
-            platform_aliases = ["darwin", "macos", "mac", "osx"]
-        elif system_name == "linux":
-            platform_aliases = ["linux"]
-        elif system_name == "windows":
-            platform_aliases = ["windows", "win32"]
-        else:
-            platform_aliases = [system_name]
-
-        if machine_name:
-            machine_specific = [f"{alias}-{machine_name}" for alias in platform_aliases]
-            return machine_specific + platform_aliases
-        return platform_aliases
-
-    normalized_child_registry_ids = {
-        registry_id.strip()
-        for registry_id in (child_registry_ids or set())
-        if isinstance(registry_id, str) and registry_id.strip()
-    }
-    if normalized_child_registry_ids and len(drivers) > 1:
-        for driver_name, driver_config in drivers.items():
-            if driver_name == "default":
-                continue
-            if driver_name not in normalized_child_registry_ids:
-                continue
-            return _extract_driver_image_and_params(driver_name, driver_config)
-
-    for platform_key in _resolve_platform_driver_keys():
-        if platform_key not in drivers:
-            continue
-        return _extract_driver_image_and_params(platform_key, drivers[platform_key])
-
-    default_driver = drivers.get("default")
-    return _extract_driver_image_and_params("default", default_driver)
+# Re-exported from driver_selection for backward compat.
+from .driver_selection import _get_best_driver_image_and_params as _get_best_driver_image_and_params  # noqa: E402
 
 
 def register_edge(token: str) -> bool:
@@ -3972,6 +3377,12 @@ def run_runtime_loop() -> None:
             twin_sync_summary["changed"],
             twin_sync_summary["synced"],
         )
+
+        try:
+            if reconcile_camera_config_drift():
+                continue
+        except Exception:
+            logger.exception("Unexpected error in camera config drift reconciliation")
 
         # Reconcile worker file changes and health probes each cycle.
         try:

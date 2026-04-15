@@ -165,12 +165,13 @@ class TestWorkerManagerVolumes:
         workers_dir = tmp_config / "workers"
         assert f"{workers_dir}:/app/workers:ro" in args
 
-    def test_volume_args_include_models_dir_ro(
+    def test_volume_args_include_models_dir_rw(
         self, worker_manager: WorkerManager, tmp_config: Path
     ) -> None:
         args = worker_manager._build_volume_args()
         models_dir = tmp_config / "models"
-        assert f"{models_dir}:/app/models:ro" in args
+        assert f"{models_dir}:/app/models" in args
+        assert f"{models_dir}:/app/models:ro" not in args
 
     def test_volume_dirs_created(
         self, worker_manager: WorkerManager, tmp_config: Path

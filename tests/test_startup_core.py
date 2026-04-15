@@ -20,6 +20,7 @@ import uuid as _uuid_module
 from pathlib import Path
 from unittest.mock import patch
 
+import cyberwave_edge_core.driver_selection as driver_selection
 import cyberwave_edge_core.startup as startup
 
 # ===========================================================================
@@ -1158,8 +1159,8 @@ class TestRunDockerImagePullFallback:
 
 class TestDriverSelection:
     def test_prefers_platform_specific_driver_by_machine(self, monkeypatch):
-        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
-        monkeypatch.setattr(startup.platform, "machine", lambda: "arm64")
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "arm64")
 
         image, params = startup._get_best_driver_image_and_params(
             {
@@ -1176,8 +1177,8 @@ class TestDriverSelection:
         assert params == ["--log-level", "debug"]
 
     def test_falls_back_to_default_when_no_platform_driver_matches(self, monkeypatch):
-        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
-        monkeypatch.setattr(startup.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
 
         image, params = startup._get_best_driver_image_and_params(
             {
@@ -1216,10 +1217,12 @@ class TestPullDockerImageWithProgress:
             self.mqtt = TestPullDockerImageWithProgress._FakeMQTT()
 
     def test_streams_pull_progress_lines_to_mqtt(self, monkeypatch):
+        from cyberwave_edge_core import driver_logs
+
         fake_client = self._FakeClient()
         monkeypatch.setattr(startup, "_get_shared_mqtt_client", lambda token: fake_client)
         monkeypatch.setattr(
-            startup.subprocess,
+            driver_logs.subprocess,
             "Popen",
             lambda *args, **kwargs: self._FakeProcess(
                 "layer-1: Pulling fs layer\rlayer-1: Downloading 10%\r"
@@ -1260,13 +1263,15 @@ class TestReconcileDriverLogStreams:
             return True
 
     def test_skips_token_reload_when_log_thread_is_already_attached(self, monkeypatch):
+        from cyberwave_edge_core import driver_logs
+
         monkeypatch.setattr(
             startup,
             "_list_running_driver_containers",
             lambda: ["cyberwave-driver-abcd1234"],
         )
         monkeypatch.setattr(
-            startup,
+            driver_logs,
             "_CONTAINER_LOG_THREADS",
             {"cyberwave-driver-abcd1234": self._AliveThread()},
         )
@@ -1280,7 +1285,7 @@ class TestReconcileDriverLogStreams:
         stream_calls: list[str] = []
         monkeypatch.setattr(startup, "load_token", lambda: load_calls.append("load") or "token")
         monkeypatch.setattr(
-            startup,
+            driver_logs,
             "_stream_container_logs",
             lambda *args, **kwargs: stream_calls.append("stream"),
         )
@@ -1305,9 +1310,11 @@ class TestBuildDriverLogPayload:
         )
 
     def test_includes_edge_core_and_sdk_versions(self, monkeypatch):
+        from cyberwave_edge_core import driver_logs
+
         monkeypatch.setattr(startup, "EDGE_CORE_VERSION", "0.0.18-test")
         monkeypatch.setattr(startup, "CYBERWAVE_SDK_VERSION", "0.3.20-test")
-        monkeypatch.setattr(startup.time, "time", lambda: 1234.5)
+        monkeypatch.setattr(driver_logs.time, "time", lambda: 1234.5)
 
         payload = startup._build_driver_log_payload(
             "2026-03-09 12:00:00 ERROR driver failed",
@@ -1328,9 +1335,11 @@ class TestBuildDriverLogPayload:
         }
 
     def test_omits_optional_fields_when_unavailable(self, monkeypatch):
+        from cyberwave_edge_core import driver_logs
+
         monkeypatch.setattr(startup, "EDGE_CORE_VERSION", "0.0.18-test")
         monkeypatch.setattr(startup, "CYBERWAVE_SDK_VERSION", None)
-        monkeypatch.setattr(startup.time, "time", lambda: 99.0)
+        monkeypatch.setattr(driver_logs.time, "time", lambda: 99.0)
 
         payload = startup._build_driver_log_payload(
             "informational startup message",
@@ -1570,3 +1579,140 @@ class TestFixConfigDirOwnership:
         for _, uid, gid in lchown_calls:
             assert uid == 1000
             assert gid == 1000
+
+
+# ===========================================================================
+# Camera config drift reconciliation
+# ===========================================================================
+
+
+class TestReconcileCameraConfigDrift:
+    """Tests for reconcile_camera_config_drift()."""
+
+    def _write_cameras_json(self, config_dir: Path, selected_device: int) -> Path:
+        cameras_file = config_dir / "cameras.json"
+        cameras_file.write_text(json.dumps({"selected_device": selected_device}))
+        return cameras_file
+
+    def test_no_cameras_json_returns_false(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "_cameras_json_mtime", None)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        assert startup.reconcile_camera_config_drift() is False
+
+    def test_skips_on_macos(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "_cameras_json_mtime", None)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+
+        self._write_cameras_json(tmp_path, 2)
+        assert startup.reconcile_camera_config_drift() is False
+
+    def test_first_call_seeds_mtime_without_restart(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "_cameras_json_mtime", None)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        self._write_cameras_json(tmp_path, 2)
+        assert startup.reconcile_camera_config_drift() is False
+
+    def test_no_drift_when_mtime_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = self._write_cameras_json(tmp_path, 2)
+        mtime = cameras_file.stat().st_mtime
+        monkeypatch.setattr(startup, "_cameras_json_mtime", mtime)
+
+        assert startup.reconcile_camera_config_drift() is False
+
+    def test_drift_triggers_restart(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = self._write_cameras_json(tmp_path, 0)
+        old_mtime = cameras_file.stat().st_mtime - 10
+        monkeypatch.setattr(startup, "_cameras_json_mtime", old_mtime)
+
+        cameras_file.write_text(json.dumps({"selected_device": 2}))
+
+        fake_inspect = {
+            "Config": {
+                "Env": ["CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video0"],
+            },
+        }
+
+        monkeypatch.setattr(
+            startup, "_list_running_driver_containers",
+            lambda: ["cyberwave-driver-abc12345"],
+        )
+        monkeypatch.setattr(
+            startup, "_inspect_driver_container",
+            lambda name: fake_inspect,
+        )
+
+        restart_calls: list[str] = []
+        monkeypatch.setattr(
+            startup, "_perform_edge_core_restart",
+            lambda token: restart_calls.append(token) or {},
+        )
+        monkeypatch.setattr(startup, "load_token", lambda: "test-token")
+
+        assert startup.reconcile_camera_config_drift() is True
+        assert restart_calls == ["test-token"]
+
+    def test_no_restart_when_container_matches(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = self._write_cameras_json(tmp_path, 2)
+        old_mtime = cameras_file.stat().st_mtime - 10
+        monkeypatch.setattr(startup, "_cameras_json_mtime", old_mtime)
+
+        cameras_file.write_text(json.dumps({"selected_device": 2}))
+
+        fake_inspect = {
+            "Config": {
+                "Env": ["CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video2"],
+            },
+        }
+
+        monkeypatch.setattr(
+            startup, "_list_running_driver_containers",
+            lambda: ["cyberwave-driver-abc12345"],
+        )
+        monkeypatch.setattr(
+            startup, "_inspect_driver_container",
+            lambda name: fake_inspect,
+        )
+
+        assert startup.reconcile_camera_config_drift() is False
+
+    def test_no_restart_without_token(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = self._write_cameras_json(tmp_path, 0)
+        old_mtime = cameras_file.stat().st_mtime - 10
+        monkeypatch.setattr(startup, "_cameras_json_mtime", old_mtime)
+
+        cameras_file.write_text(json.dumps({"selected_device": 2}))
+
+        fake_inspect = {
+            "Config": {
+                "Env": ["CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video0"],
+            },
+        }
+
+        monkeypatch.setattr(
+            startup, "_list_running_driver_containers",
+            lambda: ["cyberwave-driver-abc12345"],
+        )
+        monkeypatch.setattr(
+            startup, "_inspect_driver_container",
+            lambda name: fake_inspect,
+        )
+        monkeypatch.setattr(startup, "load_token", lambda: None)
+
+        assert startup.reconcile_camera_config_drift() is False

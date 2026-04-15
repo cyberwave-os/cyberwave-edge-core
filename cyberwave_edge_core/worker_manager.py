@@ -35,6 +35,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _ensure_dir_writable_by_container_user(path: Path) -> None:
+    """Best-effort chown so the container user (``os.getuid()``) can write.
+
+    When edge-core runs as root (systemd), directories it creates are
+    root-owned.  The worker container runs as the invoking user via
+    ``build_user_args()``, so it cannot write to root-owned mounts.
+    """
+    if platform.system() != "Linux":
+        return
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    target_uid = os.getuid()
+    if target_uid == 0:
+        sudo_uid = os.environ.get("SUDO_UID")
+        if sudo_uid:
+            target_uid = int(sudo_uid)
+        else:
+            return
+    if st.st_uid != target_uid:
+        try:
+            os.chown(path, target_uid, os.getgid())
+        except OSError:
+            logger.debug("Cannot chown %s to uid %d", path, target_uid)
+
+
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
 _WORKER_IMAGE_BASE = "cyberwaveos/edge-ml-worker"
 DEFAULT_WORKER_IMAGE = f"{_WORKER_IMAGE_BASE}:latest"
@@ -433,6 +461,7 @@ class WorkerManager:
 
         workers_dir.mkdir(parents=True, exist_ok=True)
         models_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_dir_writable_by_container_user(models_dir)
 
         return [
             "-v",
@@ -440,7 +469,7 @@ class WorkerManager:
             "-v",
             f"{workers_dir}:/app/workers:ro",
             "-v",
-            f"{models_dir}:/app/models:ro",
+            f"{models_dir}:/app/models",
         ]
 
     def _build_network_args(self) -> list[str]:
