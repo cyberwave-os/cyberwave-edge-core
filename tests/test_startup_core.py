@@ -1450,7 +1450,11 @@ class TestFixConfigDirOwnership:
                      0, 0,
                      result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
                 )
-            return result
+            return os.stat_result(
+                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                 target_uid, target_gid,
+                 result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+            )
 
         monkeypatch.setattr(startup.os, "lstat", fake_lstat)
 
