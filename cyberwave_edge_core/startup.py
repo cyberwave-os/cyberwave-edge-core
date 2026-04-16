@@ -1729,6 +1729,65 @@ def reconcile_driver_restart_failures() -> dict[str, int]:
     return summary
 
 
+_DRIVER_HEALTH_PREVIOUS: dict[str, str] = {}
+
+
+def reconcile_driver_health_for_worker() -> dict[str, str]:
+    """Check whether any driver container has gone down since the last cycle.
+
+    Returns a mapping of ``container_name -> status`` for all tracked drivers.
+    When a driver transitions from ``running`` to ``exited``/``dead``/``none``,
+    a warning is logged and an alert is sent to the corresponding twin.
+
+    This complements ``reconcile_driver_restart_failures`` which handles
+    crash-loop detection — this function catches clean exits and removals.
+
+    Note: if a driver is stopped by the restart-loop handler in the same
+    reconcile cycle, both this function and the restart handler may send
+    alerts.  The alert types differ (``driver_health`` vs
+    ``driver_restart_loop``), so this is informative rather than redundant.
+    """
+    running = set(_list_running_driver_containers())
+    all_containers = set(_list_driver_containers(include_stopped=True))
+    known = set(_DRIVER_HEALTH_PREVIOUS.keys())
+
+    statuses: dict[str, str] = {}
+    for name in all_containers | known:
+        if name in running:
+            statuses[name] = "running"
+        elif name in all_containers:
+            statuses[name] = "down"
+        else:
+            statuses[name] = "removed"
+
+    for name, status in statuses.items():
+        prev = _DRIVER_HEALTH_PREVIOUS.get(name)
+        if prev == "running" and status in {"down", "removed"}:
+            twin_uuid = _CONTAINER_TWIN_MAP.get(name)
+            logger.warning(
+                "Driver container %s (twin %s) went %s while worker may be running",
+                name,
+                (twin_uuid or "unknown")[:8],
+                status,
+            )
+            if twin_uuid:
+                try:
+                    _send_alert_for_twin(
+                        twin_uuid,
+                        "Driver container stopped",
+                        f"Driver container '{name}' is no longer running ({status}). "
+                        f"Frames from this camera will not be available to the worker.",
+                        "driver_health",
+                        severity="warning",
+                    )
+                except Exception as exc:
+                    logger.debug("Could not send driver-down alert: %s", exc)
+
+    _DRIVER_HEALTH_PREVIOUS.clear()
+    _DRIVER_HEALTH_PREVIOUS.update(statuses)
+    return statuses
+
+
 _cameras_json_mtime: Optional[float] = None
 
 
@@ -2366,14 +2425,143 @@ def fetch_and_run_twin_drivers(
     return results
 
 
+def _wait_for_driver_readiness(
+    twin_uuids: list[str],
+    *,
+    timeout_seconds: float = 30.0,
+    poll_interval: float = 2.0,
+) -> dict[str, str]:
+    """Wait for all expected driver containers to reach a running state.
+
+    Returns a mapping of ``container_name -> status`` for each driver.
+    Containers that do not exist (e.g. child-camera twins with no dedicated
+    driver) are silently skipped.
+    """
+    expected_containers: dict[str, str] = {}
+    for tu in twin_uuids:
+        container_name = f"{DRIVER_CONTAINER_PREFIX}{tu[:8]}"
+        if container_name in expected_containers:
+            logger.warning(
+                "UUID prefix collision: twins %s and %s both map to container %s",
+                expected_containers[container_name][:12],
+                tu[:12],
+                container_name,
+            )
+        expected_containers[container_name] = tu
+    if not expected_containers:
+        return {}
+
+    # Identify which containers actually exist (some twins are children and
+    # share a parent's driver, so they have no dedicated container).
+    all_driver_names = set(_list_driver_containers(include_stopped=True))
+    relevant = {
+        name: tu
+        for name, tu in expected_containers.items()
+        if name in all_driver_names
+    }
+    if not relevant:
+        logger.debug("No driver containers found for twin UUIDs; skipping readiness wait")
+        return {}
+
+    deadline = time.time() + timeout_seconds
+    final_statuses: dict[str, str] = {}
+
+    while time.time() < deadline:
+        pending = []
+        for container_name in relevant:
+            if container_name in final_statuses:
+                continue
+            status = _get_container_status_fast(container_name)
+            if status == "running":
+                final_statuses[container_name] = "running"
+            elif status in {"exited", "dead", "restarting"}:
+                final_statuses[container_name] = status
+            else:
+                pending.append(container_name)
+
+        if not pending:
+            break
+        time.sleep(poll_interval)
+
+    for container_name in relevant:
+        if container_name not in final_statuses:
+            final_statuses[container_name] = "timeout"
+
+    healthy = [n for n, s in final_statuses.items() if s == "running"]
+    unhealthy = {n: s for n, s in final_statuses.items() if s != "running"}
+
+    logger.info(
+        "Driver readiness check complete: %d/%d healthy",
+        len(healthy),
+        len(final_statuses),
+    )
+    for name in healthy:
+        logger.info("  ✓ %s (twin %s): running", name, relevant[name][:8])
+    for name, status in unhealthy.items():
+        logger.warning("  ✗ %s (twin %s): %s", name, relevant[name][:8], status)
+
+    return final_statuses
+
+
+def _get_container_status_fast(container_name: str) -> str:
+    """Return the container status string without a full inspect."""
+    try:
+        result = subprocess.run(
+            [
+                "docker", "inspect",
+                "--format", "{{.State.Status}}",
+                container_name,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip().lower()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return "none"
+
+
 def _start_worker_after_drivers(
     token: str,
     environment_uuid: str,
     twin_uuids: list[str],
 ) -> None:
-    """Start the worker container after driver startup (best-effort, non-blocking)."""
+    """Start the worker container after verifying driver readiness.
+
+    Waits for all driver containers to reach a stable state (running or
+    failed), pre-downloads required ML models, then starts the worker.
+    Proceeds even if some drivers are unhealthy so that healthy cameras
+    can still be utilized.
+    """
     try:
+        logger.info(
+            "Preparing worker startup with %d twin(s): %s",
+            len(twin_uuids),
+            ", ".join(tu[:8] + "..." for tu in twin_uuids) if twin_uuids else "(none)",
+        )
+
+        driver_statuses = _wait_for_driver_readiness(twin_uuids)
+        unhealthy = {n: s for n, s in driver_statuses.items() if s != "running"}
+        if unhealthy:
+            logger.warning(
+                "Starting worker despite %d unhealthy driver(s): %s",
+                len(unhealthy),
+                ", ".join(f"{n}={s}" for n, s in unhealthy.items()),
+            )
+
+        from .model_manager import ModelManager
         from .worker_manager import WorkerManager, resolve_worker_image
+
+        workers_dir = CONFIG_DIR / "workers"
+        models_dir = CONFIG_DIR / "models"
+        if workers_dir.is_dir():
+            model_ids = ModelManager.scan_worker_model_ids(workers_dir)
+            if model_ids:
+                logger.info("Pre-downloading %d model(s) before worker startup: %s", len(model_ids), model_ids)
+                base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+                mm = ModelManager(cache_dir=models_dir, api_token=token, base_url=base_url)
+                mm.ensure_models(model_ids)
 
         worker_manager = WorkerManager(
             config_dir=CONFIG_DIR,
@@ -3370,6 +3558,19 @@ def run_runtime_loop() -> None:
             restart_summary["stopped"],
             restart_summary["alerts_sent"],
         )
+
+        try:
+            driver_health = reconcile_driver_health_for_worker()
+            down_drivers = [n for n, s in driver_health.items() if s != "running"]
+            if down_drivers:
+                logger.debug(
+                    "Driver health: %d down (%s)",
+                    len(down_drivers),
+                    ", ".join(down_drivers),
+                )
+        except Exception:
+            logger.exception("Unexpected error in driver health reconciliation")
+
         twin_sync_summary = reconcile_twin_json_file_sync()
         logger.debug(
             "Twin JSON sync reconcile complete (tracked=%d, changed=%d, synced=%d)",

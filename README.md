@@ -190,6 +190,18 @@ GPU memory fraction can be limited via `CYBERWAVE_GPU_MEM_FRACTION` (a float bet
 
 When an NVIDIA container runtime is detected (`docker info` reports `nvidia` runtime), Edge Core adds `--gpus all` to the worker container's `docker run` command.
 
+## Multi-camera orchestration
+
+When multiple cameras are connected to the same edge device (each represented as a separate digital twin), Edge Core orchestrates them as follows:
+
+1. **One driver per camera:** Each camera twin gets its own `cyberwave-driver-{uuid[:8]}` container. Child camera twins that are attached to a parent twin share the parent's driver instead.
+2. **One shared worker:** A single `cyberwave-worker-{env[:8]}` container receives frames from all cameras. The worker container receives `CYBERWAVE_TWIN_UUIDS` as a comma-separated list of all linked twins.
+3. **Readiness probes:** Edge Core waits for all driver containers to reach a `running` state before starting the worker. If some drivers fail, the worker starts anyway so healthy cameras can be utilized.
+4. **Model pre-download:** Before the worker starts, Edge Core scans worker scripts and pre-downloads all referenced ML models.
+5. **Driver health monitoring:** If a driver goes down while the worker is running, Edge Core sends an alert to the affected twin.
+
+Use `cyberwave edge status` to see all driver and worker containers with their twin mappings.
+
 ## Writing compatible drivers
 
 A Cyberwave driver is a Docker image that interacts with device hardware and the Cyberwave backend. When Edge Core starts a driver container it sets the following environment variables (provided to the container):
