@@ -49,7 +49,7 @@ DOWNLOAD_RETRY_BASE_DELAY = 2.0
 DOWNLOAD_CHUNK_SIZE = 64 * 1024  # 64 KiB
 
 #: API endpoint for fetching a model catalog entry.
-ML_MODELS_ENDPOINT = "/api/v1/ml-models"
+ML_MODELS_ENDPOINT = "/api/v1/mlmodels"
 
 #: Name of the per-model metadata sidecar inside a model sub-directory.
 MODEL_METADATA_FILENAME = "metadata.json"
@@ -409,7 +409,7 @@ class ModelManager:
         """Call the Cyberwave catalog API and return the model metadata dict.
 
         If *model_id* looks like a UUID, fetch directly via
-        ``GET /api/v1/ml-models/{uuid}``.  Otherwise fall back to the list
+        ``GET /api/v1/mlmodels/{uuid}``.  Otherwise fall back to the list
         endpoint filtered by ``model_external_id`` (e.g. ``yolov8n.pt``).
         """
         import httpx
