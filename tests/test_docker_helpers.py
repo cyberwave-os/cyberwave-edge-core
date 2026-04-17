@@ -486,6 +486,58 @@ class TestDockerHasNvidiaRuntime:
 
 
 # ---------------------------------------------------------------------------
+# docker_has_nvidia_default_runtime
+# ---------------------------------------------------------------------------
+
+
+class TestDockerHasNvidiaDefaultRuntime:
+    def test_returns_true_when_nvidia_is_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        daemon_json = tmp_path / "daemon.json"
+        daemon_json.write_text(json.dumps({"default-runtime": "nvidia"}))
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            dh, "docker_has_nvidia_default_runtime",
+            lambda: json.loads(daemon_json.read_text()).get("default-runtime") == "nvidia",
+        )
+        assert dh.docker_has_nvidia_default_runtime() is True
+
+    def test_returns_false_when_not_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Darwin")
+        assert dh.docker_has_nvidia_default_runtime() is False
+
+    def test_returns_false_when_daemon_json_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+        original = dh.docker_has_nvidia_default_runtime
+
+        import builtins
+        real_open = builtins.open
+
+        def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+            if str(path) == "/etc/docker/daemon.json":
+                raise FileNotFoundError("no such file")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        assert original() is False
+
+    def test_returns_false_when_different_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        daemon_json = tmp_path / "daemon.json"
+        daemon_json.write_text(json.dumps({"default-runtime": "runc"}))
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            dh, "docker_has_nvidia_default_runtime",
+            lambda: json.loads(daemon_json.read_text()).get("default-runtime") == "nvidia",
+        )
+        assert dh.docker_has_nvidia_default_runtime() is False
+
+
+# ---------------------------------------------------------------------------
 # docker_logs_follow
 # ---------------------------------------------------------------------------
 

@@ -185,6 +185,23 @@ def docker_has_nvidia_runtime() -> bool:
         return False
 
 
+def docker_has_nvidia_default_runtime() -> bool:
+    """Return True when ``/etc/docker/daemon.json`` uses nvidia as the default runtime.
+
+    Even if NVIDIA runtime is available (``docker_has_nvidia_runtime()``),
+    ``--gpus all`` is only reliable when nvidia is the *default* runtime
+    configured in the Docker daemon.
+    """
+    if platform.system() != "Linux":
+        return False
+    try:
+        with open("/etc/docker/daemon.json", encoding="utf-8") as fh:
+            daemon_cfg = json.load(fh)
+        return daemon_cfg.get("default-runtime") == "nvidia"
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+
+
 def docker_logs_follow(container_name: str) -> Optional[subprocess.Popen]:  # type: ignore[type-arg]
     """Start a ``docker logs -f`` process and return its Popen handle."""
     if not docker_available():

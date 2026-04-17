@@ -556,6 +556,8 @@ class TestTwoCameraOneWorkerScenario:
             child_camera_twin_uuids=None,
             macos_bridge_device_candidates=None,
             skip_pull=False,
+            prefer_gpu=False,
+            gpu_spec="all",
         ):
             run_calls.append({"twin_uuid": twin_uuid, "image": image})
             return True

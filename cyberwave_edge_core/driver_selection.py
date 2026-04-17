@@ -7,40 +7,67 @@ and any child-twin registry overrides.
 
 from __future__ import annotations
 
+import logging
+import os
 import platform
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+_jetson_detected: Optional[bool] = None
+
+
+def is_jetson() -> bool:
+    """Detect NVIDIA Jetson hardware via ``/etc/nv_tegra_release``.
+
+    Also honours the ``CYBERWAVE_PLATFORM_VARIANT=jetson`` env override.
+    """
+    global _jetson_detected
+    if _jetson_detected is not None:
+        return _jetson_detected
+
+    override = os.environ.get("CYBERWAVE_PLATFORM_VARIANT", "").strip().lower()
+    if override == "jetson":
+        _jetson_detected = True
+        return True
+
+    _jetson_detected = Path("/etc/nv_tegra_release").exists()
+    return _jetson_detected
 
 
 def _get_best_driver_image_and_params(
     drivers: Dict[str, Dict[str, Any]],
     child_registry_ids: Optional[set[str]] = None,
-) -> tuple[str, list[str]]:
-    """
-    Given a list of drivers specified in the metadata of the asset,
-    and given the hardware where the edge is running,
-    Returns:
-    - The best driver to run.
-    - A list of parameters to pass to the driver when doing docker run
-    If any non-default driver key matches one of the child asset registry IDs,
-    that driver is preferred over ``default``.
+) -> tuple[str, list[str], bool, str]:
+    """Select the best driver image for this platform.
+
+    Returns ``(docker_image, params, prefer_gpu, gpu_spec)`` where
+    *prefer_gpu* is a hint that the driver benefits from ``--gpus``
+    when an NVIDIA runtime is available, and *gpu_spec* controls which
+    GPUs are exposed (``"all"`` by default, or a count/device selector
+    like ``"1"`` or ``"device=0,1"``).
 
     "drivers": {
         "default": {
             "docker_image": "helloworld",
             "version": "0.1.0",
             "params": ["--param1", "--param2"],
+            "prefer_gpu": true,
+            "gpu": "all"
         },
-        "mac": {
-            "docker_image": "helloworld",
-            "version": "0.1.0",
+        "linux-aarch64-jetson": {
+            "docker_image": "helloworld:jetson-humble",
             "params": ["--param1", "--param2"],
+            "prefer_gpu": true,
+            "gpu": 1
         },
     },
     """
-    def _extract_driver_image_and_params(
+    def _extract(
         driver_name: str,
         driver_config: Any,
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], bool, str]:
         if not isinstance(driver_config, dict):
             raise ValueError(f"Invalid config for driver '{driver_name}'")
         if not driver_config.get("docker_image") or not isinstance(
@@ -54,7 +81,9 @@ def _get_best_driver_image_and_params(
             params = raw_params
         else:
             raise ValueError(f"Invalid params for driver '{driver_name}'")
-        return driver_config["docker_image"], params
+        prefer_gpu = bool(driver_config.get("prefer_gpu", False))
+        gpu_spec = str(driver_config.get("gpu", "all"))
+        return driver_config["docker_image"], params, prefer_gpu, gpu_spec
 
     def _resolve_platform_driver_keys() -> list[str]:
         system_name = platform.system().lower()
@@ -70,10 +99,16 @@ def _get_best_driver_image_and_params(
         else:
             platform_aliases = [system_name]
 
+        keys: list[str] = []
+
+        if machine_name and system_name == "linux" and is_jetson():
+            keys.append(f"linux-{machine_name}-jetson")
+
         if machine_name:
-            machine_specific = [f"{alias}-{machine_name}" for alias in platform_aliases]
-            return machine_specific + platform_aliases
-        return platform_aliases
+            keys.extend(f"{alias}-{machine_name}" for alias in platform_aliases)
+
+        keys.extend(platform_aliases)
+        return keys
 
     normalized_child_registry_ids = {
         registry_id.strip()
@@ -86,12 +121,12 @@ def _get_best_driver_image_and_params(
                 continue
             if driver_name not in normalized_child_registry_ids:
                 continue
-            return _extract_driver_image_and_params(driver_name, driver_config)
+            return _extract(driver_name, driver_config)
 
     for platform_key in _resolve_platform_driver_keys():
         if platform_key not in drivers:
             continue
-        return _extract_driver_image_and_params(platform_key, drivers[platform_key])
+        return _extract(platform_key, drivers[platform_key])
 
     default_driver = drivers.get("default")
-    return _extract_driver_image_and_params("default", default_driver)
+    return _extract("default", default_driver)

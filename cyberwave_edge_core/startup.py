@@ -967,6 +967,8 @@ def _run_docker_image(
     child_camera_twin_uuids: Optional[list[str]] = None,
     macos_bridge_device_candidates: Optional[list[str]] = None,
     skip_pull: bool = False,
+    prefer_gpu: bool = False,
+    gpu_spec: str = "all",
 ) -> bool:
     """Run a driver Docker container for a twin.
 
@@ -1257,10 +1259,33 @@ def _run_docker_image(
 
     network_args = _build_driver_network_args(params)
 
-    # Run the container.  --init injects tini as PID 1 so signals are
-    # forwarded properly even if the driver blocks on serial/USB I/O.
-    # --stop-timeout limits the SIGTERM grace period so Docker escalates
-    # to SIGKILL faster when USB devices cause unresponsive I/O.
+    gpu_args: list[str] = []
+    if prefer_gpu and platform.system() == "Linux":
+        from .docker_helpers import docker_has_nvidia_default_runtime, docker_has_nvidia_runtime
+
+        if docker_has_nvidia_runtime() and docker_has_nvidia_default_runtime():
+            gpu_value = gpu_spec or "all"
+            gpu_args = ["--gpus", gpu_value]
+            logger.info(
+                "NVIDIA runtime detected with default daemon config — "
+                "enabling GPU passthrough (--gpus %s) for %s",
+                gpu_value,
+                container_name,
+            )
+        elif docker_has_nvidia_runtime():
+            logger.info(
+                "NVIDIA runtime is available but not the default in "
+                "/etc/docker/daemon.json — skipping --gpus for %s. "
+                "Set \"default-runtime\": \"nvidia\" in "
+                "/etc/docker/daemon.json to enable GPU passthrough.",
+                container_name,
+            )
+        else:
+            logger.debug(
+                "prefer_gpu is set for %s but no NVIDIA runtime found",
+                container_name,
+            )
+
     cmd = [
         "docker",
         "run",
@@ -1271,6 +1296,7 @@ def _run_docker_image(
         "--restart",
         "unless-stopped",
         "--privileged",
+        *gpu_args,
         *pid_args,
         *network_args,
         "--name",
@@ -1418,6 +1444,47 @@ def _resolve_driver_image_tag(image: str) -> str:
     if runtime_environment != "production":
         return f"{image}:{runtime_environment}"
     return image
+
+
+def _maybe_rewrite_jetson_tag(image: str, twin_name: str = "") -> str:
+    """On Jetson hardware, try the ``jetson-`` prefixed image tag.
+
+    For example ``cyberwaveos/go2-ros2-driver:humble`` becomes
+    ``cyberwaveos/go2-ros2-driver:jetson-humble``.
+
+    If the tag already starts with ``jetson-`` or the platform is not Jetson,
+    the image reference is returned unchanged.
+    """
+    from .driver_selection import is_jetson
+
+    if not is_jetson():
+        return image
+
+    if ":" not in image:
+        logger.info(
+            "[Jetson] Detected Jetson platform for twin '%s' but image "
+            "%s has no explicit tag — keeping as-is",
+            twin_name,
+            image,
+        )
+        return image
+
+    repo, tag = image.rsplit(":", 1)
+
+    if tag.startswith("jetson-"):
+        return image
+
+    jetson_tag = f"jetson-{tag}"
+    jetson_image = f"{repo}:{jetson_tag}"
+    logger.info(
+        "[Jetson] Detected Jetson platform — rewriting driver tag for "
+        "twin '%s': %s -> %s (will fall back to %s if pull fails)",
+        twin_name,
+        image,
+        jetson_image,
+        image,
+    )
+    return jetson_image
 
 
 def _pull_driver_images_parallel(
@@ -2179,6 +2246,8 @@ def fetch_and_run_twin_drivers(
         driver_params: list[str]
         child_camera_twin_uuids: list[str]
         macos_bridge_candidates: list[str]
+        prefer_gpu: bool = False
+        gpu_spec: str = "all"
 
     driver_specs: list[_DriverSpec] = []
 
@@ -2265,9 +2334,11 @@ def fetch_and_run_twin_drivers(
                     ),
                     twin.name,
                 )
-        driver_image, driver_params = _get_best_driver_image_and_params(
-            drivers,
-            child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+        driver_image, driver_params, driver_prefer_gpu, driver_gpu_spec = (
+            _get_best_driver_image_and_params(
+                drivers,
+                child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+            )
         )
 
         _driver_overrides = load_driver_overrides()
@@ -2297,6 +2368,7 @@ def fetch_and_run_twin_drivers(
             )
 
         driver_image = _resolve_driver_image_tag(driver_image)
+        driver_image = _maybe_rewrite_jetson_tag(driver_image, twin.name)
 
         child_camera_uuids = list(dict.fromkeys(camera_children_by_parent.get(twin_uuid, [])))
         if child_camera_uuids:
@@ -2325,6 +2397,8 @@ def fetch_and_run_twin_drivers(
             driver_params=driver_params,
             child_camera_twin_uuids=child_camera_uuids,
             macos_bridge_candidates=macos_bridge_candidates,
+            prefer_gpu=driver_prefer_gpu,
+            gpu_spec=driver_gpu_spec,
         ))
 
     # ------------------------------------------------------------------
@@ -2336,6 +2410,35 @@ def fetch_and_run_twin_drivers(
         pull_results = _pull_driver_images_parallel(images_to_pull)
     else:
         pull_results = {}
+
+    # If a Jetson-rewritten tag failed to pull, fall back to the
+    # original (non-jetson) tag and re-pull.
+    from .driver_selection import is_jetson as _is_jetson_platform
+
+    if _is_jetson_platform():
+        fallback_needed: list[tuple[_DriverSpec, str]] = []
+        for spec in driver_specs:
+            if not pull_results.get(spec.driver_image, False) and ":" in spec.driver_image:
+                repo, tag = spec.driver_image.rsplit(":", 1)
+                if tag.startswith("jetson-"):
+                    original_tag = tag[len("jetson-"):]
+                    original_image = f"{repo}:{original_tag}"
+                    logger.warning(
+                        "[Jetson] jetson-prefixed image %s not found — "
+                        "falling back to %s for twin '%s'",
+                        spec.driver_image,
+                        original_image,
+                        spec.twin.name,
+                    )
+                    fallback_needed.append((spec, original_image))
+
+        if fallback_needed:
+            fallback_images = [img for _, img in fallback_needed]
+            fallback_results = _pull_driver_images_parallel(fallback_images)
+            for spec, original_image in fallback_needed:
+                if fallback_results.get(original_image, False):
+                    pull_results[original_image] = True
+                    spec.driver_image = original_image
 
     # ------------------------------------------------------------------
     # Pass 3: Start containers (images are already local).
@@ -2380,6 +2483,8 @@ def fetch_and_run_twin_drivers(
                 child_camera_twin_uuids=spec.child_camera_twin_uuids,
                 macos_bridge_device_candidates=spec.macos_bridge_candidates,
                 skip_pull=True,
+                prefer_gpu=spec.prefer_gpu,
+                gpu_spec=spec.gpu_spec,
             )
             results.append({
                 "twin_uuid": spec.twin_uuid,
