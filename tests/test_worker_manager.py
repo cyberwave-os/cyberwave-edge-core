@@ -254,6 +254,51 @@ class TestWorkerManagerGPU:
         assert docker_run_cmd is not None
         assert "--gpus" in docker_run_cmd
         assert "all" in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-gpu"
+
+    def test_gpu_image_not_double_suffixed_when_already_selected(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+
+        def fake_run(cmd: list, **kwargs: object) -> MagicMock:
+            run_calls.append(cmd)
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        worker_manager._image = "cyberwaveos/edge-ml-worker:latest-gpu"
+
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: default,
+        )
+        monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+        monkeypatch.setattr("os.environ", {})
+
+        with patch.object(
+            wm_module, "docker_container_status", side_effect=["none", "running"]
+        ):
+            assert worker_manager._run_container() is True
+
+        docker_run_cmd = next(
+            (c for c in run_calls if c and c[0] == "docker" and "run" in c), None
+        )
+        assert docker_run_cmd is not None
+        assert "--gpus" in docker_run_cmd
+        assert "all" in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-gpu"
 
     def test_no_gpu_args_when_nvidia_absent(
         self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
