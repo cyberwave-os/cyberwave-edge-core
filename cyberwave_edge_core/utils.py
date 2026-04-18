@@ -110,8 +110,16 @@ class DriverStartingAlertContext:
                 exc,
             )
 
-    def fail_without_resolve(self, description: str, *, phase: str = "pull_failed") -> None:
-        """Mark alert as failed; leave active so operators can see the issue."""
+    def mark_failed_and_resolve(self, description: str, *, phase: str = "pull_failed") -> None:
+        """Annotate the alert with failure context, then resolve it.
+
+        The "Driver starting" alert tracks an in-flight startup attempt and
+        should not stay active after that attempt finishes — failure or
+        success.  Higher-level driver-startup failures are surfaced via
+        separate ``driver_start_failure`` alerts created by the caller, so
+        leaving this alert active would be redundant and confusing
+        (especially after an explicit ``restart edge-core`` request).
+        """
         if not self._alert:
             return
         try:
@@ -129,8 +137,52 @@ class DriverStartingAlertContext:
             )
         except Exception as exc:
             logger.debug(
-                "Could not mark driver_starting alert failed for twin %s: %s",
+                "Could not annotate driver_starting alert failure for twin %s: %s",
                 self.twin_uuid,
                 exc,
                 exc_info=True,
             )
+        self.resolve()
+
+    @staticmethod
+    def resolve_active_for_twin(twin_uuid: str) -> int:
+        """Resolve any active ``driver_starting`` alerts for *twin_uuid*.
+
+        Used to clear orphans left behind by interrupted driver-startup
+        attempts (for example, before an ``edge-core`` restart wipes the
+        in-process alert context).  Best-effort: failures are logged and
+        never raised.  Returns the number of alerts resolved.
+        """
+        from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
+
+        token = load_token()
+        if not token:
+            return 0
+
+        base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+
+        resolved = 0
+        try:
+            client = Cyberwave(base_url=base_url, api_key=token)
+            twin = client.twin(twin_id=twin_uuid)
+            for alert in twin.alerts.list(status="active", limit=100):
+                if getattr(alert, "alert_type", None) != DRIVER_STARTING_ALERT_TYPE:
+                    continue
+                try:
+                    alert.resolve()
+                    resolved += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Could not resolve stale driver_starting alert %s for twin %s: %s",
+                        getattr(alert, "uuid", "<unknown>"),
+                        twin_uuid,
+                        exc,
+                    )
+        except Exception as exc:
+            logger.debug(
+                "Could not list driver_starting alerts for twin %s: %s",
+                twin_uuid,
+                exc,
+                exc_info=True,
+            )
+        return resolved

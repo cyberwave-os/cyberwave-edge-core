@@ -85,10 +85,13 @@ When Edge Core receives this command it performs a graceful restart consisting o
 1. Stopping the worker container (if running).
 2. Removing cached twin JSON files from the edge config directory.
 3. Stopping and removing any edge-managed driver containers, then pruning stopped containers.
-4. Re-downloading the selected environment and restarting drivers.
-5. Restarting the worker container (if worker files exist).
+4. Resolving any active `driver_starting` alerts on the affected twins so leftovers from the previous run do not stay visible after the restart.
+5. Re-downloading the selected environment and restarting drivers.
+6. Restarting the worker container (if worker files exist).
 
 The restart is intended to preserve durable state where possible. If connectivity is available before shutdown, Edge Core will attempt to sync any twin JSON changes back to the backend.
+
+Each driver startup attempt creates a `driver_starting` twin alert that tracks the in-flight startup (image pull, container launch, post-launch health probe). The alert is automatically resolved once the driver container is observed `running`, and is annotated and resolved with a failure phase if the attempt fails. The alert is therefore guaranteed to clear when the driver has restarted; longer-lived failure conditions are surfaced through separate `driver_start_failure` alerts created by the orchestrator.
 
 ## Model Manager (ML model cache)
 

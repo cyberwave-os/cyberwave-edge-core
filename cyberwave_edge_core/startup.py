@@ -1004,7 +1004,7 @@ def _run_docker_image(
     if skip_pull:
         if not _docker_image_exists_locally(image):
             logger.error("Image %s not available locally (skip_pull=True)", image)
-            driver_alert_ctx.fail_without_resolve(
+            driver_alert_ctx.mark_failed_and_resolve(
                 f"Driver image {image} not available locally after pull phase.",
                 phase="image_missing",
             )
@@ -1034,10 +1034,9 @@ def _run_docker_image(
                     },
                     force=True,
                 )
-                driver_alert_ctx.resolve()
             else:
                 logger.error("Failed to pull docker image %s: %s", image, exc.stderr)
-                driver_alert_ctx.fail_without_resolve(
+                driver_alert_ctx.mark_failed_and_resolve(
                     f"Failed to pull driver image {image}. {err_tail[:300]}",
                     phase="pull_failed",
                 )
@@ -1048,11 +1047,12 @@ def _run_docker_image(
                     "Docker pull timed out for image %s; using local image copy",
                     image,
                 )
-                driver_alert_ctx.update_metadata({"phase": "pull_timeout_using_local"}, force=True)
-                driver_alert_ctx.resolve()
+                driver_alert_ctx.update_metadata(
+                    {"phase": "pull_timeout_using_local"}, force=True
+                )
             else:
                 logger.error("Docker pull timed out for image: %s", image)
-                driver_alert_ctx.fail_without_resolve(
+                driver_alert_ctx.mark_failed_and_resolve(
                     f"Timed out pulling driver image {image}.",
                     phase="pull_timeout",
                 )
@@ -1068,17 +1068,21 @@ def _run_docker_image(
                     {"phase": "pull_oserror_using_local", "last_error": str(exc)[:500]},
                     force=True,
                 )
-                driver_alert_ctx.resolve()
             else:
                 logger.error("Docker pull failed for image %s: %s", image, exc)
-                driver_alert_ctx.fail_without_resolve(
+                driver_alert_ctx.mark_failed_and_resolve(
                     f"Could not pull driver image {image}: {exc}",
                     phase="pull_oserror",
                 )
                 return False
         else:
-            driver_alert_ctx.update_metadata({"phase": "pull_complete"}, force=True)
-        driver_alert_ctx.resolve()
+            # NOTE: deliberately not "pull_complete" — the frontend treats that
+            # as a terminal phase and would briefly drop the spinner between
+            # pull-finished and container-running.  ``starting_container`` keeps
+            # the spinner on through the docker-run + health-probe window.
+            driver_alert_ctx.update_metadata(
+                {"phase": "starting_container"}, force=True
+            )
 
     # Build env vars for the container
     container_env: dict[str, str] = {
@@ -1125,6 +1129,10 @@ def _run_docker_image(
         usbip_active=usbip_active,
     )
     if not macos_bridge_ok:
+        driver_alert_ctx.mark_failed_and_resolve(
+            f"macOS device bridge setup failed for image {image}.",
+            phase="macos_bridge_failed",
+        )
         return False
 
     if platform.system() == "Darwin" and not _macos_camera_stream_url:
@@ -1330,6 +1338,10 @@ def _run_docker_image(
             state = inspect_data.get("State") if isinstance(inspect_data.get("State"), dict) else {}
             status = str(state.get("Status", "")).lower()
             if status == "running":
+                driver_alert_ctx.update_metadata(
+                    {"phase": "container_running"}, force=True
+                )
+                driver_alert_ctx.resolve()
                 return True
             if status in {"restarting", "exited", "dead"}:
                 logger.error(
@@ -1338,6 +1350,13 @@ def _run_docker_image(
                     status,
                     str(state.get("Error", "")).strip() or "none",
                 )
+                driver_alert_ctx.mark_failed_and_resolve(
+                    (
+                        f"Driver container {container_name} failed to start cleanly "
+                        f"(status={status})."
+                    ),
+                    phase="container_unhealthy",
+                )
                 return False
             time.sleep(1.0)
 
@@ -1345,12 +1364,27 @@ def _run_docker_image(
             "Driver container %s did not reach a stable running state within startup probe window",
             container_name,
         )
+        # Probe window elapsed without confirmation; the container may still
+        # come up successfully, so close the alert as resolved (the caller
+        # surfaces a separate ``driver_start_failure`` alert if needed).
+        driver_alert_ctx.update_metadata(
+            {"phase": "container_probe_unconfirmed"}, force=True
+        )
+        driver_alert_ctx.resolve()
         return True
     except subprocess.CalledProcessError as exc:
         logger.error("Failed to start container %s: %s", container_name, exc.stderr)
+        driver_alert_ctx.mark_failed_and_resolve(
+            f"Failed to start container {container_name}.",
+            phase="docker_run_failed",
+        )
         return False
     except subprocess.TimeoutExpired:
         logger.error("Docker run timed out for image: %s", image)
+        driver_alert_ctx.mark_failed_and_resolve(
+            f"Docker run timed out for image {image}.",
+            phase="docker_run_timeout",
+        )
         return False
 
 
@@ -2675,9 +2709,34 @@ def _stop_worker_container_for_restart() -> None:
 
 def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     """Execute restart workflow: cleanup local state and re-run driver startup."""
+    # Capture the twins whose driver containers we are about to tear down so
+    # we can clear any in-flight ``driver_starting`` alerts that would
+    # otherwise be orphaned by the restart.  ``_stop_and_prune_driver_containers``
+    # mutates ``_CONTAINER_TWIN_MAP`` in place, so we snapshot it first.
+    twin_uuids_to_clear = {
+        twin_uuid for twin_uuid in _CONTAINER_TWIN_MAP.values() if twin_uuid
+    }
+
     _stop_worker_container_for_restart()
     removed_json_files = _remove_cached_twin_json_files()
     removed_containers = _stop_and_prune_driver_containers()
+
+    if twin_uuids_to_clear:
+        cleared = 0
+        for twin_uuid in twin_uuids_to_clear:
+            try:
+                cleared += DriverStartingAlertContext.resolve_active_for_twin(twin_uuid)
+            except Exception:
+                logger.debug(
+                    "Failed to clear stale driver_starting alerts for twin %s",
+                    twin_uuid,
+                    exc_info=True,
+                )
+        if cleared:
+            logger.info(
+                "Cleared %d stale driver_starting alert(s) before edge-core restart",
+                cleared,
+            )
 
     environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
 

@@ -1157,6 +1157,49 @@ class TestRunDockerImagePullFallback:
         assert "/dev/ttyACM0" in bridge_calls[0]
 
 
+class TestDriverStartingAlertLifecycle:
+    """Regression: the ``driver_starting`` alert must be resolved on the
+    ``skip_pull=True`` path used by the remote ``restart edge-core`` command.
+    Previously the alert was only resolved at "pull complete", so skip-pull
+    left it active and the UI showed "Driver starting" forever after a
+    restart.
+    """
+
+    def test_skip_pull_resolves_alert_when_container_runs(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        spy = MagicMock(name="DriverStartingAlertContext")
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", lambda **kw: spy)
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.shutil, "which", lambda name: "/usr/bin/docker")
+        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **k: None)
+        monkeypatch.setattr(startup.time, "sleep", lambda _: None)
+        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **k: None)
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda _n: {"State": {"Status": "running", "Error": ""}},
+        )
+        monkeypatch.setattr(
+            startup.subprocess,
+            "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr=""),
+        )
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid="11111111-2222-3333-4444-555555555555",
+            token="test-token",
+            skip_pull=True,
+        )
+
+        assert success is True
+        spy.resolve.assert_called()
+        spy.mark_failed_and_resolve.assert_not_called()
+
+
 class TestDriverSelection:
     def test_prefers_platform_specific_driver_by_machine(self, monkeypatch):
         monkeypatch.setattr(driver_selection.platform, "system", lambda: "Darwin")
