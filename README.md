@@ -158,7 +158,7 @@ Edge Core also auto-detects models by scanning `cw.models.load("...")` calls in 
 | `CYBERWAVE_TWIN_UUIDS` | Comma-separated twin UUIDs in environment |
 | `CYBERWAVE_DATA_BACKEND` | `zenoh` |
 | `ZENOH_CONNECT` | Set when a Zenoh router is configured |
-| `ZENOH_SHARED_MEMORY` | `true` on Linux (shared memory transport) |
+| `ZENOH_SHARED_MEMORY` | `false` by default (opt-in; requires `--ipc=host`) |
 
 ### File watching and hot-reload
 
@@ -223,7 +223,7 @@ Edge Core automatically injects Zenoh transport configuration into every driver 
 | Variable | Default | Description |
 |---|---|---|
 | `CYBERWAVE_DATA_BACKEND` | `zenoh` | Data transport: `zenoh` or `filesystem` |
-| `ZENOH_SHARED_MEMORY` | `false` | Enable Zenoh shared-memory for same-host zero-copy delivery |
+| `ZENOH_SHARED_MEMORY` | `false` | Opt-in zero-copy shared-memory transport. Requires `--ipc=host` between containers; leave disabled unless your runtime is configured for it. |
 | `ZENOH_CONNECT` | (empty) | Router endpoints, e.g. `tcp/10.0.0.1:7447` |
 
 All variables can be overridden per-driver with `-e KEY=VALUE` in driver params.
@@ -239,7 +239,7 @@ Environment variables for Zenoh infrastructure:
 | `ZENOH_ROUTER_ENABLED` | `false` | Start a Zenoh router container before drivers |
 | `ZENOH_ROUTER_IMAGE` | `eclipse/zenoh:latest` | Docker image for the router |
 | `ZENOH_ROUTER_PORT` | `7447` | Host port for the router |
-| `ZENOH_SHARED_MEMORY` | `false` | Enable shared-memory transport (Linux only) |
+| `ZENOH_SHARED_MEMORY` | `false` | Opt-in shared-memory transport. Requires all Cyberwave containers to share an IPC namespace (`--ipc=host`); leave disabled unless validated end-to-end. |
 
 ### Driver failure handling
 

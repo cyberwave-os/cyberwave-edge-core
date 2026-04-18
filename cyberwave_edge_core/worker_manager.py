@@ -29,6 +29,7 @@ from .docker_helpers import (
     docker_has_nvidia_runtime,
     docker_rm,
 )
+from .zenoh_config import ZenohConfig, build_zenoh_env_vars
 
 if TYPE_CHECKING:
     from .worker_health import WorkerHealthMonitor, WorkerHealthState
@@ -80,6 +81,7 @@ def resolve_worker_image() -> str:
     if env_name and env_name != "production":
         return f"{_WORKER_IMAGE_BASE}:{env_name}"
     return DEFAULT_WORKER_IMAGE
+
 
 _LEVEL_COLORS = {
     "DEBUG": "\033[36m",
@@ -433,8 +435,15 @@ class WorkerManager:
         zenoh_listen = get_runtime_env_var("ZENOH_LISTEN")
         env["ZENOH_LISTEN"] = zenoh_listen or "tcp/0.0.0.0:7447"
 
-        if platform.system() == "Linux":
-            env["ZENOH_SHARED_MEMORY"] = "true"
+        # Route the worker through the same Zenoh env builder that driver
+        # containers use (see ``startup._run_docker_image``). This keeps the
+        # two sides in lock-step: ``ZENOH_SHARED_MEMORY`` defaults to
+        # ``"false"`` because SHM between Docker containers requires
+        # ``--ipc=host``, which weakens isolation and has historically caused
+        # instability. Operators opt in by exporting
+        # ``ZENOH_SHARED_MEMORY=true`` in the edge-core process env.
+        for key, value in build_zenoh_env_vars(ZenohConfig()).items():
+            env.setdefault(key, value)
 
         for key, value in load_credentials_envs().items():
             if key.startswith("CYBERWAVE_"):
@@ -476,8 +485,10 @@ class WorkerManager:
         """Build network args; mirrors driver container networking."""
         if platform.system() == "Darwin":
             return [
-                "--add-host", "host.docker.internal:host-gateway",
-                "-p", "7447:7447/tcp",
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "-p",
+                "7447:7447/tcp",
             ]
         return ["--network", "host"]
 
@@ -584,9 +595,7 @@ class WorkerManager:
 
         if not self._ensure_image_pulled(image):
             if non_gpu_image:
-                logger.warning(
-                    "GPU image %s unavailable; falling back to %s", image, non_gpu_image
-                )
+                logger.warning("GPU image %s unavailable; falling back to %s", image, non_gpu_image)
                 image = non_gpu_image
                 cmd[-1] = image
                 if not self._ensure_image_pulled(image):
@@ -630,7 +639,6 @@ class WorkerManager:
             self._container_name,
         )
         return False
-
 
 
 def get_zenoh_env_vars() -> dict[str, str]:

@@ -234,10 +234,16 @@ class TestValidateZenohConfig:
         shm_warnings = [w for w in diag.warnings if "ZENOH_SHARED_MEMORY" in w]
         assert not shm_warnings
 
-    def test_shm_disabled_generates_warning(self):
+    def test_shm_disabled_does_not_generate_warning(self):
+        """``shared_memory=False`` is the intentional default for
+        containerised deployments (see the ``ZENOH_SHARED_MEMORY`` note in
+        ``zenoh_config`` module docstring).  It must not emit an operator
+        warning, otherwise every default startup logs a scary line."""
         cfg = _config(data_backend="zenoh", shared_memory=False)
         diag = validate_zenoh_config(cfg)
-        assert any("TCP loopback" in w or "ZENOH_SHARED_MEMORY" in w for w in diag.warnings)
+        assert not any(
+            "TCP loopback" in w or "ZENOH_SHARED_MEMORY is not enabled" in w for w in diag.warnings
+        )
 
     def test_router_enabled_without_connect_generates_warning(self):
         cfg = _config(data_backend="zenoh", router_enabled=True, connect_endpoints=[])

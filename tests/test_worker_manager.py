@@ -8,6 +8,7 @@ Covers:
 - start() skips container when no worker files present
 - status() reflects correct state
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -86,9 +87,16 @@ class TestWorkerManagerEnvVars:
         env = worker_manager._build_env_vars()
         assert "ZENOH_CONNECT" not in env
 
-    def test_zenoh_shm_enabled_on_linux(
+    def test_zenoh_shm_disabled_by_default_on_linux(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """SHM must default to ``false`` on Linux — enabling it requires
+        ``--ipc=host`` between containers, which we do not configure by
+        default.  The worker and driver paths both route through
+        ``build_zenoh_env_vars(ZenohConfig())``, so an explicit opt-in via
+        the ``ZENOH_SHARED_MEMORY`` process env propagates consistently to
+        both sides.
+        """
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,
@@ -98,9 +106,9 @@ class TestWorkerManagerEnvVars:
         monkeypatch.setattr(wm_module.platform, "system", lambda: "Linux")
 
         env = worker_manager._build_env_vars()
-        assert env.get("ZENOH_SHARED_MEMORY") == "true"
+        assert env.get("ZENOH_SHARED_MEMORY") == "false"
 
-    def test_zenoh_shm_not_set_on_macos(
+    def test_zenoh_shm_disabled_by_default_on_macos(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
@@ -112,7 +120,23 @@ class TestWorkerManagerEnvVars:
         monkeypatch.setattr(wm_module.platform, "system", lambda: "Darwin")
 
         env = worker_manager._build_env_vars()
-        assert "ZENOH_SHARED_MEMORY" not in env
+        assert env.get("ZENOH_SHARED_MEMORY") == "false"
+
+    def test_zenoh_shm_opt_in_from_env(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit ``ZENOH_SHARED_MEMORY=true`` in the edge-core process env
+        must propagate to the worker container."""
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: default,
+        )
+        monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+        monkeypatch.setattr("os.environ", {"ZENOH_SHARED_MEMORY": "true"})
+        monkeypatch.setattr(wm_module.platform, "system", lambda: "Linux")
+
+        env = worker_manager._build_env_vars()
+        assert env.get("ZENOH_SHARED_MEMORY") == "true"
 
     def test_non_production_environment_included(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
@@ -173,9 +197,7 @@ class TestWorkerManagerVolumes:
         assert f"{models_dir}:/app/models" in args
         assert f"{models_dir}:/app/models:ro" not in args
 
-    def test_volume_dirs_created(
-        self, worker_manager: WorkerManager, tmp_config: Path
-    ) -> None:
+    def test_volume_dirs_created(self, worker_manager: WorkerManager, tmp_config: Path) -> None:
         worker_manager._build_volume_args()
         assert (tmp_config / "workers").exists()
         assert (tmp_config / "models").exists()
@@ -200,7 +222,6 @@ class TestWorkerManagerStartSkipWhenNoWorkers:
 
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
-
 
         result = worker_manager.start()
         assert result is True
@@ -243,14 +264,10 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(
-            wm_module, "docker_container_status", side_effect=["none", "running"]
-        ):
+        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
             worker_manager._run_container()
 
-        docker_run_cmd = next(
-            (c for c in run_calls if c and c[0] == "docker" and "run" in c), None
-        )
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
         assert docker_run_cmd is not None
         assert "--gpus" in docker_run_cmd
         assert "all" in docker_run_cmd
@@ -287,14 +304,10 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(
-            wm_module, "docker_container_status", side_effect=["none", "running"]
-        ):
+        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
             assert worker_manager._run_container() is True
 
-        docker_run_cmd = next(
-            (c for c in run_calls if c and c[0] == "docker" and "run" in c), None
-        )
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
         assert docker_run_cmd is not None
         assert "--gpus" in docker_run_cmd
         assert "all" in docker_run_cmd
@@ -328,14 +341,10 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(
-            wm_module, "docker_container_status", side_effect=["none", "running"]
-        ):
+        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
             worker_manager._run_container()
 
-        docker_run_cmd = next(
-            (c for c in run_calls if c and c[0] == "docker" and "run" in c), None
-        )
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
         assert docker_run_cmd is not None
         assert "--gpus" not in docker_run_cmd
 
@@ -394,9 +403,7 @@ class TestWorkerManagerStop:
         removed: list[str] = []
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
-        monkeypatch.setattr(
-            wm_module, "docker_rm", lambda name, **kw: removed.append(name) or True
-        )
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: removed.append(name) or True)
         result = worker_manager.stop()
         assert result is True
         assert removed == [worker_manager.container_name]
@@ -497,12 +504,14 @@ class TestWorkerManagerLogs:
     @staticmethod
     def _fake_popen(captured: list[list[str]]):
         """Return a Popen factory that records cmd and returns a no-op proc."""
+
         def factory(cmd, **kw):
             captured.append(cmd)
             proc = MagicMock()
             proc.stdout = iter([])
             proc.wait.return_value = 0
             return proc
+
         return factory
 
     def test_logs_returns_early_when_docker_unavailable(
@@ -593,7 +602,9 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
-        monkeypatch.setattr(WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True))
+        monkeypatch.setattr(
+            WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True)
+        )
 
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
@@ -692,13 +703,10 @@ class TestWorkerManagerStartHealthIntegration:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(
-            wm_module, "docker_container_status", side_effect=["none", "running"]
-        ):
+        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
             result = worker_manager.start()
 
         assert result is True
         # record_start sets _last_start_time; uptime will be non-None in check()
         state = monitor.check(container_status="running")
         assert state.uptime_seconds is not None
-

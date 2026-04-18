@@ -20,8 +20,13 @@ ZENOH_CONNECT
 ZENOH_SHARED_MEMORY
     ``"1"`` / ``"true"`` / ``"yes"`` to enable Zenoh shared-memory transport
     for zero-copy delivery between containers on the same Docker host.
-    Defaults to ``"false"`` (safe fallback to TCP).  Set to ``"true"`` on Linux
-    hosts where all service containers share the same kernel and SHM namespace.
+    Defaults to ``"false"``.  Cyberwave runs every managed service in its own
+    Docker container, and SHM transport between containers requires them to
+    share an IPC namespace via ``--ipc=host``, which weakens container
+    isolation and has historically been a source of instability on our
+    edge deployments.  Enable this only after verifying that your runtime
+    launches drivers and workers with ``--ipc=host`` and you have validated
+    the transport end-to-end on the target hardware.
 
 ZENOH_ROUTER_ENABLED
     ``"1"`` / ``"true"`` to start an optional Zenoh router container before
@@ -261,14 +266,11 @@ def validate_zenoh_config(config: ZenohConfig) -> ZenohDiagnostics:
             ],
         )
 
-    if not config.shared_memory:
-        warnings.append(
-            "ZENOH_SHARED_MEMORY is not enabled.  "
-            "Binary stream channels (frames, depth) will use TCP loopback, "
-            "which is significantly slower than shared-memory transport.  "
-            "Set ZENOH_SHARED_MEMORY=true on Linux hosts where all "
-            "containers run on the same kernel."
-        )
+    # Note: we deliberately do NOT warn when ``shared_memory`` is disabled.
+    # ``false`` is the intentional default for containerised Cyberwave
+    # deployments because SHM between Docker containers requires
+    # ``--ipc=host`` (see module docstring).  Emitting a warning on every
+    # startup would only add noise to the common case.
 
     if config.router_enabled and not config.connect_endpoints:
         warnings.append(
