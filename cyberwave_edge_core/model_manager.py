@@ -59,6 +59,7 @@ call into it.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -67,9 +68,10 @@ import re
 import shutil
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,12 @@ SOURCE_KIND_UPSTREAM = "download_url"
 #: disk (no Edge Core download involved). Set during disk reconciliation.
 SOURCE_KIND_PRESTAGED = "prestaged"
 
+#: Per-model lock filename (``cache_dir/{model_id}/.lock``). Held with
+#: :func:`fcntl.flock` for the duration of :meth:`ModelManager.ensure_model`
+#: so that two callers (e.g. worker startup racing the watcher loop) cannot
+#: clobber each other's downloads.
+MODEL_LOCK_FILENAME = ".lock"
+
 #: Regex that matches ``cw.models.load("model-id")`` or
 #: ``cw.models.load('model-id')`` calls in worker Python source files.
 _CW_MODELS_LOAD_RE = re.compile(
@@ -130,7 +138,30 @@ _CW_MODELS_LOAD_RE = re.compile(
 
 @dataclass
 class CachedModel:
-    """Describes a single model artifact stored in the local cache."""
+    """Describes a single model artifact stored in the local cache.
+
+    Fields
+    ------
+    source_url:
+        For artifact downloads this stores the *resolver endpoint*
+        (``{base_url}/api/v1/mlmodels/{uuid}/weights``), not the
+        time-limited signed URL we actually fetched. The signed URL is
+        useless for re-fetching and would mislead anyone reading the
+        manifest. For upstream downloads it is the public ``download_url``.
+        ``None`` for pre-staged files.
+    pinned:
+        When ``True``, Edge Core treats this entry as operator-curated
+        truth: catalog refresh probes are skipped and download paths
+        will not overwrite the file. Pin is meaningful only for
+        ``downloaded_from == prestaged`` sidecars; opt in by
+        hand-writing ``"pinned": true`` in ``metadata.json``.
+    mtime_ns:
+        File modification time (nanoseconds since epoch) recorded the
+        last time we hashed or wrote this file. Used by
+        :meth:`ModelManager._cache_is_intact` as a cheap-gate to skip
+        re-hashing when ``stat()`` says nothing changed. ``None`` for
+        legacy entries; on first verification it is back-filled.
+    """
 
     model_id: str
     local_path: str
@@ -139,12 +170,19 @@ class CachedModel:
     source_url: Optional[str] = None
     checksum_sha256: Optional[str] = None
     runtime: Optional[str] = None
+    pinned: bool = False
+    mtime_ns: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CachedModel":
+        mtime_raw = data.get("mtime_ns")
+        try:
+            mtime_ns = int(mtime_raw) if mtime_raw is not None else None
+        except (TypeError, ValueError):
+            mtime_ns = None
         return cls(
             model_id=data["model_id"],
             local_path=data["local_path"],
@@ -153,6 +191,8 @@ class CachedModel:
             source_url=data.get("source_url"),
             checksum_sha256=data.get("checksum_sha256"),
             runtime=data.get("runtime"),
+            pinned=bool(data.get("pinned", False)),
+            mtime_ns=mtime_ns,
         )
 
 
@@ -263,38 +303,55 @@ class ModelManager:
         if not model_id:
             raise ValueError("model_id must be a non-empty string")
 
-        self._reconcile_disk_for(model_id)
+        with self._per_model_lock(model_id):
+            # Reload manifest under the lock: another writer may have updated
+            # it since our last read (worker startup racing the watcher loop).
+            self._manifest = _Manifest.load(self._manifest_path)
 
-        cached = self._manifest.get(model_id)
-        cached_path: Optional[Path] = Path(cached.local_path) if cached else None
-        cached_intact = self._cache_is_intact(cached, cached_path)
-        # _cache_is_intact may have restamped a re-staged prestaged file;
-        # re-read so downstream sees the fresh checksum.
-        if cached_intact and cached is not None:
-            cached = self._manifest.get(model_id) or cached
+            self._reconcile_disk_for(model_id)
 
-        if (
-            cached_intact
-            and cached is not None
-            and not self._catalog_indicates_refresh(model_id, cached)
-        ):
-            assert cached_path is not None
-            logger.debug("Cache hit for model '%s' at %s", model_id, cached_path)
-            return cached_path
+            cached = self._manifest.get(model_id)
+            cached_path: Optional[Path] = Path(cached.local_path) if cached else None
+            cached_intact = self._cache_is_intact(cached, cached_path)
+            # _cache_is_intact may have restamped a re-staged prestaged file
+            # or back-filled mtime_ns; re-read so downstream sees the fresh
+            # state.
+            if cached_intact and cached is not None:
+                cached = self._manifest.get(model_id) or cached
 
-        try:
-            return self._download_model(model_id)
-        except Exception as exc:
-            if cached_intact and cached_path is not None:
-                logger.warning(
-                    "Download failed for model '%s' (%s); falling back to cached "
-                    "weights at %s — checksum may not match the latest catalog entry",
+            if cached_intact and cached is not None and cached.pinned:
+                # Operator-pinned: never probe the catalog, never download.
+                # The on-disk file is the source of truth.
+                assert cached_path is not None
+                logger.debug(
+                    "Pinned cache hit for model '%s' at %s — skipping catalog refresh",
                     model_id,
-                    exc,
                     cached_path,
                 )
                 return cached_path
-            raise
+
+            if (
+                cached_intact
+                and cached is not None
+                and not self._catalog_indicates_refresh(model_id, cached)
+            ):
+                assert cached_path is not None
+                logger.debug("Cache hit for model '%s' at %s", model_id, cached_path)
+                return cached_path
+
+            try:
+                return self._download_model(model_id)
+            except Exception as exc:
+                if cached_intact and cached_path is not None:
+                    logger.warning(
+                        "Download failed for model '%s' (%s); falling back to cached "
+                        "weights at %s — checksum may not match the latest catalog entry",
+                        model_id,
+                        exc,
+                        cached_path,
+                    )
+                    return cached_path
+                raise
 
     def ensure_models(self, model_ids: list[str]) -> dict[str, Path]:
         """Batch version of :meth:`ensure_model`.
@@ -402,38 +459,88 @@ class ModelManager:
         return model_ids
 
     # ------------------------------------------------------------------
+    # Concurrency
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _per_model_lock(self, model_id: str) -> Iterator[None]:
+        """Hold an exclusive flock on ``cache_dir/{model_id}/.lock``.
+
+        Without this, two ``ensure_model`` calls for the same model — for
+        example a worker container restart racing Edge Core's worker
+        watcher loop — could both stream into the same destination via
+        their own ``.dl_*`` temp files and either clobber each other on
+        ``replace()`` or interleave manifest writes.
+
+        ``fcntl.flock`` is advisory and process-scoped: the OS releases
+        the lock automatically when the process exits, so a crash during
+        download leaves no stale lock to clean up.
+        """
+        lock_dir = self._cache_dir / model_id
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / MODEL_LOCK_FILENAME
+        # Open in "a+" so we never truncate the file (other processes may
+        # already have a handle to it) and we get write permission for
+        # flock on every platform we care about.
+        lock_fh = open(lock_path, "a+")
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_fh.close()
+
+    # ------------------------------------------------------------------
     # Cache integrity helpers
     # ------------------------------------------------------------------
 
     def _cache_is_intact(self, cached: Optional[CachedModel], cached_path: Optional[Path]) -> bool:
         """Return True if the on-disk file matches what we last wrote.
 
-        * No manifest entry → not intact (cold cache).
-        * Manifest entry but file missing → not intact.
-        * Manifest entry with stored checksum that does not match the file
-          on disk:
+        Resolution order:
 
-          - If the file was operator-staged (sidecar
-            ``downloaded_from == prestaged``), this is the expected signal
-            that an operator dropped a new build into place; the manifest
-            and sidecar are restamped from disk and the cache is reported
-            intact. Without this, an offline edge that just received a
-            hand-delivered weight update would treat the new file as
-            corrupt and refuse to load it.
-          - Otherwise (artifact / upstream download), the file is reported
-            corrupt and will be re-downloaded.
+        * No manifest entry, or file missing → not intact (cold cache).
+        * Manifest has no stored checksum → treat as intact (legacy
+          entries / pre-staged without sidecar).
+        * **mtime fast-path**: when the file's ``(size, mtime_ns)`` match
+          the manifest, skip SHA-256 entirely and report intact. This is
+          the steady-state cost on warm cache (one ``stat()`` per model
+          per call). A back-fill happens on first miss for legacy
+          entries that lack ``mtime_ns``.
+        * Otherwise compute SHA-256 and compare to the manifest:
 
-        * Manifest entry with no stored checksum and file present → treated
-          as intact (legacy entries / pre-staged without sidecar).
+          - Match → report intact and back-fill ``mtime_ns`` so the next
+            call hits the fast-path.
+          - Mismatch on a ``downloaded_from == prestaged`` sidecar →
+            operator dropped a new build into place; restamp manifest
+            and report intact.
+          - Mismatch on a downloaded artifact → corrupt; report not
+            intact and let the caller try to re-download.
         """
         if cached is None or cached_path is None or not cached_path.exists():
             return False
         if not cached.checksum_sha256:
             return True
+
+        try:
+            stat = cached_path.stat()
+        except OSError:
+            return False
+
+        if (
+            cached.mtime_ns is not None
+            and stat.st_mtime_ns == cached.mtime_ns
+            and stat.st_size == cached.size_bytes
+        ):
+            return True
+
         actual = _sha256_file(cached_path)
         if actual == cached.checksum_sha256:
+            self._backfill_mtime(cached, stat.st_mtime_ns, stat.st_size)
             return True
-        if self._restamp_if_prestaged(cached, cached_path, actual):
+        if self._restamp_if_prestaged(cached, cached_path, actual, stat):
             return True
         logger.warning(
             "Local file for model '%s' is corrupt (expected sha256=%s…, got %s…) "
@@ -444,8 +551,35 @@ class ModelManager:
         )
         return False
 
+    def _backfill_mtime(self, cached: CachedModel, mtime_ns: int, size_bytes: int) -> None:
+        """Persist ``mtime_ns`` (and refreshed size) onto a manifest entry.
+
+        Used after a successful SHA-256 verification so that subsequent
+        calls hit the cheap-stat fast path. We avoid touching the on-disk
+        file's mtime here — that would defeat the point.
+        """
+        if cached.mtime_ns == mtime_ns and cached.size_bytes == size_bytes:
+            return
+        refreshed = CachedModel(
+            model_id=cached.model_id,
+            local_path=cached.local_path,
+            size_bytes=size_bytes,
+            downloaded_at=cached.downloaded_at,
+            source_url=cached.source_url,
+            checksum_sha256=cached.checksum_sha256,
+            runtime=cached.runtime,
+            pinned=cached.pinned,
+            mtime_ns=mtime_ns,
+        )
+        self._manifest.set(refreshed)
+        self._manifest.save(self._manifest_path)
+
     def _restamp_if_prestaged(
-        self, cached: CachedModel, cached_path: Path, actual_checksum: str
+        self,
+        cached: CachedModel,
+        cached_path: Path,
+        actual_checksum: str,
+        stat: "os.stat_result",
     ) -> bool:
         """Refresh the manifest from disk when *cached_path* is operator-staged.
 
@@ -453,6 +587,9 @@ class ModelManager:
         sidecar's ``downloaded_from`` field so that bit-rot in downloaded
         artifacts still triggers a re-download rather than being silently
         accepted as the new truth.
+
+        ``pinned`` is preserved from the existing sidecar — restamping is
+        an in-place update, not a re-pin.
         """
         sidecar_path = cached_path.parent / MODEL_METADATA_FILENAME
         if not sidecar_path.exists():
@@ -465,10 +602,6 @@ class ModelManager:
         if not isinstance(meta, dict) or meta.get("downloaded_from") != SOURCE_KIND_PRESTAGED:
             return False
 
-        try:
-            actual_size = cached_path.stat().st_size
-        except OSError:
-            return False
         new_at = _utc_iso_now()
         logger.info(
             "Operator-staged model '%s' changed on disk (sha256 %s… → %s…); re-stamping manifest",
@@ -478,19 +611,30 @@ class ModelManager:
         )
 
         meta["checksum_sha256"] = actual_checksum
-        meta["size_bytes"] = actual_size
+        meta["size_bytes"] = stat.st_size
         meta["downloaded_at"] = new_at
         _write_json_safe(sidecar_path, meta)
 
+        # Re-stat after the sidecar write to capture the file's mtime as
+        # it is now (the sidecar write doesn't touch the weight file but
+        # the operator's own write does).
+        try:
+            fresh_mtime = cached_path.stat().st_mtime_ns
+        except OSError:
+            fresh_mtime = stat.st_mtime_ns
+
+        pinned = bool(meta.get("pinned", cached.pinned))
         self._manifest.set(
             CachedModel(
                 model_id=cached.model_id,
                 local_path=cached.local_path,
-                size_bytes=actual_size,
+                size_bytes=stat.st_size,
                 downloaded_at=new_at,
                 source_url=cached.source_url,
                 checksum_sha256=actual_checksum,
                 runtime=cached.runtime,
+                pinned=pinned,
+                mtime_ns=fresh_mtime,
             )
         )
         self._manifest.save(self._manifest_path)
@@ -564,14 +708,31 @@ class ModelManager:
         if weight_path is None:
             return
 
-        checksum = meta.get("checksum_sha256")
-        if not isinstance(checksum, str) or not checksum.strip():
-            checksum = _sha256_file(weight_path)
+        # Always recompute the on-disk SHA-256 during reconcile, even when
+        # the sidecar stores one. Otherwise an operator who overwrites the
+        # file *after* writing the sidecar leaves the manifest in an
+        # inconsistent state — stale checksum paired with the fresh mtime
+        # — that subsequently passes the mtime fast-path in
+        # _cache_is_intact and serves the new bytes under the old hash.
+        on_disk_checksum = _sha256_file(weight_path)
+        sidecar_checksum = meta.get("checksum_sha256")
+        if isinstance(sidecar_checksum, str) and sidecar_checksum.strip():
+            sidecar_checksum = sidecar_checksum.strip()
+            if sidecar_checksum != on_disk_checksum:
+                logger.warning(
+                    "Pre-staged model '%s' sidecar checksum %s… does not match "
+                    "on-disk %s… — using on-disk hash (sidecar is stale or wrong)",
+                    model_id,
+                    sidecar_checksum[:12],
+                    on_disk_checksum[:12],
+                )
+        else:
             logger.info(
                 "Pre-staged model '%s' has no sidecar checksum; computed sha256=%s… from disk",
                 model_id,
-                checksum[:12],
+                on_disk_checksum[:12],
             )
+        checksum = on_disk_checksum
 
         runtime = meta.get("runtime") if isinstance(meta.get("runtime"), str) else None
         if not runtime:
@@ -585,15 +746,19 @@ class ModelManager:
                 )
         downloaded_at = meta.get("downloaded_at") or _utc_iso_now()
         source_url = meta.get("source_url") or meta.get("download_url") or meta.get("upstream_url")
+        pinned = bool(meta.get("pinned", False))
 
+        weight_stat = weight_path.stat()
         cached = CachedModel(
             model_id=model_id,
             local_path=str(weight_path),
-            size_bytes=weight_path.stat().st_size,
+            size_bytes=weight_stat.st_size,
             downloaded_at=downloaded_at,
             source_url=source_url if isinstance(source_url, str) else None,
             checksum_sha256=checksum,
             runtime=runtime,
+            pinned=pinned,
+            mtime_ns=weight_stat.st_mtime_ns,
         )
         self._manifest.set(cached)
         self._manifest.save(self._manifest_path)
@@ -611,14 +776,16 @@ class ModelManager:
                     "downloaded_from": SOURCE_KIND_PRESTAGED,
                     "source_url": None,
                     "upstream_url": None,
+                    "pinned": False,
                 },
             )
 
         logger.info(
-            "Reconciled pre-staged model '%s' from %s (sha256=%s…)",
+            "Reconciled pre-staged model '%s' from %s (sha256=%s…%s)",
             model_id,
             weight_path,
             checksum[:12],
+            ", pinned" if pinned else "",
         )
 
     @staticmethod
@@ -665,11 +832,22 @@ class ModelManager:
         upstream_url = _extract_download_url(catalog_entry, model_id)
         artifact_url = self._fetch_artifact_url_safe(catalog_entry)
 
-        sources: list[tuple[str, str]] = []
+        # Each source carries three URLs:
+        #   kind:        which catalog field it came from
+        #   fetch_url:   the URL we actually GET (may be a time-limited
+        #                signed URL that expires)
+        #   source_id:   the URL we persist as a stable identifier of the
+        #                source. For artifact downloads this is the
+        #                resolver endpoint (/mlmodels/{uuid}/weights), not
+        #                the signed URL — the signed URL is useless for
+        #                re-fetching and would mislead anyone reading the
+        #                manifest later.
+        sources: list[tuple[str, str, str]] = []
         if artifact_url:
-            sources.append((SOURCE_KIND_ARTIFACT, artifact_url))
+            artifact_endpoint = self._artifact_endpoint(catalog_entry) or artifact_url
+            sources.append((SOURCE_KIND_ARTIFACT, artifact_url, artifact_endpoint))
         if upstream_url:
-            sources.append((SOURCE_KIND_UPSTREAM, upstream_url))
+            sources.append((SOURCE_KIND_UPSTREAM, upstream_url, upstream_url))
 
         if not sources:
             raise RuntimeError(
@@ -691,16 +869,16 @@ class ModelManager:
         dest_path = model_dir / filename
 
         last_exc: Optional[Exception] = None
-        for source_kind, url in sources:
+        for source_kind, fetch_url, source_id in sources:
             logger.info(
                 "Downloading model '%s' from %s (%s) → %s",
                 model_id,
                 source_kind,
-                _redact_url(url),
+                _redact_url(fetch_url),
                 dest_path,
             )
             try:
-                self._download_with_retries(url, dest_path)
+                self._download_with_retries(fetch_url, dest_path)
             except Exception as exc:
                 last_exc = exc
                 logger.warning(
@@ -722,7 +900,7 @@ class ModelManager:
                 logger.warning("%s", last_exc)
                 # If this was the only/last source, surface the error to the
                 # caller (which may then fall back to the stale cached file).
-                if (source_kind, url) == sources[-1]:
+                if (source_kind, fetch_url, source_id) == sources[-1]:
                     raise last_exc
                 continue
 
@@ -732,7 +910,7 @@ class ModelManager:
                 checksum=actual_checksum,
                 runtime=runtime,
                 source_kind=source_kind,
-                source_url=url,
+                source_url=source_id,
                 upstream_url=upstream_url,
                 filename=filename,
             )
@@ -741,6 +919,19 @@ class ModelManager:
         raise RuntimeError(
             f"All download sources failed for model '{model_id}': {last_exc}"
         ) from last_exc
+
+    def _artifact_endpoint(self, catalog_entry: dict[str, Any]) -> Optional[str]:
+        """Return the persistent ``/mlmodels/{uuid}/weights`` endpoint URL.
+
+        This is the URL we record as ``source_url`` for artifact
+        downloads (vs. the time-limited signed URL we actually fetched).
+        Anyone reading the manifest can re-issue this exact request to
+        refresh credentials and download again.
+        """
+        uuid = catalog_entry.get("uuid")
+        if not isinstance(uuid, str) or not _looks_like_uuid(uuid):
+            return None
+        return f"{self._base_url}{ML_MODELS_ENDPOINT}/{uuid}/weights"
 
     def _record_successful_download(
         self,
@@ -754,8 +945,17 @@ class ModelManager:
         upstream_url: Optional[str],
         filename: str,
     ) -> None:
-        """Persist sidecar + manifest entry for a freshly downloaded model."""
-        size = dest_path.stat().st_size
+        """Persist sidecar + manifest entry for a freshly downloaded model.
+
+        ``source_url`` here is the stable identifier of the source (the
+        resolver endpoint for artifact downloads, the public URL for
+        upstream downloads), not the time-limited signed URL we fetched.
+        See :meth:`_download_model` for the rationale.
+
+        Downloaded artifacts are *never* pinned: pinning is an explicit
+        operator action recorded in a hand-written prestaged sidecar.
+        """
+        stat = dest_path.stat()
         downloaded_at = _utc_iso_now()
 
         _write_json_safe(
@@ -765,22 +965,33 @@ class ModelManager:
                 "runtime": runtime,
                 "filename": filename,
                 "checksum_sha256": checksum,
-                "size_bytes": size,
+                "size_bytes": stat.st_size,
                 "downloaded_at": downloaded_at,
                 "downloaded_from": source_kind,
                 "source_url": source_url,
                 "upstream_url": upstream_url,
+                "pinned": False,
             },
         )
+
+        # Re-stat after the sidecar write to capture the weight file's
+        # mtime as it is now (sidecar write is atomic-replace and does
+        # not touch the weight file, but be defensive).
+        try:
+            mtime_ns = dest_path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = stat.st_mtime_ns
 
         cached = CachedModel(
             model_id=model_id,
             local_path=str(dest_path),
-            size_bytes=size,
+            size_bytes=stat.st_size,
             downloaded_at=downloaded_at,
             source_url=source_url,
             checksum_sha256=checksum,
             runtime=runtime,
+            pinned=False,
+            mtime_ns=mtime_ns,
         )
         self._manifest.set(cached)
         self._manifest.save(self._manifest_path)
@@ -788,7 +999,7 @@ class ModelManager:
             "Model '%s' cached at %s (%d bytes, sha256=%s…, source=%s)",
             model_id,
             dest_path,
-            size,
+            stat.st_size,
             checksum[:12],
             source_kind,
         )

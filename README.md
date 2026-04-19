@@ -132,10 +132,12 @@ For each required model, `ensure_model(model_id)` runs the following steps:
    1. **Cyberwave-hosted signed URL** from `GET /api/v1/mlmodels/{uuid}/weights` — used for checkpoints we have uploaded to our private GCS bucket (e.g. internally trained or mirrored models). Authenticated, served from infrastructure we control.
    2. **Upstream weights URL** from the catalog entry (`download_url` / `metadata.upstream_weights_url`) — used for community checkpoints we did not mirror.
 
-   The first source that yields a checksum-verified file wins. The sidecar records `downloaded_from` (`artifact_url` / `download_url` / `prestaged`), `source_url` (the URL actually hit), and `upstream_url` (provenance).
+   The first source that yields a checksum-verified file wins. The sidecar records `downloaded_from` (`artifact_url` / `download_url` / `prestaged`), `source_url` (the *resolver endpoint* — `/api/v1/mlmodels/{uuid}/weights` for artifact downloads, the public URL for upstream), and `upstream_url` (provenance). The signed URL we actually fetched is intentionally *not* persisted: it expires within minutes and would mislead anyone reading the manifest later.
 5. **Fail-soft.** If every download attempt fails *and* the cached file is intact, Edge Core returns the cached path with a warning. This keeps workers running across transient network failures and on permanently air-gapped sites. If the cache is empty or corrupt, `RuntimeError` is raised.
 
-**Cache integrity:** SHA-256 checksums are verified on every cache hit, on every download, and during disk reconciliation. A checksum mismatch on the local file triggers a re-download attempt; a download whose checksum does not match the catalog is rejected and the partial file removed.
+**Cache integrity:** SHA-256 checksums are verified on every cold start, on every download, and during disk reconciliation. The steady-state warm-cache path uses an `(size, mtime_ns)` fast check and skips re-hashing when nothing has changed on disk; this keeps cold-start cost bounded for multi-gigabyte checkpoints. Any mismatch — externally touched mtime, modified size — falls back to a full SHA-256 verification. A checksum mismatch on a downloaded artifact triggers a re-download attempt; a download whose checksum does not match the catalog is rejected and the partial file removed.
+
+**Concurrency:** Each model directory has a `.lock` file held with an exclusive `flock()` for the duration of `ensure_model`. This prevents the worker startup path and the watcher loop from racing on the same model — they serialise per model, with a single download even when both observe a cold cache simultaneously.
 
 ### Pre-staging weights for air-gapped deployments
 
@@ -155,6 +157,19 @@ cp /usb-stick/yolov8n-v2.pt ~/.cyberwave/models/yolov8n/yolov8n.pt
 ```
 
 The mismatch between the on-disk SHA-256 and the manifest checksum triggers a re-stamp (not a re-download), provided the sidecar still records `downloaded_from: prestaged`. This keeps offline edges functional across model upgrades. Files that were previously *downloaded* by Edge Core keep the corruption-detection semantics — bit-rot still triggers a re-download attempt rather than being silently accepted.
+
+**Pinning a build (do-not-overwrite).** When a site needs to lock a specific hand-vetted weight file and refuse any catalog-driven updates, add `"pinned": true` to the sidecar:
+
+```json
+{
+  "model_id": "yolov8n",
+  "filename": "yolov8n.pt",
+  "downloaded_from": "prestaged",
+  "pinned": true
+}
+```
+
+Pinned files skip the catalog refresh probe entirely and are never overwritten by Edge Core's download path, even when the catalog publishes a different checksum. The pin survives in-place re-staging (overwriting the file on disk re-stamps the manifest but preserves the pin). To unpin, edit the sidecar and set `"pinned": false` (or remove the field).
 
 Provide a hand-written `metadata.json` (with `filename`, `checksum_sha256`, and `runtime`) when there are multiple weight files in the directory or when corruption detection should compare against a known-good hash.
 
