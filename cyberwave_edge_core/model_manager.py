@@ -1,14 +1,15 @@
 """Model Manager — download, cache, and sync ML model weights for Edge Core.
 
-Implements the model lifecycle described in CYB-1561:
+Responsibilities:
 
 * Resolve required models from worker files (regex scan for ``cw.models.load(...)``).
 * Reconcile any pre-staged weights on disk into the local manifest (air-gap
   friendly: an operator can drop ``~/.cyberwave/models/{model_id}/weights.pt``
   on a USB stick and Edge Core will pick it up).
 * Download model artifacts from the Cyberwave catalog API and store in a local
-  cache directory (``~/.cyberwave/models/`` on macOS, ``/etc/cyberwave/models/``
-  on Linux by default).
+  cache directory. The default cache lives under the resolved edge config
+  directory (``~/.cyberwave/models/`` on every platform; overridable via
+  ``CYBERWAVE_EDGE_CONFIG_DIR``).
 * Validate checksums and reuse existing artifacts on cache hit.
 * Expose helper for listing and evicting cached models.
 
@@ -51,7 +52,8 @@ mount — Edge Core is responsible for pre-populating it before starting the
 container.
 
 This module is Edge Core-internal and intentionally has **no** user-facing
-CLI surface of its own. The ``WorkerManager`` (CYB-1546) calls into it.
+CLI surface of its own. The ``WorkerManager`` and the startup bootstrap
+call into it.
 """
 
 from __future__ import annotations
@@ -216,8 +218,9 @@ class ModelManager:
     Parameters
     ----------
     cache_dir:
-        Root directory for the model cache. Defaults to the same directory
-        that startup.py uses as ``CONFIG_DIR`` / ``models/``.
+        Root directory for the model cache. Edge Core points this at
+        ``CONFIG_DIR / "models"`` (``~/.cyberwave/models/`` by default,
+        overridable via ``CYBERWAVE_EDGE_CONFIG_DIR``).
     api_token:
         Cyberwave API token used for catalog API calls.
     base_url:
@@ -265,6 +268,10 @@ class ModelManager:
         cached = self._manifest.get(model_id)
         cached_path: Optional[Path] = Path(cached.local_path) if cached else None
         cached_intact = self._cache_is_intact(cached, cached_path)
+        # _cache_is_intact may have restamped a re-staged prestaged file;
+        # re-read so downstream sees the fresh checksum.
+        if cached_intact and cached is not None:
+            cached = self._manifest.get(model_id) or cached
 
         if (
             cached_intact
@@ -404,7 +411,18 @@ class ModelManager:
         * No manifest entry → not intact (cold cache).
         * Manifest entry but file missing → not intact.
         * Manifest entry with stored checksum that does not match the file
-          on disk → not intact (corrupted; will be re-downloaded).
+          on disk:
+
+          - If the file was operator-staged (sidecar
+            ``downloaded_from == prestaged``), this is the expected signal
+            that an operator dropped a new build into place; the manifest
+            and sidecar are restamped from disk and the cache is reported
+            intact. Without this, an offline edge that just received a
+            hand-delivered weight update would treat the new file as
+            corrupt and refuse to load it.
+          - Otherwise (artifact / upstream download), the file is reported
+            corrupt and will be re-downloaded.
+
         * Manifest entry with no stored checksum and file present → treated
           as intact (legacy entries / pre-staged without sidecar).
         """
@@ -415,6 +433,8 @@ class ModelManager:
         actual = _sha256_file(cached_path)
         if actual == cached.checksum_sha256:
             return True
+        if self._restamp_if_prestaged(cached, cached_path, actual):
+            return True
         logger.warning(
             "Local file for model '%s' is corrupt (expected sha256=%s…, got %s…) "
             "— will attempt to re-download",
@@ -423,6 +443,58 @@ class ModelManager:
             actual[:12],
         )
         return False
+
+    def _restamp_if_prestaged(
+        self, cached: CachedModel, cached_path: Path, actual_checksum: str
+    ) -> bool:
+        """Refresh the manifest from disk when *cached_path* is operator-staged.
+
+        Returns True when a restamp happened. The check is gated on the
+        sidecar's ``downloaded_from`` field so that bit-rot in downloaded
+        artifacts still triggers a re-download rather than being silently
+        accepted as the new truth.
+        """
+        sidecar_path = cached_path.parent / MODEL_METADATA_FILENAME
+        if not sidecar_path.exists():
+            return False
+        try:
+            with open(sidecar_path) as fh:
+                meta = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(meta, dict) or meta.get("downloaded_from") != SOURCE_KIND_PRESTAGED:
+            return False
+
+        try:
+            actual_size = cached_path.stat().st_size
+        except OSError:
+            return False
+        new_at = _utc_iso_now()
+        logger.info(
+            "Operator-staged model '%s' changed on disk (sha256 %s… → %s…); re-stamping manifest",
+            cached.model_id,
+            (cached.checksum_sha256 or "?")[:12],
+            actual_checksum[:12],
+        )
+
+        meta["checksum_sha256"] = actual_checksum
+        meta["size_bytes"] = actual_size
+        meta["downloaded_at"] = new_at
+        _write_json_safe(sidecar_path, meta)
+
+        self._manifest.set(
+            CachedModel(
+                model_id=cached.model_id,
+                local_path=cached.local_path,
+                size_bytes=actual_size,
+                downloaded_at=new_at,
+                source_url=cached.source_url,
+                checksum_sha256=actual_checksum,
+                runtime=cached.runtime,
+            )
+        )
+        self._manifest.save(self._manifest_path)
+        return True
 
     def _catalog_indicates_refresh(self, model_id: str, cached: CachedModel) -> bool:
         """Best-effort probe: does the catalog have a newer checksum?
@@ -502,6 +574,15 @@ class ModelManager:
             )
 
         runtime = meta.get("runtime") if isinstance(meta.get("runtime"), str) else None
+        if not runtime:
+            runtime = _runtime_from_extension(weight_path.suffix)
+            if runtime:
+                logger.info(
+                    "Inferred runtime '%s' for pre-staged model '%s' from extension '%s'",
+                    runtime,
+                    model_id,
+                    weight_path.suffix,
+                )
         downloaded_at = meta.get("downloaded_at") or _utc_iso_now()
         source_url = meta.get("source_url") or meta.get("download_url") or meta.get("upstream_url")
 
@@ -754,9 +835,7 @@ class ModelManager:
                     raise RuntimeError(f"No model found with model_external_id='{model_id}'")
                 first = data[0]
                 if not isinstance(first, dict):
-                    raise RuntimeError(
-                        f"Unexpected catalog list element type: {type(first)}"
-                    )
+                    raise RuntimeError(f"Unexpected catalog list element type: {type(first)}")
                 return first
             if isinstance(data, dict):
                 return data
@@ -851,7 +930,13 @@ class ModelManager:
         return None
 
     def _download_with_retries(self, url: str, dest: Path) -> None:
-        """Download *url* to *dest* with retry and exponential back-off."""
+        """Download *url* to *dest* with retry and exponential back-off.
+
+        Auth failures (HTTP 401/403) short-circuit the retry loop: an
+        expired GCS signed URL or a missing Bearer token will not become
+        valid by waiting, and the caller may have a different source to
+        try.
+        """
 
         last_exc: Optional[Exception] = None
         for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
@@ -860,6 +945,15 @@ class ModelManager:
                 return
             except Exception as exc:
                 last_exc = exc
+                if _is_auth_failure(exc):
+                    logger.warning(
+                        "Authentication failed for %s (%s) — not retrying",
+                        _redact_url(url),
+                        exc,
+                    )
+                    raise RuntimeError(
+                        f"Authentication failed for {_redact_url(url)}: {exc}"
+                    ) from exc
                 if attempt < MAX_DOWNLOAD_RETRIES:
                     delay = DOWNLOAD_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     logger.warning(
@@ -964,6 +1058,41 @@ def _write_json_safe(path: Path, data: Any) -> None:
 def _redact_url(url: str) -> str:
     """Strip query strings from a URL for logging (signed URLs leak tokens)."""
     return url.split("?", 1)[0]
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Return True if *exc* represents an HTTP 401/403 from httpx.
+
+    Used to short-circuit the download retry loop: auth failures will not
+    become valid by waiting, and the caller can fall through to the next
+    source (e.g. expired signed URL → upstream public URL).
+    """
+    try:
+        import httpx
+    except ImportError:
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (401, 403)
+    return False
+
+
+#: Map weight-file extensions to SDK runtime names. Mirrors the SDK's
+#: ``ModelManager._detect_runtime_from_extension`` so that pre-staged files
+#: get the same default the SDK would pick.
+_RUNTIME_BY_EXTENSION: dict[str, str] = {
+    ".pt": "ultralytics",
+    ".pth": "torch",
+    ".onnx": "onnxruntime",
+    ".tflite": "tflite",
+    ".engine": "tensorrt",
+    ".trt": "tensorrt",
+    ".xml": "opencv",
+}
+
+
+def _runtime_from_extension(suffix: str) -> Optional[str]:
+    """Return the SDK runtime name implied by a weight file's extension."""
+    return _RUNTIME_BY_EXTENSION.get(suffix.lower())
 
 
 def _extract_download_url(entry: dict[str, Any], model_id: str) -> Optional[str]:

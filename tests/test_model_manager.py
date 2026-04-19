@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -1025,3 +1026,297 @@ def test_redact_url_strips_query_string() -> None:
         == "https://signed.googleapis.com/x.pt"
     )
     assert _redact_url("https://example.com/x.pt") == "https://example.com/x.pt"
+
+
+# ---------------------------------------------------------------------------
+# Re-staging: operator overwrites a pre-staged file in place
+# ---------------------------------------------------------------------------
+
+
+def _write_prestaged_model(cache_dir: Path, model_id: str, content: bytes) -> Path:
+    """Pre-stage a model on disk and reconcile it into the manifest.
+
+    Returns the path to the weight file. The sidecar is written by
+    ensure_model's reconciliation step.
+    """
+    model_dir = cache_dir / model_id
+    model_dir.mkdir(parents=True, exist_ok=True)
+    dest = model_dir / f"{model_id}.pt"
+    dest.write_bytes(content)
+    manager = ModelManager(cache_dir=cache_dir, api_token="t", base_url="https://api.test")
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        manager.ensure_model(model_id)
+    return dest
+
+
+def test_restaging_in_place_offline_does_not_brick_worker(tmp_path: Path) -> None:
+    """Operator overwrites a prestaged file with a new build. On the next
+    ensure_model call, even with the network down, the worker should
+    successfully resolve the new file (not raise 'corrupt' + try to
+    download)."""
+    model_id = "yolov8n"
+    weight_path = _write_prestaged_model(tmp_path, model_id, b"v1-weights")
+
+    new_content = b"v2-weights-with-different-size-XXXXXX"
+    weight_path.write_bytes(new_content)
+
+    manager = _make_manager(tmp_path)
+    with patch.object(
+        manager,
+        "_download_model",
+        side_effect=AssertionError("must not download for prestaged updates"),
+    ):
+        result = manager.ensure_model(model_id)
+
+    assert result == weight_path
+    assert result.read_bytes() == new_content
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.checksum_sha256 == hashlib.sha256(new_content).hexdigest()
+    assert cached.size_bytes == len(new_content)
+    sidecar = json.loads((weight_path.parent / MODEL_METADATA_FILENAME).read_text())
+    assert sidecar["downloaded_from"] == SOURCE_KIND_PRESTAGED
+    assert sidecar["checksum_sha256"] == cached.checksum_sha256
+
+
+def test_restaging_in_place_handles_same_size_overwrite(tmp_path: Path) -> None:
+    """Same-size overwrites are unusual but possible (e.g. quantized
+    re-export of the same architecture). The restamp path keys off the
+    SHA-256 mismatch reported by ``_cache_is_intact``, not file size, so
+    these are handled too."""
+    model_id = "yolov8n"
+    original = b"weights-of-fixed-size"
+    replacement = b"different-of-same-len"
+    assert len(original) == len(replacement)
+
+    weight_path = _write_prestaged_model(tmp_path, model_id, original)
+    weight_path.write_bytes(replacement)
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == weight_path
+    cached_after = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached_after is not None
+    assert cached_after.checksum_sha256 == hashlib.sha256(replacement).hexdigest()
+
+
+def test_unchanged_prestaged_file_does_not_restamp(tmp_path: Path) -> None:
+    """Steady-state: when nothing has changed on disk, ensure_model must
+    not rewrite the manifest. Pointless writes risk pulling in noisy
+    fsync churn on flash media in field deployments."""
+    model_id = "yolov8n"
+    weight_path = _write_prestaged_model(tmp_path, model_id, b"unchanged-weights")
+    manifest_path = tmp_path / "manifest.json"
+    mtime_before = manifest_path.stat().st_mtime_ns
+
+    time.sleep(0.01)  # ensure mtime would change if rewritten
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == weight_path
+    assert manifest_path.stat().st_mtime_ns == mtime_before
+
+
+def test_restaging_does_not_apply_to_downloaded_files(tmp_path: Path) -> None:
+    """Files marked ``downloaded_from: download_url`` keep the
+    corruption-detection semantics. Bit-rot or a half-written download
+    should still trigger a re-download attempt rather than being silently
+    accepted."""
+    model_id = "yolov8n"
+    dest = _write_fake_model(tmp_path, model_id, b"original-weights")
+    sidecar_path = dest.parent / MODEL_METADATA_FILENAME
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "model_id": model_id,
+                "filename": dest.name,
+                "checksum_sha256": hashlib.sha256(b"original-weights").hexdigest(),
+                "size_bytes": len(b"original-weights"),
+                "downloaded_from": SOURCE_KIND_UPSTREAM,
+            }
+        )
+    )
+
+    dest.write_bytes(b"corrupted-bytes-XXXXXX")  # different size + content
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=RuntimeError("network down")):
+        with pytest.raises(RuntimeError, match="network down"):
+            manager.ensure_model(model_id)
+
+
+# ---------------------------------------------------------------------------
+# Auth-failure short-circuit in download retry loop
+# ---------------------------------------------------------------------------
+
+
+def test_download_retries_short_circuit_on_403(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired GCS signed URL returns 403; retrying the same URL is
+    pointless. ``_download_with_retries`` should bail immediately so the
+    caller can fall through to the next source."""
+    import httpx
+
+    manager = _make_manager(tmp_path)
+    attempts: list[int] = []
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        attempts.append(len(attempts) + 1)
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    monkeypatch.setattr(manager, "_stream_download", _fake_stream)
+    monkeypatch.setattr("cyberwave_edge_core.model_manager.MAX_DOWNLOAD_RETRIES", 5)
+
+    with pytest.raises(RuntimeError, match="Authentication failed"):
+        manager._download_with_retries("https://signed/x.pt", tmp_path / "x.pt")
+    assert attempts == [1]
+
+
+def test_download_retries_continue_on_500(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Server-side errors (5xx) and network errors are still retried."""
+    import httpx
+
+    manager = _make_manager(tmp_path)
+    attempts: list[int] = []
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        attempts.append(len(attempts) + 1)
+        request = httpx.Request("GET", url)
+        response = httpx.Response(500, request=request)
+        raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+    monkeypatch.setattr(manager, "_stream_download", _fake_stream)
+    monkeypatch.setattr("cyberwave_edge_core.model_manager.MAX_DOWNLOAD_RETRIES", 3)
+    monkeypatch.setattr("cyberwave_edge_core.model_manager.DOWNLOAD_RETRY_BASE_DELAY", 0.0)
+
+    with pytest.raises(RuntimeError, match="Download failed after 3 attempts"):
+        manager._download_with_retries("https://upstream/x.pt", tmp_path / "x.pt")
+    assert attempts == [1, 2, 3]
+
+
+def test_signed_url_403_falls_through_to_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: a 403 from the signed URL must not block the upstream
+    fallback. Combined with the retry short-circuit, this means an
+    expired signed URL costs a single HTTP attempt before we move on."""
+    import httpx
+
+    model_id = "yolov8n"
+    content = b"upstream weights"
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "download_url": "https://upstream.example.com/yolov8n.pt",
+        "checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "filename": f"{model_id}.pt",
+    }
+    artifact_url = "https://signed.googleapis.com/expired"
+    monkeypatch.setattr(ModelManager, "_fetch_artifact_url_safe", lambda self, entry: artifact_url)
+
+    manager = _make_manager(tmp_path)
+    attempts: list[str] = []
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        attempts.append(url)
+        if url == artifact_url:
+            request = httpx.Request("GET", url)
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+    with (
+        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
+        patch.object(manager, "_stream_download", side_effect=_fake_stream),
+    ):
+        manager.ensure_model(model_id)
+
+    assert attempts == [artifact_url, catalog_entry["download_url"]]
+
+
+# ---------------------------------------------------------------------------
+# Runtime inference for pre-staged files
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "filename,expected_runtime",
+    [
+        ("model.pt", "ultralytics"),
+        ("model.onnx", "onnxruntime"),
+        ("model.engine", "tensorrt"),
+        ("model.tflite", "tflite"),
+        ("model.pth", "torch"),
+        ("model.xml", "opencv"),
+    ],
+)
+def test_reconcile_infers_runtime_from_extension(
+    tmp_path: Path, filename: str, expected_runtime: str
+) -> None:
+    """When a pre-staged file has no sidecar, the reconciler infers a
+    sensible default runtime from the file extension. Without this, the
+    SDK falls back to its own filename heuristics, which only recognise
+    well-known model_ids like 'yolov8n'."""
+    model_id = "my-custom-model"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir(parents=True)
+    weight_path = model_dir / filename
+    weight_path.write_bytes(b"opaque-bytes")
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        manager.ensure_model(model_id)
+
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.runtime == expected_runtime
+    sidecar = json.loads((model_dir / MODEL_METADATA_FILENAME).read_text())
+    assert sidecar["runtime"] == expected_runtime
+
+
+def test_reconcile_unknown_extension_leaves_runtime_none(tmp_path: Path) -> None:
+    """Unknown extensions (e.g. .gguf) get runtime=None. The SDK is then
+    free to apply its own heuristics or to error out at load time."""
+    model_id = "exotic"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.gguf").write_bytes(b"opaque-bytes")
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        manager.ensure_model(model_id)
+
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.runtime is None
+
+
+def test_reconcile_honors_explicit_sidecar_runtime_over_extension(
+    tmp_path: Path,
+) -> None:
+    """An explicit ``runtime`` in the sidecar always wins over the
+    extension-based inference (e.g. a .pt file actually loaded by the
+    'torch' runtime, not 'ultralytics')."""
+    model_id = "yolov8n"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir(parents=True)
+    weight_path = model_dir / "yolov8n.pt"
+    weight_path.write_bytes(b"weights")
+    (model_dir / MODEL_METADATA_FILENAME).write_text(
+        json.dumps({"model_id": model_id, "filename": "yolov8n.pt", "runtime": "torch"})
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        manager.ensure_model(model_id)
+
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.runtime == "torch"

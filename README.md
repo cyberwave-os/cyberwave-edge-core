@@ -146,7 +146,17 @@ mkdir -p ~/.cyberwave/models/yolov8n
 cp /usb-stick/yolov8n.pt ~/.cyberwave/models/yolov8n/
 ```
 
-Edge Core picks up the file on the next `ensure_model("yolov8n")` call, computes a SHA-256, and writes a sidecar `metadata.json` so subsequent runs are deterministic. Provide a hand-written `metadata.json` (with `filename`, `checksum_sha256`, and `runtime`) when there are multiple weight files in the directory or when corruption detection should compare against a known-good hash.
+Edge Core picks up the file on the next `ensure_model("yolov8n")` call, computes a SHA-256, and writes a sidecar `metadata.json` so subsequent runs are deterministic. The `runtime` field is inferred from the file extension (`.pt` → `ultralytics`, `.onnx` → `onnxruntime`, `.engine`/`.trt` → `tensorrt`, `.tflite` → `tflite`, `.pth` → `torch`, `.xml` → `opencv`); provide a hand-written `metadata.json` to override.
+
+**Updating in place.** Operators can drop a new build into the same directory and Edge Core will detect the change on the next call:
+
+```bash
+cp /usb-stick/yolov8n-v2.pt ~/.cyberwave/models/yolov8n/yolov8n.pt
+```
+
+The mismatch between the on-disk SHA-256 and the manifest checksum triggers a re-stamp (not a re-download), provided the sidecar still records `downloaded_from: prestaged`. This keeps offline edges functional across model upgrades. Files that were previously *downloaded* by Edge Core keep the corruption-detection semantics — bit-rot still triggers a re-download attempt rather than being silently accepted.
+
+Provide a hand-written `metadata.json` (with `filename`, `checksum_sha256`, and `runtime`) when there are multiple weight files in the directory or when corruption detection should compare against a known-good hash.
 
 ## Worker container
 
