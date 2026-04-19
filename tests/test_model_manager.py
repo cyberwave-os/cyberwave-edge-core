@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -26,6 +27,10 @@ from unittest.mock import patch
 import pytest
 
 from cyberwave_edge_core.model_manager import (
+    MODEL_METADATA_FILENAME,
+    SOURCE_KIND_ARTIFACT,
+    SOURCE_KIND_PRESTAGED,
+    SOURCE_KIND_UPSTREAM,
     CachedModel,
     ModelManager,
     _derive_filename,
@@ -33,10 +38,36 @@ from cyberwave_edge_core.model_manager import (
     _extract_download_url,
     _extract_runtime,
     _Manifest,
+    _redact_url,
     _sha256_file,
     _utc_iso_now,
     scan_worker_model_ids,
 )
+
+# ---------------------------------------------------------------------------
+# Test fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _disable_network_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the warm-cache catalog refresh probe a no-op by default.
+
+    Tests that exercise the refresh path explicitly opt in by
+    monkeypatching ``_fetch_catalog_entry_safe`` (and/or
+    ``_fetch_artifact_url_safe``) themselves.
+    """
+    monkeypatch.setattr(
+        ModelManager,
+        "_fetch_catalog_entry_safe",
+        lambda self, model_id: None,
+    )
+    monkeypatch.setattr(
+        ModelManager,
+        "_fetch_artifact_url_safe",
+        lambda self, catalog_entry: None,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -642,3 +673,355 @@ def test_ensure_model_empty_id_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="non-empty"):
         manager.ensure_model("   ")
+
+
+# ---------------------------------------------------------------------------
+# Source priority: signed Cyberwave URL preferred over upstream download_url
+# ---------------------------------------------------------------------------
+
+
+def test_download_prefers_artifact_url_over_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both a signed /weights URL and an upstream download_url are
+    available, Edge Core hits the signed URL first."""
+    model_id = "yolov8n"
+    content = b"signed weights"
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "download_url": "https://upstream.example.com/yolov8n.pt",
+        "checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "filename": f"{model_id}.pt",
+        "runtime": "ultralytics",
+    }
+    artifact_url = "https://signed.googleapis.com/yolov8n.pt?Signature=xyz"
+    monkeypatch.setattr(ModelManager, "_fetch_artifact_url_safe", lambda self, entry: artifact_url)
+
+    manager = _make_manager(tmp_path)
+    hits: list[str] = []
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        hits.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+    with (
+        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
+        patch.object(manager, "_stream_download", side_effect=_fake_stream),
+    ):
+        manager.ensure_model(model_id)
+
+    assert hits == [artifact_url]
+    sidecar = tmp_path / model_id / MODEL_METADATA_FILENAME
+    meta = json.loads(sidecar.read_text())
+    assert meta["downloaded_from"] == SOURCE_KIND_ARTIFACT
+    assert meta["source_url"] == artifact_url
+    assert meta["upstream_url"] == catalog_entry["download_url"]
+
+
+def test_download_falls_back_to_upstream_when_artifact_url_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the signed URL download fails (e.g. expired token), Edge Core
+    transparently retries against the upstream download_url."""
+    model_id = "yolov8n"
+    content = b"upstream weights"
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "download_url": "https://upstream.example.com/yolov8n.pt",
+        "checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "filename": f"{model_id}.pt",
+    }
+    artifact_url = "https://signed.googleapis.com/expired"
+    monkeypatch.setattr(ModelManager, "_fetch_artifact_url_safe", lambda self, entry: artifact_url)
+
+    manager = _make_manager(tmp_path)
+    hits: list[str] = []
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        hits.append(url)
+        if url == artifact_url:
+            raise RuntimeError("403 expired")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+    # Disable retries so the test is fast.
+    monkeypatch.setattr("cyberwave_edge_core.model_manager.MAX_DOWNLOAD_RETRIES", 1)
+
+    with (
+        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
+        patch.object(manager, "_stream_download", side_effect=_fake_stream),
+    ):
+        manager.ensure_model(model_id)
+
+    assert hits == [artifact_url, catalog_entry["download_url"]]
+    sidecar = tmp_path / model_id / MODEL_METADATA_FILENAME
+    meta = json.loads(sidecar.read_text())
+    assert meta["downloaded_from"] == SOURCE_KIND_UPSTREAM
+    assert meta["source_url"] == catalog_entry["download_url"]
+
+
+def test_download_raises_when_no_sources_available(tmp_path: Path) -> None:
+    """A catalog entry with neither signed URL nor download_url is fatal."""
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "name": "broken-entry",
+    }
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        with pytest.raises(RuntimeError, match="No download sources"):
+            manager.ensure_model("broken")
+
+
+# ---------------------------------------------------------------------------
+# Air-gap / fail-soft: cached file used when download fails
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_model_falls_back_to_cached_when_download_fails(
+    tmp_path: Path,
+) -> None:
+    """If a model is intact in the cache but the network is unreachable,
+    ensure_model returns the cached path instead of raising."""
+    model_id = "yolov8n"
+    dest = _write_fake_model(tmp_path, model_id, b"local weights")
+    manager = _make_manager(tmp_path)
+
+    with patch.object(
+        manager,
+        "_download_model",
+        side_effect=RuntimeError("network unreachable"),
+    ):
+        # Force the warm-cache fast path to attempt a refresh by signaling
+        # that the catalog has a different checksum.
+        with patch.object(manager, "_catalog_indicates_refresh", return_value=True):
+            result = manager.ensure_model(model_id)
+
+    assert result == dest
+    assert result.read_bytes() == b"local weights"
+
+
+def test_ensure_model_no_cache_no_network_raises(tmp_path: Path) -> None:
+    """Cold cache + unreachable network → RuntimeError. There is no
+    fail-soft for a model that has never been downloaded."""
+    manager = _make_manager(tmp_path)
+    with patch.object(
+        manager,
+        "_download_model",
+        side_effect=RuntimeError("offline"),
+    ):
+        with pytest.raises(RuntimeError, match="offline"):
+            manager.ensure_model("never-seen")
+
+
+# ---------------------------------------------------------------------------
+# Catalog refresh probe: triggers re-download when checksum drifts
+# ---------------------------------------------------------------------------
+
+
+def test_warm_cache_with_matching_catalog_checksum_skips_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warm cache + catalog reachable + checksums match → no download."""
+    model_id = "yolov8n"
+    dest = _write_fake_model(tmp_path, model_id, b"weights")
+    cached_checksum = hashlib.sha256(b"weights").hexdigest()
+
+    monkeypatch.setattr(
+        ModelManager,
+        "_fetch_catalog_entry_safe",
+        lambda self, mid: {"checksum_sha256": cached_checksum},
+    )
+    manager = _make_manager(tmp_path)
+
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+    assert result == dest
+
+
+def test_warm_cache_with_drifted_catalog_checksum_triggers_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warm cache + catalog reachable + checksums differ → re-download."""
+    model_id = "yolov8n"
+    _write_fake_model(tmp_path, model_id, b"old weights")
+    new_content = b"new weights"
+    new_checksum = hashlib.sha256(new_content).hexdigest()
+
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "download_url": "https://upstream.example.com/yolov8n.pt",
+        "checksum_sha256": new_checksum,
+        "filename": f"{model_id}.pt",
+    }
+    monkeypatch.setattr(
+        ModelManager,
+        "_fetch_catalog_entry_safe",
+        lambda self, mid: catalog_entry,
+    )
+
+    manager = _make_manager(tmp_path)
+    download_called: list[str] = []
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        download_called.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(new_content)
+
+    with (
+        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
+        patch.object(manager, "_stream_download", side_effect=_fake_stream),
+    ):
+        result = manager.ensure_model(model_id)
+
+    assert download_called == [catalog_entry["download_url"]]
+    assert result.read_bytes() == new_content
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.checksum_sha256 == new_checksum
+
+
+def test_warm_cache_unreachable_catalog_uses_cached(
+    tmp_path: Path,
+) -> None:
+    """Warm cache + catalog unreachable (probe returns None) → cached path,
+    no download attempted. This is the air-gap default."""
+    model_id = "yolov8n"
+    dest = _write_fake_model(tmp_path, model_id, b"weights")
+    manager = _make_manager(tmp_path)
+
+    # The autouse fixture already sets _fetch_catalog_entry_safe → None.
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+    assert result == dest
+
+
+# ---------------------------------------------------------------------------
+# Disk reconciliation: pre-staged files (air-gapped operator workflow)
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_picks_up_prestaged_weight_file_without_sidecar(
+    tmp_path: Path,
+) -> None:
+    """An operator drops ``cache_dir/{model_id}/weights.pt`` from a USB
+    stick. ensure_model picks it up, computes a checksum, and writes a
+    sidecar so the file is treated as a normal cache hit thereafter."""
+    model_id = "yolov8n"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir(parents=True)
+    weight_path = model_dir / "weights.pt"
+    weight_path.write_bytes(b"prestaged-bytes")
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == weight_path
+    sidecar = model_dir / MODEL_METADATA_FILENAME
+    assert sidecar.exists()
+    meta = json.loads(sidecar.read_text())
+    assert meta["downloaded_from"] == SOURCE_KIND_PRESTAGED
+    assert meta["filename"] == "weights.pt"
+    assert meta["checksum_sha256"] == hashlib.sha256(b"prestaged-bytes").hexdigest()
+
+
+def test_reconcile_honors_existing_sidecar(tmp_path: Path) -> None:
+    """When a sidecar already exists, reconcile uses its filename and
+    checksum verbatim (the operator may have populated those fields by
+    hand to enable corruption detection)."""
+    model_id = "detector"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir(parents=True)
+    weight_path = model_dir / "model.onnx"
+    content = b"onnx-bytes"
+    weight_path.write_bytes(content)
+    sidecar_checksum = hashlib.sha256(content).hexdigest()
+    (model_dir / MODEL_METADATA_FILENAME).write_text(
+        json.dumps(
+            {
+                "model_id": model_id,
+                "filename": "model.onnx",
+                "runtime": "onnxruntime",
+                "checksum_sha256": sidecar_checksum,
+            }
+        )
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == weight_path
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.runtime == "onnxruntime"
+    assert cached.checksum_sha256 == sidecar_checksum
+
+
+def test_reconcile_skips_dir_with_multiple_unidentified_weights(
+    tmp_path: Path,
+) -> None:
+    """Two weight files in the dir without a sidecar → cannot disambiguate;
+    reconcile is a no-op and ensure_model attempts to download instead."""
+    model_id = "ambiguous"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir(parents=True)
+    (model_dir / "a.pt").write_bytes(b"a")
+    (model_dir / "b.pt").write_bytes(b"b")
+
+    manager = _make_manager(tmp_path)
+    download_called: list[str] = []
+
+    def _fake_download(mid: str) -> Path:
+        download_called.append(mid)
+        raise RuntimeError("network down for test")
+
+    with patch.object(manager, "_download_model", side_effect=_fake_download):
+        with pytest.raises(RuntimeError, match="network down"):
+            manager.ensure_model(model_id)
+
+    assert download_called == [model_id]
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is None
+
+
+def test_reconcile_ignores_dotfiles_and_temp_downloads(tmp_path: Path) -> None:
+    """In-flight ``.dl_*`` temp files and other dotfiles must not count
+    as candidate weights during reconciliation."""
+    model_id = "yolov8n"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir(parents=True)
+    weight_path = model_dir / "yolov8n.pt"
+    weight_path.write_bytes(b"weights")
+    (model_dir / ".dl_partial").write_bytes(b"junk")
+    (model_dir / ".DS_Store").write_bytes(b"junk")
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == weight_path
+
+
+# ---------------------------------------------------------------------------
+# _extract_download_url: new upstream_weights_url alias
+# ---------------------------------------------------------------------------
+
+
+def test_extract_download_url_metadata_upstream_weights_url(tmp_path: Path) -> None:
+    entry = {"metadata": {"upstream_weights_url": "https://up.example.com/yolov8n.pt"}}
+    assert _extract_download_url(entry, "m") == "https://up.example.com/yolov8n.pt"
+
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
+
+def test_redact_url_strips_query_string() -> None:
+    assert (
+        _redact_url("https://signed.googleapis.com/x.pt?Signature=secret&Key=foo")
+        == "https://signed.googleapis.com/x.pt"
+    )
+    assert _redact_url("https://example.com/x.pt") == "https://example.com/x.pt"

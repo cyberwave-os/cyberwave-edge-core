@@ -95,7 +95,7 @@ Each driver startup attempt creates a `driver_starting` twin alert that tracks t
 
 ## Model Manager (ML model cache)
 
-Edge Core includes a `ModelManager` that pre-downloads ML model weights from the Cyberwave catalog API into a local cache before starting the worker container.
+Edge Core includes a `ModelManager` that resolves ML model weights into a local cache before starting the worker container. It is designed for both online deployments and air-gapped sites: it prefers fresh weights from Cyberwave when the network is available, falls back to upstream public mirrors, and finally to whatever is already on disk.
 
 **Cache location:**
 
@@ -112,14 +112,41 @@ Override with `CYBERWAVE_EDGE_CONFIG_DIR`.
 ├── manifest.json            # index of all cached models
 ├── yolov8n/
 │   ├── yolov8n.pt           # weight file
-│   └── metadata.json        # checksum, runtime, download URL
+│   └── metadata.json        # checksum, runtime, source URL, upstream URL
 └── background-subtraction/
     └── ...
 ```
 
-**Model requirements discovery:** Edge Core scans `*.py` files in `~/.cyberwave/workers/` for `cw.models.load(...)` calls to determine which weights to pre-download.
+**Model requirements discovery:** Edge Core scans `*.py` files in `~/.cyberwave/workers/` for `cw.models.load(...)` calls to determine which weights to ensure.
 
-**Cache integrity:** SHA-256 checksums are verified on every cache hit. A checksum mismatch or missing file triggers an automatic re-download.
+### Resolution order
+
+For each required model, `ensure_model(model_id)` runs the following steps:
+
+1. **Reconcile disk.** If `cache_dir/{model_id}/` already contains a weight file (with or without a sidecar), it is registered in the manifest. A missing sidecar is generated from the on-disk file (with a freshly computed SHA-256). This is how an operator pre-stages weights from a USB stick on an air-gapped site.
+2. **Verify cache integrity.** If the local file's SHA-256 matches the manifest checksum, the cache is *intact*.
+3. **Best-effort catalog probe.** When the cache is intact, Edge Core does a short-timeout `GET /api/v1/mlmodels/...` to compare checksums.
+   * Catalog unreachable, no checksum, or matching checksum → return the cached file (no download).
+   * Catalog returns a different checksum → fall through to the download path.
+4. **Download.** Sources are tried in priority order:
+   1. **Cyberwave-hosted signed URL** from `GET /api/v1/mlmodels/{uuid}/weights` — used for checkpoints we have uploaded to our private GCS bucket (e.g. internally trained or mirrored models). Authenticated, served from infrastructure we control.
+   2. **Upstream weights URL** from the catalog entry (`download_url` / `metadata.upstream_weights_url`) — used for community checkpoints we did not mirror.
+
+   The first source that yields a checksum-verified file wins. The sidecar records `downloaded_from` (`artifact_url` / `download_url` / `prestaged`), `source_url` (the URL actually hit), and `upstream_url` (provenance).
+5. **Fail-soft.** If every download attempt fails *and* the cached file is intact, Edge Core returns the cached path with a warning. This keeps workers running across transient network failures and on permanently air-gapped sites. If the cache is empty or corrupt, `RuntimeError` is raised.
+
+**Cache integrity:** SHA-256 checksums are verified on every cache hit, on every download, and during disk reconciliation. A checksum mismatch on the local file triggers a re-download attempt; a download whose checksum does not match the catalog is rejected and the partial file removed.
+
+### Pre-staging weights for air-gapped deployments
+
+On a site without internet access, an operator can place weights directly into the cache:
+
+```bash
+mkdir -p ~/.cyberwave/models/yolov8n
+cp /usb-stick/yolov8n.pt ~/.cyberwave/models/yolov8n/
+```
+
+Edge Core picks up the file on the next `ensure_model("yolov8n")` call, computes a SHA-256, and writes a sidecar `metadata.json` so subsequent runs are deterministic. Provide a hand-written `metadata.json` (with `filename`, `checksum_sha256`, and `runtime`) when there are multiple weight files in the directory or when corruption detection should compare against a known-good hash.
 
 ## Worker container
 
