@@ -123,21 +123,20 @@ Override with `CYBERWAVE_EDGE_CONFIG_DIR`.
 
 For each required model, `ensure_model(model_id)` runs the following steps:
 
-1. **Reconcile disk.** If `cache_dir/{model_id}/` already contains a weight file (with or without a sidecar), it is registered in the manifest. A missing sidecar is generated from the on-disk file (with a freshly computed SHA-256). This is how an operator pre-stages weights from a USB stick on an air-gapped site.
+1. **Reconcile disk.** If `cache_dir/{model_id}/` already contains a weight file (with or without a sidecar), it is registered in the manifest. A missing sidecar is generated from the on-disk file (with a freshly computed SHA-256) and tagged `downloaded_from: prestaged`. This is how an operator pre-stages weights from a USB stick on an air-gapped site.
 2. **Verify cache integrity.** If the local file's SHA-256 matches the manifest checksum, the cache is *intact*.
-3. **Best-effort catalog probe.** When the cache is intact, Edge Core does a short-timeout `GET /api/v1/mlmodels/...` to compare checksums.
+3. **Pre-staged short-circuit.** When an intact entry is tagged `downloaded_from: prestaged`, Edge Core returns it without ever contacting the catalog. Pre-staged files are operator-curated truth; to force a re-download, evict the model directory.
+4. **Best-effort catalog probe.** For non-prestaged intact entries, Edge Core does a short-timeout `GET /api/v1/mlmodels/...` to compare checksums.
    * Catalog unreachable, no checksum, or matching checksum → return the cached file (no download).
    * Catalog returns a different checksum → fall through to the download path.
-4. **Download.** Sources are tried in priority order:
+5. **Download.** Sources are tried in priority order:
    1. **Cyberwave-hosted signed URL** from `GET /api/v1/mlmodels/{uuid}/weights` — used for checkpoints we have uploaded to our private GCS bucket (e.g. internally trained or mirrored models). Authenticated, served from infrastructure we control.
    2. **Upstream weights URL** from the catalog entry (`download_url` / `metadata.upstream_weights_url`) — used for community checkpoints we did not mirror.
 
-   The first source that yields a checksum-verified file wins. The sidecar records `downloaded_from` (`artifact_url` / `download_url` / `prestaged`), `source_url` (the *resolver endpoint* — `/api/v1/mlmodels/{uuid}/weights` for artifact downloads, the public URL for upstream), and `upstream_url` (provenance). The signed URL we actually fetched is intentionally *not* persisted: it expires within minutes and would mislead anyone reading the manifest later.
-5. **Fail-soft.** If every download attempt fails *and* the cached file is intact, Edge Core returns the cached path with a warning. This keeps workers running across transient network failures and on permanently air-gapped sites. If the cache is empty or corrupt, `RuntimeError` is raised.
+   The first source that yields a checksum-verified file wins. The sidecar records `downloaded_from` (`artifact_url` / `download_url` / `prestaged`), `source_url` (the public URL we fetched, or `null` for artifact downloads — the signed URL expires in minutes and is useless to persist), and `upstream_url` (provenance).
+6. **Fail-soft.** If every download attempt fails *and* the cached file is intact, Edge Core returns the cached path with a warning. This keeps workers running across transient network failures and on permanently air-gapped sites. If the cache is empty or corrupt, `RuntimeError` is raised.
 
-**Cache integrity:** SHA-256 checksums are verified on every cold start, on every download, and during disk reconciliation. The steady-state warm-cache path uses an `(size, mtime_ns)` fast check and skips re-hashing when nothing has changed on disk; this keeps cold-start cost bounded for multi-gigabyte checkpoints. Any mismatch — externally touched mtime, modified size — falls back to a full SHA-256 verification. A checksum mismatch on a downloaded artifact triggers a re-download attempt; a download whose checksum does not match the catalog is rejected and the partial file removed.
-
-**Concurrency:** Each model directory has a `.lock` file held with an exclusive `flock()` for the duration of `ensure_model`. This prevents the worker startup path and the watcher loop from racing on the same model — they serialise per model, with a single download even when both observe a cold cache simultaneously.
+**Cache integrity:** SHA-256 checksums are verified on every `ensure_model` call when a checksum is recorded — on cold start, after every download, during disk reconciliation, and on every warm-cache hit. There is no shortcut. For multi-gigabyte checkpoints this is the dominant cost of the call, but `ensure_model` only runs when a worker file changes (rare) or the worker container restarts; in exchange we get unconditional bit-rot detection. A checksum mismatch on a downloaded artifact triggers a re-download attempt; a download whose checksum does not match the catalog is rejected and the partial file removed.
 
 ### Pre-staging weights for air-gapped deployments
 
@@ -158,18 +157,11 @@ cp /usb-stick/yolov8n-v2.pt ~/.cyberwave/models/yolov8n/yolov8n.pt
 
 The mismatch between the on-disk SHA-256 and the manifest checksum triggers a re-stamp (not a re-download), provided the sidecar still records `downloaded_from: prestaged`. This keeps offline edges functional across model upgrades. Files that were previously *downloaded* by Edge Core keep the corruption-detection semantics — bit-rot still triggers a re-download attempt rather than being silently accepted.
 
-**Pinning a build (do-not-overwrite).** When a site needs to lock a specific hand-vetted weight file and refuse any catalog-driven updates, add `"pinned": true` to the sidecar:
+**Pre-staged files are never auto-overwritten by catalog updates.** Once a file lives under `cache_dir/{model_id}/` with a `downloaded_from: prestaged` sidecar, Edge Core treats it as the source of truth and skips the catalog probe entirely. To force a re-download from the Cyberwave catalog, evict the model:
 
-```json
-{
-  "model_id": "yolov8n",
-  "filename": "yolov8n.pt",
-  "downloaded_from": "prestaged",
-  "pinned": true
-}
+```bash
+rm -rf ~/.cyberwave/models/yolov8n
 ```
-
-Pinned files skip the catalog refresh probe entirely and are never overwritten by Edge Core's download path, even when the catalog publishes a different checksum. The pin survives in-place re-staging (overwriting the file on disk re-stamps the manifest but preserves the pin). To unpin, edit the sidecar and set `"pinned": false` (or remove the field).
 
 Provide a hand-written `metadata.json` (with `filename`, `checksum_sha256`, and `runtime`) when there are multiple weight files in the directory or when corruption detection should compare against a known-good hash.
 

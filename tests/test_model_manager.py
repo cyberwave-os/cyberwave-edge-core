@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -717,13 +716,10 @@ def test_download_prefers_artifact_url_over_upstream(
     sidecar = tmp_path / model_id / MODEL_METADATA_FILENAME
     meta = json.loads(sidecar.read_text())
     assert meta["downloaded_from"] == SOURCE_KIND_ARTIFACT
-    # source_url is the *resolver endpoint*, not the time-limited signed
-    # URL. The signed URL is useless for re-fetching: anyone reading the
-    # manifest later should re-issue this exact request to obtain a
-    # fresh credential.
-    assert meta["source_url"] == (
-        f"https://api.test/api/v1/mlmodels/{catalog_entry['uuid']}/weights"
-    )
+    # The signed URL we fetched expires within minutes; persisting it
+    # would mislead anyone reading the manifest later. Use the catalog
+    # entry to refresh.
+    assert meta["source_url"] is None
     assert meta["upstream_url"] == catalog_entry["download_url"]
 
 
@@ -1330,46 +1326,19 @@ def test_reconcile_honors_explicit_sidecar_runtime_over_extension(
 
 
 # ---------------------------------------------------------------------------
-# #1 — Pinned pre-staged weights (operator says "do not overwrite")
+# Pre-staged files are operator-curated truth: never auto-overwritten
 # ---------------------------------------------------------------------------
 
 
-def _write_pinned_prestaged(
-    cache_dir: Path, model_id: str, content: bytes = b"pinned-weights"
-) -> Path:
-    """Pre-stage a weight file with ``pinned: true`` in the sidecar.
-
-    Returns the path to the weight file. Does NOT call ensure_model so
-    the caller can observe the very first reconciliation pass.
-    """
-    model_dir = cache_dir / model_id
-    model_dir.mkdir(parents=True, exist_ok=True)
-    dest = model_dir / f"{model_id}.pt"
-    dest.write_bytes(content)
-    (model_dir / MODEL_METADATA_FILENAME).write_text(
-        json.dumps(
-            {
-                "model_id": model_id,
-                "filename": dest.name,
-                "checksum_sha256": hashlib.sha256(content).hexdigest(),
-                "size_bytes": len(content),
-                "downloaded_from": SOURCE_KIND_PRESTAGED,
-                "pinned": True,
-            }
-        )
-    )
-    return dest
-
-
-def test_pinned_prestaged_skips_catalog_probe_and_download(
+def test_prestaged_file_skips_catalog_probe_and_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Operator-pinned weights are authoritative. Even when the catalog
-    publishes a different checksum, Edge Core must not overwrite the
-    file."""
+    """An operator-staged file is never auto-overwritten by Edge Core,
+    even when the catalog publishes a different checksum. To force a
+    re-download the operator must evict the model directory."""
     model_id = "yolov8n"
-    weight_path = _write_pinned_prestaged(tmp_path, model_id, b"the-blessed-build")
-    pinned_sha = hashlib.sha256(b"the-blessed-build").hexdigest()
+    weight_path = _write_prestaged_model(tmp_path, model_id, b"the-blessed-build")
+    blessed_sha = hashlib.sha256(b"the-blessed-build").hexdigest()
 
     catalog_probe_calls: list[str] = []
 
@@ -1381,391 +1350,54 @@ def test_pinned_prestaged_skips_catalog_probe_and_download(
 
     manager = _make_manager(tmp_path)
     with patch.object(
-        manager, "_download_model", side_effect=AssertionError("pinned: must not download")
+        manager,
+        "_download_model",
+        side_effect=AssertionError("prestaged: must not download"),
     ):
         result = manager.ensure_model(model_id)
 
     assert result == weight_path
     assert result.read_bytes() == b"the-blessed-build"
-    assert catalog_probe_calls == [], "pinned cache must not probe the catalog"
+    assert catalog_probe_calls == [], "prestaged cache must not probe the catalog"
     cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
     assert cached is not None
-    assert cached.pinned is True
-    assert cached.checksum_sha256 == pinned_sha
+    assert cached.downloaded_from == SOURCE_KIND_PRESTAGED
+    assert cached.checksum_sha256 == blessed_sha
 
 
-def test_pinned_prestaged_persists_through_restamp(tmp_path: Path) -> None:
-    """The pin survives an in-place update of the weight file."""
-    model_id = "yolov8n"
-    weight_path = _write_pinned_prestaged(tmp_path, model_id, b"v1-pinned")
-    weight_path.write_bytes(b"v2-pinned-with-different-size")
-
-    manager = _make_manager(tmp_path)
-    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
-        manager.ensure_model(model_id)
-
-    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
-    assert cached is not None
-    assert cached.pinned is True
-    assert cached.checksum_sha256 == hashlib.sha256(b"v2-pinned-with-different-size").hexdigest()
-    sidecar = json.loads((weight_path.parent / MODEL_METADATA_FILENAME).read_text())
-    assert sidecar["pinned"] is True
-
-
-def test_unpinned_prestaged_still_probes_catalog(
+def test_downloaded_file_round_trips_downloaded_from_through_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pre-staged files without ``pinned: true`` keep the existing
-    behavior: catalog probe runs, and a checksum drift triggers a
-    download attempt that may overwrite the file."""
+    """``downloaded_from`` survives a manifest serialise/deserialise.
+
+    This matters because the prestaged-skip-catalog logic above keys off
+    of ``cached.downloaded_from`` after a fresh process load.
+    """
     model_id = "yolov8n"
-    model_dir = tmp_path / model_id
-    model_dir.mkdir(parents=True)
-    weight_path = model_dir / "yolov8n.pt"
-    weight_path.write_bytes(b"unpinned-weights")
-    (model_dir / MODEL_METADATA_FILENAME).write_text(
-        json.dumps(
-            {
-                "model_id": model_id,
-                "filename": weight_path.name,
-                "checksum_sha256": hashlib.sha256(b"unpinned-weights").hexdigest(),
-                "size_bytes": len(b"unpinned-weights"),
-                "downloaded_from": SOURCE_KIND_PRESTAGED,
-            }
-        )
-    )
+    content = b"upstream-weights"
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "download_url": "https://upstream.example.com/yolov8n.pt",
+        "checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "filename": f"{model_id}.pt",
+    }
 
-    monkeypatch.setattr(
-        ModelManager,
-        "_fetch_catalog_entry_safe",
-        lambda self, mid: {"checksum_sha256": "deadbeef" * 8},
-    )
-
-    manager = _make_manager(tmp_path)
-    download_called: list[str] = []
-
-    def _fake_download(mid: str) -> Path:
-        download_called.append(mid)
-        return weight_path
-
-    with patch.object(manager, "_download_model", side_effect=_fake_download):
-        manager.ensure_model(model_id)
-
-    assert download_called == [model_id]
-
-
-def test_pinned_flag_round_trips_through_manifest(tmp_path: Path) -> None:
-    """``pinned`` survives manifest serialise/deserialise."""
-    model_id = "yolov8n"
-    _write_pinned_prestaged(tmp_path, model_id)
+    def _fake_stream(url: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
 
     manager_a = _make_manager(tmp_path)
-    with patch.object(manager_a, "_download_model", side_effect=AssertionError("no download")):
+    with (
+        patch.object(manager_a, "_fetch_catalog_entry", return_value=catalog_entry),
+        patch.object(manager_a, "_stream_download", side_effect=_fake_stream),
+    ):
         manager_a.ensure_model(model_id)
 
     raw = json.loads((tmp_path / "manifest.json").read_text())
-    assert raw[model_id]["pinned"] is True
+    assert raw[model_id]["downloaded_from"] == SOURCE_KIND_UPSTREAM
+    assert raw[model_id]["source_url"] == catalog_entry["download_url"]
 
     manager_b = _make_manager(tmp_path)
     cached = manager_b._manifest.get(model_id)
-    assert cached is not None and cached.pinned is True
-
-
-# ---------------------------------------------------------------------------
-# #5 — Per-model file lock (concurrency)
-# ---------------------------------------------------------------------------
-
-
-def test_per_model_lock_creates_lock_file(tmp_path: Path) -> None:
-    """The lock file is created on first ensure_model call and lives
-    next to the weights so it shares the directory's lifecycle."""
-    model_id = "yolov8n"
-    _write_fake_model(tmp_path, model_id)
-    manager = _make_manager(tmp_path)
-
-    with patch.object(manager, "_download_model", side_effect=AssertionError("warm cache")):
-        manager.ensure_model(model_id)
-
-    lock_path = tmp_path / model_id / ".lock"
-    assert lock_path.exists()
-
-
-def test_per_model_lock_serialises_concurrent_callers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Two threads racing on the same model see exactly one download.
-
-    Without the lock, both threads would observe a cold cache, both
-    would invoke _download_model, and the second writer would clobber
-    the first via tempfile.replace().
-    """
-    import threading
-
-    model_id = "yolov8n"
-    content = b"raced weights"
-    catalog_entry: dict[str, Any] = {
-        "uuid": "12345678-1234-1234-1234-123456789abc",
-        "download_url": "https://upstream.example.com/yolov8n.pt",
-        "checksum_sha256": hashlib.sha256(content).hexdigest(),
-        "filename": f"{model_id}.pt",
-    }
-
-    download_invocations = 0
-    download_started = threading.Event()
-    let_first_finish = threading.Event()
-
-    def _slow_download(mid: str) -> Path:
-        nonlocal download_invocations
-        download_invocations += 1
-        download_started.set()
-        let_first_finish.wait(timeout=5.0)
-        dest = tmp_path / model_id / f"{model_id}.pt"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content)
-        manager._record_successful_download(
-            model_id=model_id,
-            dest_path=dest,
-            checksum=hashlib.sha256(content).hexdigest(),
-            runtime="ultralytics",
-            source_kind=SOURCE_KIND_UPSTREAM,
-            source_url=catalog_entry["download_url"],
-            upstream_url=catalog_entry["download_url"],
-            filename=f"{model_id}.pt",
-        )
-        return dest
-
-    manager = _make_manager(tmp_path)
-    monkeypatch.setattr(manager, "_download_model", _slow_download)
-
-    results: list[Path] = []
-    errors: list[BaseException] = []
-
-    def _worker() -> None:
-        try:
-            results.append(manager.ensure_model(model_id))
-        except BaseException as exc:
-            errors.append(exc)
-
-    threads = [threading.Thread(target=_worker) for _ in range(2)]
-    threads[0].start()
-    download_started.wait(timeout=2.0)
-    threads[1].start()
-    # Give the second thread a moment to block on the lock — if the lock
-    # works, it cannot have completed yet.
-    time.sleep(0.1)
-    assert results == [], "second caller must block until first releases the lock"
-
-    let_first_finish.set()
-    for t in threads:
-        t.join(timeout=5.0)
-
-    assert errors == []
-    assert len(results) == 2
-    assert results[0] == results[1]
-    assert download_invocations == 1, (
-        "second caller must hit the warm cache after the first download completes, not redownload"
-    )
-
-
-# ---------------------------------------------------------------------------
-# #6 — mtime-based fast path skips redundant SHA-256 on warm cache
-# ---------------------------------------------------------------------------
-
-
-def test_warm_cache_skips_sha256_when_mtime_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Steady state: nothing changed on disk → no SHA-256 computation.
-
-    Cold-start cost on a multi-GB checkpoint is otherwise dominated by
-    re-hashing a file we just wrote.
-    """
-    model_id = "yolov8n"
-    _write_fake_model(tmp_path, model_id, b"weights")
-
-    # First call: SHA-256 runs (legacy entry has no mtime_ns) and the
-    # mtime is back-filled.
-    manager_a = _make_manager(tmp_path)
-    with patch.object(manager_a, "_download_model", side_effect=AssertionError("warm")):
-        manager_a.ensure_model(model_id)
-
-    cached = manager_a._manifest.get(model_id)
-    assert cached is not None and cached.mtime_ns is not None
-
-    # Second call: should NOT call _sha256_file at all.
-    manager_b = _make_manager(tmp_path)
-    sha_calls = 0
-
-    real_sha = _sha256_file
-
-    def _spy_sha(path: Path) -> str:
-        nonlocal sha_calls
-        sha_calls += 1
-        return real_sha(path)
-
-    monkeypatch.setattr("cyberwave_edge_core.model_manager._sha256_file", _spy_sha)
-    with patch.object(manager_b, "_download_model", side_effect=AssertionError("warm")):
-        manager_b.ensure_model(model_id)
-
-    assert sha_calls == 0
-
-
-def test_warm_cache_recomputes_sha256_when_mtime_changes(tmp_path: Path) -> None:
-    """If the file's mtime changes (e.g. an external touch), the
-    cheap-stat path declines and SHA-256 runs to verify content."""
-    model_id = "yolov8n"
-    weight_path = _write_fake_model(tmp_path, model_id, b"weights")
-
-    manager_a = _make_manager(tmp_path)
-    with patch.object(manager_a, "_download_model", side_effect=AssertionError("warm")):
-        manager_a.ensure_model(model_id)
-
-    cached_before = manager_a._manifest.get(model_id)
-    assert cached_before is not None
-    original_mtime = cached_before.mtime_ns
-    assert original_mtime is not None
-
-    new_mtime_ns = original_mtime + 5_000_000_000
-    os.utime(weight_path, ns=(new_mtime_ns, new_mtime_ns))
-
-    manager_b = _make_manager(tmp_path)
-    with patch.object(manager_b, "_download_model", side_effect=AssertionError("warm")):
-        manager_b.ensure_model(model_id)
-
-    cached_after = manager_b._manifest.get(model_id)
-    assert cached_after is not None
-    assert cached_after.mtime_ns == new_mtime_ns
-
-
-def test_legacy_manifest_without_mtime_backfills_on_first_call(tmp_path: Path) -> None:
-    """A manifest written by an older Edge Core version has no
-    ``mtime_ns`` field. The first ensure_model call must compute it and
-    persist it so subsequent calls hit the fast path."""
-    model_id = "yolov8n"
-    weight_path = _write_fake_model(tmp_path, model_id, b"weights")
-
-    raw = json.loads((tmp_path / "manifest.json").read_text())
-    raw[model_id].pop("mtime_ns", None)
-    (tmp_path / "manifest.json").write_text(json.dumps(raw))
-
-    manager = _make_manager(tmp_path)
-    with patch.object(manager, "_download_model", side_effect=AssertionError("warm")):
-        manager.ensure_model(model_id)
-
-    cached = manager._manifest.get(model_id)
     assert cached is not None
-    assert cached.mtime_ns == weight_path.stat().st_mtime_ns
-
-
-# ---------------------------------------------------------------------------
-# #9 — source_url stores the resolver endpoint, not the signed URL
-# ---------------------------------------------------------------------------
-
-
-def test_artifact_download_records_resolver_endpoint_in_source_url(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The persisted ``source_url`` must be re-issuable. Signed URLs
-    expire; the resolver endpoint always works."""
-    model_id = "yolov8n"
-    content = b"signed weights"
-    uuid = "12345678-1234-1234-1234-123456789abc"
-    catalog_entry: dict[str, Any] = {
-        "uuid": uuid,
-        "download_url": "https://upstream.example.com/yolov8n.pt",
-        "checksum_sha256": hashlib.sha256(content).hexdigest(),
-        "filename": f"{model_id}.pt",
-    }
-    artifact_url = "https://signed.googleapis.com/yolov8n.pt?X-Goog-Signature=expires-in-15-minutes"
-    monkeypatch.setattr(
-        ModelManager,
-        "_fetch_artifact_url_safe",
-        lambda self, entry: artifact_url,
-    )
-
-    def _fake_stream(url: str, dest: Path) -> None:
-        assert url == artifact_url, "must fetch from the signed URL"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content)
-
-    manager = _make_manager(tmp_path, base_url="https://api.test")
-    with (
-        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
-        patch.object(manager, "_stream_download", side_effect=_fake_stream),
-    ):
-        manager.ensure_model(model_id)
-
-    expected_endpoint = f"https://api.test/api/v1/mlmodels/{uuid}/weights"
-    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
-    assert cached is not None
-    assert cached.source_url == expected_endpoint
-    sidecar = json.loads((tmp_path / model_id / MODEL_METADATA_FILENAME).read_text())
-    assert sidecar["source_url"] == expected_endpoint
-    assert "X-Goog-Signature" not in (sidecar["source_url"] or "")
-
-
-def test_upstream_download_records_actual_url_in_source_url(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """For upstream sources there is no resolver indirection — the URL
-    we hit IS the persistent identifier."""
-    model_id = "yolov8n"
-    content = b"upstream weights"
-    upstream_url = "https://github.com/ultralytics/assets/releases/download/v1/yolov8n.pt"
-    catalog_entry: dict[str, Any] = {
-        "uuid": "12345678-1234-1234-1234-123456789abc",
-        "download_url": upstream_url,
-        "checksum_sha256": hashlib.sha256(content).hexdigest(),
-        "filename": f"{model_id}.pt",
-    }
-
-    def _fake_stream(url: str, dest: Path) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content)
-
-    manager = _make_manager(tmp_path)
-    with (
-        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
-        patch.object(manager, "_stream_download", side_effect=_fake_stream),
-    ):
-        manager.ensure_model(model_id)
-
-    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
-    assert cached is not None
-    assert cached.source_url == upstream_url
-
-
-def test_artifact_endpoint_falls_back_to_signed_url_without_uuid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """If the catalog entry has no UUID we cannot construct the
-    resolver endpoint, so we fall back to the signed URL (degraded but
-    not broken)."""
-    model_id = "yolov8n"
-    content = b"signed weights"
-    catalog_entry: dict[str, Any] = {
-        "download_url": "https://upstream.example.com/yolov8n.pt",
-        "checksum_sha256": hashlib.sha256(content).hexdigest(),
-        "filename": f"{model_id}.pt",
-    }
-    artifact_url = "https://signed.googleapis.com/yolov8n.pt?Signature=xyz"
-    monkeypatch.setattr(
-        ModelManager,
-        "_fetch_artifact_url_safe",
-        lambda self, entry: artifact_url,
-    )
-
-    def _fake_stream(url: str, dest: Path) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content)
-
-    manager = _make_manager(tmp_path)
-    with (
-        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
-        patch.object(manager, "_stream_download", side_effect=_fake_stream),
-    ):
-        manager.ensure_model(model_id)
-
-    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
-    assert cached is not None
-    assert cached.source_url == artifact_url
+    assert cached.downloaded_from == SOURCE_KIND_UPSTREAM
