@@ -235,7 +235,45 @@ GPU memory fraction can be limited via `CYBERWAVE_GPU_MEM_FRACTION` (a float bet
 
 ### GPU support
 
-When an NVIDIA container runtime is detected (`docker info` reports `nvidia` runtime), Edge Core adds `--gpus all` to the worker container's `docker run` command.
+When an NVIDIA container runtime is detected (`docker info` reports `nvidia` runtime), Edge Core adds `--gpus all` to the **worker** container's `docker run` command.
+
+**Driver GPU passthrough** is opt-in via asset metadata. When a driver's config includes `"prefer_gpu": true` and the host has:
+
+1. NVIDIA container runtime available (`docker info` reports `nvidia`), **and**
+2. `nvidia` set as the default runtime in `/etc/docker/daemon.json`
+
+…Edge Core passes `--gpus` to the driver container. The optional `"gpu"` field controls which GPUs are exposed:
+
+| `gpu` value | Docker flag | Use case |
+|---|---|---|
+| _(not set)_ | `--gpus all` | All available GPUs (default) |
+| `1` | `--gpus 1` | Limit to 1 GPU |
+| `"device=0,2"` | `--gpus "device=0,2"` | Specific GPU devices |
+
+Example driver metadata:
+
+```json
+{
+  "drivers": {
+    "default": {
+      "docker_image": "cyberwaveos/go2-ros2-driver:humble",
+      "prefer_gpu": true,
+      "gpu": "all"
+    }
+  }
+}
+```
+
+If the NVIDIA runtime is available but not configured as the default in `daemon.json`, Edge Core logs an informational message with setup instructions instead of silently skipping GPU passthrough.
+
+### Jetson detection
+
+Edge Core auto-detects NVIDIA Jetson hardware via `/etc/nv_tegra_release`. When running on a Jetson:
+
+- The platform key `linux-aarch64-jetson` is added to the driver resolution order, allowing asset metadata to specify a Jetson-optimised image.
+- If no `linux-aarch64-jetson` driver key exists in metadata, Edge Core rewrites the image tag by prepending `jetson-` (e.g. `cyberwaveos/go2-ros2-driver:humble` → `cyberwaveos/go2-ros2-driver:jetson-humble`). If the Jetson-prefixed image is not available, it falls back to the original tag automatically.
+
+Override detection with `CYBERWAVE_PLATFORM_VARIANT=jetson` for testing.
 
 ## Multi-camera orchestration
 

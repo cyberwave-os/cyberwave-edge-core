@@ -1204,8 +1204,10 @@ class TestDriverSelection:
     def test_prefers_platform_specific_driver_by_machine(self, monkeypatch):
         monkeypatch.setattr(driver_selection.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(driver_selection.platform, "machine", lambda: "arm64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
 
-        image, params = startup._get_best_driver_image_and_params(
+        image, params, prefer_gpu, gpu_spec = startup._get_best_driver_image_and_params(
             {
                 "default": {"docker_image": "cyberwave/default-driver:latest"},
                 "macos": {"docker_image": "cyberwave/macos-driver:latest"},
@@ -1218,12 +1220,16 @@ class TestDriverSelection:
 
         assert image == "cyberwave/macos-arm-driver:latest"
         assert params == ["--log-level", "debug"]
+        assert prefer_gpu is False
+        assert gpu_spec == "all"
 
     def test_falls_back_to_default_when_no_platform_driver_matches(self, monkeypatch):
         monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
         monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
 
-        image, params = startup._get_best_driver_image_and_params(
+        image, params, prefer_gpu, gpu_spec = startup._get_best_driver_image_and_params(
             {
                 "default": {"docker_image": "cyberwave/default-driver:latest"},
                 "macos": {"docker_image": "cyberwave/macos-driver:latest"},
@@ -1232,6 +1238,88 @@ class TestDriverSelection:
 
         assert image == "cyberwave/default-driver:latest"
         assert params == []
+        assert prefer_gpu is False
+        assert gpu_spec == "all"
+
+    def test_prefers_jetson_platform_key_on_jetson(self, monkeypatch):
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "aarch64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: True)
+
+        image, params, prefer_gpu, gpu_spec = startup._get_best_driver_image_and_params(
+            {
+                "default": {"docker_image": "cyberwave/driver:humble"},
+                "linux-aarch64": {"docker_image": "cyberwave/driver:humble"},
+                "linux-aarch64-jetson": {
+                    "docker_image": "cyberwave/driver:jetson-humble",
+                    "params": ["--jetson"],
+                    "prefer_gpu": True,
+                },
+            }
+        )
+
+        assert image == "cyberwave/driver:jetson-humble"
+        assert params == ["--jetson"]
+        assert prefer_gpu is True
+        assert gpu_spec == "all"
+
+    def test_prefer_gpu_returned_from_driver_config(self, monkeypatch):
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        image, params, prefer_gpu, gpu_spec = startup._get_best_driver_image_and_params(
+            {
+                "default": {
+                    "docker_image": "cyberwave/driver:latest",
+                    "prefer_gpu": True,
+                },
+            }
+        )
+
+        assert image == "cyberwave/driver:latest"
+        assert prefer_gpu is True
+        assert gpu_spec == "all"
+
+    def test_gpu_spec_from_driver_config(self, monkeypatch):
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        _, _, prefer_gpu, gpu_spec = startup._get_best_driver_image_and_params(
+            {
+                "default": {
+                    "docker_image": "cyberwave/driver:latest",
+                    "prefer_gpu": True,
+                    "gpu": 1,
+                },
+            }
+        )
+
+        assert prefer_gpu is True
+        assert gpu_spec == "1"
+
+    def test_gpu_spec_device_selector(self, monkeypatch):
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        _, _, prefer_gpu, gpu_spec = startup._get_best_driver_image_and_params(
+            {
+                "default": {
+                    "docker_image": "cyberwave/driver:latest",
+                    "prefer_gpu": True,
+                    "gpu": "device=0,2",
+                },
+            }
+        )
+
+        assert prefer_gpu is True
+        assert gpu_spec == "device=0,2"
 
 
 class TestPullDockerImageWithProgress:
