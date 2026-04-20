@@ -497,27 +497,75 @@ def _resolve_macos_camera_bridge_candidates(asset: Any, twin_metadata: dict[str,
     return list(dict.fromkeys(candidate_devices))
 
 
-def _load_selected_camera_device() -> Optional[str]:
-    """Read the selected video device from ``cameras.json``.
-
-    Returns the ``/dev/video<N>`` path if ``cameras.json`` exists and has a
-    valid ``selected_device`` index, otherwise ``None``.
-    """
+def _read_cameras_config() -> Optional[dict]:
+    """Return the raw ``cameras.json`` payload, or ``None`` when unavailable."""
     cameras_file = CONFIG_DIR / "cameras.json"
     if not cameras_file.exists():
         return None
     try:
         with open(cameras_file) as f:
-            data = json.load(f)
+            return json.load(f)
     except (json.JSONDecodeError, OSError):
         logger.debug("Could not read cameras.json")
         return None
-    selected = data.get("selected_device")
-    if selected is None:
+
+
+def _coerce_video_index(value: Any) -> Optional[int]:
+    """Best-effort conversion of a stored video index to ``int``."""
+    if value is None:
         return None
     try:
-        selected_index = int(selected)
+        return int(value)
     except (ValueError, TypeError):
+        return None
+
+
+def _load_camera_stream_url_for_twin(twin_uuid: Optional[str]) -> Optional[str]:
+    """Return the MJPEG stream URL assigned to *twin_uuid* on macOS, if any.
+
+    Reads ``~/.cyberwave/camera_streams.json`` (written by the CLI installer
+    when multiple camera twins are mapped to different AVFoundation cameras)
+    and returns the entry for *twin_uuid*.  Returns ``None`` when no mapping
+    exists or the file is missing/invalid.
+    """
+    if not twin_uuid:
+        return None
+    streams_file = CONFIG_DIR / "camera_streams.json"
+    if not streams_file.exists():
+        return None
+    try:
+        with open(streams_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.debug("Could not read camera_streams.json")
+        return None
+    mapping = data.get("twin_to_stream_url") or {}
+    url = mapping.get(str(twin_uuid))
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
+
+
+def _load_selected_camera_device(twin_uuid: Optional[str] = None) -> Optional[str]:
+    """Read the selected video device from ``cameras.json``.
+
+    When ``twin_uuid`` is provided, first look it up in the optional
+    ``twin_to_device`` mapping persisted by the CLI.  Fall back to the global
+    ``selected_device`` value for backward compatibility.  Returns the
+    ``/dev/video<N>`` path, or ``None`` when no selection is available.
+    """
+    data = _read_cameras_config()
+    if data is None:
+        return None
+
+    if twin_uuid:
+        mapping = data.get("twin_to_device") or {}
+        mapped = _coerce_video_index(mapping.get(str(twin_uuid)))
+        if mapped is not None:
+            return f"/dev/video{mapped}"
+
+    selected_index = _coerce_video_index(data.get("selected_device"))
+    if selected_index is None:
         return None
     return f"/dev/video{selected_index}"
 
@@ -1153,7 +1201,7 @@ def _run_docker_image(
     # On Linux, read the selected camera device from cameras.json so camera
     # drivers open the correct /dev/video* instead of defaulting to index 0.
     if platform.system() == "Linux" and "CYBERWAVE_METADATA_VIDEO_DEVICE" not in explicit_params_env:
-        selected_video_device = _load_selected_camera_device()
+        selected_video_device = _load_selected_camera_device(twin_uuid)
         if selected_video_device is not None:
             container_env.setdefault("CYBERWAVE_METADATA_VIDEO_DEVICE", selected_video_device)
 
@@ -1166,11 +1214,22 @@ def _run_docker_image(
     # Check for an explicit MJPEG camera stream URL early.  When the user has
     # configured one, video device bridge resolution is pointless because the
     # driver will consume the HTTP stream instead of /dev/video*.
+    #
+    # Resolution order (most-specific wins):
+    #   1) ``camera_streams.json['twin_to_stream_url'][twin_uuid]`` — set by
+    #      the CLI installer when the user mapped multiple camera twins to
+    #      distinct AVFoundation cameras.
+    #   2) ``CYBERWAVE_MACOS_CAMERA_STREAM_URL`` runtime env var — legacy
+    #      single-camera fallback.
     _macos_camera_stream_url: Optional[str] = None
     if platform.system() == "Darwin":
-        _raw = get_runtime_env_var("CYBERWAVE_MACOS_CAMERA_STREAM_URL")
-        if _raw and _raw.strip():
-            _macos_camera_stream_url = _raw.strip()
+        _per_twin = _load_camera_stream_url_for_twin(twin_uuid)
+        if _per_twin:
+            _macos_camera_stream_url = _per_twin
+        else:
+            _raw = get_runtime_env_var("CYBERWAVE_MACOS_CAMERA_STREAM_URL")
+            if _raw and _raw.strip():
+                _macos_camera_stream_url = _raw.strip()
 
     macos_bridge_ok, macos_resolved_devices = _run_macos_device_bridge_commands(
         params=params,
@@ -1918,12 +1977,16 @@ def reconcile_camera_config_drift() -> bool:
 
     _cameras_json_mtime = current_mtime
 
-    desired_device = _load_selected_camera_device()
-    if desired_device is None:
+    # Fallback to the legacy global device when no per-twin mapping exists;
+    # otherwise each container is compared against the device its twin is
+    # bound to.
+    fallback_device = _load_selected_camera_device()
+    if fallback_device is None:
         return False
 
     containers = _list_running_driver_containers()
     stale_containers: list[str] = []
+    restart_reason_device = fallback_device
 
     for container_name in containers:
         inspect_data = _inspect_driver_container(container_name)
@@ -1934,22 +1997,32 @@ def reconcile_camera_config_drift() -> bool:
         )
         if current_device is None:
             continue
+        container_twin_uuid = _get_container_env_var(
+            inspect_data, "CYBERWAVE_TWIN_UUID"
+        )
+        desired_device = (
+            _load_selected_camera_device(container_twin_uuid)
+            if container_twin_uuid
+            else fallback_device
+        ) or fallback_device
         if current_device != desired_device:
             logger.info(
-                "Camera config drift detected for %s: "
+                "Camera config drift detected for %s (twin=%s): "
                 "container has %s, cameras.json wants %s",
                 container_name,
+                container_twin_uuid or "<unknown>",
                 current_device,
                 desired_device,
             )
             stale_containers.append(container_name)
+            restart_reason_device = desired_device
 
     if not stale_containers:
         return False
 
     logger.info(
         "Triggering edge restart to apply camera config change (%s)",
-        desired_device,
+        restart_reason_device,
     )
     token = load_token()
     if not token:
