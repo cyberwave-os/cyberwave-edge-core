@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -130,3 +131,147 @@ def _get_best_driver_image_and_params(
 
     default_driver = drivers.get("default")
     return _extract("default", default_driver)
+
+
+# ---------------------------------------------------------------------------
+# Multi-container service support
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ServiceSpec:
+    """Describes one service within a multi-container driver stack."""
+
+    image: str
+    name: str
+    command: list[str] | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    params: list[str] = field(default_factory=list)
+    prefer_gpu: bool = False
+    gpu_spec: str = "all"
+
+
+def _get_driver_services(
+    drivers: Dict[str, Dict[str, Any]],
+    child_registry_ids: Optional[set[str]] = None,
+) -> tuple[list[_ServiceSpec], dict[str, str], list[str]] | None:
+    """Extract multi-container service definitions from the drivers dict.
+
+    Returns ``(services, shared_env, shared_params)`` when the matched
+    platform config contains a ``services`` array, or ``None`` when the
+    config uses the legacy single-image ``docker_image`` key.
+
+    The platform resolution order is identical to
+    :func:`_get_best_driver_image_and_params`.
+    """
+
+    def _resolve_platform_driver_keys() -> list[str]:
+        system_name = platform.system().lower()
+        machine_name = platform.machine().lower()
+
+        platform_aliases: list[str]
+        if system_name == "darwin":
+            platform_aliases = ["darwin", "macos", "mac", "osx"]
+        elif system_name == "linux":
+            platform_aliases = ["linux"]
+        elif system_name == "windows":
+            platform_aliases = ["windows", "win32"]
+        else:
+            platform_aliases = [system_name]
+
+        keys: list[str] = []
+
+        if machine_name and system_name == "linux" and is_jetson():
+            keys.append(f"linux-{machine_name}-jetson")
+
+        if machine_name:
+            keys.extend(f"{alias}-{machine_name}" for alias in platform_aliases)
+
+        keys.extend(platform_aliases)
+        return keys
+
+    def _match_config() -> Dict[str, Any] | None:
+        normalized_child_registry_ids = {
+            rid.strip()
+            for rid in (child_registry_ids or set())
+            if isinstance(rid, str) and rid.strip()
+        }
+        if normalized_child_registry_ids and len(drivers) > 1:
+            for driver_name, driver_config in drivers.items():
+                if driver_name == "default":
+                    continue
+                if driver_name in normalized_child_registry_ids and isinstance(driver_config, dict):
+                    return driver_config
+
+        for platform_key in _resolve_platform_driver_keys():
+            cfg = drivers.get(platform_key)
+            if isinstance(cfg, dict):
+                return cfg
+
+        cfg = drivers.get("default")
+        return cfg if isinstance(cfg, dict) else None
+
+    config = _match_config()
+    if config is None or "services" not in config:
+        return None
+
+    raw_services = config["services"]
+    if not isinstance(raw_services, list) or not raw_services:
+        return None
+
+    specs: list[_ServiceSpec] = []
+    for idx, svc in enumerate(raw_services):
+        if not isinstance(svc, dict):
+            raise ValueError(f"services[{idx}] is not a dict")
+        image = svc.get("image")
+        name = svc.get("name")
+        if not image or not isinstance(image, str):
+            raise ValueError(f"services[{idx}] missing required 'image' string")
+        if not name or not isinstance(name, str):
+            raise ValueError(f"services[{idx}] missing required 'name' string")
+
+        raw_cmd = svc.get("command")
+        command: list[str] | None = None
+        if raw_cmd is not None:
+            if isinstance(raw_cmd, list) and all(isinstance(c, str) for c in raw_cmd):
+                command = raw_cmd
+            else:
+                raise ValueError(f"services[{idx}].command must be a list of strings")
+
+        raw_env = svc.get("env")
+        env: dict[str, str] = {}
+        if raw_env is not None:
+            if isinstance(raw_env, dict):
+                env = {str(k): str(v) for k, v in raw_env.items()}
+            else:
+                raise ValueError(f"services[{idx}].env must be a dict")
+
+        raw_params = svc.get("params")
+        params: list[str] = []
+        if raw_params is not None:
+            if isinstance(raw_params, list) and all(isinstance(p, str) for p in raw_params):
+                params = raw_params
+            else:
+                raise ValueError(f"services[{idx}].params must be a list of strings")
+
+        specs.append(_ServiceSpec(
+            image=image,
+            name=name,
+            command=command,
+            env=env,
+            params=params,
+            prefer_gpu=bool(svc.get("prefer_gpu", False)),
+            gpu_spec=str(svc.get("gpu", "all")),
+        ))
+
+    shared_env: dict[str, str] = {}
+    raw_shared_env = config.get("shared_env")
+    if isinstance(raw_shared_env, dict):
+        shared_env = {str(k): str(v) for k, v in raw_shared_env.items()}
+
+    shared_params: list[str] = []
+    raw_shared_params = config.get("shared_params")
+    if isinstance(raw_shared_params, list):
+        shared_params = [str(p) for p in raw_shared_params]
+
+    return specs, shared_env, shared_params

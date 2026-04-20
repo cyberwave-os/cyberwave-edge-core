@@ -299,6 +299,94 @@ When multiple cameras are connected to the same edge device (each represented as
 
 Use `cyberwave edge status` to see all driver and worker containers with their twin mappings.
 
+## Multi-container drivers
+
+Some robots require multiple cooperating containers (e.g. a driver, bridge nodes, Nav2, SLAM, and elevation mapping). Edge Core supports this via an optional `services` array in the driver metadata. When present, Edge Core launches one container per service instead of a single driver container.
+
+### Metadata schema
+
+```json
+{
+  "drivers": {
+    "linux-aarch64-jetson": {
+      "services": [
+        {
+          "image": "cyberwaveos/go2-ros2-driver:jetson-humble",
+          "name": "driver",
+          "command": ["ros2", "launch", "cyberwave_go2_driver", "robot_driver.launch.py"]
+        },
+        {
+          "image": "cyberwaveos/go2-ros2-driver:jetson-humble",
+          "name": "bridges",
+          "command": ["ros2", "launch", "cyberwave_go2_driver", "robot_bridges.launch.py"]
+        },
+        {
+          "image": "cyberwaveos/ros2-nav2:jetson-humble",
+          "name": "nav2"
+        },
+        {
+          "image": "cyberwaveos/ros2-slam:jetson-humble",
+          "name": "slam"
+        },
+        {
+          "image": "cyberwaveos/ros2-elevation-mapping:jetson-humble",
+          "name": "elevation",
+          "prefer_gpu": true
+        }
+      ],
+      "shared_env": {
+        "CONFIG_PROFILE": "jetson",
+        "ROS_DOMAIN_ID": "0",
+        "CYBERWAVE_MAP_DIR": "/data"
+      },
+      "shared_params": ["--network", "host", "-v", "/data:/data"]
+    },
+    "default": {
+      "docker_image": "cyberwaveos/go2-ros2-driver",
+      "prefer_gpu": true
+    }
+  }
+}
+```
+
+### How it works
+
+- **`services`** present → multi-container mode (one container per service entry).
+- **`docker_image`** present, no `services` → single-container mode (existing behavior, unchanged).
+- The `default` fallback key works as before for platforms that don't match a specific key.
+
+### Per-service fields
+
+| Field | Required | Description |
+|---|---|---|
+| `image` | Yes | Docker image reference |
+| `name` | Yes | Service name (used in container naming) |
+| `command` | No | Override the container entrypoint command |
+| `env` | No | Per-service environment variables |
+| `params` | No | Per-service Docker params |
+| `prefer_gpu` | No | Enable GPU passthrough for this service |
+| `gpu` | No | GPU device selector (default: `all`) |
+
+### Shared configuration
+
+- `shared_env`: Environment variables applied to every service. Per-service `env` overrides shared values.
+- `shared_params`: Docker params applied to every service (e.g. `--network host`, volume mounts).
+
+### Environment layering
+
+1. Edge Core base env (`CYBERWAVE_API_KEY`, MQTT, Zenoh, etc.) — existing, unchanged
+2. `shared_env` from metadata
+3. Per-service `env` from metadata
+
+### Container naming
+
+- Single-container mode (unchanged): `cyberwave-driver-{twin_uuid[:8]}`
+- Multi-container mode: `cyberwave-driver-{twin_uuid[:8]}-{service_name}`
+
+### Backward compatibility
+
+The existing single-image contract is fully preserved. Metadata without a `services` key follows the original code path with zero changes. All existing tests continue to pass unmodified.
+
 ## Writing compatible drivers
 
 A Cyberwave driver is a Docker image that interacts with device hardware and the Cyberwave backend. When Edge Core starts a driver container it sets the following environment variables (provided to the container):

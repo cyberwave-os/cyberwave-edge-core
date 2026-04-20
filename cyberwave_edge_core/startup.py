@@ -1068,6 +1068,9 @@ def _run_docker_image(
     skip_pull: bool = False,
     prefer_gpu: bool = False,
     gpu_spec: str = "all",
+    service_name: str | None = None,
+    command: list[str] | None = None,
+    service_env: dict[str, str] | None = None,
 ) -> bool:
     """Run a driver Docker container for a twin.
 
@@ -1086,7 +1089,10 @@ def _run_docker_image(
         logger.error("Docker is not installed or not in PATH")
         return False
 
-    container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+    if service_name:
+        container_name = f"cyberwave-driver-{twin_uuid[:8]}-{service_name}"
+    else:
+        container_name = f"cyberwave-driver-{twin_uuid[:8]}"
     image = _resolve_driver_image_tag(image)
     runtime_environment = (
         get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
@@ -1357,6 +1363,9 @@ def _run_docker_image(
             usbip_active,
         )
 
+    if service_env:
+        container_env.update(service_env)
+
     env_vars: List[str] = []
     for key, value in container_env.items():
         env_vars += ["-e", f"{key}={value}"]
@@ -1422,6 +1431,7 @@ def _run_docker_image(
         *params,
         *env_vars,
         image,
+        *(command or []),
     ]
     if logger.isEnabledFor(logging.DEBUG):
         debug_env_vars: list[str] = []
@@ -2440,6 +2450,10 @@ def fetch_and_run_twin_drivers(
         macos_bridge_candidates: list[str]
         prefer_gpu: bool = False
         gpu_spec: str = "all"
+        # Multi-container fields (None/empty for single-container mode)
+        service_name: str | None = None
+        command: list[str] | None = None
+        service_env: dict[str, str] | None = None
 
     driver_specs: list[_DriverSpec] = []
 
@@ -2526,41 +2540,7 @@ def fetch_and_run_twin_drivers(
                     ),
                     twin.name,
                 )
-        driver_image, driver_params, driver_prefer_gpu, driver_gpu_spec = (
-            _get_best_driver_image_and_params(
-                drivers,
-                child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
-            )
-        )
-
-        _driver_overrides = load_driver_overrides()
-        if twin_uuid in _driver_overrides:
-            override_image = _driver_overrides[twin_uuid]
-            logger.info(
-                "Applying local driver override for twin '%s': %s -> %s",
-                twin.name,
-                driver_image,
-                override_image,
-            )
-            driver_image = override_image
-            driver_params = []
-
         _persist_twin_json_for_driver(twin, twin_uuid, asset)
-
-        if not driver_image:
-            logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
-            _send_alert_for_twin(
-                twin_uuid,
-                "No driver_docker_image in asset metadata",
-                f"No driver_docker_image in asset metadata for twin '{twin.name}'",
-                "error",
-            )
-            raise ValueError(
-                f"No drivers specified in asset metadata for paired twin '{twin.name}'"
-            )
-
-        driver_image = _resolve_driver_image_tag(driver_image)
-        driver_image = _maybe_rewrite_jetson_tag(driver_image, twin.name)
 
         child_camera_uuids = list(dict.fromkeys(camera_children_by_parent.get(twin_uuid, [])))
         if child_camera_uuids:
@@ -2581,6 +2561,73 @@ def fetch_and_run_twin_drivers(
                     twin.name,
                     ",".join(macos_bridge_candidates),
                 )
+
+        # --- Multi-container mode: services array -----------------------
+        multi = _get_driver_services(
+            drivers,
+            child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+        )
+        if multi is not None:
+            svc_specs, shared_env, shared_params = multi
+            logger.info(
+                "Multi-container mode for twin '%s': %d service(s)",
+                twin.name,
+                len(svc_specs),
+            )
+            for svc in svc_specs:
+                svc_image = _resolve_driver_image_tag(svc.image)
+                svc_image = _maybe_rewrite_jetson_tag(svc_image, twin.name)
+                merged_env = {**shared_env, **svc.env}
+                merged_params = shared_params + svc.params
+                driver_specs.append(_DriverSpec(
+                    twin=twin,
+                    twin_uuid=twin_uuid,
+                    driver_image=svc_image,
+                    driver_params=merged_params,
+                    child_camera_twin_uuids=child_camera_uuids,
+                    macos_bridge_candidates=macos_bridge_candidates,
+                    prefer_gpu=svc.prefer_gpu,
+                    gpu_spec=svc.gpu_spec,
+                    service_name=svc.name,
+                    command=svc.command,
+                    service_env=merged_env,
+                ))
+            continue
+
+        # --- Single-container mode (existing path) ----------------------
+        driver_image, driver_params, driver_prefer_gpu, driver_gpu_spec = (
+            _get_best_driver_image_and_params(
+                drivers,
+                child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+            )
+        )
+
+        _driver_overrides = load_driver_overrides()
+        if twin_uuid in _driver_overrides:
+            override_image = _driver_overrides[twin_uuid]
+            logger.info(
+                "Applying local driver override for twin '%s': %s -> %s",
+                twin.name,
+                driver_image,
+                override_image,
+            )
+            driver_image = override_image
+            driver_params = []
+
+        if not driver_image:
+            logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
+            _send_alert_for_twin(
+                twin_uuid,
+                "No driver_docker_image in asset metadata",
+                f"No driver_docker_image in asset metadata for twin '{twin.name}'",
+                "error",
+            )
+            raise ValueError(
+                f"No drivers specified in asset metadata for paired twin '{twin.name}'"
+            )
+
+        driver_image = _resolve_driver_image_tag(driver_image)
+        driver_image = _maybe_rewrite_jetson_tag(driver_image, twin.name)
 
         driver_specs.append(_DriverSpec(
             twin=twin,
@@ -2653,17 +2700,21 @@ def fetch_and_run_twin_drivers(
                 "driver_start_failure",
                 severity="error",
             )
-            results.append({
+            fail_entry: Dict[str, Any] = {
                 "twin_uuid": spec.twin_uuid,
                 "twin_name": spec.twin.name,
                 "driver_image": spec.driver_image,
                 "success": False,
-            })
+            }
+            if spec.service_name:
+                fail_entry["service_name"] = spec.service_name
+            results.append(fail_entry)
             continue
 
         logger.info(
-            "Starting driver container %s for twin '%s'",
+            "Starting driver container %s%s for twin '%s'",
             spec.driver_image,
+            f" (service={spec.service_name})" if spec.service_name else "",
             spec.twin.name,
         )
         try:
@@ -2677,13 +2728,19 @@ def fetch_and_run_twin_drivers(
                 skip_pull=True,
                 prefer_gpu=spec.prefer_gpu,
                 gpu_spec=spec.gpu_spec,
+                service_name=spec.service_name,
+                command=spec.command,
+                service_env=spec.service_env,
             )
-            results.append({
+            result_entry: Dict[str, Any] = {
                 "twin_uuid": spec.twin_uuid,
                 "twin_name": spec.twin.name,
                 "driver_image": spec.driver_image,
                 "success": success,
-            })
+            }
+            if spec.service_name:
+                result_entry["service_name"] = spec.service_name
+            results.append(result_entry)
             if not success:
                 try:
                     startup_failure_message = (
@@ -2898,6 +2955,7 @@ def _send_alert_for_twin(
 
 # Re-exported from driver_selection for backward compat.
 from .driver_selection import _get_best_driver_image_and_params as _get_best_driver_image_and_params  # noqa: E402
+from .driver_selection import _get_driver_services as _get_driver_services  # noqa: E402
 
 
 def register_edge(token: str) -> bool:

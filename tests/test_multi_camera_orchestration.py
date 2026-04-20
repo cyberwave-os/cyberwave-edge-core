@@ -558,6 +558,9 @@ class TestTwoCameraOneWorkerScenario:
             skip_pull=False,
             prefer_gpu=False,
             gpu_spec="all",
+            service_name=None,
+            command=None,
+            service_env=None,
         ):
             run_calls.append({"twin_uuid": twin_uuid, "image": image})
             return True

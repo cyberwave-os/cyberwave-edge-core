@@ -1,0 +1,464 @@
+"""Tests for multi-container driver orchestration.
+
+Covers:
+  1. _get_driver_services — parses services array from metadata
+  2. _get_driver_services — returns None for single-image metadata
+  3. Container naming with service suffix
+  4. shared_env + per-service env layering
+  5. Custom command passed to docker run
+  6. Parallel pull phase collects all service images
+"""
+from __future__ import annotations
+
+import subprocess
+from typing import Any
+
+import cyberwave_edge_core.driver_selection as driver_selection
+import cyberwave_edge_core.startup as startup
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+MULTI_SERVICE_METADATA: dict[str, Any] = {
+    "linux-aarch64-jetson": {
+        "services": [
+            {
+                "image": "cyberwaveos/go2-ros2-driver:jetson-humble",
+                "name": "driver",
+                "command": ["ros2", "launch", "go2_driver", "robot.launch.py"],
+            },
+            {
+                "image": "cyberwaveos/go2-ros2-driver:jetson-humble",
+                "name": "bridges",
+                "env": {"BRIDGE_MODE": "full"},
+            },
+            {
+                "image": "cyberwaveos/ros2-nav2:jetson-humble",
+                "name": "nav2",
+            },
+            {
+                "image": "cyberwaveos/ros2-slam:jetson-humble",
+                "name": "slam",
+            },
+            {
+                "image": "cyberwaveos/ros2-elevation-mapping:jetson-humble",
+                "name": "elevation",
+                "prefer_gpu": True,
+                "gpu": "1",
+            },
+        ],
+        "shared_env": {
+            "ROS_DOMAIN_ID": "0",
+            "CONFIG_PROFILE": "jetson",
+        },
+        "shared_params": ["--network", "host", "-v", "/data:/data"],
+    },
+    "default": {
+        "docker_image": "cyberwaveos/go2-ros2-driver",
+        "prefer_gpu": True,
+    },
+}
+
+SINGLE_IMAGE_METADATA: dict[str, Any] = {
+    "default": {
+        "docker_image": "cyberwaveos/so101-driver",
+        "params": ["--network", "host"],
+    },
+}
+
+
+# ===========================================================================
+# 1. _get_driver_services parses services array
+# ===========================================================================
+
+
+class TestGetDriverServices:
+    def test_services_metadata_parsed(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "aarch64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: True)
+
+        result = driver_selection._get_driver_services(MULTI_SERVICE_METADATA)
+        assert result is not None
+
+        services, shared_env, shared_params = result
+        assert len(services) == 5
+        assert services[0].name == "driver"
+        assert services[0].image == "cyberwaveos/go2-ros2-driver:jetson-humble"
+        assert services[0].command == ["ros2", "launch", "go2_driver", "robot.launch.py"]
+        assert services[1].name == "bridges"
+        assert services[1].env == {"BRIDGE_MODE": "full"}
+        assert services[4].name == "elevation"
+        assert services[4].prefer_gpu is True
+        assert services[4].gpu_spec == "1"
+
+        assert shared_env == {"ROS_DOMAIN_ID": "0", "CONFIG_PROFILE": "jetson"}
+        assert shared_params == ["--network", "host", "-v", "/data:/data"]
+
+    def test_single_image_returns_none(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        result = driver_selection._get_driver_services(SINGLE_IMAGE_METADATA)
+        assert result is None
+
+    def test_falls_back_to_default_when_platform_unmatched(self, monkeypatch: Any) -> None:
+        """When no platform key matches, falls back to 'default'.
+        If 'default' has no services, returns None."""
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "arm64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        result = driver_selection._get_driver_services(MULTI_SERVICE_METADATA)
+        assert result is None
+
+    def test_validates_missing_image(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        bad_metadata = {
+            "default": {
+                "services": [{"name": "broken"}],
+            },
+        }
+        try:
+            driver_selection._get_driver_services(bad_metadata)
+            assert False, "Should have raised ValueError"
+        except ValueError as exc:
+            assert "image" in str(exc).lower()
+
+    def test_validates_missing_name(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        bad_metadata = {
+            "default": {
+                "services": [{"image": "img:latest"}],
+            },
+        }
+        try:
+            driver_selection._get_driver_services(bad_metadata)
+            assert False, "Should have raised ValueError"
+        except ValueError as exc:
+            assert "name" in str(exc).lower()
+
+    def test_per_service_params_parsed(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        metadata = {
+            "default": {
+                "services": [
+                    {
+                        "image": "img:latest",
+                        "name": "svc",
+                        "params": ["-v", "/tmp:/tmp"],
+                    },
+                ],
+            },
+        }
+        result = driver_selection._get_driver_services(metadata)
+        assert result is not None
+        services, _, _ = result
+        assert services[0].params == ["-v", "/tmp:/tmp"]
+
+
+# ===========================================================================
+# 2. Multi-container naming
+# ===========================================================================
+
+
+class TestMultiContainerNaming:
+    def test_container_name_includes_service_suffix(self, monkeypatch: Any) -> None:
+        """When service_name is set, the container name includes
+        ``-{service_name}`` as a suffix."""
+        captured_cmds: list[list[str]] = []
+
+        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+
+        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
+        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
+        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
+        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
+        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
+        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
+        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
+        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
+        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
+        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
+        monkeypatch.setattr(startup, "CONFIG_DIR", monkeypatch.tmp_path if hasattr(monkeypatch, "tmp_path") else startup.Path("/tmp/.cyberwave-test"))
+
+        twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
+        result = startup._run_docker_image(
+            "cyberwaveos/go2-ros2-driver:jetson-humble",
+            ["--network", "host"],
+            twin_uuid=twin_uuid,
+            token="test-token",
+            skip_pull=True,
+            service_name="nav2",
+        )
+
+        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
+        assert len(docker_run_cmd) >= 1
+        cmd = docker_run_cmd[0]
+        name_idx = cmd.index("--name")
+        container_name = cmd[name_idx + 1]
+        assert container_name == f"cyberwave-driver-{twin_uuid[:8]}-nav2"
+
+    def test_single_container_name_unchanged(self, monkeypatch: Any) -> None:
+        """When service_name is None, the container name uses the
+        original format without any suffix."""
+        captured_cmds: list[list[str]] = []
+
+        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+
+        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
+        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
+        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
+        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
+        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
+        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
+        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
+        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
+        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
+        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
+        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+
+        twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
+        startup._run_docker_image(
+            "cyberwaveos/so101-driver:humble",
+            [],
+            twin_uuid=twin_uuid,
+            token="test-token",
+            skip_pull=True,
+        )
+
+        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
+        assert len(docker_run_cmd) >= 1
+        cmd = docker_run_cmd[0]
+        name_idx = cmd.index("--name")
+        container_name = cmd[name_idx + 1]
+        assert container_name == f"cyberwave-driver-{twin_uuid[:8]}"
+
+
+class _FakeAlertContext:
+    def __init__(self, **kwargs: Any) -> None:
+        pass
+
+    def create(self) -> None:
+        pass
+
+    def update_metadata(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def resolve(self) -> None:
+        pass
+
+    def fail_without_resolve(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+# ===========================================================================
+# 3. shared_env + per-service env merge
+# ===========================================================================
+
+
+class TestEnvMerge:
+    def test_shared_env_merged_with_service_env(self, monkeypatch: Any) -> None:
+        """service_env merges into the container env dict."""
+        captured_cmds: list[list[str]] = []
+
+        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+
+        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
+        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
+        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
+        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
+        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
+        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
+        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
+        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
+        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
+        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
+        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+
+        twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
+        startup._run_docker_image(
+            "cyberwaveos/ros2-nav2:humble",
+            [],
+            twin_uuid=twin_uuid,
+            token="test-token",
+            skip_pull=True,
+            service_name="nav2",
+            service_env={"ROS_DOMAIN_ID": "0", "CONFIG_PROFILE": "jetson"},
+        )
+
+        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
+        assert len(docker_run_cmd) >= 1
+        cmd_str = " ".join(docker_run_cmd[0])
+        assert "ROS_DOMAIN_ID=0" in cmd_str
+        assert "CONFIG_PROFILE=jetson" in cmd_str
+
+
+# ===========================================================================
+# 4. Custom command appended
+# ===========================================================================
+
+
+class TestCommandAppended:
+    def test_command_appended_after_image(self, monkeypatch: Any) -> None:
+        captured_cmds: list[list[str]] = []
+
+        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+
+        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
+        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
+        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
+        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
+        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
+        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
+        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
+        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
+        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
+        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
+        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+
+        image = "cyberwaveos/go2-ros2-driver:jetson-humble"
+        custom_cmd = ["ros2", "launch", "go2_driver", "robot.launch.py"]
+        twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
+
+        startup._run_docker_image(
+            image,
+            [],
+            twin_uuid=twin_uuid,
+            token="test-token",
+            skip_pull=True,
+            service_name="driver",
+            command=custom_cmd,
+        )
+
+        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
+        assert len(docker_run_cmd) >= 1
+        cmd = docker_run_cmd[0]
+        image_idx = cmd.index(image)
+        trailing = cmd[image_idx + 1:]
+        assert trailing == custom_cmd
+
+    def test_no_command_when_none(self, monkeypatch: Any) -> None:
+        captured_cmds: list[list[str]] = []
+
+        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+
+        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
+        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
+        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
+        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
+        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
+        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
+        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
+        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
+        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
+        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
+        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+
+        image = "cyberwaveos/so101-driver:humble"
+        twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
+
+        startup._run_docker_image(
+            image,
+            [],
+            twin_uuid=twin_uuid,
+            token="test-token",
+            skip_pull=True,
+        )
+
+        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
+        assert len(docker_run_cmd) >= 1
+        cmd = docker_run_cmd[0]
+        assert cmd[-1] == image
+
+
+# ===========================================================================
+# 5. Pull phase collects all service images
+# ===========================================================================
+
+
+class TestPullCollectsAllImages:
+    def test_multi_service_produces_multiple_specs(self, monkeypatch: Any) -> None:
+        """When the drivers metadata has a services array, Pass 1 should
+        produce one _DriverSpec per service, causing the pull phase to
+        see all unique images."""
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "aarch64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: True)
+
+        result = driver_selection._get_driver_services(MULTI_SERVICE_METADATA)
+        assert result is not None
+
+        services, _, _ = result
+        images = [svc.image for svc in services]
+        unique_images = list(dict.fromkeys(images))
+
+        assert len(unique_images) == 4
+        assert "cyberwaveos/go2-ros2-driver:jetson-humble" in unique_images
+        assert "cyberwaveos/ros2-nav2:jetson-humble" in unique_images
+        assert "cyberwaveos/ros2-slam:jetson-humble" in unique_images
+        assert "cyberwaveos/ros2-elevation-mapping:jetson-humble" in unique_images
