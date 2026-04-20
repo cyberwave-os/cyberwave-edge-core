@@ -237,6 +237,7 @@ class TestRunStartupChecksHappyPath:
 class TestRunStartupChecksFailurePaths:
     def test_returns_false_when_credentials_missing(self, tmp_path, monkeypatch):
         """No credentials file → run_startup_checks() must return False immediately."""
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup, "CREDENTIALS_FILE", tmp_path / "credentials.json")
         # No file written — CREDENTIALS_FILE is absent
 
@@ -247,6 +248,7 @@ class TestRunStartupChecksFailurePaths:
     def test_returns_false_when_token_invalid(self, tmp_path, monkeypatch):
         """Rejected token (SDK raises) → run_startup_checks() must return False."""
         _write_config(tmp_path)
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup, "CREDENTIALS_FILE", tmp_path / "credentials.json")
 
         def _bad_client(*_args, **_kwargs):
@@ -265,6 +267,7 @@ class TestRunStartupChecksFailurePaths:
     def test_returns_false_when_edge_registration_fails(self, tmp_path, monkeypatch):
         """A failed edge registration must cause run_startup_checks() to return False."""
         _write_config(tmp_path)
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup, "CREDENTIALS_FILE", tmp_path / "credentials.json")
         monkeypatch.setattr(startup, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
         monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: _FINGERPRINT)

@@ -269,6 +269,49 @@ def _atomic_write_json(path: Path, data: Any, *, mode: int = 0o600) -> None:
             pass
         raise
 
+
+def resolve_config_owner_uid_gid(config_dir: "Path | None" = None) -> "tuple[int, int] | None":
+    """Return the ``(uid, gid)`` that should own files inside *config_dir*.
+
+    Used to repair ownership when edge-core runs as root — either via
+    ``sudo`` (where ``SUDO_UID`` is set) or via ``systemd`` (where it is
+    not).  Resolution order:
+
+    1. If ``SUDO_UID`` is present, use it (falling back to ``SUDO_UID``
+       for the gid when ``SUDO_GID`` is absent).  Matches the previous
+       ``sudo``-only behavior exactly.
+    2. Otherwise, look at the owner of ``config_dir.parent`` (e.g.
+       ``/home/alice`` for ``/home/alice/.cyberwave``).  When that
+       directory is owned by a non-root user, return its uid/gid.  This
+       is the systemd-case fallback: the unit file bakes in
+       ``CYBERWAVE_EDGE_CONFIG_DIR=/home/<user>/.cyberwave`` at install
+       time, so the home-directory owner is the user we want to chown to.
+
+    Returns ``None`` when the process is not root on Linux or when no
+    sensible non-root owner can be determined.
+    """
+    if platform.system() != "Linux" or os.getuid() != 0:
+        return None
+
+    sudo_uid = os.environ.get("SUDO_UID", "").strip()
+    if sudo_uid:
+        sudo_gid = os.environ.get("SUDO_GID", "").strip()
+        try:
+            uid = int(sudo_uid)
+            gid = int(sudo_gid) if sudo_gid else uid
+        except ValueError:
+            return None
+        return uid, gid
+
+    cfg = config_dir if config_dir is not None else CONFIG_DIR
+    try:
+        st = cfg.parent.stat()
+    except OSError:
+        return None
+    if st.st_uid == 0:
+        return None
+    return st.st_uid, st.st_gid
+
 DEFAULT_DRIVER_TROUBLESHOOTING_URL = "https://docs.cyberwave.com"
 DRIVER_TROUBLESHOOTING_URL = (
     os.getenv("CYBERWAVE_DRIVER_TROUBLESHOOTING_URL", DEFAULT_DRIVER_TROUBLESHOOTING_URL).strip()
@@ -798,9 +841,17 @@ def load_saved_fingerprint() -> Optional[str]:
 
 
 def save_fingerprint(fingerprint: str) -> bool:
-    """Persist fingerprint to the edge config directory."""
+    """Persist fingerprint to the edge config directory.
+
+    Written with mode ``0o644`` (world-readable) because the fingerprint
+    is a hardware identifier, not a secret.  This matters when edge-core
+    runs as root (systemd) but the invoking user later reads the file
+    via the CLI: a restrictive ``0o600`` owned by root would make the
+    CLI silently fall back to regenerating a fresh fingerprint,
+    desynchronising it from the one registered with the backend.
+    """
     try:
-        _atomic_write_json(FINGERPRINT_FILE, {"fingerprint": fingerprint})
+        _atomic_write_json(FINGERPRINT_FILE, {"fingerprint": fingerprint}, mode=0o644)
         return True
     except OSError as exc:
         logger.warning("Failed to save fingerprint file: %s", exc)
@@ -3356,22 +3407,17 @@ def reconcile_twin_json_file_sync() -> dict[str, int]:
 def _fix_config_dir_ownership() -> None:
     """Re-chown CONFIG_DIR entries that were written as root back to the invoking user.
 
-    Only runs on Linux when the process is root *and* ``SUDO_UID`` is set (i.e.
-    invoked via ``sudo``).  Under the systemd unit (root, no ``SUDO_UID``) this
-    is a no-op.  Non-root processes cannot chown files they don't own, so they
-    skip the fix as well — the ``--user`` flag on new containers prevents future
-    mismatches.
+    Only runs on Linux when the process is root.  The target uid/gid is
+    resolved via :func:`resolve_config_owner_uid_gid`, which handles both
+    the ``sudo`` case (``SUDO_UID`` set) and the ``systemd`` case (no
+    ``SUDO_UID``, but ``CONFIG_DIR.parent`` is owned by a non-root user).
+    Non-root processes cannot chown files they don't own, so they skip
+    the fix as well.
     """
-    if platform.system() != "Linux" or os.getuid() != 0:
+    target = resolve_config_owner_uid_gid()
+    if target is None:
         return
-
-    sudo_uid = os.environ.get("SUDO_UID", "").strip()
-    sudo_gid = os.environ.get("SUDO_GID", "").strip()
-    if not sudo_uid:
-        return
-
-    target_uid = int(sudo_uid)
-    target_gid = int(sudo_gid) if sudo_gid else target_uid
+    target_uid, target_gid = target
     fixed = 0
 
     try:
@@ -3400,6 +3446,51 @@ def _fix_config_dir_ownership() -> None:
         )
 
 
+def _ensure_config_subdirs() -> None:
+    """Eagerly create standard subdirectories under CONFIG_DIR.
+
+    ``workers/`` and ``models/`` were historically created lazily — the
+    first at worker-container launch, the second at the first model
+    download.  On an edge node with no linked twins or a failed workflow
+    sync, neither path runs and the directories simply never exist,
+    leaving users and standalone SDK scripts confused about where to
+    drop pre-staged weights.
+
+    Creating them eagerly at startup (with ownership matching
+    :func:`resolve_config_owner_uid_gid`) gives operators a predictable
+    layout they can inspect from a regular shell.  ``CONFIG_DIR``
+    itself is also chowned when newly created so the subdirectories do
+    not live inside a root-only parent.
+    """
+    target = resolve_config_owner_uid_gid()
+
+    def _chown_if_needed(path: Path) -> None:
+        if target is None:
+            return
+        try:
+            st = path.stat()
+            if st.st_uid != target[0] or st.st_gid != target[1]:
+                os.chown(path, target[0], target[1])
+        except OSError as exc:
+            logger.debug("Cannot chown %s: %s", path, exc)
+
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.debug("Cannot create %s: %s", CONFIG_DIR, exc)
+        return
+    _chown_if_needed(CONFIG_DIR)
+
+    for name in ("workers", "models"):
+        subdir = CONFIG_DIR / name
+        try:
+            subdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.debug("Cannot create %s: %s", subdir, exc)
+            continue
+        _chown_if_needed(subdir)
+
+
 def run_startup_checks() -> bool:
     """Execute every boot-time check in sequence.
 
@@ -3407,6 +3498,7 @@ def run_startup_checks() -> bool:
     Returns ``True`` only when **all** checks pass.
     """
     _fix_config_dir_ownership()
+    _ensure_config_subdirs()
 
     console.print("\n[bold]Cyberwave Edge Core — Startup Checks[/bold]\n")
 

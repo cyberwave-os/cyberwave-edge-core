@@ -1550,17 +1550,68 @@ class TestFixConfigDirOwnership:
         startup._fix_config_dir_ownership()
         assert lchown_calls == []
 
-    def test_noop_when_root_without_sudo(self, tmp_path: Path, monkeypatch) -> None:
-        """systemd runs as root with no SUDO_UID — should be a no-op."""
+    def test_noop_when_root_without_sudo_and_root_parent(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """systemd-style: root without SUDO_UID and a root-owned parent → no-op."""
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
         monkeypatch.setattr(startup.os, "getuid", lambda: 0)
         monkeypatch.delenv("SUDO_UID", raising=False)
         monkeypatch.delenv("SUDO_GID", raising=False)
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        # Simulate a root-owned parent by forcing the helper to return None.
+        monkeypatch.setattr(startup, "resolve_config_owner_uid_gid", lambda: None)
+
         lchown_calls: list[tuple] = []
         monkeypatch.setattr(startup.os, "lchown", lambda p, u, g: lchown_calls.append((p, u, g)))
         startup._fix_config_dir_ownership()
         assert lchown_calls == []
+
+    def test_chowns_under_systemd_via_config_parent_owner(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """systemd-style: root without SUDO_UID, but CONFIG_DIR.parent is user-owned."""
+        target_uid, target_gid = 1000, 1000
+        (tmp_path / "fingerprint.json").write_text("{}")
+
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+        monkeypatch.delenv("SUDO_UID", raising=False)
+        monkeypatch.delenv("SUDO_GID", raising=False)
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        # Simulate a user-owned parent — helper returns that user's uid/gid.
+        monkeypatch.setattr(
+            startup, "resolve_config_owner_uid_gid",
+            lambda: (target_uid, target_gid),
+        )
+
+        original_lstat = os.lstat
+
+        def fake_lstat(path):
+            result = original_lstat(path)
+            return os.stat_result(
+                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                 0, 0,
+                 result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+            )
+
+        monkeypatch.setattr(startup.os, "lstat", fake_lstat)
+
+        lchown_calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup.os, "lchown",
+            lambda p, u, g: lchown_calls.append((p, u, g)),
+        )
+
+        startup._fix_config_dir_ownership()
+
+        assert lchown_calls
+        chowned_paths = {call[0] for call in lchown_calls}
+        assert str(tmp_path) in chowned_paths
+        assert str(tmp_path / "fingerprint.json") in chowned_paths
+        for _, uid, gid in lchown_calls:
+            assert uid == target_uid
+            assert gid == target_gid
 
     def test_chowns_misowned_files_via_sudo(self, tmp_path: Path, monkeypatch) -> None:
         """sudo cyberwave edge start: root process with SUDO_UID/SUDO_GID."""
@@ -1710,6 +1761,107 @@ class TestFixConfigDirOwnership:
         for _, uid, gid in lchown_calls:
             assert uid == 1000
             assert gid == 1000
+
+
+# ===========================================================================
+# _ensure_config_subdirs
+# ===========================================================================
+
+
+class TestEnsureConfigSubdirs:
+    def test_creates_workers_and_models_non_root(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Non-root caller (macOS dev, Linux user): subdirs get created, no chown."""
+        cfg_dir = tmp_path / ".cyberwave"
+        monkeypatch.setattr(startup, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(startup, "resolve_config_owner_uid_gid", lambda: None)
+
+        chown_calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup.os, "chown",
+            lambda p, u, g: chown_calls.append((p, u, g)),
+        )
+
+        startup._ensure_config_subdirs()
+
+        assert cfg_dir.is_dir()
+        assert (cfg_dir / "workers").is_dir()
+        assert (cfg_dir / "models").is_dir()
+        assert chown_calls == []
+
+    def test_chowns_created_subdirs_under_systemd(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Root caller with a user-owned parent chowns created subdirs."""
+        cfg_dir = tmp_path / ".cyberwave"
+        monkeypatch.setattr(startup, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(
+            startup, "resolve_config_owner_uid_gid",
+            lambda: (1000, 1000),
+        )
+
+        original_stat = Path.stat
+
+        def fake_stat(self):
+            result = original_stat(self)
+            return os.stat_result(
+                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
+                 0, 0,
+                 result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+            )
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+
+        chown_calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup.os, "chown",
+            lambda p, u, g: chown_calls.append((str(p), u, g)),
+        )
+
+        startup._ensure_config_subdirs()
+
+        chowned_paths = {call[0] for call in chown_calls}
+        assert str(cfg_dir) in chowned_paths
+        assert str(cfg_dir / "workers") in chowned_paths
+        assert str(cfg_dir / "models") in chowned_paths
+        for _, uid, gid in chown_calls:
+            assert (uid, gid) == (1000, 1000)
+
+    def test_is_idempotent(self, tmp_path: Path, monkeypatch) -> None:
+        """Re-running with existing subdirs is a no-op."""
+        cfg_dir = tmp_path / ".cyberwave"
+        cfg_dir.mkdir()
+        (cfg_dir / "workers").mkdir()
+        (cfg_dir / "models").mkdir()
+        monkeypatch.setattr(startup, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(startup, "resolve_config_owner_uid_gid", lambda: None)
+
+        # Must not raise.
+        startup._ensure_config_subdirs()
+        startup._ensure_config_subdirs()
+
+    def test_macos_does_not_chown(self, tmp_path: Path, monkeypatch) -> None:
+        """On Darwin the helper returns None → subdirs are created but never chowned."""
+        cfg_dir = tmp_path / ".cyberwave"
+        monkeypatch.setattr(startup, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        # getuid is irrelevant on Darwin but set it to 0 to prove the platform
+        # gate — not the uid gate — is what prevents chown.
+        monkeypatch.setattr(startup.os, "getuid", lambda: 0)
+
+        chown_calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup.os, "chown",
+            lambda p, u, g: chown_calls.append((p, u, g)),
+        )
+
+        startup._ensure_config_subdirs()
+
+        assert cfg_dir.is_dir()
+        assert (cfg_dir / "workers").is_dir()
+        assert (cfg_dir / "models").is_dir()
+        assert chown_calls == []
 
 
 # ===========================================================================
