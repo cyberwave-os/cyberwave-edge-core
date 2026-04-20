@@ -2175,6 +2175,40 @@ def _list_linked_twin_uuids_for_fingerprint(
     return list(dict.fromkeys(linked))
 
 
+def load_selected_twin_uuids() -> Optional[list[str]]:
+    """Twin UUIDs the operator picked at install time, from ``environment.json``.
+
+    Returns a (possibly empty) list when ``twin_uuids`` is present, or ``None``
+    when the file or field is missing so callers can fall back to fingerprint
+    discovery for installs that predate the field (pre–Feb 2026).
+    """
+    try:
+        data = json.loads(ENVIRONMENT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = data.get("twin_uuids") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return None
+    return list(dict.fromkeys(str(u).strip() for u in raw if isinstance(u, str) and u.strip()))
+
+
+def _resolve_worker_sync_twin_uuids(
+    token: str,
+    environment_uuid: str,
+    fingerprint: str,
+) -> list[str]:
+    """Twin UUIDs to pull workflow workers for.
+
+    The operator's selection in ``environment.json`` wins when present (incl.
+    an explicit empty list). Falls back to fingerprint metadata discovery
+    only for legacy installs missing the field.
+    """
+    selected = load_selected_twin_uuids()
+    if selected is not None:
+        return selected
+    return _list_linked_twin_uuids_for_fingerprint(token, environment_uuid, fingerprint)
+
+
 def _start_bootstrap_edge_health_publisher(
     token: str,
     twin_uuids: list[str],
@@ -3141,7 +3175,7 @@ def ensure_twin_command_subscriptions() -> bool:
             return False
 
         try:
-            twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+            twin_uuids = _resolve_worker_sync_twin_uuids(
                 token, environment_uuid, fingerprint
             )
         except Exception:
@@ -3662,12 +3696,22 @@ def run_startup_checks() -> bool:
                     _stop_bootstrap_edge_health_publisher()
 
             # 7 — workflow worker sync (pull generated wf_*.py files from backend)
-            if linked_twin_uuids:
+            #
+            # Scope here is the operator-selected twin list from
+            # ``environment.json``, not the fingerprint-discovered set used
+            # for drivers/health.  The two can legitimately diverge (e.g.
+            # stale ``metadata.edge_fingerprint`` from a previous install),
+            # and we want the edge to pull workers strictly for the twins
+            # the user picked in ``cyberwave edge install``.
+            sync_twin_uuids = _resolve_worker_sync_twin_uuids(
+                token, environment_uuid, fingerprint
+            )
+            if sync_twin_uuids:
                 _t0 = time.perf_counter()
                 base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
                 sync_summary = _sync_workers_for_twins(
                     token=token,
-                    twin_uuids=linked_twin_uuids,
+                    twin_uuids=sync_twin_uuids,
                     base_url=base_url,
                 )
                 total_written = sum(r["written"] for r in sync_summary.values())
@@ -3753,7 +3797,7 @@ def reconcile_worker_sync() -> dict[str, int]:
         return {"written": 0, "removed": 0, "unchanged": 0, "errors": 0}
 
     try:
-        twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+        twin_uuids = _resolve_worker_sync_twin_uuids(
             token, environment_uuid, fingerprint
         )
     except Exception:
@@ -3951,7 +3995,7 @@ def _reconcile_worker_watcher(
         try:
             fingerprint = get_or_create_fingerprint()
             if fingerprint:
-                twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+                twin_uuids = _resolve_worker_sync_twin_uuids(
                     token, environment_uuid, fingerprint
                 )
         except Exception:

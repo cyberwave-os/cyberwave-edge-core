@@ -64,7 +64,11 @@ On startup (service or direct run), Edge Core performs the following steps:
    - If a twin is a camera child (has `attach_to_twin_uuid`), Edge Core does not start a separate driver for it.
    - Camera child UUIDs are passed to the parent driver via `CYBERWAVE_CHILD_TWIN_UUIDS`.
 7. **Stop the bootstrap health publisher** once drivers are running (drivers publish their own health messages; keeping both would produce duplicate signals in the UI).
-8. Start the worker container (if worker files exist in `{config_dir}/workers/`).
+8. Pull workflow workers (`wf_*.py`) for the twins listed in `environment.json` and start the worker container (if any worker files exist in `{config_dir}/workers/`).
+
+### Scope of workflow worker sync
+
+Workflow worker sync is scoped strictly to the twin UUIDs the operator selected at install time and persisted to `environment.json` under `twin_uuids`. This is intentionally narrower than the fingerprint-based discovery used for drivers and the bootstrap health publisher: an environment can carry stale `metadata.edge_fingerprint` entries from previous installs, and we don't want those to pull unrelated `wf_*.py` files onto this edge. For backward compatibility, installs that predate the `twin_uuids` field still fall back to fingerprint-based discovery.
 
 During driver startup, Docker image pull progress is mirrored into the edge-core service logs and forwarded through the same MQTT-backed driver log stream used for runtime container logs, so users can follow image download progress remotely.
 

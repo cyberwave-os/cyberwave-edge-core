@@ -1513,6 +1513,13 @@ class TestStartupHeartbeatOrdering:
             "fetch_and_run_twin_drivers",
             lambda token, env_uuid, fingerprint: call_order.append("fetch_drivers") or [],
         )
+        # Skip step 7 (worker sync) so we're strictly exercising the
+        # heartbeat-vs-drivers ordering contract this test is about.
+        monkeypatch.setattr(
+            startup,
+            "_resolve_worker_sync_twin_uuids",
+            lambda token, env_uuid, fingerprint: [],
+        )
 
         result = startup.run_startup_checks()
 
