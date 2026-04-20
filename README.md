@@ -29,7 +29,13 @@ curl -fsSL https://cyberwave.com/install.sh | bash
 sudo cyberwave edge install
 ```
 
-The installer will prompt you to log in with your Cyberwave account, select a workspace and environment, and persist configuration under `~/.cyberwave/` (owner-only permissions). You can override the config directory via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable. Legacy installs that used `/etc/cyberwave` are automatically migrated.
+The installer will prompt you to log in with your Cyberwave account, select a workspace and environment, and persist configuration under `~/.cyberwave/`. You can override the config directory via the `CYBERWAVE_EDGE_CONFIG_DIR` environment variable. Legacy installs that used `/etc/cyberwave` are automatically migrated.
+
+Permissions on the config directory:
+
+- `credentials.json` is written with mode `0600` (owner-only) because it holds your API token.
+- `fingerprint.json` is written with mode `0644` (world-readable) because the device fingerprint is a hardware identifier, not a secret. This lets user shells read it even when Edge Core runs as root via `systemd`.
+- On `systemd` deployments where Edge Core runs as root, the service re-chowns files under `~/.cyberwave/` on startup so they stay owned by the user whose home directory holds them.
 
 > Don't have a Cyberwave account? Get one at [cyberwave.com](https://cyberwave.com)
 
@@ -118,6 +124,8 @@ Override with `CYBERWAVE_EDGE_CONFIG_DIR`.
 ```
 
 **Model requirements discovery:** Edge Core scans `*.py` files in `~/.cyberwave/workers/` for `cw.models.load(...)` calls to determine which weights to ensure.
+
+`~/.cyberwave/models/` and `~/.cyberwave/workers/` are created eagerly on Edge Core startup (even before any worker runs), with ownership matching the invoking user, so operators can drop pre-staged weights into `~/.cyberwave/models/{model_id}/` from a regular shell.
 
 ### Resolution order
 

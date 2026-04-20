@@ -40,9 +40,18 @@ logger = logging.getLogger(__name__)
 def _ensure_dir_writable_by_container_user(path: Path) -> None:
     """Best-effort chown so the container user (``os.getuid()``) can write.
 
-    When edge-core runs as root (systemd), directories it creates are
-    root-owned.  The worker container runs as the invoking user via
-    ``build_user_args()``, so it cannot write to root-owned mounts.
+    When edge-core runs as root (via systemd or ``sudo``), directories
+    it creates are root-owned.  The worker container runs as the invoking
+    user via ``build_user_args()``, so it cannot write to root-owned
+    mounts.
+
+    Target uid/gid resolution:
+
+    * Non-root caller → use ``os.getuid()``/``os.getgid()`` directly.
+    * Root caller → defer to
+      :func:`cyberwave_edge_core.startup.resolve_config_owner_uid_gid`,
+      which understands both ``sudo`` (``SUDO_UID`` set) and systemd
+      (fall back to the owner of ``CONFIG_DIR.parent``).
     """
     if platform.system() != "Linux":
         return
@@ -50,16 +59,21 @@ def _ensure_dir_writable_by_container_user(path: Path) -> None:
         st = path.stat()
     except OSError:
         return
-    target_uid = os.getuid()
-    if target_uid == 0:
-        sudo_uid = os.environ.get("SUDO_UID")
-        if sudo_uid:
-            target_uid = int(sudo_uid)
-        else:
+
+    if os.getuid() != 0:
+        target_uid = os.getuid()
+        target_gid = os.getgid()
+    else:
+        from .startup import resolve_config_owner_uid_gid
+
+        resolved = resolve_config_owner_uid_gid()
+        if resolved is None:
             return
+        target_uid, target_gid = resolved
+
     if st.st_uid != target_uid:
         try:
-            os.chown(path, target_uid, os.getgid())
+            os.chown(path, target_uid, target_gid)
         except OSError:
             logger.debug("Cannot chown %s to uid %d", path, target_uid)
 
