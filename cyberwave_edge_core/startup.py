@@ -2473,9 +2473,34 @@ def fetch_and_run_twin_drivers(
             fingerprint,
         )
 
+        asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
+        if not asset_uuid:
+            # The backend stores no asset on this twin, so there is no driver
+            # metadata to read and no container we could possibly spawn. Make
+            # it loud — this was previously a silent ``continue`` that made
+            # ``No twins with driver images matched this edge.`` unhelpful.
+            logger.error(
+                "Twin '%s' (%s) has no asset attached on the backend — "
+                "driver startup is impossible. Attach an asset via the "
+                "dashboard and restart edge-core.",
+                twin.name,
+                twin_uuid,
+            )
+            _send_alert_for_twin(
+                twin_uuid,
+                "Twin has no asset",
+                (
+                    f"Twin '{twin.name}' has no asset attached on the backend. "
+                    "The edge cannot spawn a driver for this twin until an "
+                    "asset is attached via the dashboard."
+                ),
+                "driver_start_failure",
+                severity="error",
+            )
+            continue
+
         asset = assets_by_twin_uuid.get(twin_uuid)
         if asset is None:
-            asset_uuid = getattr(twin, "asset_uuid", None) or getattr(twin, "asset_id", "")
             try:
                 asset = client.assets.get(asset_uuid)
                 assets_by_twin_uuid[twin_uuid] = asset
