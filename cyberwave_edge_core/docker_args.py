@@ -179,8 +179,20 @@ def _docker_params_include_add_host(params: list[str]) -> bool:
     return False
 
 
+def _docker_params_include_network(params: list[str]) -> bool:
+    """Return True when docker params already include ``--network``."""
+    for i, param in enumerate(params):
+        if param.startswith("--network="):
+            return True
+        if param == "--network" and i + 1 < len(params):
+            return True
+    return False
+
+
 def _build_driver_network_args(params: list[str]) -> list[str]:
     """Build docker network-related args with platform-aware defaults."""
+    if _docker_params_include_network(params):
+        return []
     if platform.system() == "Darwin":
         if _docker_params_include_add_host(params):
             return []
