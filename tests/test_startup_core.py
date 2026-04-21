@@ -2006,3 +2006,224 @@ class TestReconcileCameraConfigDrift:
         monkeypatch.setattr(startup, "load_token", lambda: None)
 
         assert startup.reconcile_camera_config_drift() is False
+
+    def test_per_twin_mapping_triggers_restart_for_mismatched_twin(
+        self, tmp_path, monkeypatch
+    ):
+        """A twin whose mapping no longer matches its container should trigger a restart."""
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = tmp_path / "cameras.json"
+        cameras_file.write_text(json.dumps({"selected_device": 0}))
+        old_mtime = cameras_file.stat().st_mtime - 10
+        monkeypatch.setattr(startup, "_cameras_json_mtime", old_mtime)
+
+        cameras_file.write_text(
+            json.dumps(
+                {
+                    "selected_device": 0,
+                    "twin_to_device": {
+                        "twin-a": 0,
+                        "twin-b": 2,
+                    },
+                }
+            )
+        )
+
+        inspect_by_container = {
+            "cyberwave-driver-a": {
+                "Config": {
+                    "Env": [
+                        "CYBERWAVE_TWIN_UUID=twin-a",
+                        "CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video0",
+                    ],
+                },
+            },
+            "cyberwave-driver-b": {
+                "Config": {
+                    "Env": [
+                        "CYBERWAVE_TWIN_UUID=twin-b",
+                        "CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video0",
+                    ],
+                },
+            },
+        }
+
+        monkeypatch.setattr(
+            startup,
+            "_list_running_driver_containers",
+            lambda: list(inspect_by_container.keys()),
+        )
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda name: inspect_by_container[name],
+        )
+
+        restart_calls: list[str] = []
+        monkeypatch.setattr(
+            startup,
+            "_perform_edge_core_restart",
+            lambda token: restart_calls.append(token) or {},
+        )
+        monkeypatch.setattr(startup, "load_token", lambda: "test-token")
+
+        assert startup.reconcile_camera_config_drift() is True
+        assert restart_calls == ["test-token"]
+
+    def test_per_twin_mapping_no_restart_when_all_match(self, tmp_path, monkeypatch):
+        """Every running container already matches its twin's mapping → no restart."""
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = tmp_path / "cameras.json"
+        cameras_file.write_text(json.dumps({"selected_device": 0}))
+        old_mtime = cameras_file.stat().st_mtime - 10
+        monkeypatch.setattr(startup, "_cameras_json_mtime", old_mtime)
+
+        cameras_file.write_text(
+            json.dumps(
+                {
+                    "selected_device": 0,
+                    "twin_to_device": {
+                        "twin-a": 0,
+                        "twin-b": 2,
+                    },
+                }
+            )
+        )
+
+        inspect_by_container = {
+            "cyberwave-driver-a": {
+                "Config": {
+                    "Env": [
+                        "CYBERWAVE_TWIN_UUID=twin-a",
+                        "CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video0",
+                    ],
+                },
+            },
+            "cyberwave-driver-b": {
+                "Config": {
+                    "Env": [
+                        "CYBERWAVE_TWIN_UUID=twin-b",
+                        "CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video2",
+                    ],
+                },
+            },
+        }
+
+        monkeypatch.setattr(
+            startup,
+            "_list_running_driver_containers",
+            lambda: list(inspect_by_container.keys()),
+        )
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda name: inspect_by_container[name],
+        )
+
+        assert startup.reconcile_camera_config_drift() is False
+
+
+class TestLoadSelectedCameraDevice:
+    """Tests for _load_selected_camera_device()."""
+
+    def test_returns_none_when_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        assert startup._load_selected_camera_device() is None
+        assert startup._load_selected_camera_device("any-twin") is None
+
+    def test_falls_back_to_selected_device(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "cameras.json").write_text(
+            json.dumps({"selected_device": 3})
+        )
+        assert startup._load_selected_camera_device() == "/dev/video3"
+        assert startup._load_selected_camera_device("twin-without-mapping") == "/dev/video3"
+
+    def test_per_twin_mapping_takes_precedence(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "cameras.json").write_text(
+            json.dumps(
+                {
+                    "selected_device": 0,
+                    "twin_to_device": {"twin-a": 2, "twin-b": 4},
+                }
+            )
+        )
+        assert startup._load_selected_camera_device("twin-a") == "/dev/video2"
+        assert startup._load_selected_camera_device("twin-b") == "/dev/video4"
+        # Unknown twin falls back to selected_device.
+        assert startup._load_selected_camera_device("twin-c") == "/dev/video0"
+        # No twin_uuid still uses the fallback.
+        assert startup._load_selected_camera_device() == "/dev/video0"
+
+    def test_invalid_mapping_values_are_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "cameras.json").write_text(
+            json.dumps(
+                {
+                    "selected_device": 1,
+                    "twin_to_device": {"twin-a": "not-a-number"},
+                }
+            )
+        )
+        assert startup._load_selected_camera_device("twin-a") == "/dev/video1"
+
+
+class TestLoadCameraStreamUrlForTwin:
+    """Tests for _load_camera_stream_url_for_twin() (macOS multi-camera mapping)."""
+
+    def test_returns_none_when_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        assert startup._load_camera_stream_url_for_twin("twin-a") is None
+
+    def test_returns_none_without_twin_uuid(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "camera_streams.json").write_text(
+            json.dumps(
+                {
+                    "twin_to_stream_url": {
+                        "twin-a": "http://host.docker.internal:8091"
+                    }
+                }
+            )
+        )
+        assert startup._load_camera_stream_url_for_twin(None) is None
+        assert startup._load_camera_stream_url_for_twin("") is None
+
+    def test_resolves_mapped_twin(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "camera_streams.json").write_text(
+            json.dumps(
+                {
+                    "twin_to_stream_url": {
+                        "twin-a": "http://host.docker.internal:8091",
+                        "twin-b": "http://host.docker.internal:8092",
+                    }
+                }
+            )
+        )
+        assert (
+            startup._load_camera_stream_url_for_twin("twin-a")
+            == "http://host.docker.internal:8091"
+        )
+        assert (
+            startup._load_camera_stream_url_for_twin("twin-b")
+            == "http://host.docker.internal:8092"
+        )
+        assert startup._load_camera_stream_url_for_twin("twin-c") is None
+
+    def test_ignores_invalid_json(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "camera_streams.json").write_text("not-json")
+        assert startup._load_camera_stream_url_for_twin("twin-a") is None
+
+    def test_ignores_non_string_values(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "camera_streams.json").write_text(
+            json.dumps({"twin_to_stream_url": {"twin-a": 8091}})
+        )
+        assert startup._load_camera_stream_url_for_twin("twin-a") is None
