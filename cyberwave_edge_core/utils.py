@@ -152,6 +152,12 @@ class DriverStartingAlertContext:
         attempts (for example, before an ``edge-core`` restart wipes the
         in-process alert context).  Best-effort: failures are logged and
         never raised.  Returns the number of alerts resolved.
+
+        A ``404 Not Found`` from the backend means the twin (and therefore
+        any of its alerts) is already gone — typically because it was
+        deleted on the backend while the edge still had stale local state
+        referencing it.  In that case there is nothing to clear, so we log
+        a single ``INFO`` line instead of a debug traceback.
         """
         from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
 
@@ -172,6 +178,9 @@ class DriverStartingAlertContext:
                     alert.resolve()
                     resolved += 1
                 except Exception as exc:
+                    if _is_not_found_error(exc):
+                        # Alert was concurrently deleted/resolved; nothing to do.
+                        continue
                     logger.warning(
                         "Could not resolve stale driver_starting alert %s for twin %s: %s",
                         getattr(alert, "uuid", "<unknown>"),
@@ -179,6 +188,13 @@ class DriverStartingAlertContext:
                         exc,
                     )
         except Exception as exc:
+            if _is_not_found_error(exc):
+                logger.info(
+                    "Skipping driver_starting alert cleanup for twin %s: "
+                    "twin no longer exists on backend (404)",
+                    twin_uuid,
+                )
+                return 0
             logger.debug(
                 "Could not list driver_starting alerts for twin %s: %s",
                 twin_uuid,
@@ -186,3 +202,22 @@ class DriverStartingAlertContext:
                 exc_info=True,
             )
         return resolved
+
+
+def _is_not_found_error(exc: BaseException) -> bool:
+    """Return True if *exc* represents an HTTP 404 from the Cyberwave API.
+
+    Robust to both the wrapped ``CyberwaveAPIError`` (which exposes
+    ``status_code``) and the underlying ``ApiException`` family from the
+    generated REST client (which uses ``status``).
+    """
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        if value is None:
+            continue
+        try:
+            if int(value) == 404:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
