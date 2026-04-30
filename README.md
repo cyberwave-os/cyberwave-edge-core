@@ -229,6 +229,14 @@ Edge Core monitors `{config_dir}/workers/` every reconcile cycle (~15 seconds). 
 
 A minimum cool-down of 10 seconds between successive automatic restarts prevents rapid churn when files are written incrementally (e.g. by `rsync` or `scp`).
 
+### Workflow-driven worker lifecycle
+
+The worker container is brought up and torn down based on whether any active workflows are currently synced for the connected twins:
+
+- **Startup:** after pulling worker files from the backend (step 8), Edge Core inspects `{config_dir}/workers/`. If at least one `wf_*.py` file is present, the worker container is started; otherwise it is left down — and the `cyberwaveos/edge-ml-worker` image is **not** pulled.
+- **Periodic reconcile:** every ~5 minutes (configurable via `CYBERWAVE_WORKER_SYNC_INTERVAL_LOOPS`), Edge Core resyncs worker files from the backend. If a workflow was activated mid-run and new files appeared, the worker container is started. If every workflow was deactivated and the directory is now empty, the container is stopped. Both calls are idempotent.
+- **Sync errors:** if a sync cycle reports any errors, the lifecycle reconcile is skipped to avoid churning a healthy worker on transient API failures. The next successful sync re-evaluates state.
+
 ### Worker health monitoring
 
 Edge Core continuously monitors the worker container for spontaneous exits and crash loops:
