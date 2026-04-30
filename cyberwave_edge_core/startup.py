@@ -2800,7 +2800,13 @@ def fetch_and_run_twin_drivers(
                 exc,
             )
 
-    _start_worker_after_drivers(token, environment_uuid, list(linked_twin_uuids))
+    # Worker start has been moved to ``run_startup_checks``. It now runs
+    # *after* ``_sync_workers_for_twins`` so that the workers/ directory
+    # reflects the currently-active workflows for the twins the operator
+    # actually selected (env.json) — rather than firing against a stale
+    # snapshot left over from a previous activation. This gates the
+    # ``cyberwaveos/edge-ml-worker`` image pull on the presence of active
+    # workflows (CYB-1766).
     return results
 
 
@@ -2902,6 +2908,7 @@ def _get_container_status_fast(container_name: str) -> str:
 
 
 def _start_worker_after_drivers(
+    *,
     token: str,
     environment_uuid: str,
     twin_uuids: list[str],
@@ -2912,6 +2919,11 @@ def _start_worker_after_drivers(
     failed), pre-downloads required ML models, then starts the worker.
     Proceeds even if some drivers are unhealthy so that healthy cameras
     can still be utilized.
+
+    Callers are expected to invoke this *after* ``_sync_workers_for_twins``
+    so that ``WorkerManager.start()`` sees the up-to-date set of
+    ``wf_*.py`` files and can correctly skip the image pull when no active
+    workflows exist (CYB-1766).
     """
     try:
         logger.info(
@@ -3885,6 +3897,51 @@ def run_startup_checks() -> bool:
                         f"[dim](written={total_written}, removed={total_removed}, {elapsed:.3f}s)[/dim]"
                     )
 
+                # 8 — start the worker container only if active workflows exist.
+                #
+                # We base this on the actual on-disk state of ``workers/``
+                # rather than the sync counts, so that pre-existing files
+                # from a previous boot still trigger a worker start when
+                # this boot's sync errored. ``WorkerManager.start()`` is
+                # itself a no-op when ``workers/*.py`` is empty (and
+                # therefore skips the ``cyberwaveos/edge-ml-worker`` image
+                # pull — CYB-1766), so we only need the gate here for the
+                # operator-friendly log.
+                workers_dir = CONFIG_DIR / "workers"
+                has_active_workers = workers_dir.is_dir() and any(
+                    workers_dir.glob("*.py")
+                )
+                if has_active_workers:
+                    _start_worker_after_drivers(
+                        token=token,
+                        environment_uuid=environment_uuid,
+                        twin_uuids=sync_twin_uuids,
+                    )
+                elif total_errors:
+                    logger.warning(
+                        "Could not determine active workflows due to %d sync "
+                        "error(s); worker container not started. Will retry on "
+                        "the next reconcile cycle.",
+                        total_errors,
+                    )
+                    console.print(
+                        "  [yellow]⚠[/yellow] Sync errors prevented worker "
+                        "startup; will retry."
+                    )
+                else:
+                    from .worker_manager import resolve_worker_image as _resolve_worker_image  # noqa: PLC0415
+
+                    logger.info(
+                        "No active workflows for any of the %d connected twin(s); "
+                        "skipping worker container start (no '%s' image pull).",
+                        len(sync_twin_uuids),
+                        _resolve_worker_image(),
+                    )
+                    console.print(
+                        "  [dim]No active workflows for connected twins; "
+                        "worker container not started.[/dim]"
+                    )
+
     console.print("\n[green]All startup checks passed.[/green]\n")
     return True
 
@@ -3975,6 +4032,66 @@ def reconcile_worker_sync() -> dict[str, int]:
         for key in totals:
             totals[key] += stats.get(key, 0)
     return totals
+
+
+def reconcile_worker_lifecycle(sync_summary: dict[str, int]) -> None:
+    """Start the worker if active workflows produced files; stop it otherwise.
+
+    Called from the runtime loop right after :func:`reconcile_worker_sync`
+    so that mid-run activations/deactivations are picked up promptly:
+
+    * Files appeared (workflow activated) → ``WorkerManager.start()`` brings
+      the container up and pulls ``cyberwaveos/edge-ml-worker`` on first
+      activation.
+    * Files disappeared (workflow deactivated) → ``WorkerManager.stop()``
+      tears the container down so we don't leave it idling.
+
+    Both ``start`` and ``stop`` are idempotent in their respective steady
+    states (already running / already absent), so the periodic call is
+    cheap. We bail out early when sync reported any errors to avoid
+    churning the worker on transient API failures (CYB-1766).
+    """
+    if sync_summary.get("errors"):
+        return
+
+    token = load_token()
+    if not token:
+        return
+
+    environment_uuid = load_environment_uuid()
+    if not environment_uuid:
+        return
+
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        return
+
+    try:
+        twin_uuids = _resolve_worker_sync_twin_uuids(
+            token, environment_uuid, fingerprint
+        )
+    except Exception:
+        logger.exception("Could not resolve twins for worker lifecycle reconcile")
+        return
+
+    workers_dir = CONFIG_DIR / "workers"
+    has_files = workers_dir.is_dir() and any(workers_dir.glob("*.py"))
+
+    from .worker_manager import WorkerManager, resolve_worker_image  # noqa: PLC0415
+
+    worker_manager = WorkerManager(
+        config_dir=CONFIG_DIR,
+        environment_uuid=environment_uuid,
+        token=token,
+        twin_uuids=twin_uuids,
+        image=resolve_worker_image(),
+        resource_limits=load_worker_resource_limits(),
+    )
+
+    if has_files:
+        worker_manager.start()
+    else:
+        worker_manager.stop()
 
 
 # Interval at which worker sync reconciliation runs (every N runtime loops).
@@ -4076,6 +4193,16 @@ def run_runtime_loop() -> None:
                         "Worker sync reconcile: no changes (unchanged=%d, errors=%d)",
                         worker_sync_summary["unchanged"],
                         worker_sync_summary["errors"],
+                    )
+                # Start/stop the worker container based on whether any
+                # active-workflow files exist after the sync. Idempotent —
+                # both start() and stop() are no-ops in their respective
+                # steady states (CYB-1766).
+                try:
+                    reconcile_worker_lifecycle(worker_sync_summary)
+                except Exception:
+                    logger.exception(
+                        "Unexpected error during worker lifecycle reconcile"
                     )
             except Exception:
                 logger.exception("Unexpected error during worker sync reconcile")

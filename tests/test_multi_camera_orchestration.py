@@ -338,7 +338,11 @@ class TestStartWorkerAfterDrivers:
             lambda: "test-image",
         )
 
-        startup._start_worker_after_drivers("token", "env-uuid", [TWIN_A, TWIN_B])
+        startup._start_worker_after_drivers(
+            token="token",
+            environment_uuid="env-uuid",
+            twin_uuids=[TWIN_A, TWIN_B],
+        )
 
         assert captured["twin_uuids"] == [TWIN_A, TWIN_B]
 
@@ -389,7 +393,11 @@ class TestStartWorkerAfterDrivers:
             lambda: "test-image",
         )
 
-        startup._start_worker_after_drivers("token", "env-uuid", [TWIN_A])
+        startup._start_worker_after_drivers(
+            token="token",
+            environment_uuid="env-uuid",
+            twin_uuids=[TWIN_A],
+        )
 
         assert len(ensure_calls) == 1
         assert ensure_calls[0] == ["yolov8n"]
@@ -496,8 +504,15 @@ class TestDriverHealthReconciliation:
 
 
 class TestTwoCameraOneWorkerScenario:
-    """Verify that fetch_and_run_twin_drivers starts 2 driver containers
-    and passes both twin UUIDs to the worker."""
+    """Verify that fetch_and_run_twin_drivers starts 2 driver containers.
+
+    Note: as of CYB-1766, ``fetch_and_run_twin_drivers`` no longer starts
+    the worker container. Worker start is the responsibility of
+    ``run_startup_checks`` (which calls it after ``_sync_workers_for_twins``)
+    and of ``reconcile_worker_lifecycle`` in the runtime loop. Those
+    integrations are covered by ``test_startup_worker_sync.py`` and
+    ``test_worker_lifecycle_reconcile.py``.
+    """
 
     def test_two_independent_cameras(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fingerprint = "edge-fp"
@@ -567,10 +582,13 @@ class TestTwoCameraOneWorkerScenario:
 
         monkeypatch.setattr(startup, "_run_docker_image", _fake_run)
 
-        worker_twin_uuids: list[str] = []
+        # Guard rail: ``fetch_and_run_twin_drivers`` must NOT start the
+        # worker any more (CYB-1766). If somebody re-introduces that call
+        # site, this test will fail.
+        worker_start_calls: list[tuple] = []
 
-        def _fake_start_worker(token, env_uuid, twin_uuids):
-            worker_twin_uuids.extend(twin_uuids)
+        def _fake_start_worker(*args, **kwargs):
+            worker_start_calls.append((args, kwargs))
 
         monkeypatch.setattr(
             startup, "_start_worker_after_drivers", _fake_start_worker
@@ -582,7 +600,10 @@ class TestTwoCameraOneWorkerScenario:
         started_twins = {r["twin_uuid"] for r in results}
         assert started_twins == {TWIN_A, TWIN_B}
 
-        assert set(worker_twin_uuids) == {TWIN_A, TWIN_B}
+        assert worker_start_calls == [], (
+            "fetch_and_run_twin_drivers should not start the worker; "
+            "that's now run_startup_checks' job (CYB-1766)."
+        )
 
 
 # ---------------------------------------------------------------------------
