@@ -327,7 +327,11 @@ _EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 _EDGE_RESTART_LOCK = threading.Lock()
 _EDGE_RESTART_IN_PROGRESS = False
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
-_TWIN_COMMAND_SUBSCRIBED = False
+# Twin UUIDs whose ``cyberwave/twin/{uuid}/command`` topic is currently
+# subscribed. Tracked as a set rather than a boolean so that twins paired
+# *after* edge-core started are picked up automatically and twins that get
+# unpaired stop being listened to (CYB-1766 follow-up).
+_SUBSCRIBED_TWIN_COMMAND_UUIDS: set[str] = set()
 _TWIN_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 TWIN_COMMAND_SYNC_WORKFLOWS = "sync_workflows"
 _TWIN_FILE_CHECKSUMS: dict[str, str] = {}
@@ -3317,23 +3321,26 @@ def _run_immediate_worker_sync() -> None:
 
 
 def ensure_twin_command_subscriptions() -> bool:
-    """Subscribe once to MQTT command topics for all linked twins.
+    """Reconcile MQTT command topic subscriptions with the linked twin set.
 
-    Listens for ``sync_workflows`` commands published by the CLI
-    (``cyberwave workflow sync`` / ``cyberwave edge sync-workflows``).
+    Subscribes to ``cyberwave/twin/{twin_uuid}/command`` for every twin
+    currently linked to this edge, and unsubscribes from topics for twins
+    that are no longer linked. Idempotent and cheap when nothing changed.
+
+    Listens for ``sync_workflows`` commands published either by the CLI
+    (``cyberwave workflow sync`` / ``cyberwave edge sync-workflows``) or
+    by the dashboard (``POST /api/v1/twins/{uuid}/sync-workflows``).
+
+    Returns ``True`` when the subscription set is in sync with the API
+    (including the case where there are no linked twins), and ``False``
+    when reconciliation could not be attempted (missing token / env /
+    fingerprint, API failure, or no MQTT client available).
     """
-    global _TWIN_COMMAND_SUBSCRIBED
-    if _TWIN_COMMAND_SUBSCRIBED:
-        return True
-
     token = load_token()
     if not token:
         return False
 
     with _TWIN_COMMAND_SUBSCRIPTION_LOCK:
-        if _TWIN_COMMAND_SUBSCRIBED:
-            return True
-
         environment_uuid = load_environment_uuid()
         if not environment_uuid:
             return False
@@ -3343,27 +3350,53 @@ def ensure_twin_command_subscriptions() -> bool:
             return False
 
         try:
-            twin_uuids = _resolve_worker_sync_twin_uuids(
-                token, environment_uuid, fingerprint
+            desired_uuids = set(
+                _resolve_worker_sync_twin_uuids(
+                    token, environment_uuid, fingerprint
+                )
             )
         except Exception:
             logger.exception("Could not list linked twins for command subscription")
             return False
 
-        if not twin_uuids:
-            return False
+        # Fast path: nothing to add or remove. Avoids touching the MQTT
+        # client (and creating one when no twins are linked yet).
+        if desired_uuids == _SUBSCRIBED_TWIN_COMMAND_UUIDS:
+            return True
 
         mqtt_client = _get_shared_mqtt_client(token)
         if not mqtt_client:
             return False
 
         prefix = mqtt_client.mqtt.topic_prefix
-        for twin_uuid in twin_uuids:
+        to_subscribe = desired_uuids - _SUBSCRIBED_TWIN_COMMAND_UUIDS
+        to_unsubscribe = _SUBSCRIBED_TWIN_COMMAND_UUIDS - desired_uuids
+
+        for twin_uuid in sorted(to_subscribe):
             topic = f"{prefix}cyberwave/twin/{twin_uuid}/command"
-            mqtt_client.mqtt.subscribe(topic, _handle_twin_command_message)
+            try:
+                mqtt_client.mqtt.subscribe(topic, _handle_twin_command_message)
+            except Exception:
+                logger.exception(
+                    "Failed to subscribe to twin command topic: %s", topic
+                )
+                continue
+            _SUBSCRIBED_TWIN_COMMAND_UUIDS.add(twin_uuid)
             logger.info("Subscribed to twin command topic: %s", topic)
 
-        _TWIN_COMMAND_SUBSCRIBED = True
+        for twin_uuid in sorted(to_unsubscribe):
+            topic = f"{prefix}cyberwave/twin/{twin_uuid}/command"
+            try:
+                mqtt_client.mqtt.unsubscribe(topic)
+            except Exception:
+                logger.exception(
+                    "Failed to unsubscribe from twin command topic: %s", topic
+                )
+                # Drop from the tracked set anyway so we don't loop forever
+                # trying to unsubscribe a topic the broker already forgot.
+            _SUBSCRIBED_TWIN_COMMAND_UUIDS.discard(twin_uuid)
+            logger.info("Unsubscribed from twin command topic: %s", topic)
+
         return True
 
 
