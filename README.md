@@ -237,6 +237,17 @@ The worker container is brought up and torn down based on whether any active wor
 - **Periodic reconcile:** every ~5 minutes (configurable via `CYBERWAVE_WORKER_SYNC_INTERVAL_LOOPS`), Edge Core resyncs worker files from the backend. If a workflow was activated mid-run and new files appeared, the worker container is started. If every workflow was deactivated and the directory is now empty, the container is stopped. Both calls are idempotent.
 - **Sync errors:** if a sync cycle reports any errors, the lifecycle reconcile is skipped to avoid churning a healthy worker on transient API failures. The next successful sync re-evaluates state.
 
+### Worker image refresh policy
+
+`WorkerManager._ensure_image_pulled` decides whether to issue `docker pull` before each worker (re)start:
+
+| Tag basename (with optional `-gpu`/`-cpu`/`-arch` suffix) | Mutability | Pull behaviour |
+|---|---|---|
+| `latest`, `dev`, `local`, `staging`, `nightly`, `edge`, `main`, `master` | Mutable | Pull every time, even when the image is already present locally. If the registry is unreachable but a local copy exists, fall back to the local copy and warn. |
+| Anything else (`v1.2.3`, dated build IDs, `@sha256:…`) | Immutable | Skip the pull when the image is already present locally; only pull when missing. |
+
+This avoids the previous failure mode where a stale `cyberwaveos/edge-ml-worker:dev-gpu` image stayed cached after a developer pushed a new build — operators no longer need to remember to `docker rmi` before restarting the worker. Immutable tags keep the original fast-path so versioned production deployments are not slowed down by an extra round-trip to the registry on every restart.
+
 ### Worker health monitoring
 
 Edge Core continuously monitors the worker container for spontaneous exits and crash loops:
@@ -454,6 +465,17 @@ Optional environment variables to tune restart behavior:
 `CYBERWAVE_TWIN_JSON_FILE` is an absolute path to a JSON file provided to the driver. The file contains the digital twin instance object (including its `metadata`) and the associated catalog twin data, matching the API schema: TwinSchema and AssetSchema.
 
 Drivers may modify this file; Edge Core will sync changes back to the backend when connectivity is available.
+
+#### Bidirectional twin sync
+
+`reconcile_twin_json_file_sync()` runs on every reconcile cycle (~15 s) and now operates in **both directions**:
+
+- **Push** (legacy): a local file whose checksum changed since the last cycle is pushed to `PUT /api/v1/twins/{uuid}`. The set of fields the edge is allowed to push is constrained by `_TWIN_UPDATE_ALLOWED_FIELDS` (no `asset_uuid`, `environment_uuid`, etc.).
+- **Pull** (new): for every tracked twin file that did *not* change locally this cycle, the latest twin is fetched via `client.twins.get_raw(uuid)` and the fields in `_TWIN_PULL_ALLOWED_FIELDS` (currently just `metadata`) are merged into the local file.
+
+The pull leg closes the gap that previously forced an `edge-core` restart for UI-driven metadata edits (e.g. flipping the privacy frame filter on/off in the sensor settings dialog) to reach the driver container's environment via `entrypoint.sh`. Push wins for the cycle in which the local file changed; the next cycle's pull surfaces any concurrent backend edits.
+
+The pull set is intentionally narrow: any field the edge legitimately writes locally **must not** be added to `_TWIN_PULL_ALLOWED_FIELDS`, otherwise the next cycle would silently clobber the local edit.
 
 ### Twin metadata
 

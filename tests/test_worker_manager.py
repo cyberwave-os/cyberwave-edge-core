@@ -710,3 +710,163 @@ class TestWorkerManagerStartHealthIntegration:
         # record_start sets _last_start_time; uptime will be non-None in check()
         state = monitor.check(container_status="running")
         assert state.uptime_seconds is not None
+
+
+# ---------------------------------------------------------------------------
+# Mutable-tag detection and force-pull behavior
+# ---------------------------------------------------------------------------
+
+
+class TestImageTagMutability:
+    """:dev / :local / :latest etc. must be re-pulled on every worker start."""
+
+    @pytest.mark.parametrize(
+        "image",
+        [
+            "cyberwaveos/edge-ml-worker",
+            "cyberwaveos/edge-ml-worker:latest",
+            "cyberwaveos/edge-ml-worker:dev",
+            "cyberwaveos/edge-ml-worker:dev-gpu",
+            "cyberwaveos/edge-ml-worker:dev-cpu",
+            "cyberwaveos/edge-ml-worker:local",
+            "cyberwaveos/edge-ml-worker:local-arm64",
+            "cyberwaveos/edge-ml-worker:staging",
+            "cyberwaveos/edge-ml-worker:nightly",
+            "cyberwaveos/edge-ml-worker:edge",
+            "cyberwaveos/edge-ml-worker:main",
+            "cyberwaveos/edge-ml-worker:master",
+            # Registry with a port, no explicit tag → docker treats as :latest.
+            "myregistry.io:5000/cyberwaveos/edge-ml-worker",
+            # Registry with a port AND a mutable tag.
+            "myregistry.io:5000/cyberwaveos/edge-ml-worker:dev-gpu",
+        ],
+    )
+    def test_mutable_tags_are_detected(self, image: str) -> None:
+        assert wm_module._image_tag_is_mutable(image) is True
+
+    @pytest.mark.parametrize(
+        "image",
+        [
+            "cyberwaveos/edge-ml-worker:v1.2.3",
+            "cyberwaveos/edge-ml-worker:1.2.3",
+            "cyberwaveos/edge-ml-worker:20260501",
+            "cyberwaveos/edge-ml-worker:release-v1.2.3",
+            "cyberwaveos/edge-ml-worker@sha256:" + "0" * 64,
+            # Registry with a port AND an immutable tag.
+            "myregistry.io:5000/cyberwaveos/edge-ml-worker:v1.2.3",
+        ],
+    )
+    def test_immutable_tags_are_detected(self, image: str) -> None:
+        assert wm_module._image_tag_is_mutable(image) is False
+
+
+class TestEnsureImagePulledForceRePullsMutableTags:
+    """Regression: stale ``:dev-gpu`` was used silently before this fix."""
+
+    def _patch_inspect_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            wm_module,
+            "_docker_image_present",
+            lambda image: True,
+        )
+
+    def _patch_inspect_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            wm_module,
+            "_docker_image_present",
+            lambda image: False,
+        )
+
+    def test_mutable_tag_always_pulls_even_when_local_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_inspect_present(monkeypatch)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is True
+        assert calls == [["docker", "pull", "cyberwaveos/edge-ml-worker:dev-gpu"]]
+
+    def test_immutable_tag_skips_pull_when_local_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_inspect_present(monkeypatch)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:v1.2.3") is True
+        # Immutable + local present → no docker pull issued.
+        assert calls == []
+
+    def test_immutable_tag_pulls_when_local_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._patch_inspect_absent(monkeypatch)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:v1.2.3") is True
+        assert calls == [["docker", "pull", "cyberwaveos/edge-ml-worker:v1.2.3"]]
+
+    def test_pull_failure_with_local_copy_falls_back_to_local(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as _sp
+
+        self._patch_inspect_present(monkeypatch)
+
+        def raise_cpe(*a, **kw):
+            raise _sp.CalledProcessError(1, "docker", stderr="network unreachable")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_cpe)
+        # Mutable tag, local copy present, registry unreachable → keep going.
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is True
+
+    def test_pull_failure_without_local_copy_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as _sp
+
+        self._patch_inspect_absent(monkeypatch)
+
+        def raise_cpe(*a, **kw):
+            raise _sp.CalledProcessError(1, "docker", stderr="not found")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_cpe)
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is False
+
+    def test_pull_timeout_with_local_copy_falls_back_to_local(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as _sp
+
+        self._patch_inspect_present(monkeypatch)
+
+        def raise_timeout(*a, **kw):
+            raise _sp.TimeoutExpired("docker", 60)
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_timeout)
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is True
+
+    def test_pull_timeout_without_local_copy_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as _sp
+
+        self._patch_inspect_absent(monkeypatch)
+
+        def raise_timeout(*a, **kw):
+            raise _sp.TimeoutExpired("docker", 60)
+
+        monkeypatch.setattr(wm_module.subprocess, "run", raise_timeout)
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is False

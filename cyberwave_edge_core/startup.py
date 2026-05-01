@@ -3584,8 +3584,178 @@ def _sync_twin_json_file_with_backend(
         return False
 
 
+# Fields the edge will overwrite from the backend twin into the local JSON
+# file when the local file has not changed since the last cycle. Kept narrow
+# on purpose:
+#
+#   * ``metadata`` is the canonical case — operator-driven flags such as
+#     ``frame_filter_enabled`` are toggled in the UI and need to reach the
+#     driver container's environment via ``entrypoint.sh``. Without a pull
+#     leg the only way to push a UI change to the edge was to restart
+#     edge-core (which re-fetches twins on startup).
+#
+# Adding more fields here is OK as long as they are *backend-owned* — i.e.
+# the edge never legitimately mutates them locally. Pulling a field that
+# the edge also writes would silently clobber the local edit on the next
+# cycle.
+_TWIN_PULL_ALLOWED_FIELDS = frozenset({"metadata"})
+
+
+def _coerce_twin_to_dict(twin: Any) -> dict[str, Any] | None:
+    """Best-effort conversion of an SDK twin object to a plain dict."""
+    if isinstance(twin, dict):
+        return twin
+    for attr in ("to_dict", "model_dump", "dict"):
+        method = getattr(twin, attr, None)
+        if callable(method):
+            try:
+                value = method()
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                return value
+    if hasattr(twin, "__dict__") and isinstance(twin.__dict__, dict):
+        return {k: v for k, v in twin.__dict__.items() if not k.startswith("_")}
+    return None
+
+
+def _atomic_write_twin_json(twin_json_file: Path, rendered: str) -> bool:
+    """Write *rendered* into *twin_json_file* atomically via a same-dir temp."""
+    twin_json_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=twin_json_file.parent,
+            prefix=f"{twin_json_file.stem}.",
+            suffix=".tmp",
+            delete=False,
+            encoding="utf-8",
+        ) as temp_file:
+            temp_file.write(rendered)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_path = temp_file.name
+        if os.name != "nt":
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+        os.replace(temp_path, twin_json_file)
+        return True
+    except OSError as exc:
+        logger.warning("Failed to write twin JSON %s: %s", twin_json_file, exc)
+        return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.debug("Could not remove temp twin JSON %s", temp_path, exc_info=True)
+
+
+def _pull_twin_json_file_from_backend(
+    client: Cyberwave, twin_uuid: str, twin_json_file: Path
+) -> bool:
+    """Apply backend-managed twin fields to the local JSON file.
+
+    Returns True when the local file was actually modified. Backend fields
+    listed in :data:`_TWIN_PULL_ALLOWED_FIELDS` win over the local value;
+    everything else (asset, environment, edge-owned positions, kinematics,
+    capabilities, ...) is left untouched.
+
+    Errors (network, JSON, missing twin) are logged at debug and treated as
+    no-op so the reconcile loop keeps running.
+    """
+    if not twin_json_file.exists():
+        return False
+
+    try:
+        with open(twin_json_file) as file_handle:
+            local_data = json.load(file_handle)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Twin pull skipped for %s: invalid local JSON (%s)", twin_uuid, exc)
+        return False
+    if not isinstance(local_data, dict):
+        logger.warning("Twin pull skipped for %s: expected object root in local JSON", twin_uuid)
+        return False
+
+    try:
+        twin = client.twins.get_raw(twin_uuid)
+    except Exception as exc:
+        logger.debug("Twin pull skipped for %s: backend fetch failed (%s)", twin_uuid, exc)
+        return False
+
+    backend_data = _coerce_twin_to_dict(twin)
+    if backend_data is None:
+        logger.debug("Twin pull skipped for %s: cannot serialize backend twin", twin_uuid)
+        return False
+
+    changed_fields: list[str] = []
+    for field in _TWIN_PULL_ALLOWED_FIELDS:
+        if field not in backend_data:
+            continue
+        if local_data.get(field) == backend_data[field]:
+            continue
+        local_data[field] = backend_data[field]
+        changed_fields.append(field)
+
+    if not changed_fields:
+        return False
+
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    rendered = json.dumps(local_data, indent=2, default=_json_default) + "\n"
+    if not _atomic_write_twin_json(twin_json_file, rendered):
+        return False
+
+    logger.info(
+        "Pulled twin JSON updates for %s from backend (fields=%s)",
+        twin_uuid,
+        sorted(changed_fields),
+    )
+    return True
+
+
+def _build_twin_sync_client() -> Optional[Cyberwave]:
+    """Construct an SDK client for twin sync, returning None on failure."""
+    token = load_token()
+    if not token:
+        logger.warning("Cannot reconcile twin JSON files: no API token available")
+        return None
+
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    try:
+        return Cyberwave(base_url=base_url, token=token)
+    except Exception as exc:
+        logger.warning("Cannot reconcile twin JSON files: failed to create client (%s)", exc)
+        return None
+
+
 def reconcile_twin_json_file_sync() -> dict[str, int]:
-    """Detect and sync local twin JSON changes to the backend."""
+    """Reconcile local twin JSON files with the backend in both directions.
+
+    The reconcile is bidirectional:
+
+    * **Push** (legacy behaviour): a local file whose checksum changed since
+      the last cycle is pushed to the backend via the twin REST update
+      endpoint. The set of fields the edge is allowed to push is constrained
+      by :data:`_TWIN_UPDATE_ALLOWED_FIELDS`.
+
+    * **Pull** (new behaviour): for every tracked twin file that did *not*
+      change locally this cycle, the latest twin is fetched from the backend
+      and the fields in :data:`_TWIN_PULL_ALLOWED_FIELDS` (currently just
+      ``metadata``) are merged in. This closes the gap that previously
+      forced an edge-core restart for UI-driven metadata edits to reach the
+      driver container's environment via ``entrypoint.sh``.
+
+    Push wins for the current cycle; the next cycle's pull will reflect any
+    backend-side reconciliation. The summary dict is the only return value
+    and is used by the runtime loop for log output.
+    """
     changed_candidates: list[tuple[str, Path, str]] = []
     active_twin_uuids: set[str] = set()
 
@@ -3615,26 +3785,33 @@ def reconcile_twin_json_file_sync() -> dict[str, int]:
         "tracked": len(active_twin_uuids),
         "changed": len(changed_candidates),
         "synced": 0,
+        "pulled": 0,
     }
-    if not changed_candidates:
+    if not active_twin_uuids:
         return summary
 
-    token = load_token()
-    if not token:
-        logger.warning("Cannot sync changed twin JSON files: no API token available")
+    client = _build_twin_sync_client()
+    if client is None:
         return summary
 
-    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-    try:
-        client = Cyberwave(base_url=base_url, token=token)
-    except Exception as exc:
-        logger.warning("Cannot sync changed twin JSON files: failed to create client (%s)", exc)
-        return summary
-
+    pushed_uuids: set[str] = set()
     for twin_uuid, twin_json_file, checksum in changed_candidates:
         if _sync_twin_json_file_with_backend(client, twin_uuid, twin_json_file):
             _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
             summary["synced"] += 1
+            pushed_uuids.add(twin_uuid)
+
+    for twin_uuid in sorted(active_twin_uuids):
+        if twin_uuid in pushed_uuids:
+            # Already in sync this cycle; the next cycle's pull will surface
+            # any concurrent backend edits.
+            continue
+        twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
+        if _pull_twin_json_file_from_backend(client, twin_uuid, twin_json_file):
+            new_checksum = _calculate_file_checksum(twin_json_file)
+            if new_checksum:
+                _TWIN_FILE_CHECKSUMS[twin_uuid] = new_checksum
+            summary["pulled"] += 1
 
     return summary
 
@@ -4179,10 +4356,12 @@ def run_runtime_loop() -> None:
 
         twin_sync_summary = reconcile_twin_json_file_sync()
         logger.debug(
-            "Twin JSON sync reconcile complete (tracked=%d, changed=%d, synced=%d)",
+            "Twin JSON sync reconcile complete "
+            "(tracked=%d, changed=%d, synced=%d, pulled=%d)",
             twin_sync_summary["tracked"],
             twin_sync_summary["changed"],
             twin_sync_summary["synced"],
+            twin_sync_summary.get("pulled", 0),
         )
 
         try:

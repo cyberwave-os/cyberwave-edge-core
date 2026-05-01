@@ -36,6 +36,61 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Tag basenames that operators expect to roll forward over time. Anything
+# matching one of these (optionally suffixed with ``-gpu``/``-cpu``/etc.)
+# is treated as mutable and re-pulled on every worker (re)start so a
+# freshly published image is picked up without the operator having to
+# remember to ``docker rmi`` first. Immutable tags (e.g. ``v1.2.3``,
+# sha digests, dated build IDs) keep the previous fast-path that skips
+# the pull when the image is already present locally.
+_MUTABLE_TAG_BASENAMES = frozenset(
+    {"latest", "dev", "local", "staging", "nightly", "edge", "main", "master"}
+)
+
+
+def _image_tag_is_mutable(image: str) -> bool:
+    """Return True for image references whose tag rolls forward over time.
+
+    Examples:
+        ``cyberwaveos/edge-ml-worker``           -> True (no tag → ``latest``)
+        ``cyberwaveos/edge-ml-worker:latest``    -> True
+        ``cyberwaveos/edge-ml-worker:dev``       -> True
+        ``cyberwaveos/edge-ml-worker:dev-gpu``   -> True
+        ``cyberwaveos/edge-ml-worker:local``     -> True
+        ``cyberwaveos/edge-ml-worker:v1.2.3``    -> False
+        ``cyberwaveos/edge-ml-worker@sha256:...`` -> False
+        ``myregistry.io:5000/cyberwaveos/img``   -> True (registry port, no tag)
+        ``myregistry.io:5000/cyberwaveos/img:dev`` -> True
+    """
+    if "@" in image:
+        # Pinned-by-digest references are immutable by definition.
+        return False
+    if ":" not in image:
+        # Bare image refs default to ``:latest`` which is mutable.
+        return True
+    tag = image.rsplit(":", 1)[1]
+    if not tag or "/" in tag:
+        # Either no actual tag, or the colon was part of a registry port
+        # (e.g. ``myregistry.io:5000/img``); docker resolves both to
+        # ``:latest`` which is mutable.
+        return True
+    # Strip arch/runtime suffixes such as ``-gpu``, ``-cpu``, ``-arm64``.
+    base = tag.split("-", 1)[0].lower()
+    return base in _MUTABLE_TAG_BASENAMES
+
+
+def _docker_image_present(image: str) -> bool:
+    """Return True if ``docker image inspect`` finds *image* locally."""
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
 
 def _ensure_dir_writable_by_container_user(path: Path) -> None:
     """Best-effort chown so the container user (``os.getuid()``) can write.
@@ -508,21 +563,41 @@ class WorkerManager:
 
     @staticmethod
     def _ensure_image_pulled(image: str, timeout: int = 600) -> bool:
-        """Pull *image* if it is not available locally.
+        """Pull *image* and make it ready for ``docker run``.
+
+        For mutable tags (``latest``, ``dev``, ``local``, ``staging``,
+        ``nightly``, ``edge`` and any of those with arch/runtime suffixes
+        like ``dev-gpu``) we always issue ``docker pull`` so a developer
+        who just rebuilt or pushed a new image gets the new digest on the
+        next worker recycle. For immutable tags (e.g. ``v1.2.3``, sha256
+        digests) we keep the previous fast-path of skipping the pull when
+        the image is already present locally.
+
+        If ``docker pull`` fails but a local copy exists, we fall back to
+        the local copy and warn — losing connectivity should not knock
+        the worker offline.
 
         Uses a generous timeout (default 10 min) to accommodate large GPU
-        images on slow connections.  Returns True when the image is available.
+        images on slow connections.  Returns True when the image is
+        available locally.
         """
-        check = subprocess.run(
-            ["docker", "image", "inspect", image],
-            capture_output=True,
-            timeout=10,
-        )
-        if check.returncode == 0:
-            logger.debug("Image %s already present locally", image)
+        has_local = _docker_image_present(image)
+        mutable = _image_tag_is_mutable(image)
+
+        if has_local and not mutable:
+            logger.debug(
+                "Image %s already present locally (immutable tag); skipping pull",
+                image,
+            )
             return True
 
-        logger.info("Pulling worker image %s (timeout=%ds)...", image, timeout)
+        logger.info(
+            "Pulling worker image %s (timeout=%ds, mutable_tag=%s, local_present=%s)...",
+            image,
+            timeout,
+            mutable,
+            has_local,
+        )
         try:
             subprocess.run(
                 ["docker", "pull", image],
@@ -534,9 +609,23 @@ class WorkerManager:
             logger.info("Successfully pulled %s", image)
             return True
         except subprocess.CalledProcessError as exc:
+            if has_local:
+                logger.warning(
+                    "Pull failed for %s; using local copy. stderr=%s",
+                    image,
+                    exc.stderr,
+                )
+                return True
             logger.error("Failed to pull worker image %s: %s", image, exc.stderr)
             return False
         except subprocess.TimeoutExpired:
+            if has_local:
+                logger.warning(
+                    "Timed out pulling %s after %ds; using local copy",
+                    image,
+                    timeout,
+                )
+                return True
             logger.error("Timed out pulling worker image %s after %ds", image, timeout)
             return False
 
