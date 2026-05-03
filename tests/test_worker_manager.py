@@ -713,6 +713,102 @@ class TestWorkerManagerStartHealthIntegration:
 
 
 # ---------------------------------------------------------------------------
+# resolve_worker_image — env / override resolution
+# ---------------------------------------------------------------------------
+
+
+class TestResolveWorkerImage:
+    """``resolve_worker_image`` translates env state into the worker image
+    reference used by ``WorkerManager._run_container``.
+
+    Resolution order (most specific → least):
+      1. ``CYBERWAVE_WORKER_IMAGE`` — explicit local override (mirrors
+         ``driver_overrides`` for the worker side).
+      2. ``CYBERWAVE_ENVIRONMENT`` — non-production envs map to the
+         matching tag (``dev`` → ``...:dev``).
+      3. Production / unknown → ``...:latest``.
+    """
+
+    @staticmethod
+    def _runtime_env(values: dict[str, str | None]):
+        def _get(name: str, default=None):
+            return values.get(name, default)
+
+        return _get
+
+    def test_unset_falls_back_to_latest(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            self._runtime_env({}),
+        )
+        assert wm_module.resolve_worker_image() == "cyberwaveos/edge-ml-worker:latest"
+
+    def test_environment_dev_maps_to_dev_tag(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            self._runtime_env({"CYBERWAVE_ENVIRONMENT": "dev"}),
+        )
+        assert wm_module.resolve_worker_image() == "cyberwaveos/edge-ml-worker:dev"
+
+    def test_environment_production_uses_latest(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            self._runtime_env({"CYBERWAVE_ENVIRONMENT": "production"}),
+        )
+        assert wm_module.resolve_worker_image() == "cyberwaveos/edge-ml-worker:latest"
+
+    def test_explicit_override_wins_over_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Even when CYBERWAVE_ENVIRONMENT=dev (which would normally pick
+        # ``:dev``), the operator-specified image must take precedence.
+        # This is the path used by the `:local-gpu` SDK hot-fix loop —
+        # `docker commit` to a tag the registry doesn't have, point the
+        # override at it, edge-core's pull falls back to local.
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            self._runtime_env(
+                {
+                    "CYBERWAVE_ENVIRONMENT": "dev",
+                    "CYBERWAVE_WORKER_IMAGE": "cyberwaveos/edge-ml-worker:local-gpu",
+                }
+            ),
+        )
+        assert (
+            wm_module.resolve_worker_image()
+            == "cyberwaveos/edge-ml-worker:local-gpu"
+        )
+
+    def test_override_passes_through_third_party_registry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Override is forwarded verbatim — no rewriting of registry / tag.
+        # Operator owns correctness (including any ``-gpu`` suffix when
+        # bypassing the cyberwaveos/edge-ml-worker auto-suffix path).
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            self._runtime_env(
+                {"CYBERWAVE_WORKER_IMAGE": "myregistry.io:5000/cw/worker:custom"}
+            ),
+        )
+        assert (
+            wm_module.resolve_worker_image()
+            == "myregistry.io:5000/cw/worker:custom"
+        )
+
+    def test_blank_override_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Whitespace-only override falls through to the env-name path so a
+        # stale empty value doesn't accidentally collapse to ``:latest``.
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            self._runtime_env(
+                {"CYBERWAVE_WORKER_IMAGE": "   ", "CYBERWAVE_ENVIRONMENT": "staging"}
+            ),
+        )
+        assert wm_module.resolve_worker_image() == "cyberwaveos/edge-ml-worker:staging"
+
+
+# ---------------------------------------------------------------------------
 # Mutable-tag detection and force-pull behavior
 # ---------------------------------------------------------------------------
 

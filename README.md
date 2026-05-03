@@ -248,6 +248,58 @@ The worker container is brought up and torn down based on whether any active wor
 
 This avoids the previous failure mode where a stale `cyberwaveos/edge-ml-worker:dev-gpu` image stayed cached after a developer pushed a new build — operators no longer need to remember to `docker rmi` before restarting the worker. Immutable tags keep the original fast-path so versioned production deployments are not slowed down by an extra round-trip to the registry on every restart.
 
+### Pinning a custom worker image (`CYBERWAVE_WORKER_IMAGE`)
+
+`resolve_worker_image()` consults `CYBERWAVE_WORKER_IMAGE` before falling back to the `CYBERWAVE_ENVIRONMENT`-derived tag. This is the worker-side counterpart to the `driver_overrides` field in `credentials.json` for camera/asset drivers, and is the recommended way to run a locally-built or hot-patched worker image without re-pushing to the registry.
+
+Two ways to set it (both honoured by `get_runtime_env_var`):
+
+- **Operator config (preferred for dev hosts, no `sudo`)** — add to the `envs` block of `~/.cyberwave/credentials.json`:
+
+  ```json
+  {
+    "envs": {
+      "CYBERWAVE_ENVIRONMENT": "dev",
+      "CYBERWAVE_WORKER_IMAGE": "cyberwaveos/edge-ml-worker:local"
+    }
+  }
+  ```
+
+- **Systemd dropin (preferred for managed deployments)** — `sudo systemctl edit cyberwave-edge-core`:
+
+  ```ini
+  [Service]
+  Environment=CYBERWAVE_WORKER_IMAGE=cyberwaveos/edge-ml-worker:local
+  ```
+
+Either way, restart edge-core (`sudo systemctl restart cyberwave-edge-core`) to reload the resolver.
+
+Use the `:local` tag (no `-gpu`/`-cpu` suffix) — same convention as the camera-driver `:local` tag. `_run_container` auto-appends `-gpu` for `cyberwaveos/edge-ml-worker:*` overrides on GPU hosts, so the operator only commits and pins one tag.
+
+Typical hot-fix loop (mirroring the camera-driver `:local` tag pattern):
+
+```bash
+# 1. Hot-patch the running container (e.g. swap an SDK runtime file).
+WORKER=cyberwave-worker-<fingerprint>
+docker cp /path/to/patched/file.py "$WORKER:/usr/local/lib/python3.12/dist-packages/cyberwave/.../file.py"
+docker exec -u root "$WORKER" rm /usr/local/.../file.cpython-312-x86_64-linux-gnu.so
+
+# 2. Snapshot the patched container as a local-only tag (and an alias on the
+#    GPU-suffixed tag, so the same image is used regardless of which path
+#    `_run_container` resolves to on this host).
+docker commit "$WORKER" cyberwaveos/edge-ml-worker:local
+docker tag    cyberwaveos/edge-ml-worker:local cyberwaveos/edge-ml-worker:local-gpu
+
+# 3. Tell edge-core to use it (see the two options above), then restart it.
+#    Pull will fail (registry has no :local) and `_ensure_image_pulled`
+#    falls back to the locally-present image.
+sudo systemctl restart cyberwave-edge-core
+```
+
+The patched image survives every `docker rm`/`docker run` cycle from edge-core's reconcile loop. To revert, remove the env var (or `systemctl revert cyberwave-edge-core` if you used the dropin) and `docker rmi cyberwaveos/edge-ml-worker:local cyberwaveos/edge-ml-worker:local-gpu`.
+
+When overriding to a registry outside `cyberwaveos/edge-ml-worker:*` (e.g. an internal mirror), include the `-gpu` suffix yourself if you need GPU access — the auto-suffix path in `_run_container` only triggers for the canonical `cyberwaveos/edge-ml-worker:` prefix.
+
 ### Worker health monitoring
 
 Edge Core continuously monitors the worker container for spontaneous exits and crash loops:

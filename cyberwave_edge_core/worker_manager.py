@@ -141,10 +141,26 @@ DEFAULT_WORKER_IMAGE = f"{_WORKER_IMAGE_BASE}:latest"
 def resolve_worker_image() -> str:
     """Return the worker image reference for the current environment.
 
-    Non-production environments (dev, staging, …) use the environment name
-    as the Docker tag.  Production and unknown environments use ``:latest``.
+    Resolution order:
+
+    1. ``CYBERWAVE_WORKER_IMAGE`` env var — explicit local override.  The
+       same escape hatch :func:`load_driver_overrides` provides for
+       drivers via ``credentials.json``: lets an operator pin a custom
+       (e.g. ``cyberwaveos/edge-ml-worker:local-gpu``) build without
+       round-tripping through cloud config.  Useful for hot-patches and
+       SDK debugging.  When the override resolves to a tag that the
+       registry does not have, ``_ensure_image_pulled`` falls back to
+       the locally-present image (same code path the ``:local`` tag
+       relies on for camera drivers).
+    2. ``CYBERWAVE_ENVIRONMENT`` env var (``dev``, ``staging`` …) maps
+       to the matching image tag.
+    3. Production and unknown environments use ``:latest``.
     """
     from .startup import get_runtime_env_var
+
+    override = (get_runtime_env_var("CYBERWAVE_WORKER_IMAGE") or "").strip()
+    if override:
+        return override
 
     env_name = (get_runtime_env_var("CYBERWAVE_ENVIRONMENT") or "").strip().lower()
     if env_name and env_name != "production":
