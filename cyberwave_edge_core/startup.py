@@ -2013,6 +2013,124 @@ def reconcile_driver_health_for_worker() -> dict[str, str]:
     return statuses
 
 
+# Debounce state for ``reconcile_driver_revival``.  Module-level so the
+# 60s minimum gap between revival attempts persists across loop ticks.
+# A monotonic timestamp is used so wall-clock jumps cannot bypass the
+# debounce.
+_LAST_REVIVAL_ATTEMPT_AT: Optional[float] = None
+_REVIVAL_BACKOFF_SECONDS = 60
+
+
+def reconcile_driver_revival(
+    *,
+    skip_revival: bool = False,
+) -> dict[str, int]:
+    """Re-spawn driver containers that exited cleanly.
+
+    Reads the driver health snapshot populated by
+    :func:`reconcile_driver_health_for_worker` earlier in the same
+    runtime-loop tick.  When at least one driver is in ``down`` state
+    (clean exit, removed by an external actor, etc.) and the debounce
+    window has elapsed, re-runs :func:`fetch_and_run_twin_drivers` to
+    recreate the missing containers.
+
+    Only containers that this edge-core process is managing (tracked in
+    ``_CONTAINER_TWIN_MAP``) are eligible for revival.  Stopped driver
+    containers belonging to twins that are no longer linked to this edge
+    are treated as orphans and skipped, otherwise every revival cycle
+    would re-run :func:`fetch_and_run_twin_drivers` — which forcibly
+    recreates the *currently healthy* drivers as a side effect of
+    iterating linked twins (CYB-2231).
+
+    This complements:
+
+    * :func:`reconcile_driver_restart_failures` — only *stops* flapping
+      drivers; it never starts anything.
+    * The Docker ``--restart unless-stopped`` policy on driver
+      containers — ``unless-stopped`` does not auto-revive containers
+      that exited cleanly (exit 0 after SIGTERM), only crashed ones.
+
+    Without this reconciler a driver that's stopped via ``docker stop``
+    (or by ``_graceful_shutdown`` followed by an edge-core restart that
+    didn't actually re-run boot-time startup) stays down forever.
+
+    Caller-supplied *skip_revival* lets the runtime loop opt out for one
+    tick — used when the flap detector just stopped a driver, so we
+    don't immediately undo its decision.
+
+    Returns a summary dict.  All values default to 0 so callers can log
+    a single line regardless of which branch fired.
+    """
+    global _LAST_REVIVAL_ATTEMPT_AT
+    summary = {
+        "down": 0,
+        "skipped_orphan": 0,
+        "skipped_flap_protection": 0,
+        "skipped_debounce": 0,
+        "skipped_no_credentials": 0,
+        "revived_attempted": 0,
+    }
+
+    all_down_names = [n for n, s in _DRIVER_HEALTH_PREVIOUS.items() if s == "down"]
+    if not all_down_names:
+        return summary
+
+    # Skip stopped containers we don't manage.  ``_CONTAINER_TWIN_MAP`` is
+    # populated only when this process successfully starts a driver, so
+    # membership identifies containers belonging to twins currently linked
+    # to this edge.  Without this filter, a leftover stopped container from
+    # an unlinked twin keeps re-triggering ``fetch_and_run_twin_drivers``
+    # and force-recreating the healthy drivers via the idempotent
+    # ``docker rm -f`` step (CYB-2231).
+    orphan_names = [n for n in all_down_names if n not in _CONTAINER_TWIN_MAP]
+    down_names = [n for n in all_down_names if n in _CONTAINER_TWIN_MAP]
+    if orphan_names:
+        summary["skipped_orphan"] = len(orphan_names)
+        logger.debug(
+            "Driver revival ignoring %d orphan stopped container(s) "
+            "(twin no longer linked to this edge): %s",
+            len(orphan_names),
+            ", ".join(orphan_names),
+        )
+    if not down_names:
+        return summary
+    summary["down"] = len(down_names)
+
+    if skip_revival:
+        summary["skipped_flap_protection"] = len(down_names)
+        return summary
+
+    now = time.monotonic()
+    if (
+        _LAST_REVIVAL_ATTEMPT_AT is not None
+        and (now - _LAST_REVIVAL_ATTEMPT_AT) < _REVIVAL_BACKOFF_SECONDS
+    ):
+        summary["skipped_debounce"] = len(down_names)
+        return summary
+
+    token = load_token()
+    fingerprint = load_saved_fingerprint()
+    environment_uuid = load_environment_uuid()
+    if not (token and fingerprint and environment_uuid):
+        summary["skipped_no_credentials"] = len(down_names)
+        return summary
+
+    _LAST_REVIVAL_ATTEMPT_AT = now
+    summary["revived_attempted"] = len(down_names)
+
+    logger.info(
+        "Reviving %d down driver container(s): %s",
+        len(down_names),
+        ", ".join(down_names),
+    )
+    try:
+        fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
+    except Exception:
+        logger.exception("Driver revival run failed")
+
+    return summary
+
+
 _cameras_json_mtime: Optional[float] = None
 
 
@@ -4344,15 +4462,45 @@ def run_runtime_loop() -> None:
 
         try:
             driver_health = reconcile_driver_health_for_worker()
-            down_drivers = [n for n, s in driver_health.items() if s != "running"]
-            if down_drivers:
+            unhealthy_drivers = [
+                f"{n}={s}" for n, s in driver_health.items() if s != "running"
+            ]
+            if unhealthy_drivers:
                 logger.debug(
-                    "Driver health: %d down (%s)",
-                    len(down_drivers),
-                    ", ".join(down_drivers),
+                    "Driver health: %d not running (%s)",
+                    len(unhealthy_drivers),
+                    ", ".join(unhealthy_drivers),
                 )
         except Exception:
             logger.exception("Unexpected error in driver health reconciliation")
+
+        try:
+            # Skip revival in the same tick the flap detector stopped a
+            # driver — otherwise we'd immediately undo its decision and
+            # start a tug-of-war.  Debounce inside reconcile_driver_revival
+            # handles the steady-state "always-down" twin case.
+            revival_summary = reconcile_driver_revival(
+                skip_revival=restart_summary["stopped"] > 0,
+            )
+            if revival_summary["revived_attempted"]:
+                logger.info(
+                    "Driver revival reconcile (down=%d, revived_attempted=%d)",
+                    revival_summary["down"],
+                    revival_summary["revived_attempted"],
+                )
+            elif revival_summary["down"] or revival_summary["skipped_orphan"]:
+                logger.debug(
+                    "Driver revival reconcile skipped "
+                    "(down=%d, orphans=%d, flap_protected=%d, "
+                    "debounced=%d, no_credentials=%d)",
+                    revival_summary["down"],
+                    revival_summary["skipped_orphan"],
+                    revival_summary["skipped_flap_protection"],
+                    revival_summary["skipped_debounce"],
+                    revival_summary["skipped_no_credentials"],
+                )
+        except Exception:
+            logger.exception("Unexpected error in driver revival reconciliation")
 
         twin_sync_summary = reconcile_twin_json_file_sync()
         logger.debug(

@@ -499,6 +499,113 @@ class TestDriverHealthReconciliation:
 
 
 # ---------------------------------------------------------------------------
+# reconcile_driver_revival
+# ---------------------------------------------------------------------------
+
+
+class TestDriverRevivalReconciliation:
+    """Verify that revival only acts on managed driver containers.
+
+    Regression coverage for CYB-2231: a leftover stopped container from
+    an unlinked twin used to keep tripping ``reconcile_driver_revival``,
+    which then re-ran ``fetch_and_run_twin_drivers`` and force-recreated
+    every healthy driver via the idempotent ``docker rm -f`` step.
+    """
+
+    def _reset_revival_state(self) -> None:
+        startup._DRIVER_HEALTH_PREVIOUS.clear()
+        startup._CONTAINER_TWIN_MAP.clear()
+        startup._LAST_REVIVAL_ATTEMPT_AT = None
+
+    def test_orphan_container_does_not_trigger_revival(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._reset_revival_state()
+        # Container exists on the host but was never started by this
+        # process — i.e. its twin is no longer linked to this edge.
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_B_CONTAINER] = "down"
+
+        fetch_mock = MagicMock()
+        monkeypatch.setattr(startup, "fetch_and_run_twin_drivers", fetch_mock)
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: "fp")
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env")
+
+        summary = startup.reconcile_driver_revival()
+
+        fetch_mock.assert_not_called()
+        assert summary["skipped_orphan"] == 1
+        assert summary["down"] == 0
+        assert summary["revived_attempted"] == 0
+        # Debounce timestamp must stay None so a managed driver going
+        # down on the next tick is acted on immediately.
+        assert startup._LAST_REVIVAL_ATTEMPT_AT is None
+
+    def test_managed_down_driver_triggers_revival(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._reset_revival_state()
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_A_CONTAINER] = "down"
+        startup._CONTAINER_TWIN_MAP[TWIN_A_CONTAINER] = TWIN_A
+
+        fetch_mock = MagicMock()
+        monkeypatch.setattr(startup, "fetch_and_run_twin_drivers", fetch_mock)
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: "fp")
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env")
+
+        summary = startup.reconcile_driver_revival()
+
+        fetch_mock.assert_called_once_with("tok", "env", "fp")
+        assert summary["down"] == 1
+        assert summary["revived_attempted"] == 1
+        assert summary["skipped_orphan"] == 0
+
+    def test_orphan_alongside_managed_only_revives_managed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._reset_revival_state()
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_A_CONTAINER] = "down"
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_B_CONTAINER] = "down"
+        startup._CONTAINER_TWIN_MAP[TWIN_A_CONTAINER] = TWIN_A
+
+        fetch_mock = MagicMock()
+        monkeypatch.setattr(startup, "fetch_and_run_twin_drivers", fetch_mock)
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: "fp")
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env")
+
+        summary = startup.reconcile_driver_revival()
+
+        fetch_mock.assert_called_once()
+        assert summary["down"] == 1
+        assert summary["skipped_orphan"] == 1
+        assert summary["revived_attempted"] == 1
+
+    def test_orphan_only_with_running_managed_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Orphan visible + healthy managed driver → no revival, no debounce burn."""
+        self._reset_revival_state()
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_A_CONTAINER] = "running"
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_B_CONTAINER] = "down"
+        startup._CONTAINER_TWIN_MAP[TWIN_A_CONTAINER] = TWIN_A
+
+        fetch_mock = MagicMock()
+        monkeypatch.setattr(startup, "fetch_and_run_twin_drivers", fetch_mock)
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: "fp")
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env")
+
+        summary = startup.reconcile_driver_revival()
+
+        fetch_mock.assert_not_called()
+        assert summary["skipped_orphan"] == 1
+        assert summary["down"] == 0
+        assert startup._LAST_REVIVAL_ATTEMPT_AT is None
+
+
+# ---------------------------------------------------------------------------
 # Full two-camera + one worker end-to-end scenario
 # ---------------------------------------------------------------------------
 

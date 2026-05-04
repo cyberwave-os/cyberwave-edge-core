@@ -512,6 +512,12 @@ Optional environment variables to tune restart behavior:
 - `CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS` (default: `60`)
 - `CYBERWAVE_DRIVER_TROUBLESHOOTING_URL` (default: `https://docs.cyberwave.com`)
 
+#### Driver revival and orphan containers
+
+When a managed driver exits cleanly (Docker's `--restart unless-stopped` policy does not auto-revive clean exits), Edge Core's revival reconciler re-runs driver startup so the missing container is recreated. Revival is restricted to driver containers this Edge Core process is currently managing — i.e. whose twin is still linked to this edge's fingerprint.
+
+Stopped `cyberwave-driver-*` containers belonging to twins that have since been unlinked are treated as **orphans** and ignored by revival. They remain on the host harmlessly until the user removes them with `docker rm` or `docker container prune`. Without this guard, an orphan would re-trigger driver startup every revival cycle and force-recreate the currently healthy drivers as a side effect of the idempotent `docker rm -f` step.
+
 ### Twin JSON file
 
 `CYBERWAVE_TWIN_JSON_FILE` is an absolute path to a JSON file provided to the driver. The file contains the digital twin instance object (including its `metadata`) and the associated catalog twin data, matching the API schema: TwinSchema and AssetSchema.
