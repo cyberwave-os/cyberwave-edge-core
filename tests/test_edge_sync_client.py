@@ -99,7 +99,10 @@ class TestEdgeSyncClientSync:
         assert result.unchanged == []
         assert (workers_dir / "wf_abc.py").read_text() == new_source
 
-    def test_removes_stale_wf_file(self, tmp_path):
+    def test_removes_stale_wf_file_after_two_consecutive_misses(self, tmp_path):
+        """Two-strikes rule: a stale file is removed only on the
+        SECOND consecutive sync where it's missing from the payload.
+        First sync = warning + keep; second sync = remove."""
         client = _make_client(tmp_path)
         workers_dir = tmp_path / "workers"
         workers_dir.mkdir(parents=True)
@@ -110,9 +113,14 @@ class TestEdgeSyncClientSync:
         payload = _make_payload(workflows=[])
 
         with patch.object(client, "_fetch_sync_payload", return_value=payload):
-            results = client.sync_all(["twin-1"])
+            first_results = client.sync_all(["twin-1"])
+            # First sync: file should be kept (first strike).
+            assert all("wf_old.py" not in r.removed for r in first_results)
+            assert stale.exists(), "first strike must keep file on disk"
 
-        assert any("wf_old.py" in r.removed for r in results)
+            second_results = client.sync_all(["twin-1"])
+
+        assert any("wf_old.py" in r.removed for r in second_results)
         assert not stale.exists()
 
     def test_does_not_remove_custom_workers(self, tmp_path):
@@ -259,6 +267,113 @@ class TestEdgeSyncClientSync:
     def test_result_ok_false_when_errors(self):
         result = EdgeSyncResult(twin_uuid="t1", errors=["some error"])
         assert not result.ok
+
+
+class TestEdgeSyncClientTwoStrikesCleanup:
+    """Two-strikes rule for stale-file cleanup.
+
+    Regression coverage for the case where the cloud's edge-sync
+    response is briefly empty (e.g. while the operator is saving an
+    intermediate workflow state in the editor) and a single bad sync
+    used to wipe every local ``wf_*.py`` file.
+    """
+
+    def test_transient_empty_response_does_not_delete(self, tmp_path):
+        """Sync 1 has the workflow, sync 2 is transiently empty,
+        sync 3 has it again. The file must survive the dip."""
+        previously_missing: set[str] = set()
+        client = EdgeSyncClient(
+            workers_dir=tmp_path / "workers",
+            base_url="http://localhost:8000",
+            token="test-token",
+            previously_missing=previously_missing,
+        )
+        source = "# generated\n"
+        full_payload = _make_payload(workflows=[_wf_entry("wf_x.py", source)])
+        empty_payload = _make_payload(workflows=[])
+        worker_path = tmp_path / "workers" / "wf_x.py"
+
+        with patch.object(client, "_fetch_sync_payload", return_value=full_payload):
+            client.sync_all(["twin-1"])
+        assert worker_path.exists()
+
+        with patch.object(client, "_fetch_sync_payload", return_value=empty_payload):
+            results = client.sync_all(["twin-1"])
+        assert worker_path.exists(), "first strike must not delete the file"
+        assert all("wf_x.py" not in r.removed for r in results)
+        assert "wf_x.py" in previously_missing, "file should be flagged for next-sync removal"
+
+        with patch.object(client, "_fetch_sync_payload", return_value=full_payload):
+            client.sync_all(["twin-1"])
+        assert worker_path.exists()
+        assert "wf_x.py" not in previously_missing, "strike count should reset on re-claim"
+
+    def test_two_consecutive_empty_responses_delete(self, tmp_path):
+        """Two empty syncs in a row: the file is removed on the second."""
+        previously_missing: set[str] = set()
+        client = EdgeSyncClient(
+            workers_dir=tmp_path / "workers",
+            base_url="http://localhost:8000",
+            token="test-token",
+            previously_missing=previously_missing,
+        )
+        full_payload = _make_payload(
+            workflows=[_wf_entry("wf_x.py", "# source\n")]
+        )
+        empty_payload = _make_payload(workflows=[])
+        worker_path = tmp_path / "workers" / "wf_x.py"
+
+        with patch.object(client, "_fetch_sync_payload", return_value=full_payload):
+            client.sync_all(["twin-1"])
+        assert worker_path.exists()
+
+        with patch.object(client, "_fetch_sync_payload", return_value=empty_payload):
+            first_empty = client.sync_all(["twin-1"])
+            assert worker_path.exists()
+            assert all("wf_x.py" not in r.removed for r in first_empty)
+
+            second_empty = client.sync_all(["twin-1"])
+
+        assert not worker_path.exists()
+        assert any("wf_x.py" in r.removed for r in second_empty)
+        assert "wf_x.py" not in previously_missing, "strike state should clear on delete"
+
+    def test_file_recovering_clears_strike(self, tmp_path):
+        """Strike count must reset when the cloud re-claims the file,
+        so a later transient miss starts fresh from strike 1 instead
+        of getting deleted immediately."""
+        previously_missing: set[str] = set()
+        client = EdgeSyncClient(
+            workers_dir=tmp_path / "workers",
+            base_url="http://localhost:8000",
+            token="test-token",
+            previously_missing=previously_missing,
+        )
+        full_payload = _make_payload(
+            workflows=[_wf_entry("wf_x.py", "# source\n")]
+        )
+        empty_payload = _make_payload(workflows=[])
+        worker_path = tmp_path / "workers" / "wf_x.py"
+
+        with patch.object(client, "_fetch_sync_payload", return_value=full_payload):
+            client.sync_all(["twin-1"])
+        assert worker_path.exists()
+
+        with patch.object(client, "_fetch_sync_payload", return_value=empty_payload):
+            client.sync_all(["twin-1"])
+        assert worker_path.exists()
+        assert "wf_x.py" in previously_missing
+
+        with patch.object(client, "_fetch_sync_payload", return_value=full_payload):
+            client.sync_all(["twin-1"])
+        assert "wf_x.py" not in previously_missing
+
+        with patch.object(client, "_fetch_sync_payload", return_value=empty_payload):
+            results = client.sync_all(["twin-1"])
+        assert worker_path.exists(), (
+            "after a recovery, the next miss must be treated as a fresh first strike"
+        )
+        assert all("wf_x.py" not in r.removed for r in results)
 
 
 class TestAtomicWrite:

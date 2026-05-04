@@ -170,9 +170,16 @@ class TestSyncWorkersForTwins:
         constructed_args: list[dict] = []
 
         class FakeEdgeSyncClient:
-            def __init__(self, *, workers_dir, base_url, token):
+            def __init__(
+                self, *, workers_dir, base_url, token, previously_missing=None
+            ):
                 constructed_args.append(
-                    {"workers_dir": workers_dir, "base_url": base_url, "token": token}
+                    {
+                        "workers_dir": workers_dir,
+                        "base_url": base_url,
+                        "token": token,
+                        "previously_missing": previously_missing,
+                    }
                 )
 
             def sync_all(self, twin_uuids):
@@ -192,6 +199,12 @@ class TestSyncWorkersForTwins:
         assert constructed_args[0]["workers_dir"] == tmp_path / "workers"
         assert constructed_args[0]["base_url"] == "https://api.cyberwave.com"
         assert constructed_args[0]["token"] == "tok"
+        # Persistent module-level set is passed in so two-strikes
+        # cleanup state survives across periodic-sync cycles.
+        assert (
+            constructed_args[0]["previously_missing"]
+            is startup._WORKER_SYNC_PREVIOUSLY_MISSING
+        )
 
 
 # ===========================================================================

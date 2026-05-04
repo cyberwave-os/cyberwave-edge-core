@@ -80,10 +80,22 @@ class EdgeSyncClient:
         workers_dir: str | Path,
         base_url: str,
         token: str,
+        previously_missing: set[str] | None = None,
     ) -> None:
         self._workers_dir = Path(workers_dir)
         self._base_url = base_url.rstrip("/")
         self._token = token
+        # Two-strikes cleanup state — see :meth:`_cleanup_stale`. The
+        # caller owns the set so the strike count survives across
+        # separate ``sync_all`` invocations even when a fresh
+        # ``EdgeSyncClient`` is constructed each time (which is how
+        # ``cyberwave_edge_core.startup._sync_workers_for_twins``
+        # uses this class). Defaults to a fresh empty set for one-shot
+        # use (tests, manual ``cleanup_stale`` calls) so files get one
+        # strike of grace before being removed.
+        self._previously_missing: set[str] = (
+            previously_missing if previously_missing is not None else set()
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -192,18 +204,72 @@ class EdgeSyncClient:
     def _cleanup_stale(
         self, expected: dict[str, str], result: EdgeSyncResult
     ) -> None:
-        """Remove wf_*.py files that are not in *expected*."""
+        """Remove wf_*.py files that haven't been claimed by the cloud
+        for two consecutive syncs.
+
+        **Two-strikes rule.** A file present on disk but missing from
+        the latest sync payload is *marked* on the first such sync
+        (logged at WARNING) and only deleted on the second consecutive
+        sync where it's still missing. Any sync that re-claims the
+        file resets its strike count.
+
+        Why: the cloud's ``/workflows/edge-sync`` endpoint silently
+        drops workflows that don't compile cleanly to edge — which can
+        happen for a single tick while the operator is saving an
+        intermediate workflow state in the editor (e.g. a connection
+        is briefly broken, ``run_on_edge`` flickers, ``twin_uuid`` is
+        empty between saves). A fail-fast cleanup would unlink every
+        local worker on that single bad sync, leaving the edge worker
+        with nothing to load until the next ~5-minute sync rewrites
+        the file. The two-strikes rule keeps a single bad response
+        from triggering wholesale deletion, at the cost of a one-cycle
+        delay (~5 min in production) before deactivated workflows are
+        actually removed from disk — an acceptable trade.
+
+        Strike state lives on ``self._previously_missing`` and is
+        owned by the caller (see :meth:`__init__`). After an edge-core
+        process restart the set is empty by design — every existing
+        ``wf_*.py`` gets one fresh strike of grace, matching the
+        "be conservative on cold start" intuition.
+        """
         self._workers_dir.mkdir(parents=True, exist_ok=True)
+        expected_filenames = set(expected.keys())
+
+        # Files reclaimed by this sync get their strike count reset.
+        self._previously_missing.difference_update(expected_filenames)
+
         for existing_file in sorted(self._workers_dir.glob(f"{_WF_PREFIX}*.py")):
-            if existing_file.name not in expected:
-                try:
-                    existing_file.unlink()
-                    result.removed.append(existing_file.name)
-                    logger.info("Removed stale worker: %s", existing_file.name)
-                except OSError as exc:
-                    msg = f"Failed to remove {existing_file.name}: {exc}"
-                    logger.error(msg)
-                    result.errors.append(msg)
+            name = existing_file.name
+            if name in expected_filenames:
+                continue
+
+            if name not in self._previously_missing:
+                # First strike — keep on disk and give the cloud one
+                # more sync to claim it. If this is a transient blip
+                # (editor save mid-flight, etc.) the next sync will
+                # re-claim the file and the strike resets.
+                self._previously_missing.add(name)
+                logger.warning(
+                    "Worker %s missing from edge-sync response; "
+                    "keeping for one more sync (transient-state guard)",
+                    name,
+                )
+                continue
+
+            # Second consecutive miss — the cloud has consistently
+            # said this worker should not exist. Safe to delete.
+            try:
+                existing_file.unlink()
+                self._previously_missing.discard(name)
+                result.removed.append(name)
+                logger.info(
+                    "Removed stale worker: %s (missing from 2 consecutive syncs)",
+                    name,
+                )
+            except OSError as exc:
+                msg = f"Failed to remove {name}: {exc}"
+                logger.error(msg)
+                result.errors.append(msg)
 
     # ------------------------------------------------------------------
     # Private helpers

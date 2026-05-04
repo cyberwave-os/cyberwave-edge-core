@@ -4274,6 +4274,17 @@ def run_startup_checks() -> bool:
     return True
 
 
+# Persistent two-strikes state for worker cleanup. Owned by the
+# ``EdgeSyncClient`` instances that ``_sync_workers_for_twins``
+# constructs, but stored at module scope so the strike count survives
+# across the periodic-sync cycle (each cycle creates a fresh client).
+# A worker file disappearing from one sync response is recorded here;
+# only on a second consecutive miss is the file actually removed.
+# Cleared on edge-core process restart, which gives every existing
+# ``wf_*.py`` one strike of grace after a cold start.
+_WORKER_SYNC_PREVIOUSLY_MISSING: set[str] = set()
+
+
 def _sync_workers_for_twins(
     *,
     token: str,
@@ -4295,6 +4306,7 @@ def _sync_workers_for_twins(
         workers_dir=workers_dir,
         base_url=base_url,
         token=token,
+        previously_missing=_WORKER_SYNC_PREVIOUSLY_MISSING,
     )
 
     summary: dict[str, dict[str, int]] = {}
