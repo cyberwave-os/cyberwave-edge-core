@@ -235,6 +235,7 @@ The worker container is brought up and torn down based on whether any active wor
 
 - **Startup:** after pulling worker files from the backend (step 8), Edge Core inspects `{config_dir}/workers/`. If at least one `wf_*.py` file is present, the worker container is started; otherwise it is left down — and the `cyberwaveos/edge-ml-worker` image is **not** pulled.
 - **Periodic reconcile:** every ~5 minutes (configurable via `CYBERWAVE_WORKER_SYNC_INTERVAL_LOOPS`), Edge Core resyncs worker files from the backend. If a workflow was activated mid-run and new files appeared, the worker container is started. If every workflow was deactivated and the directory is now empty, the container is stopped. Both calls are idempotent.
+- **Immediate reconcile on activate:** when a `run_on_edge` workflow is activated (UI, CLI, or API), the backend publishes a `sync_workflows` command on `cyberwave/twin/{twin_uuid}/command` for each twin the workflow references. Edge Core runs `reconcile_worker_sync` right away so the new `wf_*.py` lands within seconds instead of up to one periodic interval. Failures fall back to the periodic reconcile; the MQTT nudge is best-effort, not a correctness guarantee.
 - **Sync errors:** if a sync cycle reports any errors, the lifecycle reconcile is skipped to avoid churning a healthy worker on transient API failures. The next successful sync re-evaluates state.
 
 ### Worker image refresh policy
