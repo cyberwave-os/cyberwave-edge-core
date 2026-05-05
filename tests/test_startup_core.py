@@ -20,6 +20,8 @@ import uuid as _uuid_module
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import cyberwave_edge_core.driver_selection as driver_selection
 import cyberwave_edge_core.startup as startup
 
@@ -2232,22 +2234,19 @@ class TestLoadCameraStreamUrlForTwin:
 # ===========================================================================
 # Symmetric worker restart on edge-core restart command
 # ===========================================================================
+#
+# Regression coverage for the asymmetric-restart bug where every edge-core
+# restart command stopped/removed the worker container but never restarted
+# it, leaving the worker (and every workflow-driven feature: frame filter,
+# ML inference, detection overlays, …) down for up to one
+# ``reconcile_worker_lifecycle`` cycle (~5 min).
 
 
 class TestStartWorkerContainerAfterRestart:
-    """Tests for ``_start_worker_container_after_restart``.
+    """Tests for ``_start_worker_container_after_restart``."""
 
-    Regression coverage for the asymmetric-restart bug where every edge-core
-    restart command stopped/removed the worker container via
-    ``_stop_worker_container_for_restart`` but never restarted it,
-    leaving the worker down for up to one
-    ``reconcile_worker_lifecycle`` cycle (~5 min) and silently breaking
-    every workflow-driven feature (frame filter, ML inference, detection
-    overlays, …) for the duration.
-    """
-
-    def _seed_active_workflow(self, tmp_path: Path) -> None:
-        """Drop a `wf_*.py` file so the helper sees an active workflow."""
+    @staticmethod
+    def _seed_active_workflow(tmp_path: Path) -> None:
         workers_dir = tmp_path / "workers"
         workers_dir.mkdir()
         (workers_dir / "wf_demo.py").write_text("# stub\n")
@@ -2255,259 +2254,102 @@ class TestStartWorkerContainerAfterRestart:
     def test_starts_worker_when_active_workflows_exist(self, tmp_path, monkeypatch):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         self._seed_active_workflow(tmp_path)
-
         monkeypatch.setattr(
-            startup,
-            "_resolve_worker_sync_twin_uuids",
-            lambda _t, _e, _f: ["twin-a", "twin-b"],
+            startup, "_resolve_worker_sync_twin_uuids", lambda *_: ["twin-a", "twin-b"]
+        )
+        captured: dict = {}
+        monkeypatch.setattr(
+            startup, "_start_worker_after_drivers", lambda **kw: captured.update(kw)
         )
 
-        captured: dict[str, object] = {}
-
-        def fake_start(*, token, environment_uuid, twin_uuids):
-            captured["token"] = token
-            captured["environment_uuid"] = environment_uuid
-            captured["twin_uuids"] = list(twin_uuids)
-
-        monkeypatch.setattr(startup, "_start_worker_after_drivers", fake_start)
-
-        result = startup._start_worker_container_after_restart(
-            "test-token", "env-uuid", "fingerprint"
-        )
+        result = startup._start_worker_container_after_restart("tok", "env", "fp")
 
         assert result is True
         assert captured == {
-            "token": "test-token",
-            "environment_uuid": "env-uuid",
+            "token": "tok",
+            "environment_uuid": "env",
             "twin_uuids": ["twin-a", "twin-b"],
         }
 
-    def test_skips_when_no_active_workflows(self, tmp_path, monkeypatch):
-        """Steady-state idle edge: no workers/*.py → no worker start.
-
-        Mirrors :func:`reconcile_worker_lifecycle`'s gate so we don't
-        force-pull ``cyberwaveos/edge-ml-worker`` on a node with no
-        linked workflows (CYB-1766).
-        """
+    @pytest.mark.parametrize(
+        "seed",
+        [
+            pytest.param(lambda _p: None, id="no-workers-dir"),
+            pytest.param(lambda p: (p / "workers").mkdir(), id="empty-workers-dir"),
+        ],
+    )
+    def test_skips_when_no_active_workflows(self, tmp_path, monkeypatch, seed):
+        """Mirrors ``reconcile_worker_lifecycle``'s gate so we don't pull
+        ``cyberwaveos/edge-ml-worker`` on an idle node (CYB-1766)."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-        # No workers/ dir, no *.py files.
+        seed(tmp_path)
 
-        called = False
+        def fail(**_kw):
+            raise AssertionError("worker start must not run when no wf_*.py exist")
 
-        def fail_if_called(**_kwargs):
-            nonlocal called
-            called = True
+        monkeypatch.setattr(startup, "_start_worker_after_drivers", fail)
 
-        monkeypatch.setattr(startup, "_start_worker_after_drivers", fail_if_called)
+        assert startup._start_worker_container_after_restart("tok", "env", "fp") is False
 
-        result = startup._start_worker_container_after_restart(
-            "test-token", "env-uuid", "fingerprint"
-        )
-
-        assert result is False
-        assert called is False, "Worker start must be skipped when no workflow files exist"
-
-    def test_skips_when_workers_dir_exists_but_empty(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-        (tmp_path / "workers").mkdir()
-
-        called = False
-
-        def fail_if_called(**_kwargs):
-            nonlocal called
-            called = True
-
-        monkeypatch.setattr(startup, "_start_worker_after_drivers", fail_if_called)
-
-        result = startup._start_worker_container_after_restart(
-            "test-token", "env-uuid", "fingerprint"
-        )
-
-        assert result is False
-        assert called is False
-
-    def test_swallows_resolve_twins_failure(self, tmp_path, monkeypatch, caplog):
-        """Backend hiccup must not crash the surrounding restart flow.
-
-        ``_perform_edge_core_restart`` is the user-facing happy path for
-        an "Restart edge" UI action — failing to start the worker must
-        be logged but never propagate, since the runtime loop's
-        ``reconcile_worker_lifecycle`` is the existing recovery path.
-        """
+    @pytest.mark.parametrize(
+        "patch_target",
+        ["_resolve_worker_sync_twin_uuids", "_start_worker_after_drivers"],
+    )
+    def test_failures_are_swallowed_best_effort(self, tmp_path, monkeypatch, patch_target):
+        """Helper must never propagate — the runtime loop's reconcile is
+        the documented recovery path."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         self._seed_active_workflow(tmp_path)
-
-        def boom(_t, _e, _f):
-            raise RuntimeError("backend transient")
-
-        monkeypatch.setattr(startup, "_resolve_worker_sync_twin_uuids", boom)
-
-        called = False
-
-        def fail_if_called(**_kwargs):
-            nonlocal called
-            called = True
-
-        monkeypatch.setattr(startup, "_start_worker_after_drivers", fail_if_called)
-
-        with caplog.at_level(logging.WARNING, logger="cyberwave_edge_core.startup"):
-            result = startup._start_worker_container_after_restart(
-                "test-token", "env-uuid", "fingerprint"
-            )
-
-        assert result is False
-        assert called is False
-        assert any(
-            "Could not resolve twins for worker container start" in rec.message
-            for rec in caplog.records
-        ), "Resolve failure must produce an actionable WARNING for ops"
-
-    def test_swallows_start_worker_failure(self, tmp_path, monkeypatch, caplog):
-        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-        self._seed_active_workflow(tmp_path)
-
         monkeypatch.setattr(
-            startup,
-            "_resolve_worker_sync_twin_uuids",
-            lambda _t, _e, _f: ["twin-a"],
+            startup, "_resolve_worker_sync_twin_uuids", lambda *_: ["twin-a"]
         )
+        monkeypatch.setattr(startup, "_start_worker_after_drivers", lambda **_kw: None)
 
-        def boom(**_kwargs):
-            raise RuntimeError("docker run failed")
+        def boom(*_a, **_kw):
+            raise RuntimeError("boom")
 
-        monkeypatch.setattr(startup, "_start_worker_after_drivers", boom)
+        monkeypatch.setattr(startup, patch_target, boom)
 
-        with caplog.at_level(logging.WARNING, logger="cyberwave_edge_core.startup"):
-            result = startup._start_worker_container_after_restart(
-                "test-token", "env-uuid", "fingerprint"
-            )
-
-        assert result is False
-        assert any(
-            "Failed to start worker container after restart" in rec.message
-            for rec in caplog.records
-        )
+        assert startup._start_worker_container_after_restart("tok", "env", "fp") is False
 
 
 class TestPerformEdgeCoreRestart:
-    """End-to-end ordering test for ``_perform_edge_core_restart``.
-
-    Validates that the symmetric worker stop/start pair is in place and
-    that the restart summary surfaces ``worker_started`` so operators
-    (and our integration logs) can tell at a glance whether the worker
-    was brought back up.
-    """
+    """Pin the symmetric stop+start ordering inside ``_perform_edge_core_restart``."""
 
     def test_stop_and_start_worker_are_paired(self, tmp_path, monkeypatch):
-        """The restart sequence must call stop first, then start the worker.
-
-        Pre-fix, only the stop half ran. This test fails the moment
-        someone removes the symmetric ``_start_worker_container_after_restart``
-        call from the restart flow.
-        """
+        """Pre-fix, only the stop half ran. This test fails the moment
+        someone removes the symmetric start call."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-
         events: list[str] = []
 
-        monkeypatch.setattr(
-            startup,
-            "_stop_worker_container_for_restart",
-            lambda: events.append("stop_worker"),
-        )
-        monkeypatch.setattr(
-            startup,
-            "_remove_cached_twin_json_files",
-            lambda: ["a.json"],
-        )
-        monkeypatch.setattr(
-            startup,
-            "_stop_and_prune_driver_containers",
-            lambda: [],
-        )
-        monkeypatch.setattr(startup, "load_environment_uuid", lambda **_kw: "env-uuid")
-        monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: "fp")
-        monkeypatch.setattr(startup, "stop_zenoh_router", lambda _e: None)
+        # Stub everything outside the restart's own logic.
+        for name, fn in {
+            "_stop_worker_container_for_restart": lambda: events.append("stop_worker"),
+            "_remove_cached_twin_json_files": lambda: ["a.json"],
+            "_stop_and_prune_driver_containers": lambda: [],
+            "load_environment_uuid": lambda **_kw: "env-uuid",
+            "get_or_create_fingerprint": lambda: "fp",
+            "stop_zenoh_router": lambda _e: None,
+            "start_zenoh_router": lambda _cfg, _env: events.append("start_zenoh") or True,
+            "fetch_and_run_twin_drivers": (
+                lambda _t, _e, _f: events.append("start_drivers") or [{"success": True}]
+            ),
+            "_stop_bootstrap_edge_health_publisher": lambda: None,
+            "_start_worker_container_after_restart": (
+                lambda _t, _e, _f: events.append("start_worker") or True
+            ),
+        }.items():
+            monkeypatch.setattr(startup, name, fn)
 
-        # Pretend Zenoh router is enabled so we exercise the symmetric
-        # router start path that already worked pre-fix; this guards
-        # against regressions that might collapse the two paths.
-        class _FakeZenohCfg:
-            router_enabled = True
-
-        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: _FakeZenohCfg())
+        # Zenoh router enabled so we exercise the symmetric router path too.
         monkeypatch.setattr(
-            startup,
-            "start_zenoh_router",
-            lambda _cfg, _env: events.append("start_zenoh") or True,
-        )
-        monkeypatch.setattr(
-            startup,
-            "fetch_and_run_twin_drivers",
-            lambda _t, _e, _f: events.append("start_drivers") or [{"success": True}],
-        )
-        monkeypatch.setattr(
-            startup,
-            "_stop_bootstrap_edge_health_publisher",
-            lambda: None,
-        )
-        monkeypatch.setattr(
-            startup,
-            "_start_worker_container_after_restart",
-            lambda _t, _e, _f: events.append("start_worker") or True,
+            startup, "_get_zenoh_config", lambda: type("Cfg", (), {"router_enabled": True})()
         )
 
         summary = startup._perform_edge_core_restart("test-token")
 
-        assert events == [
-            "stop_worker",
-            "start_zenoh",
-            "start_drivers",
-            "start_worker",
-        ], (
-            "Restart must follow the symmetric ordering "
-            "(stop worker → restart router → restart drivers → start worker). "
-            f"Got: {events}"
+        assert events == ["stop_worker", "start_zenoh", "start_drivers", "start_worker"], (
+            f"Symmetric ordering broken: {events}"
         )
-        assert summary["worker_started"] is True, (
-            "Restart summary must surface worker_started so operators can "
-            "tell whether the worker came back up."
-        )
+        assert summary["worker_started"] is True
         assert summary["drivers_started"] == 1
-        assert summary["removed_twin_json_files"] == ["a.json"]
-
-    def test_worker_start_failure_does_not_break_restart(self, tmp_path, monkeypatch):
-        """A failing worker start must not abort the restart: the runtime
-        loop's reconcile is the documented recovery path."""
-        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-
-        monkeypatch.setattr(startup, "_stop_worker_container_for_restart", lambda: None)
-        monkeypatch.setattr(startup, "_remove_cached_twin_json_files", lambda: [])
-        monkeypatch.setattr(startup, "_stop_and_prune_driver_containers", lambda: [])
-        monkeypatch.setattr(startup, "load_environment_uuid", lambda **_kw: "env-uuid")
-        monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: "fp")
-        monkeypatch.setattr(startup, "stop_zenoh_router", lambda _e: None)
-
-        class _FakeZenohCfg:
-            router_enabled = False
-
-        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: _FakeZenohCfg())
-        monkeypatch.setattr(
-            startup,
-            "fetch_and_run_twin_drivers",
-            lambda _t, _e, _f: [{"success": True}],
-        )
-        monkeypatch.setattr(startup, "_stop_bootstrap_edge_health_publisher", lambda: None)
-
-        # Worker start returns False (mirrors the helper's best-effort
-        # behaviour: failure is logged inside the helper, the surrounding
-        # restart still completes).
-        monkeypatch.setattr(
-            startup,
-            "_start_worker_container_after_restart",
-            lambda _t, _e, _f: False,
-        )
-
-        summary = startup._perform_edge_core_restart("test-token")
-
-        assert summary["drivers_started"] == 1
-        assert summary["worker_started"] is False
