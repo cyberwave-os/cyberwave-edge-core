@@ -20,6 +20,8 @@ import uuid as _uuid_module
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import cyberwave_edge_core.driver_selection as driver_selection
 import cyberwave_edge_core.startup as startup
 
@@ -2227,3 +2229,127 @@ class TestLoadCameraStreamUrlForTwin:
             json.dumps({"twin_to_stream_url": {"twin-a": 8091}})
         )
         assert startup._load_camera_stream_url_for_twin("twin-a") is None
+
+
+# ===========================================================================
+# Symmetric worker restart on edge-core restart command
+# ===========================================================================
+#
+# Regression coverage for the asymmetric-restart bug where every edge-core
+# restart command stopped/removed the worker container but never restarted
+# it, leaving the worker (and every workflow-driven feature: frame filter,
+# ML inference, detection overlays, …) down for up to one
+# ``reconcile_worker_lifecycle`` cycle (~5 min).
+
+
+class TestStartWorkerContainerAfterRestart:
+    """Tests for ``_start_worker_container_after_restart``."""
+
+    @staticmethod
+    def _seed_active_workflow(tmp_path: Path) -> None:
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+        (workers_dir / "wf_demo.py").write_text("# stub\n")
+
+    def test_starts_worker_when_active_workflows_exist(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        self._seed_active_workflow(tmp_path)
+        monkeypatch.setattr(
+            startup, "_resolve_worker_sync_twin_uuids", lambda *_: ["twin-a", "twin-b"]
+        )
+        captured: dict = {}
+        monkeypatch.setattr(
+            startup, "_start_worker_after_drivers", lambda **kw: captured.update(kw)
+        )
+
+        result = startup._start_worker_container_after_restart("tok", "env", "fp")
+
+        assert result is True
+        assert captured == {
+            "token": "tok",
+            "environment_uuid": "env",
+            "twin_uuids": ["twin-a", "twin-b"],
+        }
+
+    @pytest.mark.parametrize(
+        "seed",
+        [
+            pytest.param(lambda _p: None, id="no-workers-dir"),
+            pytest.param(lambda p: (p / "workers").mkdir(), id="empty-workers-dir"),
+        ],
+    )
+    def test_skips_when_no_active_workflows(self, tmp_path, monkeypatch, seed):
+        """Mirrors ``reconcile_worker_lifecycle``'s gate so we don't pull
+        ``cyberwaveos/edge-ml-worker`` on an idle node (CYB-1766)."""
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        seed(tmp_path)
+
+        def fail(**_kw):
+            raise AssertionError("worker start must not run when no wf_*.py exist")
+
+        monkeypatch.setattr(startup, "_start_worker_after_drivers", fail)
+
+        assert startup._start_worker_container_after_restart("tok", "env", "fp") is False
+
+    @pytest.mark.parametrize(
+        "patch_target",
+        ["_resolve_worker_sync_twin_uuids", "_start_worker_after_drivers"],
+    )
+    def test_failures_are_swallowed_best_effort(self, tmp_path, monkeypatch, patch_target):
+        """Helper must never propagate — the runtime loop's reconcile is
+        the documented recovery path."""
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        self._seed_active_workflow(tmp_path)
+        monkeypatch.setattr(
+            startup, "_resolve_worker_sync_twin_uuids", lambda *_: ["twin-a"]
+        )
+        monkeypatch.setattr(startup, "_start_worker_after_drivers", lambda **_kw: None)
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(startup, patch_target, boom)
+
+        assert startup._start_worker_container_after_restart("tok", "env", "fp") is False
+
+
+class TestPerformEdgeCoreRestart:
+    """Pin the symmetric stop+start ordering inside ``_perform_edge_core_restart``."""
+
+    def test_stop_and_start_worker_are_paired(self, tmp_path, monkeypatch):
+        """Pre-fix, only the stop half ran. This test fails the moment
+        someone removes the symmetric start call."""
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        events: list[str] = []
+
+        # Stub everything outside the restart's own logic.
+        for name, fn in {
+            "_stop_worker_container_for_restart": lambda: events.append("stop_worker"),
+            "_remove_cached_twin_json_files": lambda: ["a.json"],
+            "_stop_and_prune_driver_containers": lambda: [],
+            "load_environment_uuid": lambda **_kw: "env-uuid",
+            "get_or_create_fingerprint": lambda: "fp",
+            "stop_zenoh_router": lambda _e: None,
+            "start_zenoh_router": lambda _cfg, _env: events.append("start_zenoh") or True,
+            "fetch_and_run_twin_drivers": (
+                lambda _t, _e, _f: events.append("start_drivers") or [{"success": True}]
+            ),
+            "_stop_bootstrap_edge_health_publisher": lambda: None,
+            "_start_worker_container_after_restart": (
+                lambda _t, _e, _f: events.append("start_worker") or True
+            ),
+        }.items():
+            monkeypatch.setattr(startup, name, fn)
+
+        # Zenoh router enabled so we exercise the symmetric router path too.
+        monkeypatch.setattr(
+            startup, "_get_zenoh_config", lambda: type("Cfg", (), {"router_enabled": True})()
+        )
+
+        summary = startup._perform_edge_core_restart("test-token")
+
+        assert events == ["stop_worker", "start_zenoh", "start_drivers", "start_worker"], (
+            f"Symmetric ordering broken: {events}"
+        )
+        assert summary["worker_started"] is True
+        assert summary["drivers_started"] == 1
