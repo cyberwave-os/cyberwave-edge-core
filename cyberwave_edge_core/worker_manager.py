@@ -28,6 +28,7 @@ from .docker_helpers import (
     docker_container_status,
     docker_has_nvidia_runtime,
     docker_rm,
+    docker_stop,
 )
 from .zenoh_config import ZenohConfig, build_zenoh_env_vars
 
@@ -337,20 +338,38 @@ class WorkerManager:
         return ok
 
     def stop(self) -> bool:
-        """Stop and remove the worker container.
+        """Gracefully stop the worker container without removing it.
 
-        Returns True when the container is gone after the call.
+        Leaves the container in ``exited`` state so operators can still
+        ``docker logs`` it for diagnostics and so callers that want the
+        container brought back up (e.g. ``WorkerManager.restart``,
+        :func:`reconcile_worker_lifecycle`, the symmetric edge-restart
+        flow) can do so cheaply via the regular start path.
+
+        Returns ``True`` when the container is no longer running after
+        the call (including the no-op cases where it didn't exist or was
+        already stopped). The destructive ``docker rm`` happens later,
+        only inside :meth:`_run_container`, so the next start always gets
+        a freshly-created container.
         """
         if not docker_available():
             return True
 
         current_status = docker_container_status(self._container_name)
-        if current_status == "none":
-            logger.debug("Worker container %s not found; nothing to stop", self._container_name)
+        if current_status in {"none", "exited", "created"}:
+            logger.debug(
+                "Worker container %s already in non-running state %r; nothing to stop",
+                self._container_name,
+                current_status,
+            )
             return True
 
-        logger.info("Stopping worker container %s", self._container_name)
-        return docker_rm(self._container_name)
+        logger.info(
+            "Stopping worker container %s (status=%s)",
+            self._container_name,
+            current_status,
+        )
+        return docker_stop(self._container_name)
 
     def restart(self, *, reason: str = "requested") -> bool:
         """Stop and re-start the worker container.

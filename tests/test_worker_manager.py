@@ -384,36 +384,61 @@ class TestGetZenohEnvVars:
 
 
 class TestWorkerManagerStop:
+    """``stop()`` must be non-destructive: ``docker stop``, never ``docker rm``.
+
+    Pre-fix it called ``docker rm -f`` which left every caller (the
+    edge-restart flow, ``reconcile_worker_lifecycle``) without a
+    container to inspect or restart cheaply.
+    """
+
+    @staticmethod
+    def _patch_calls(monkeypatch: pytest.MonkeyPatch, status: str) -> dict[str, list[str]]:
+        calls: dict[str, list[str]] = {"stop": [], "rm": []}
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda _n: status)
+        monkeypatch.setattr(
+            wm_module, "docker_stop", lambda name, **_kw: calls["stop"].append(name) or True
+        )
+        monkeypatch.setattr(
+            wm_module, "docker_rm", lambda name, **_kw: calls["rm"].append(name) or True
+        )
+        return calls
+
     def test_returns_true_when_docker_unavailable(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(wm_module, "docker_available", lambda: False)
         assert worker_manager.stop() is True
 
-    def test_returns_true_when_container_not_found(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("status", ["none", "exited", "created"])
+    def test_short_circuits_for_non_running_states(
+        self,
+        worker_manager: WorkerManager,
+        monkeypatch: pytest.MonkeyPatch,
+        status: str,
     ) -> None:
-        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
-        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
+        calls = self._patch_calls(monkeypatch, status)
         assert worker_manager.stop() is True
+        assert calls["stop"] == [], f"docker_stop must not be called for status={status!r}"
+        assert calls["rm"] == [], "stop() must never call docker_rm"
 
-    def test_calls_docker_rm_when_container_exists(
+    def test_calls_docker_stop_and_never_docker_rm_when_running(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        removed: list[str] = []
-        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
-        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
-        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: removed.append(name) or True)
-        result = worker_manager.stop()
-        assert result is True
-        assert removed == [worker_manager.container_name]
+        calls = self._patch_calls(monkeypatch, "running")
+        assert worker_manager.stop() is True
+        assert calls["stop"] == [worker_manager.container_name]
+        assert calls["rm"] == [], (
+            "Regression: stop() must NOT remove the container — "
+            "use docker stop only so the container persists for restart/inspection."
+        )
 
-    def test_returns_false_when_docker_rm_fails(
+    def test_returns_false_when_docker_stop_fails(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
-        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "exited")
-        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: False)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda _n: "running")
+        monkeypatch.setattr(wm_module, "docker_stop", lambda _name, **_kw: False)
         assert worker_manager.stop() is False
 
 

@@ -3177,7 +3177,14 @@ def _resolve_edge_for_fingerprint(client: Cyberwave, fingerprint: str) -> Option
 
 
 def _stop_worker_container_for_restart() -> None:
-    """Best-effort stop of the worker container before a full edge restart."""
+    """Best-effort graceful stop of the worker container before a full edge restart.
+
+    Calls :meth:`WorkerManager.stop`, which performs a ``docker stop``
+    (not ``docker rm``) — the container is left in ``exited`` state so
+    operators can ``docker logs`` it and the symmetric
+    :func:`_start_worker_container_after_restart` brings it back up on
+    a clean ``docker run`` cycle.
+    """
     try:
         from .worker_manager import WorkerManager
 
@@ -4475,10 +4482,11 @@ def reconcile_worker_lifecycle(sync_summary: dict[str, int]) -> None:
       the container up and pulls ``cyberwaveos/edge-ml-worker`` on first
       activation.
     * Files disappeared (workflow deactivated) → ``WorkerManager.stop()``
-      tears the container down so we don't leave it idling.
+      gracefully stops the container (it is left in ``exited`` state for
+      diagnostics; the next start re-creates it cleanly).
 
     Both ``start`` and ``stop`` are idempotent in their respective steady
-    states (already running / already absent), so the periodic call is
+    states (already running / already stopped), so the periodic call is
     cheap. We bail out early when sync reported any errors to avoid
     churning the worker on transient API failures (CYB-1766).
     """
