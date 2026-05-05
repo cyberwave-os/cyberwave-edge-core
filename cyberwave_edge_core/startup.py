@@ -2030,9 +2030,19 @@ def reconcile_driver_revival(
     Reads the driver health snapshot populated by
     :func:`reconcile_driver_health_for_worker` earlier in the same
     runtime-loop tick.  When at least one driver is in ``down`` state
-    (clean exit, removed by an external actor, etc.) and the debounce
-    window has elapsed, re-runs :func:`fetch_and_run_twin_drivers` to
-    recreate the missing containers.
+    (the container still exists but is not running — e.g. clean exit
+    via SIGTERM) and the debounce window has elapsed, re-runs
+    :func:`fetch_and_run_twin_drivers` to bring the missing container
+    back up.
+
+    **Fully removed containers are intentionally not revived.**  When a
+    driver is gone from Docker entirely (``docker rm -f``,
+    ``docker system prune``, manual cleanup) the health snapshot
+    reports status ``removed`` and this reconciler leaves it alone.
+    Removal is treated as an explicit operator signal — auto-respawning
+    would fight the operator on planned takedowns, image swaps, and
+    debug sessions.  To bring such a container back, restart edge-core
+    or re-link the twin.
 
     Only containers that this edge-core process is managing (tracked in
     ``_CONTAINER_TWIN_MAP``) are eligible for revival.  Stopped driver
@@ -3187,6 +3197,80 @@ def _stop_worker_container_for_restart() -> None:
         logger.warning("Failed to stop worker container before restart: %s", exc)
 
 
+def _start_worker_container_after_restart(
+    token: str,
+    environment_uuid: str,
+    fingerprint: str,
+) -> bool:
+    """Best-effort start of the worker container after a full edge restart.
+
+    Symmetric counterpart to :func:`_stop_worker_container_for_restart`.
+
+    Without this step every edge-core restart command — for example one
+    triggered by an admin "Restart edge" action or an operator
+    deactivate/reactivate cycle — would tear the worker container down
+    via :func:`_stop_worker_container_for_restart` and leave it down
+    until :func:`reconcile_worker_lifecycle` ticked again on the runtime
+    loop (~5 minutes by default, ``CYBERWAVE_WORKER_SYNC_INTERVAL_LOOPS``
+    × loop period). During that window every workflow-driven feature
+    that depends on the worker (frame filter, ML inference, detection
+    overlays, etc.) silently degrades — the camera driver visibly logs
+    ``[FRAME_FILTER] 100.0% of N frames in last 30 s emitted blank
+    fallback ... Worker likely down or not publishing on this channel``
+    while the user has no immediate way to recover other than waiting.
+
+    The Zenoh router is already restarted on the symmetric path
+    (:func:`stop_zenoh_router` / :func:`start_zenoh_router`); this
+    function closes the analogous gap for workers.
+
+    Behaves as a no-op when there are no active worker files in
+    ``CONFIG_DIR/workers/`` — matching the steady-state semantics of
+    :func:`reconcile_worker_lifecycle`, which deliberately leaves the
+    worker stopped when no workflows are linked to avoid pulling the
+    ``cyberwaveos/edge-ml-worker`` image needlessly (CYB-1766).
+
+    Returns ``True`` when the worker was started, ``False`` when the
+    start was skipped (no worker files) or when the start failed
+    (best-effort: failure is logged at WARNING and does not propagate
+    so the calling restart flow still completes successfully — the
+    runtime loop's :func:`reconcile_worker_lifecycle` will retry on the
+    next tick, which is exactly the recovery path that exists today).
+    """
+    try:
+        workers_dir = CONFIG_DIR / "workers"
+        has_active_workers = workers_dir.is_dir() and any(workers_dir.glob("*.py"))
+        if not has_active_workers:
+            logger.debug(
+                "Skipping worker container start after restart: no active workflow files in %s",
+                workers_dir,
+            )
+            return False
+
+        try:
+            twin_uuids = _resolve_worker_sync_twin_uuids(token, environment_uuid, fingerprint)
+        except Exception:
+            logger.warning(
+                "Could not resolve twins for worker container start after "
+                "restart; runtime loop reconcile will retry shortly",
+                exc_info=True,
+            )
+            return False
+
+        _start_worker_after_drivers(
+            token=token,
+            environment_uuid=environment_uuid,
+            twin_uuids=twin_uuids,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Failed to start worker container after restart "
+            "(runtime loop will retry on next reconcile): %s",
+            exc,
+        )
+        return False
+
+
 def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     """Execute restart workflow: cleanup local state and re-run driver startup."""
     # Capture the twins whose driver containers we are about to tear down so
@@ -3255,20 +3339,27 @@ def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     if started > 0:
         _stop_bootstrap_edge_health_publisher()
 
+    worker_started = _start_worker_container_after_restart(
+        token, environment_uuid, fingerprint
+    )
+
     summary = {
         "environment_uuid": environment_uuid,
         "removed_twin_json_files": removed_json_files,
         "removed_driver_containers": removed_containers,
         "drivers_started": started,
         "drivers_discovered": len(results),
+        "worker_started": worker_started,
     }
     logger.info(
-        "Edge-core restart complete: env=%s removed_json=%d removed_containers=%d started=%d/%d",
+        "Edge-core restart complete: env=%s removed_json=%d removed_containers=%d "
+        "started=%d/%d worker_started=%s",
         environment_uuid,
         len(removed_json_files),
         len(removed_containers),
         started,
         len(results),
+        worker_started,
     )
     return summary
 
