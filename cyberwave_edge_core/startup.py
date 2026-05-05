@@ -2030,9 +2030,19 @@ def reconcile_driver_revival(
     Reads the driver health snapshot populated by
     :func:`reconcile_driver_health_for_worker` earlier in the same
     runtime-loop tick.  When at least one driver is in ``down`` state
-    (clean exit, removed by an external actor, etc.) and the debounce
-    window has elapsed, re-runs :func:`fetch_and_run_twin_drivers` to
-    recreate the missing containers.
+    (the container still exists but is not running — e.g. clean exit
+    via SIGTERM) and the debounce window has elapsed, re-runs
+    :func:`fetch_and_run_twin_drivers` to bring the missing container
+    back up.
+
+    **Fully removed containers are intentionally not revived.**  When a
+    driver is gone from Docker entirely (``docker rm -f``,
+    ``docker system prune``, manual cleanup) the health snapshot
+    reports status ``removed`` and this reconciler leaves it alone.
+    Removal is treated as an explicit operator signal — auto-respawning
+    would fight the operator on planned takedowns, image swaps, and
+    debug sessions.  To bring such a container back, restart edge-core
+    or re-link the twin.
 
     Only containers that this edge-core process is managing (tracked in
     ``_CONTAINER_TWIN_MAP``) are eligible for revival.  Stopped driver
