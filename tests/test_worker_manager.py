@@ -56,6 +56,46 @@ class TestWorkerManagerEnvVars:
         assert env["CYBERWAVE_TWIN_UUIDS"] == "twin-uuid-1,twin-uuid-2"
         assert env["CYBERWAVE_EDGE_CONFIG_DIR"] == "/app/.cyberwave"
 
+    def test_macos_worker_rewrites_localhost_base_url_for_container(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_get_runtime_env_var(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_BASE_URL":
+                return "http://localhost:8000"
+            return default
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            fake_get_runtime_env_var,
+        )
+        monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+        monkeypatch.setattr("os.environ", {})
+        monkeypatch.setattr(wm_module.platform, "system", lambda: "Darwin")
+
+        env = worker_manager._build_env_vars()
+
+        assert env["CYBERWAVE_BASE_URL"] == "http://host.docker.internal:8000"
+
+    def test_macos_worker_rewrites_localhost_mqtt_host_for_container(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_get_runtime_env_var(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_MQTT_HOST":
+                return "localhost"
+            return default
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            fake_get_runtime_env_var,
+        )
+        monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+        monkeypatch.setattr("os.environ", {})
+        monkeypatch.setattr(wm_module.platform, "system", lambda: "Darwin")
+
+        env = worker_manager._build_env_vars()
+
+        assert env["CYBERWAVE_MQTT_HOST"] == "host.docker.internal"
+
     def test_zenoh_connect_injected_when_set(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:

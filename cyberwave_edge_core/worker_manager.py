@@ -30,6 +30,10 @@ from .docker_helpers import (
     docker_rm,
     docker_stop,
 )
+from .docker_args import (
+    _rewrite_macos_container_base_url,
+    _rewrite_macos_container_hostname,
+)
 from .zenoh_config import ZenohConfig, build_zenoh_env_vars
 
 if TYPE_CHECKING:
@@ -506,7 +510,7 @@ class WorkerManager:
             env.setdefault("CYBERWAVE_TWIN_UUID", self._twin_uuids[0])
 
         base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-        env["CYBERWAVE_BASE_URL"] = base_url
+        env["CYBERWAVE_BASE_URL"] = _rewrite_macos_container_base_url(base_url)
 
         for mqtt_key in (
             "CYBERWAVE_MQTT_HOST",
@@ -516,6 +520,8 @@ class WorkerManager:
         ):
             mqtt_val = get_runtime_env_var(mqtt_key)
             if mqtt_val:
+                if mqtt_key == "CYBERWAVE_MQTT_HOST":
+                    mqtt_val = _rewrite_macos_container_hostname(mqtt_val)
                 env[mqtt_key] = mqtt_val
 
         # The Python SDK uses CYBERWAVE_API_KEY as the MQTT password.
