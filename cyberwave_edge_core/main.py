@@ -80,14 +80,29 @@ def run_sdk_selfcheck() -> int:
 def cli(ctx: click.Context) -> None:
     """Cyberwave Edge Core — orchestrator for edge components."""
     if ctx.invoked_subcommand is None:
+        from .resource_monitor import SystemResourceMonitor
+        from .watchdog import ProcessWatchdog, protect_edge_core_oom
+
         signal.signal(signal.SIGTERM, _sigterm_handler)
+
+        protect_edge_core_oom()
+        watchdog = ProcessWatchdog()
+        resource_monitor = SystemResourceMonitor()
+
         if not run_startup_checks():
             sys.exit(1)
+
+        watchdog.start()
         try:
-            run_runtime_loop()
+            run_runtime_loop(
+                watchdog=watchdog,
+                resource_monitor=resource_monitor,
+            )
         except KeyboardInterrupt:
             logger.info("Received KeyboardInterrupt, shutting down edge-core")
             shutdown_event.set()
+        finally:
+            watchdog.stop()
 
 
 @cli.command(name="__selfcheck_sdk", hidden=True)

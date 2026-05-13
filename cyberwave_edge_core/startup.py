@@ -746,7 +746,10 @@ def load_worker_resource_limits() -> "Optional[Any]":
     Reads ``CYBERWAVE_WORKER_CPU_PERCENT`` (float, percent of one CPU; e.g.
     ``100`` = 1 CPU core, ``200`` = 2 cores) and
     ``CYBERWAVE_WORKER_MEMORY_MB`` (int, MiB) from the resolved env.
-    Returns None when neither is set (Docker defaults apply).
+
+    When neither is explicitly set, auto-detects memory-constrained hosts
+    (<=4 GB) and applies a safe default limit to prevent the worker from
+    consuming all available memory and triggering the OOM killer.
     """
     from .worker_manager import ResourceLimits
 
@@ -769,9 +772,53 @@ def load_worker_resource_limits() -> "Optional[Any]":
             logger.warning("Invalid CYBERWAVE_WORKER_MEMORY_MB=%r; ignoring", mem_str)
 
     if cpu is None and mem is None:
+        auto_limits = _auto_detect_worker_memory_limit()
+        if auto_limits is not None:
+            return auto_limits
         return None
 
     return ResourceLimits(cpu_quota_percent=cpu, memory_mb=mem)
+
+
+def _auto_detect_worker_memory_limit() -> "Optional[Any]":
+    """Auto-detect and apply a memory limit on memory-constrained hosts.
+
+    On devices with <=4 GB total RAM (e.g. Raspberry Pi 4), running an ML
+    inference worker without a memory limit risks the OOM killer terminating
+    the edge-core orchestrator process.  This function reserves ~25% of
+    total memory for the OS and edge-core, capping the worker at the rest.
+
+    Opt out via ``CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT=false``.
+    """
+    from .resource_monitor import _read_memory_info
+    from .worker_manager import ResourceLimits
+
+    opt_out = (
+        get_runtime_env_var("CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT") or ""
+    ).lower()
+    if opt_out in ("0", "false", "no", "off"):
+        return None
+
+    mem_info = _read_memory_info()
+    if mem_info is None:
+        return None
+
+    total_mb = mem_info.total_mb
+    if total_mb > 4096:
+        return None
+
+    reserved_mb = max(512, total_mb * 0.25)
+    limit_mb = int(total_mb - reserved_mb)
+    limit_mb = max(256, limit_mb)
+
+    logger.info(
+        "Auto-detected memory-constrained host (total=%.0fMB); "
+        "setting worker container memory limit to %dMB "
+        "(override with CYBERWAVE_WORKER_MEMORY_MB)",
+        total_mb,
+        limit_mb,
+    )
+    return ResourceLimits(memory_mb=limit_mb)
 
 
 def get_runtime_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -4541,8 +4588,24 @@ _WORKER_SYNC_INTERVAL_LOOPS = int(
 _worker_sync_loop_counter = 0
 
 
-def run_runtime_loop() -> None:
-    """Keep edge-core alive and continuously reconcile driver log forwarding."""
+def run_runtime_loop(
+    *,
+    watchdog: Optional[Any] = None,
+    resource_monitor: Optional[Any] = None,
+) -> None:
+    """Keep edge-core alive and continuously reconcile driver log forwarding.
+
+    Parameters
+    ----------
+    watchdog:
+        Optional :class:`~cyberwave_edge_core.watchdog.ProcessWatchdog`
+        to ping each reconcile cycle so systemd and/or the hardware
+        watchdog know the process is alive.
+    resource_monitor:
+        Optional :class:`~cyberwave_edge_core.resource_monitor.SystemResourceMonitor`
+        to check host memory/temperature each cycle and log warnings
+        when resources are critically low.
+    """
     global _worker_sync_loop_counter
 
     logger.info(
@@ -4677,6 +4740,19 @@ def run_runtime_loop() -> None:
                     )
             except Exception:
                 logger.exception("Unexpected error during worker sync reconcile")
+
+        # -- Watchdog and resource monitoring at end of each cycle -----------
+        if watchdog is not None:
+            try:
+                watchdog.ping()
+            except Exception:
+                logger.debug("Watchdog ping failed", exc_info=True)
+
+        if resource_monitor is not None:
+            try:
+                resource_monitor.check()
+            except Exception:
+                logger.debug("Resource monitor check failed", exc_info=True)
 
         shutdown_event.wait(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
 

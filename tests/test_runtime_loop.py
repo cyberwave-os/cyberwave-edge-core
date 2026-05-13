@@ -221,3 +221,51 @@ class TestRuntimeLoopSyncCadence:
         self._stop_after(2, monkeypatch)
 
         startup.run_runtime_loop()
+
+    def test_watchdog_pinged_each_cycle(self, monkeypatch):
+        """Verify the watchdog is pinged every reconcile cycle."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        ping_count = [0]
+
+        class FakeWatchdog:
+            def ping(self):
+                ping_count[0] += 1
+
+        self._stop_after(3, monkeypatch)
+        startup.run_runtime_loop(watchdog=FakeWatchdog())
+
+        assert ping_count[0] == 3
+
+    def test_resource_monitor_checked_each_cycle(self, monkeypatch):
+        """Verify the resource monitor is checked every reconcile cycle."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        check_count = [0]
+
+        class FakeResourceMonitor:
+            def check(self):
+                check_count[0] += 1
+                return None
+
+        self._stop_after(3, monkeypatch)
+        startup.run_runtime_loop(resource_monitor=FakeResourceMonitor())
+
+        assert check_count[0] == 3
+
+    def test_watchdog_exception_does_not_crash_loop(self, monkeypatch):
+        """Verify a watchdog exception doesn't take down the loop."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        class FailingWatchdog:
+            def ping(self):
+                raise RuntimeError("watchdog ping boom")
+
+        self._stop_after(2, monkeypatch)
+        startup.run_runtime_loop(watchdog=FailingWatchdog())
