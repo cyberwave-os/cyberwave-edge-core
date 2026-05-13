@@ -3262,15 +3262,26 @@ def register_edge(token: str) -> bool:
         return False
 
 
-def _upload_host_facts_on_startup(token: str) -> bool:
-    """Refresh ``Edge.metadata['host_facts']`` via ``POST /api/v1/edges/discover``.
+# Period for the REST keepalive that bumps ``Edge.last_seen_at``. The
+# backend's "Standby" window is 90 s, so a 30 s cadence tolerates two
+# missed posts before the row drops to "Offline" — the same 3-strikes
+# rule we use elsewhere (e.g. MQTT debounce).
+HOST_FACTS_KEEPALIVE_PERIOD_SECONDS = 30.0
 
-    Called once at the end of :func:`run_startup_checks` so the backend has
-    fresh static host facts (total RAM, CPU model, ``/dev/watchdog``
-    presence, kernel, …) without waiting for the next CLI ``twin pair`` or
-    ``edge pull`` invocation.  Failure is non-fatal — the edge already
-    operates fine without these facts; we just lose the dashboard's
-    "what hardware is this" row until the next attempt.
+# Module-level singletons so repeat callers don't spawn duplicate
+# threads. The thread is a daemon so process exit doesn't hang on it.
+_HOST_FACTS_KEEPALIVE_THREAD: Optional[threading.Thread] = None
+_HOST_FACTS_KEEPALIVE_STOP: Optional[threading.Event] = None
+_HOST_FACTS_KEEPALIVE_LOCK = threading.Lock()
+
+
+def _post_host_facts_once(token: str) -> bool:
+    """Single ``POST /api/v1/edges/discover`` with current host facts.
+
+    Returns ``True`` when the call succeeded. Failure is non-fatal at
+    every call site: we just lose one keepalive cycle (the dashboard
+    will hold "Online/Standby" within its window) and the next 30 s
+    tick retries.
     """
     try:
         from cyberwave.edge.host_metrics import read_host_facts
@@ -3304,15 +3315,111 @@ def _upload_host_facts_on_startup(token: str) -> bool:
             platform=plat,
             host_facts=facts,
         )
-        logger.info("Uploaded host_facts (%d keys) for edge fingerprint=%s", len(facts), fingerprint)
+        logger.debug(
+            "Uploaded host_facts (%d keys) for edge fingerprint=%s",
+            len(facts),
+            fingerprint,
+        )
         return True
     except Exception as exc:
         logger.warning(
-            "Host facts upload failed (%s: %s); continuing startup",
+            "Host facts upload failed (%s: %s); will retry on next keepalive tick",
             type(exc).__name__,
             exc,
         )
         return False
+
+
+def _start_host_facts_keepalive(
+    token: str,
+    *,
+    period_seconds: float = HOST_FACTS_KEEPALIVE_PERIOD_SECONDS,
+) -> bool:
+    """Spawn (once) a daemon thread that re-POSTs host facts every ~30 s.
+
+    This is what powers the "Standby" state on the dashboard: the backend
+    bumps ``Edge.last_seen_at`` on every ``/discover`` call, and our
+    keepalive guarantees that signal stays fresh even when an edge has
+    no bound twins (so no MQTT ``edge_health`` is being published).
+
+    The thread is idempotent — repeat calls return immediately if a
+    keepalive is already running. Returns ``True`` when the keepalive is
+    scheduled (either by this call or already running).
+    """
+    global _HOST_FACTS_KEEPALIVE_THREAD, _HOST_FACTS_KEEPALIVE_STOP
+
+    with _HOST_FACTS_KEEPALIVE_LOCK:
+        existing = _HOST_FACTS_KEEPALIVE_THREAD
+        if existing is not None and existing.is_alive():
+            return True
+
+        stop_event = threading.Event()
+        _HOST_FACTS_KEEPALIVE_STOP = stop_event
+
+        def _loop() -> None:
+            # First tick comes after one period — the boot path already
+            # ran an upload in the foreground, no need to double-post on
+            # second 0.
+            while not stop_event.wait(timeout=period_seconds):
+                try:
+                    _post_host_facts_once(token)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Host facts keepalive tick raised: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+
+        thread = threading.Thread(
+            target=_loop,
+            name="cyberwave-edge-core.host-facts-keepalive",
+            daemon=True,
+        )
+        _HOST_FACTS_KEEPALIVE_THREAD = thread
+        thread.start()
+
+    logger.info(
+        "Started host-facts keepalive (period=%.0fs) — Edge.last_seen_at "
+        "will stay fresh independent of twin MQTT activity",
+        period_seconds,
+    )
+    return True
+
+
+def _stop_host_facts_keepalive() -> None:
+    """Signal the keepalive thread to stop. Test/teardown only."""
+    global _HOST_FACTS_KEEPALIVE_THREAD, _HOST_FACTS_KEEPALIVE_STOP
+    with _HOST_FACTS_KEEPALIVE_LOCK:
+        stop_event = _HOST_FACTS_KEEPALIVE_STOP
+        thread = _HOST_FACTS_KEEPALIVE_THREAD
+        _HOST_FACTS_KEEPALIVE_STOP = None
+        _HOST_FACTS_KEEPALIVE_THREAD = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=1.0)
+
+
+def _upload_host_facts_on_startup(token: str) -> bool:
+    """Refresh ``Edge.metadata['host_facts']`` and start the REST keepalive.
+
+    Called once near the end of :func:`run_startup_checks` to:
+
+    1. Synchronously POST host facts so the dashboard has fresh hardware
+       identity (CPU model, RAM total, watchdog presence, …) within the
+       startup pass — useful for the "Host facts ✓" startup log line.
+    2. Kick off a 30 s background keepalive that re-POSTs to ``/discover``
+       so the backend keeps ``Edge.last_seen_at`` fresh. That field is
+       what distinguishes "edge daemon alive, no twin work" (Standby)
+       from "edge daemon dead" (Offline) on the dashboard's three-state
+       pill.
+
+    Failure of the initial upload is non-fatal — the keepalive thread is
+    started regardless so the next tick re-attempts cleanly.
+    """
+    ok = _post_host_facts_once(token)
+    _start_host_facts_keepalive(token)
+    return ok
 
 
 def _build_cyberwave_client(token: str) -> Cyberwave:

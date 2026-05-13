@@ -556,9 +556,19 @@ Edge Core augments every `cyberwave/twin/{uuid}/edge_health` heartbeat with the 
 
 Only the bootstrap publisher on the edge host injects these fields. Driver containers see their container's `/proc`, not the host's, so they intentionally omit the host block and publish only stream-level health.
 
-**Static (REST `POST /api/v1/edges/discover` once at startup):**
+**Static (REST `POST /api/v1/edges/discover`, every ~30 s):**
 
-Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, and `/dev/watchdog` availability — into `Edge.metadata['host_facts']`. The dashboard reads it once via `useEdges()` to render the "what hardware is this" row alongside the live pressure pill. The call is best-effort: a failure logs a warning and continues startup, since the edge already operates without these facts.
+Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, and `/dev/watchdog` availability — into `Edge.metadata['host_facts']`. The first POST runs synchronously during startup so the dashboard sees the "what hardware is this" row immediately. A background daemon thread then re-POSTs the same payload every ~30 s. The call is idempotent (it upserts `Edge.metadata['host_facts']` and bumps `Edge.last_seen_at`), so the keepalive cost is one tiny round-trip per edge regardless of how many bound twins the edge has — or whether it has any at all.
+
+That `Edge.last_seen_at` field is what powers the three-state dashboard pill:
+
+| State | Trigger | Meaning |
+| --- | --- | --- |
+| **Online** | `Edge.last_heartbeat` fresh (≤60 s) | A bound twin is publishing MQTT `edge_health`. |
+| **Standby** | `Edge.last_seen_at` fresh (≤90 s) but no recent MQTT | Edge Core daemon is alive and posting REST keepalives; no twin is doing work. |
+| **Offline** | Neither signal within window | Process is down, or partitioned from both transports. |
+
+The 30 s cadence is deliberately tighter than the 90 s Standby window so a single missed POST (slow DNS, transient TLS handshake) doesn't drop the row to Offline — three missed POSTs do. Failure of any individual upload logs at `debug` and falls through to the next tick.
 
 Coverage per platform:
 
