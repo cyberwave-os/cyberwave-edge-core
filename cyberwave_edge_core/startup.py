@@ -789,8 +789,15 @@ def _auto_detect_worker_memory_limit() -> "Optional[Any]":
     total memory for the OS and edge-core, capping the worker at the rest.
 
     Opt out via ``CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT=false``.
+
+    Known limitation: ``/proc/meminfo`` reports the **host** total even
+    when edge-core runs inside a cgroup-constrained container, so this
+    function may misclassify edge-core-in-a-container hosts.  We don't
+    run edge-core in a container today; if that changes, add a fallback
+    that reads ``/sys/fs/cgroup/memory.max`` (cgroup v2) or
+    ``memory.limit_in_bytes`` (cgroup v1) and uses the smaller value.
     """
-    from .resource_monitor import _read_memory_info
+    from .resource_monitor import read_memory_info
     from .worker_manager import ResourceLimits
 
     opt_out = (
@@ -799,7 +806,7 @@ def _auto_detect_worker_memory_limit() -> "Optional[Any]":
     if opt_out in ("0", "false", "no", "off"):
         return None
 
-    mem_info = _read_memory_info()
+    mem_info = read_memory_info()
     if mem_info is None:
         return None
 

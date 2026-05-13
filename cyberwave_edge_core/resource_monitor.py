@@ -1,5 +1,13 @@
 """System resource monitoring for Cyberwave Edge Core.
 
+Scope: monitors **host-level** memory and CPU temperature so the operator
+can correlate OOM kills / thermal throttling with edge-core or worker
+restarts.  This is independent of:
+
+- ``cyberwave_edge_core.worker_health`` (per-container health probes), and
+- ``cyberwave_cli.commands.edge.bench`` / ``cyberwave_cli.monitor`` (one-shot
+  diagnostic readers in the CLI).
+
 Provides lightweight, non-blocking monitoring of host system resources
 (memory, CPU temperature) to detect conditions that could cause edge-core
 or its managed containers to be killed by the OS.
@@ -11,12 +19,14 @@ running ML inference workloads.
 from __future__ import annotations
 
 import logging
-import os
-import platform
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
+
+from cyberwave.edge.host_metrics import (
+    read_host_cpu_temperature,
+    read_host_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,79 +106,45 @@ class ResourceSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# Low-level readers (Linux /proc and /sys)
+# Threshold-aware readers
 # ---------------------------------------------------------------------------
+#
+# The low-level parsing of ``/proc/meminfo`` and ``/sys/class/thermal`` lives
+# in :mod:`cyberwave.edge.host_metrics` so that the CLI (``cyberwave edge
+# bench`` and ``cyberwave monitor``) can share the same primitives.  Here we
+# only add the edge-core-specific severity layer (the warning/critical
+# thresholds defined above) by wrapping the SDK's plain data carriers.
 
 
-def _read_memory_info() -> Optional[MemoryInfo]:
-    """Parse ``/proc/meminfo`` for total and available memory."""
-    if platform.system() != "Linux":
-        return None
-    try:
-        fields: dict[str, int] = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2 and parts[0].rstrip(":") in (
-                    "MemTotal",
-                    "MemAvailable",
-                    "MemFree",
-                    "Buffers",
-                    "Cached",
-                ):
-                    fields[parts[0].rstrip(":")] = int(parts[1])
+def read_memory_info() -> Optional[MemoryInfo]:
+    """Return a threshold-aware memory snapshot, or ``None`` if unavailable.
 
-        total_kb = fields.get("MemTotal", 0)
-        available_kb = fields.get("MemAvailable")
-        if available_kb is None:
-            available_kb = (
-                fields.get("MemFree", 0)
-                + fields.get("Buffers", 0)
-                + fields.get("Cached", 0)
-            )
-
-        if total_kb == 0:
-            return None
-
-        total_mb = total_kb / 1024.0
-        available_mb = available_kb / 1024.0
-        used_percent = (1.0 - available_mb / total_mb) * 100.0
-
-        return MemoryInfo(
-            total_mb=round(total_mb, 1),
-            available_mb=round(available_mb, 1),
-            used_percent=round(used_percent, 1),
-        )
-    except OSError:
-        return None
-
-
-def _read_cpu_temperature() -> Optional[CpuTemperature]:
-    """Read CPU temperature from sysfs thermal zones.
-
-    Works on Raspberry Pi (``/sys/class/thermal/thermal_zone0/temp``)
-    and most other Linux SBCs.
+    Delegates ``/proc/meminfo`` parsing to
+    :func:`cyberwave.edge.host_metrics.read_host_memory` and wraps the
+    result with edge-core's warning/critical thresholds.
     """
-    if platform.system() != "Linux":
+    raw = read_host_memory()
+    if raw is None:
         return None
+    return MemoryInfo(
+        total_mb=raw.total_mb,
+        available_mb=raw.available_mb,
+        used_percent=raw.used_percent,
+    )
 
-    thermal_paths = [
-        ("/sys/class/thermal/thermal_zone0/temp", "thermal_zone0"),
-        ("/sys/devices/virtual/thermal/thermal_zone0/temp", "thermal_zone0"),
-    ]
 
-    for path_str, source in thermal_paths:
-        path = Path(path_str)
-        if path.exists():
-            try:
-                raw = path.read_text().strip()
-                millidegrees = int(raw)
-                celsius = millidegrees / 1000.0
-                return CpuTemperature(celsius=round(celsius, 1), source=source)
-            except (ValueError, OSError):
-                continue
+def read_cpu_temperature() -> Optional[CpuTemperature]:
+    """Return a threshold-aware CPU temperature reading, or ``None``.
 
-    return None
+    Delegates sysfs thermal-zone discovery and reading to
+    :func:`cyberwave.edge.host_metrics.read_host_cpu_temperature`, which
+    enumerates ``/sys/class/thermal/thermal_zone*``, prefers CPU-typed
+    zones and returns the hottest matching reading.
+    """
+    raw = read_host_cpu_temperature()
+    if raw is None:
+        return None
+    return CpuTemperature(celsius=raw.celsius, source=raw.source)
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +181,8 @@ class SystemResourceMonitor:
         self._last_check = now
         snapshot = ResourceSnapshot(
             timestamp=time.time(),
-            memory=_read_memory_info(),
-            cpu_temp=_read_cpu_temperature(),
+            memory=read_memory_info(),
+            cpu_temp=read_cpu_temperature(),
         )
         self._last_snapshot = snapshot
         self._log_resource_state(snapshot, now)
@@ -219,25 +195,6 @@ class SystemResourceMonitor:
     @property
     def consecutive_critical_count(self) -> int:
         return self._consecutive_critical
-
-    def suggest_worker_memory_limit_mb(self) -> Optional[int]:
-        """Suggest a memory limit for the worker container.
-
-        On devices with 4 GB or less, suggests reserving ~25% for the OS
-        and edge-core, giving the rest to the worker container.  Returns
-        None when total memory is unknown or above 8 GB (where limits are
-        less critical).
-        """
-        if self._last_snapshot is None or self._last_snapshot.memory is None:
-            return None
-
-        total_mb = self._last_snapshot.memory.total_mb
-        if total_mb > 8192:
-            return None
-
-        reserved_mb = max(512, total_mb * 0.25)
-        limit = int(total_mb - reserved_mb)
-        return max(256, limit)
 
     def _log_resource_state(self, snapshot: ResourceSnapshot, now: float) -> None:
         """Log warnings/criticals with rate-limiting to avoid log spam."""

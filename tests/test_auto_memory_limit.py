@@ -14,16 +14,14 @@ from cyberwave_edge_core.resource_monitor import MemoryInfo
 
 class TestAutoDetectWorkerMemoryLimit:
     def test_returns_none_when_no_memory_info(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            "cyberwave_edge_core.resource_monitor._read_memory_info", lambda: None
-        )
+        monkeypatch.setattr("cyberwave_edge_core.resource_monitor.read_memory_info", lambda: None)
         monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **kw: None)
         result = startup._auto_detect_worker_memory_limit()
         assert result is None
 
     def test_returns_none_for_large_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            "cyberwave_edge_core.resource_monitor._read_memory_info",
+            "cyberwave_edge_core.resource_monitor.read_memory_info",
             lambda: MemoryInfo(total_mb=16384, available_mb=12000, used_percent=27.0),
         )
         monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **kw: None)
@@ -32,7 +30,7 @@ class TestAutoDetectWorkerMemoryLimit:
 
     def test_returns_limits_for_pi4_sized_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            "cyberwave_edge_core.resource_monitor._read_memory_info",
+            "cyberwave_edge_core.resource_monitor.read_memory_info",
             lambda: MemoryInfo(total_mb=3800, available_mb=2000, used_percent=47.0),
         )
         monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **kw: None)
@@ -44,7 +42,7 @@ class TestAutoDetectWorkerMemoryLimit:
 
     def test_opt_out_via_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            "cyberwave_edge_core.resource_monitor._read_memory_info",
+            "cyberwave_edge_core.resource_monitor.read_memory_info",
             lambda: MemoryInfo(total_mb=3800, available_mb=2000, used_percent=47.0),
         )
 
@@ -61,7 +59,7 @@ class TestAutoDetectWorkerMemoryLimit:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "cyberwave_edge_core.resource_monitor._read_memory_info",
+            "cyberwave_edge_core.resource_monitor.read_memory_info",
             lambda: MemoryInfo(total_mb=2048, available_mb=1024, used_percent=50.0),
         )
         monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **kw: None)

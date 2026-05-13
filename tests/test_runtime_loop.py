@@ -4,6 +4,7 @@ Covers:
   1. _reconcile_worker_watcher() — lazy creation, reuse, early returns, method calls
   2. run_runtime_loop() — periodic sync cadence, exception resilience
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -258,14 +259,20 @@ class TestRuntimeLoopSyncCadence:
         assert check_count[0] == 3
 
     def test_watchdog_exception_does_not_crash_loop(self, monkeypatch):
-        """Verify a watchdog exception doesn't take down the loop."""
+        """Verify a watchdog exception doesn't take down the loop and that
+        the loop keeps trying to ping on subsequent cycles."""
         self._patch_loop_deps(monkeypatch)
         monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
         startup._worker_sync_loop_counter = 0
 
+        ping_count = [0]
+
         class FailingWatchdog:
             def ping(self):
+                ping_count[0] += 1
                 raise RuntimeError("watchdog ping boom")
 
         self._stop_after(2, monkeypatch)
         startup.run_runtime_loop(watchdog=FailingWatchdog())
+
+        assert ping_count[0] == 2

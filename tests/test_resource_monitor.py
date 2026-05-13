@@ -4,10 +4,9 @@ Covers:
 - MemoryInfo data class properties
 - CpuTemperature data class properties
 - ResourceSnapshot health/warning states
-- _read_memory_info parsing
-- _read_cpu_temperature reading
+- read_memory_info parsing
+- read_cpu_temperature reading
 - SystemResourceMonitor check and throttling
-- SystemResourceMonitor.suggest_worker_memory_limit_mb
 """
 
 from __future__ import annotations
@@ -15,23 +14,21 @@ from __future__ import annotations
 import platform
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from cyberwave_edge_core.resource_monitor import (
-    MEMORY_CRITICAL_PERCENT,
-    MEMORY_WARNING_PERCENT,
     CPU_TEMP_CRITICAL_C,
     CPU_TEMP_WARNING_C,
+    MEMORY_CRITICAL_PERCENT,
+    MEMORY_WARNING_PERCENT,
     CpuTemperature,
     MemoryInfo,
     ResourceSnapshot,
     SystemResourceMonitor,
-    _read_cpu_temperature,
-    _read_memory_info,
+    read_cpu_temperature,
+    read_memory_info,
 )
-
 
 # ---------------------------------------------------------------------------
 # MemoryInfo
@@ -45,16 +42,12 @@ class TestMemoryInfo:
         assert mi.is_critical is False
 
     def test_warning_at_threshold(self) -> None:
-        mi = MemoryInfo(
-            total_mb=4096, available_mb=600, used_percent=MEMORY_WARNING_PERCENT
-        )
+        mi = MemoryInfo(total_mb=4096, available_mb=600, used_percent=MEMORY_WARNING_PERCENT)
         assert mi.is_warning is True
         assert mi.is_critical is False
 
     def test_critical_at_threshold(self) -> None:
-        mi = MemoryInfo(
-            total_mb=4096, available_mb=300, used_percent=MEMORY_CRITICAL_PERCENT
-        )
+        mi = MemoryInfo(total_mb=4096, available_mb=300, used_percent=MEMORY_CRITICAL_PERCENT)
         assert mi.is_warning is True
         assert mi.is_critical is True
 
@@ -120,18 +113,50 @@ class TestResourceSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# _read_memory_info
+# read_memory_info
 # ---------------------------------------------------------------------------
 
 
 class TestReadMemoryInfo:
+    """Tests for the threshold-aware memory wrapper.
+
+    ``/proc/meminfo`` parsing semantics (MemAvailable fallback, malformed
+    input, etc.) are covered exhaustively in the SDK's
+    ``test_host_metrics.py``.  The cases here verify that the edge-core
+    wrapper:
+
+    1. forwards ``None`` from the SDK reader,
+    2. preserves field values without re-rounding, and
+    3. attaches the threshold properties.
+    """
+
+    def test_returns_none_when_sdk_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.resource_monitor as rm_mod
+
+        monkeypatch.setattr(rm_mod, "read_host_memory", lambda: None)
+        assert read_memory_info() is None
+
+    def test_wraps_sdk_result_with_thresholds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cyberwave.edge.host_metrics import HostMemoryInfo
+
+        import cyberwave_edge_core.resource_monitor as rm_mod
+
+        sdk_result = HostMemoryInfo(total_mb=4096.0, available_mb=200.0, used_percent=95.0)
+        monkeypatch.setattr(rm_mod, "read_host_memory", lambda: sdk_result)
+
+        result = read_memory_info()
+        assert result is not None
+        assert result.total_mb == 4096.0
+        assert result.available_mb == 200.0
+        assert result.used_percent == 95.0
+        assert result.is_warning is True
+        assert result.is_critical is True
+
     def test_returns_none_on_non_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
-        assert _read_memory_info() is None
+        assert read_memory_info() is None
 
-    def test_parses_meminfo(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
+    def test_parses_meminfo(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setattr(platform, "system", lambda: "Linux")
         meminfo_content = (
             "MemTotal:        3906292 kB\n"
@@ -143,8 +168,6 @@ class TestReadMemoryInfo:
         meminfo_path = tmp_path / "meminfo"
         meminfo_path.write_text(meminfo_content)
 
-        import cyberwave_edge_core.resource_monitor as rm_mod
-
         original_open = open
 
         def fake_open(path, *args, **kwargs):
@@ -154,7 +177,7 @@ class TestReadMemoryInfo:
 
         monkeypatch.setattr("builtins.open", fake_open)
 
-        result = _read_memory_info()
+        result = read_memory_info()
         assert result is not None
         assert result.total_mb == pytest.approx(3906292 / 1024, abs=1)
         assert result.available_mb == pytest.approx(1024000 / 1024, abs=1)
@@ -162,14 +185,41 @@ class TestReadMemoryInfo:
 
 
 # ---------------------------------------------------------------------------
-# _read_cpu_temperature
+# read_cpu_temperature
 # ---------------------------------------------------------------------------
 
 
 class TestReadCpuTemperature:
-    def test_returns_none_on_non_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(platform, "system", lambda: "Darwin")
-        assert _read_cpu_temperature() is None
+    """Tests for the threshold-aware wrapper around the SDK reader.
+
+    Zone-discovery semantics (CPU-typed zone preference, multi-zone max,
+    fallback to all zones) are covered exhaustively in the SDK's
+    ``test_host_metrics.py`` — here we only verify that the wrapper
+    translates the SDK's result into the edge-core ``CpuTemperature``
+    type (with thresholds) and forwards ``None``.
+    """
+
+    def test_returns_none_when_sdk_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.resource_monitor as rm_mod
+
+        monkeypatch.setattr(rm_mod, "read_host_cpu_temperature", lambda: None)
+        assert read_cpu_temperature() is None
+
+    def test_wraps_sdk_result_with_thresholds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cyberwave.edge.host_metrics import HostCpuTemperature
+
+        import cyberwave_edge_core.resource_monitor as rm_mod
+
+        sdk_result = HostCpuTemperature(celsius=83.0, source="thermal_zone1:coretemp")
+        monkeypatch.setattr(rm_mod, "read_host_cpu_temperature", lambda: sdk_result)
+
+        result = read_cpu_temperature()
+        assert result is not None
+        assert result.celsius == pytest.approx(83.0)
+        assert result.source == "thermal_zone1:coretemp"
+        # Threshold properties are still applied by the wrapper.
+        assert result.is_warning is True
+        assert result.is_critical is True
 
 
 # ---------------------------------------------------------------------------
@@ -178,20 +228,45 @@ class TestReadCpuTemperature:
 
 
 class TestSystemResourceMonitor:
-    def test_check_returns_none_on_throttle(self) -> None:
-        monitor = SystemResourceMonitor()
-        monitor._last_check = time.monotonic()
-        result = monitor.check()
-        assert result is monitor._last_snapshot
-
-    def test_check_returns_snapshot_after_interval(
+    def test_check_returns_cached_snapshot_on_throttle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """When called within the throttle window, ``check()`` returns the
+        cached ``_last_snapshot`` and does *not* re-read /proc/meminfo or
+        the thermal sysfs."""
+        import cyberwave_edge_core.resource_monitor as rm_mod
+
+        read_count = [0]
+        temp_count = [0]
+
+        def fake_read_mem() -> None:
+            read_count[0] += 1
+            return None
+
+        def fake_read_temp() -> None:
+            temp_count[0] += 1
+            return None
+
+        monkeypatch.setattr(rm_mod, "read_memory_info", fake_read_mem)
+        monkeypatch.setattr(rm_mod, "read_cpu_temperature", fake_read_temp)
+
+        monitor = SystemResourceMonitor()
+        # Pretend we just checked, so the next call is throttled.
+        monitor._last_check = time.monotonic()
+        sentinel = ResourceSnapshot(timestamp=0.0, memory=None, cpu_temp=None)
+        monitor._last_snapshot = sentinel
+
+        result = monitor.check()
+        assert result is sentinel
+        assert read_count[0] == 0
+        assert temp_count[0] == 0
+
+    def test_check_returns_snapshot_after_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import cyberwave_edge_core.resource_monitor as rm_mod
 
         monkeypatch.setattr(rm_mod, "MONITOR_CHECK_INTERVAL_SECONDS", 0.0)
-        monkeypatch.setattr(rm_mod, "_read_memory_info", lambda: None)
-        monkeypatch.setattr(rm_mod, "_read_cpu_temperature", lambda: None)
+        monkeypatch.setattr(rm_mod, "read_memory_info", lambda: None)
+        monkeypatch.setattr(rm_mod, "read_cpu_temperature", lambda: None)
 
         monitor = SystemResourceMonitor()
         result = monitor.check()
@@ -199,41 +274,16 @@ class TestSystemResourceMonitor:
         assert result.memory is None
         assert result.cpu_temp is None
 
-    def test_suggest_worker_memory_limit_for_small_device(self) -> None:
-        monitor = SystemResourceMonitor()
-        monitor._last_snapshot = ResourceSnapshot(
-            timestamp=time.time(),
-            memory=MemoryInfo(total_mb=3800, available_mb=2000, used_percent=47.0),
-            cpu_temp=None,
-        )
-
-        limit = monitor.suggest_worker_memory_limit_mb()
-        assert limit is not None
-        assert 2500 < limit < 3800
-
-    def test_suggest_worker_memory_limit_returns_none_for_large_device(self) -> None:
-        monitor = SystemResourceMonitor()
-        monitor._last_snapshot = ResourceSnapshot(
-            timestamp=time.time(),
-            memory=MemoryInfo(total_mb=16384, available_mb=12000, used_percent=27.0),
-            cpu_temp=None,
-        )
-
-        limit = monitor.suggest_worker_memory_limit_mb()
-        assert limit is None
-
-    def test_consecutive_critical_tracking(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_consecutive_critical_tracking(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import cyberwave_edge_core.resource_monitor as rm_mod
 
         monkeypatch.setattr(rm_mod, "MONITOR_CHECK_INTERVAL_SECONDS", 0.0)
         monkeypatch.setattr(
             rm_mod,
-            "_read_memory_info",
+            "read_memory_info",
             lambda: MemoryInfo(total_mb=4096, available_mb=200, used_percent=95.0),
         )
-        monkeypatch.setattr(rm_mod, "_read_cpu_temperature", lambda: None)
+        monkeypatch.setattr(rm_mod, "read_cpu_temperature", lambda: None)
 
         monitor = SystemResourceMonitor()
         monitor.check()
@@ -242,9 +292,7 @@ class TestSystemResourceMonitor:
         monitor.check()
         assert monitor.consecutive_critical_count == 2
 
-    def test_consecutive_critical_resets_on_healthy(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_consecutive_critical_resets_on_healthy(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import cyberwave_edge_core.resource_monitor as rm_mod
 
         monkeypatch.setattr(rm_mod, "MONITOR_CHECK_INTERVAL_SECONDS", 0.0)
@@ -254,10 +302,10 @@ class TestSystemResourceMonitor:
 
         monkeypatch.setattr(
             rm_mod,
-            "_read_memory_info",
+            "read_memory_info",
             lambda: MemoryInfo(total_mb=4096, available_mb=2048, used_percent=50.0),
         )
-        monkeypatch.setattr(rm_mod, "_read_cpu_temperature", lambda: None)
+        monkeypatch.setattr(rm_mod, "read_cpu_temperature", lambda: None)
 
         monitor.check()
         assert monitor.consecutive_critical_count == 0

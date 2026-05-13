@@ -81,6 +81,7 @@ def cli(ctx: click.Context) -> None:
     """Cyberwave Edge Core — orchestrator for edge components."""
     if ctx.invoked_subcommand is None:
         from .resource_monitor import SystemResourceMonitor
+        from .startup import LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS
         from .watchdog import ProcessWatchdog, protect_edge_core_oom
 
         signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -92,7 +93,7 @@ def cli(ctx: click.Context) -> None:
         if not run_startup_checks():
             sys.exit(1)
 
-        watchdog.start()
+        watchdog.start(ping_interval_seconds=LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
         try:
             run_runtime_loop(
                 watchdog=watchdog,

@@ -1,5 +1,11 @@
 """Process-level watchdog and OOM protection for Cyberwave Edge Core.
 
+Scope: this module is the **orchestrator/host-level** watchdog.  It is
+**not** the per-driver in-process command/teleop watchdog (see
+``cyberwave-edge-nodes`` and ``cyberwave-edge-runtime`` for those — same
+term, different layer) and it is **not** the worker container health
+monitor (see :mod:`cyberwave_edge_core.worker_health`).
+
 Provides three layers of resilience for edge devices running under heavy load
 (e.g. Raspberry Pi 4 with YOLO inference):
 
@@ -38,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 _NOTIFY_SOCKET: Optional[str] = os.environ.get("NOTIFY_SOCKET")
 _WATCHDOG_USEC: Optional[int] = None
+_WATCHDOG_PID: Optional[int] = None
 
 if os.environ.get("WATCHDOG_USEC"):
     try:
@@ -45,10 +52,35 @@ if os.environ.get("WATCHDOG_USEC"):
     except ValueError:
         pass
 
+if os.environ.get("WATCHDOG_PID"):
+    try:
+        _WATCHDOG_PID = int(os.environ["WATCHDOG_PID"])
+    except ValueError:
+        pass
+
+
+def _is_designated_watchdog_pid() -> bool:
+    """Return True when this process is the systemd-designated notifier.
+
+    Per ``sd_notify(3)``, ``WATCHDOG=1`` and related notifications should only
+    originate from the process whose PID matches ``$WATCHDOG_PID`` (defaulting
+    to the main service PID when unset).  This guards against subprocesses
+    that accidentally import this module from sending pings.
+    """
+    if _WATCHDOG_PID is None:
+        return True
+    return _WATCHDOG_PID == os.getpid()
+
 
 def _sd_notify(state: str) -> None:
-    """Send a notification to the systemd notify socket (best-effort)."""
+    """Send a notification to the systemd notify socket (best-effort).
+
+    Skipped silently when this process is not the systemd-designated notifier
+    (see :func:`_is_designated_watchdog_pid`).
+    """
     if not _NOTIFY_SOCKET:
+        return
+    if not _is_designated_watchdog_pid():
         return
     addr = _NOTIFY_SOCKET
     if addr.startswith("@"):
@@ -104,9 +136,9 @@ class SystemdWatchdog:
 # ---------------------------------------------------------------------------
 
 _WATCHDOG_DEV = "/dev/watchdog"
+# Only the ``SETTIMEOUT`` ioctl is used; ``KEEPALIVE`` is replaced by a plain
+# ``write(1)`` and ``GETSUPPORT`` is unused.  See ``linux/watchdog.h``.
 _WDIOC_SETTIMEOUT = 0xC0045706
-_WDIOC_KEEPALIVE = 0x80045705
-_WDIOC_GETSUPPORT = 0x81045700
 
 
 class HardwareWatchdog:
@@ -122,7 +154,7 @@ class HardwareWatchdog:
     so a graceful shutdown does not trigger a reboot.
     """
 
-    def __init__(self, *, timeout_seconds: int = 30) -> None:
+    def __init__(self, *, timeout_seconds: int = 60) -> None:
         self._fd: Optional[int] = None
         self._timeout = timeout_seconds
         self.enabled = False
@@ -218,7 +250,7 @@ class ProcessWatchdog:
         wd.stop()            # called during graceful shutdown
     """
 
-    def __init__(self, *, hardware_watchdog_timeout: int = 30) -> None:
+    def __init__(self, *, hardware_watchdog_timeout: int = 60) -> None:
         self.systemd = SystemdWatchdog()
         self.hardware = HardwareWatchdog(timeout_seconds=hardware_watchdog_timeout)
 
@@ -226,8 +258,16 @@ class ProcessWatchdog:
     def any_enabled(self) -> bool:
         return self.systemd.enabled or self.hardware.enabled
 
-    def start(self) -> None:
-        """Initialise both watchdog layers and signal readiness."""
+    def start(self, *, ping_interval_seconds: Optional[float] = None) -> None:
+        """Initialise both watchdog layers and signal readiness.
+
+        ``ping_interval_seconds`` is the cadence at which the caller intends
+        to invoke :meth:`ping`.  When supplied, it is compared against the
+        systemd-recommended interval (half of ``WatchdogSec``) and a warning
+        is logged if the caller pings too slowly — a useful sanity check
+        against future config drift where the runtime loop or
+        ``WatchdogSec`` are changed independently.
+        """
         self.hardware.open()
         self.systemd.notify_ready()
         if self.any_enabled:
@@ -237,6 +277,21 @@ class ProcessWatchdog:
             if self.hardware.enabled:
                 layers.append("hardware")
             logger.info("Watchdog started (layers: %s)", ", ".join(layers))
+
+        if (
+            ping_interval_seconds is not None
+            and self.systemd.enabled
+            and self.systemd.recommended_interval_seconds > 0
+            and ping_interval_seconds > self.systemd.recommended_interval_seconds
+        ):
+            logger.warning(
+                "Reconcile interval (%.1fs) exceeds half of WatchdogSec (%.1fs); "
+                "systemd may declare the service hung before a ping arrives — "
+                "increase WatchdogSec or decrease the loop interval",
+                ping_interval_seconds,
+                self.systemd.recommended_interval_seconds,
+            )
+
         self.ping()
 
     def ping(self) -> None:
@@ -282,7 +337,11 @@ def protect_edge_core_oom(score_adj: int = -800) -> None:
     try:
         score_adj = max(-1000, min(1000, score_adj))
         oom_path.write_text(str(score_adj))
-        logger.info("OOM score adjusted to %d for edge-core process (pid=%d)", score_adj, os.getpid())
+        logger.info(
+            "OOM score adjusted to %d for edge-core process (pid=%d)",
+            score_adj,
+            os.getpid(),
+        )
     except PermissionError:
         logger.debug(
             "Cannot adjust OOM score (requires root); "

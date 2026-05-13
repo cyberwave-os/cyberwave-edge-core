@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import platform
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -22,7 +21,6 @@ from cyberwave_edge_core.watchdog import (
     SystemdWatchdog,
     protect_edge_core_oom,
 )
-
 
 # ---------------------------------------------------------------------------
 # SystemdWatchdog
@@ -83,6 +81,52 @@ class TestSystemdWatchdog:
         sd = SystemdWatchdog()
         sd.notify_stopping()
         assert "STOPPING=1" in sent
+
+    def test_sd_notify_skipped_when_pid_mismatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``_sd_notify`` must not send when this PID is not WATCHDOG_PID."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[bytes] = []
+
+        class FakeSocket:
+            def __init__(self, *a: object, **kw: object) -> None:
+                pass
+
+            def sendto(self, data: bytes, addr: object) -> None:
+                sent.append(data)
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid() + 1)
+        monkeypatch.setattr(wd_mod.socket, "socket", lambda *a, **kw: FakeSocket())
+
+        wd_mod._sd_notify("WATCHDOG=1")
+        assert sent == []
+
+    def test_sd_notify_sends_when_pid_matches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``_sd_notify`` sends when WATCHDOG_PID matches current PID."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[bytes] = []
+
+        class FakeSocket:
+            def __init__(self, *a: object, **kw: object) -> None:
+                pass
+
+            def sendto(self, data: bytes, addr: object) -> None:
+                sent.append(data)
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid())
+        monkeypatch.setattr(wd_mod.socket, "socket", lambda *a, **kw: FakeSocket())
+
+        wd_mod._sd_notify("WATCHDOG=1")
+        assert sent == [b"WATCHDOG=1"]
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +211,7 @@ class TestProtectEdgeCoreOom:
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
         protect_edge_core_oom()
 
-    def test_writes_oom_score_adj(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
+    def test_writes_oom_score_adj(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setattr(platform, "system", lambda: "Linux")
 
         oom_file = tmp_path / "oom_score_adj"
@@ -179,16 +221,40 @@ class TestProtectEdgeCoreOom:
 
         original_path_class = Path
 
-        class FakePath(type(Path())):
-            def __new__(cls, *args, **kwargs):
-                return super().__new__(cls, *args, **kwargs)
-
         monkeypatch.setattr(
             wd_mod,
             "Path",
-            lambda p: original_path_class(str(oom_file))
-            if "oom_score_adj" in str(p)
-            else original_path_class(p),
+            lambda p: (
+                original_path_class(str(oom_file))
+                if "oom_score_adj" in str(p)
+                else original_path_class(p)
+            ),
         )
 
         protect_edge_core_oom(score_adj=-800)
+        assert oom_file.read_text() == "-800"
+
+    def test_clamps_oom_score_adj_to_valid_range(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Out-of-range values are clamped to [-1000, 1000]."""
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+        oom_file = tmp_path / "oom_score_adj"
+        oom_file.write_text("0")
+
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        original_path_class = Path
+        monkeypatch.setattr(
+            wd_mod,
+            "Path",
+            lambda p: (
+                original_path_class(str(oom_file))
+                if "oom_score_adj" in str(p)
+                else original_path_class(p)
+            ),
+        )
+
+        protect_edge_core_oom(score_adj=-5000)
+        assert oom_file.read_text() == "-1000"
