@@ -1485,6 +1485,78 @@ class TestBuildDriverLogPayload:
         assert "driver_image" not in payload
 
 
+class TestBuildHostMetricsProvider:
+    """The bootstrap publisher hands a closure to the SDK; verify what it returns.
+
+    These tests pin the publish-side contract: which keys land on
+    ``edge_health`` and in what shape.  The SDK's ``EdgeHealthCheck`` is
+    covered separately under ``cyberwave-python/tests/test_edge_health.py``.
+    """
+
+    def test_returns_none_when_both_monitors_absent(self) -> None:
+        assert startup._build_host_metrics_provider(None, None) is None
+
+    def test_includes_snapshot_dict_and_consecutive_counter(self) -> None:
+        class _FakeSnap:
+            def to_publish_dict(self) -> dict[str, float]:
+                return {"host_memory_percent": 64.2, "cpu_temp_c": 58.7}
+
+        class _FakeMonitor:
+            last_snapshot = _FakeSnap()
+            consecutive_critical_count = 0
+
+        provider = startup._build_host_metrics_provider(_FakeMonitor(), None)
+        assert provider is not None
+        out = provider()
+        assert out["host_memory_percent"] == 64.2
+        assert out["cpu_temp_c"] == 58.7
+        assert out["consecutive_critical"] == 0
+
+    def test_includes_watchdog_layers(self) -> None:
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return ["systemd", "hardware"]
+
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+        assert provider() == {"watchdog_layers": ["systemd", "hardware"]}
+
+    def test_tolerates_monitor_without_snapshot(self) -> None:
+        """``last_snapshot is None`` happens before the first ``check()`` call."""
+
+        class _FakeMonitor:
+            last_snapshot = None
+            consecutive_critical_count = 0
+
+        provider = startup._build_host_metrics_provider(_FakeMonitor(), None)
+        assert provider is not None
+        out = provider()
+        # Counter is still emitted; snapshot keys are simply absent.
+        assert out == {"consecutive_critical": 0}
+
+    def test_isolates_failing_subreaders(self) -> None:
+        """One broken subreader must not suppress the others."""
+
+        class _BoomMonitor:
+            @property
+            def last_snapshot(self):  # type: ignore[no-untyped-def]
+                raise RuntimeError("monitor exploded")
+
+            @property
+            def consecutive_critical_count(self):  # type: ignore[no-untyped-def]
+                raise RuntimeError("monitor exploded again")
+
+        class _OkWatchdog:
+            def active_layers(self) -> list[str]:
+                return ["systemd"]
+
+        provider = startup._build_host_metrics_provider(_BoomMonitor(), _OkWatchdog())
+        assert provider is not None
+        # Provider must not raise; watchdog field is still present.
+        out = provider()
+        assert out == {"watchdog_layers": ["systemd"]}
+
+
 class TestStartupHeartbeatOrdering:
     def test_starts_edge_heartbeat_before_fetching_drivers(self, monkeypatch):
         call_order: list[str] = []
@@ -1493,6 +1565,14 @@ class TestStartupHeartbeatOrdering:
         monkeypatch.setattr(startup, "validate_token", lambda token: True)
         monkeypatch.setattr(startup, "check_mqtt_connection", lambda token: True)
         monkeypatch.setattr(startup, "register_edge", lambda token: True)
+        # ``_upload_host_facts_on_startup`` would otherwise try to call the
+        # real backend.  Treat it as best-effort (already non-fatal in
+        # production) and just record the call ordering.
+        monkeypatch.setattr(
+            startup,
+            "_upload_host_facts_on_startup",
+            lambda token: call_order.append("upload_host_facts") or True,
+        )
         monkeypatch.setattr(
             startup,
             "load_environment_uuid",
@@ -1508,7 +1588,9 @@ class TestStartupHeartbeatOrdering:
         monkeypatch.setattr(
             startup,
             "_start_bootstrap_edge_health_publisher",
-            lambda token, twin_uuids, edge_id: call_order.append("start_edge_heartbeat") or True,
+            lambda token, twin_uuids, *, edge_id, resource_monitor=None, watchdog=None: (
+                call_order.append("start_edge_heartbeat") or True
+            ),
         )
         monkeypatch.setattr(
             startup,
@@ -1527,6 +1609,7 @@ class TestStartupHeartbeatOrdering:
 
         assert result is True
         assert call_order == [
+            "upload_host_facts",
             "list_linked_twins",
             "start_edge_heartbeat",
             "fetch_drivers",

@@ -23,6 +23,7 @@ import os
 import platform
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -2478,13 +2479,61 @@ def _resolve_worker_sync_twin_uuids(
     return _list_linked_twin_uuids_for_fingerprint(token, environment_uuid, fingerprint)
 
 
+def _build_host_metrics_provider(
+    resource_monitor: Optional[Any],
+    watchdog: Optional[Any],
+) -> Optional[Any]:
+    """Return a zero-arg provider that merges host pressure into edge_health.
+
+    Returns ``None`` when neither ``resource_monitor`` nor ``watchdog`` is
+    available so :class:`EdgeHealthCheck` can keep its existing minimal
+    payload shape (any subclass / older edge node without the host
+    instrumentation continues to publish unchanged).
+
+    The closure is intentionally tolerant: each subreader is wrapped so
+    that a single misbehaving source (e.g. a resource monitor that has
+    never been ``check()``-ed yet) cannot suppress the whole payload.
+    """
+    if resource_monitor is None and watchdog is None:
+        return None
+
+    def _provider() -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if resource_monitor is not None:
+            try:
+                snap = resource_monitor.last_snapshot
+                if snap is not None:
+                    out.update(snap.to_publish_dict())
+                out["consecutive_critical"] = resource_monitor.consecutive_critical_count
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("resource_monitor metrics unavailable", exc_info=True)
+        if watchdog is not None:
+            try:
+                out["watchdog_layers"] = watchdog.active_layers()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("watchdog active_layers() raised", exc_info=True)
+        return out
+
+    return _provider
+
+
 def _start_bootstrap_edge_health_publisher(
     token: str,
     twin_uuids: list[str],
     *,
     edge_id: str,
+    resource_monitor: Optional[Any] = None,
+    watchdog: Optional[Any] = None,
 ) -> bool:
-    """Start (or refresh) a lightweight edge_health publisher for linked twins."""
+    """Start (or refresh) a lightweight edge_health publisher for linked twins.
+
+    ``resource_monitor`` and ``watchdog``, when supplied, are folded into a
+    provider closure that augments every published payload with host-level
+    metrics (memory %, CPU temp, watchdog layers, consecutive-critical
+    counter).  Only the bootstrap publisher running on the edge host should
+    pass these; driver containers see their container's ``/proc``, not the
+    host's, so they must publish without a provider.
+    """
     global _EDGE_HEALTH_CHECK
     if not twin_uuids:
         return False
@@ -2508,11 +2557,18 @@ def _start_bootstrap_edge_health_publisher(
     if not normalized_twin_uuids:
         return False
 
+    host_metrics_provider = _build_host_metrics_provider(resource_monitor, watchdog)
+
     with _EDGE_HEALTH_CHECK_LOCK:
         if _EDGE_HEALTH_CHECK is not None:
             existing = list(getattr(_EDGE_HEALTH_CHECK, "twin_uuids", []) or [])
             _EDGE_HEALTH_CHECK.twin_uuids = list(dict.fromkeys(existing + normalized_twin_uuids))
             _EDGE_HEALTH_CHECK.edge_id = edge_id
+            # Refresh the provider when a caller upgraded from a no-monitor
+            # invocation to one that has the monitor wired (legitimate when
+            # the runtime loop spins up after early bootstrap).
+            if host_metrics_provider is not None:
+                _EDGE_HEALTH_CHECK.host_metrics_provider = host_metrics_provider
             _EDGE_HEALTH_CHECK.start()
             return True
 
@@ -2521,12 +2577,14 @@ def _start_bootstrap_edge_health_publisher(
             twin_uuids=normalized_twin_uuids,
             edge_id=edge_id,
             interval=EDGE_HEALTH_PUBLISH_INTERVAL_SECONDS,
+            host_metrics_provider=host_metrics_provider,
         )
         _EDGE_HEALTH_CHECK.start()
         logger.info(
-            "Started bootstrap edge health publisher for %d twin(s) (edge_id=%s)",
+            "Started bootstrap edge health publisher for %d twin(s) (edge_id=%s, host_metrics=%s)",
             len(normalized_twin_uuids),
             edge_id,
+            "on" if host_metrics_provider is not None else "off",
         )
         return True
 
@@ -3201,6 +3259,59 @@ def register_edge(token: str) -> bool:
         return bool(edge)
     except Exception as exc:
         logger.warning("Edge registration failed: %s: %s", type(exc).__name__, exc)
+        return False
+
+
+def _upload_host_facts_on_startup(token: str) -> bool:
+    """Refresh ``Edge.metadata['host_facts']`` via ``POST /api/v1/edges/discover``.
+
+    Called once at the end of :func:`run_startup_checks` so the backend has
+    fresh static host facts (total RAM, CPU model, ``/dev/watchdog``
+    presence, kernel, …) without waiting for the next CLI ``twin pair`` or
+    ``edge pull`` invocation.  Failure is non-fatal — the edge already
+    operates fine without these facts; we just lose the dashboard's
+    "what hardware is this" row until the next attempt.
+    """
+    try:
+        from cyberwave.edge.host_metrics import read_host_facts
+    except Exception as exc:
+        logger.debug("Host facts uploader: read_host_facts unavailable: %s", exc)
+        return False
+
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        logger.debug("Host facts uploader: missing fingerprint")
+        return False
+
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    try:
+        facts = read_host_facts().to_dict()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Host facts uploader: read_host_facts() raised: %s", exc)
+        return False
+
+    hostname = socket.gethostname() or ""
+    try:
+        plat = f"{platform.system()}-{platform.machine()}".strip("-")
+    except Exception:
+        plat = ""
+
+    try:
+        client = Cyberwave(base_url=base_url, api_key=token)
+        client.edges.discover(
+            fingerprint=fingerprint,
+            hostname=hostname,
+            platform=plat,
+            host_facts=facts,
+        )
+        logger.info("Uploaded host_facts (%d keys) for edge fingerprint=%s", len(facts), fingerprint)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Host facts upload failed (%s: %s); continuing startup",
+            type(exc).__name__,
+            exc,
+        )
         return False
 
 
@@ -4173,11 +4284,21 @@ def _ensure_config_subdirs() -> None:
         _chown_if_needed(subdir)
 
 
-def run_startup_checks() -> bool:
+def run_startup_checks(
+    *,
+    resource_monitor: Optional[Any] = None,
+    watchdog: Optional[Any] = None,
+) -> bool:
     """Execute every boot-time check in sequence.
 
     Prints a Rich-formatted report to the console.
     Returns ``True`` only when **all** checks pass.
+
+    ``resource_monitor`` and ``watchdog``, when provided, are folded into
+    the bootstrap ``edge_health`` publisher so the very first heartbeat
+    payload already carries host pressure data.  Both default to ``None``
+    so callers that just want the legacy startup behaviour (e.g. tests,
+    one-shot CLI flows) are unaffected.
     """
     _fix_config_dir_ownership()
     _ensure_config_subdirs()
@@ -4242,6 +4363,17 @@ def run_startup_checks() -> bool:
         console.print("  [red]Could not register the edge.[/red]")
         return False
 
+    # 4b — refresh static host facts on Edge.metadata. Non-fatal: the
+    # dashboard's "what hardware is this" row simply lags by one boot
+    # cycle if the call fails.
+    _t0 = time.perf_counter()
+    host_facts_ok = _upload_host_facts_on_startup(token)
+    elapsed = time.perf_counter() - _t0
+    if host_facts_ok:
+        console.print(f"  [green]✓[/green] Host facts [dim]({elapsed:.3f}s)[/dim]")
+    else:
+        console.print(f"  [yellow]⚠[/yellow] Host facts [dim]({elapsed:.3f}s)[/dim]")
+
     # 5 — linked environment
     _t0 = time.perf_counter()
     environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
@@ -4275,6 +4407,8 @@ def run_startup_checks() -> bool:
                     token,
                     linked_twin_uuids,
                     edge_id=fingerprint,
+                    resource_monitor=resource_monitor,
+                    watchdog=watchdog,
                 )
             except Exception as exc:
                 logger.warning("Early edge heartbeat bootstrap failed: %s", exc)

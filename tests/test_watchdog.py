@@ -200,6 +200,48 @@ class TestProcessWatchdog:
         pw.hardware.enabled = True
         assert pw.any_enabled is True
 
+    def test_active_layers_empty_when_none_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", None)
+
+        pw = ProcessWatchdog()
+        assert pw.active_layers() == []
+
+    def test_active_layers_orders_systemd_then_hardware(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order is stable so consumers can compare snapshots without sorting."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", None)
+
+        pw = ProcessWatchdog()
+        pw.systemd.enabled = True
+        pw.hardware.enabled = True
+
+        assert pw.active_layers() == ["systemd", "hardware"]
+
+    def test_active_layers_subset_when_only_one_layer_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", None)
+
+        pw = ProcessWatchdog()
+        pw.systemd.enabled = True
+        assert pw.active_layers() == ["systemd"]
+
+        pw.systemd.enabled = False
+        pw.hardware.enabled = True
+        assert pw.active_layers() == ["hardware"]
+
 
 # ---------------------------------------------------------------------------
 # OOM score adjustment

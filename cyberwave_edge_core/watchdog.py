@@ -258,6 +258,23 @@ class ProcessWatchdog:
     def any_enabled(self) -> bool:
         return self.systemd.enabled or self.hardware.enabled
 
+    def active_layers(self) -> list[str]:
+        """Return the list of enabled watchdog layer names, in protocol order.
+
+        Used by the bootstrap ``edge_health`` publisher so the dashboard
+        can show which protective layers the edge actually has (e.g.
+        ``["systemd"]`` on a developer laptop vs ``["systemd",
+        "hardware"]`` on a Raspberry Pi).  Order is stable
+        (systemd first, hardware second) so consumers can compare
+        snapshots without sorting.
+        """
+        layers: list[str] = []
+        if self.systemd.enabled:
+            layers.append("systemd")
+        if self.hardware.enabled:
+            layers.append("hardware")
+        return layers
+
     def start(self, *, ping_interval_seconds: Optional[float] = None) -> None:
         """Initialise both watchdog layers and signal readiness.
 
@@ -270,12 +287,8 @@ class ProcessWatchdog:
         """
         self.hardware.open()
         self.systemd.notify_ready()
-        if self.any_enabled:
-            layers = []
-            if self.systemd.enabled:
-                layers.append("systemd")
-            if self.hardware.enabled:
-                layers.append("hardware")
+        layers = self.active_layers()
+        if layers:
             logger.info("Watchdog started (layers: %s)", ", ".join(layers))
 
         if (

@@ -14,6 +14,13 @@ or its managed containers to be killed by the OS.
 
 Designed for resource-constrained devices (Raspberry Pi 4 with 1–4 GB RAM)
 running ML inference workloads.
+
+In addition to logging warnings/criticals, ``ResourceSnapshot`` exposes a
+``to_publish_dict()`` helper that the bootstrap edge_health publisher
+folds into every ``cyberwave/twin/{uuid}/edge_health`` payload — see
+``cyberwave_edge_core.startup._build_host_metrics_provider``.  Driver
+containers do NOT use this path because their ``/proc`` describes the
+container, not the host.
 """
 
 from __future__ import annotations
@@ -103,6 +110,27 @@ class ResourceSnapshot:
         if self.cpu_temp and self.cpu_temp.is_warning:
             return True
         return False
+
+    def to_publish_dict(self) -> dict[str, float]:
+        """Return the dynamic subset for the ``edge_health`` MQTT payload.
+
+        Keys whose underlying reader returned ``None`` (non-Linux host, no
+        thermal zone, ...) are simply omitted rather than emitted as
+        ``null`` — this keeps Vector / TwinTelemetry rows clean and lets
+        the frontend distinguish "metric absent" from "metric was zero".
+
+        The threshold-aware ``is_warning``/``is_critical`` flags are *not*
+        published; consumers re-evaluate the same thresholds locally so
+        we keep a single source of truth (``MEMORY_*_PERCENT`` /
+        ``CPU_TEMP_*_C`` exported alongside the schema).
+        """
+        out: dict[str, float] = {}
+        if self.memory is not None:
+            out["host_memory_percent"] = self.memory.used_percent
+            out["host_memory_available_mb"] = self.memory.available_mb
+        if self.cpu_temp is not None:
+            out["cpu_temp_c"] = self.cpu_temp.celsius
+        return out
 
 
 # ---------------------------------------------------------------------------

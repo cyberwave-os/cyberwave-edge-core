@@ -90,7 +90,14 @@ def cli(ctx: click.Context) -> None:
         watchdog = ProcessWatchdog()
         resource_monitor = SystemResourceMonitor()
 
-        if not run_startup_checks():
+        # Prime the monitor so the bootstrap edge_health publisher started
+        # inside run_startup_checks() can ship host pressure on its very
+        # first heartbeat instead of "metric absent" for ~30 s.
+        resource_monitor.check()
+
+        if not run_startup_checks(
+            resource_monitor=resource_monitor, watchdog=watchdog
+        ):
             sys.exit(1)
 
         watchdog.start(ping_interval_seconds=LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)

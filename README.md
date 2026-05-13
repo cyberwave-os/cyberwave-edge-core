@@ -540,6 +540,37 @@ Environment variables for Zenoh infrastructure:
 | `ZENOH_ROUTER_PORT` | `7447` | Host port for the router |
 | `ZENOH_SHARED_MEMORY` | `false` | Opt-in shared-memory transport. Requires all Cyberwave containers to share an IPC namespace (`--ipc=host`); leave disabled unless validated end-to-end. |
 
+### Host telemetry
+
+Edge Core augments every `cyberwave/twin/{uuid}/edge_health` heartbeat with the host's dynamic resource pressure and exposes static hardware facts via REST. The split mirrors the existing convention: state that changes at the publish cadence (~5 s) rides MQTT, identity that effectively never changes rides REST.
+
+**Dynamic (MQTT `edge_health` payload, every ~5 s):**
+
+| Field | Source | Notes |
+| --- | --- | --- |
+| `host_memory_percent` | `/proc/meminfo` | Absent on non-Linux hosts. |
+| `host_memory_available_mb` | `/proc/meminfo` | Free + buffers/cache. |
+| `cpu_temp_c` | `/sys/class/thermal/thermal_zone*` | Hottest CPU-typed zone. |
+| `consecutive_critical` | `resource_monitor` | Reconcile cycles where memory or CPU was over the critical threshold. Resets when pressure clears. |
+| `watchdog_layers` | `ProcessWatchdog.active_layers()` | E.g. `["systemd"]` or `["systemd", "hardware"]`. |
+
+Only the bootstrap publisher on the edge host injects these fields. Driver containers see their container's `/proc`, not the host's, so they intentionally omit the host block and publish only stream-level health.
+
+**Static (REST `POST /api/v1/edges/discover` once at startup):**
+
+Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, and `/dev/watchdog` availability — into `Edge.metadata['host_facts']`. The dashboard reads it once via `useEdges()` to render the "what hardware is this" row alongside the live pressure pill. The call is best-effort: a failure logs a warning and continues startup, since the edge already operates without these facts.
+
+Coverage per platform:
+
+| Field | Linux | macOS | Notes |
+| --- | --- | --- | --- |
+| `platform`, `kernel` | yes | yes | From `platform.platform()` / `platform.release()`. |
+| `memory_total_mb` | `/proc/meminfo` | `sysctl hw.memsize` | Rounded to one decimal on both platforms. |
+| `cpu_model` | `/proc/cpuinfo` | `sysctl machdep.cpu.brand_string` | E.g. `"Apple M2 Pro"`. |
+| `cpu_count` | `/proc/cpuinfo` (`processor:` records) | `sysctl hw.logicalcpu` → `hw.ncpu` | Logical CPU count on both platforms (after SMT expansion). |
+| `thermal_source` | first CPU thermal zone | omitted | Tracks the path the live publisher reads from. Darwin has no live thermal publisher today, so the field stays absent rather than claim a source that isn't sampled. |
+| `has_hardware_watchdog` | `/dev/watchdog` | always `false` | Linux-only kernel capability. |
+
 ### Driver failure handling
 
 Drivers must exit with a **non-zero** code when they cannot access required hardware (for example, missing `/dev/video*` or disconnected peripherals). This allows Edge Core to detect startup failures and trigger restart logic.

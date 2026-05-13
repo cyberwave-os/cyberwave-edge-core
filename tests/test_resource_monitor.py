@@ -111,6 +111,61 @@ class TestResourceSnapshot:
         assert snap.is_healthy is True
         assert snap.has_warnings is True
 
+    def test_to_publish_dict_omits_absent_sources(self) -> None:
+        """``None`` sources must be absent from the published dict.
+
+        The frontend distinguishes "metric absent" from "metric is zero",
+        so we omit the key entirely rather than emitting ``0`` or ``null``.
+        """
+        snap = ResourceSnapshot(timestamp=time.time(), memory=None, cpu_temp=None)
+        assert snap.to_publish_dict() == {}
+
+    def test_to_publish_dict_emits_memory_only(self) -> None:
+        snap = ResourceSnapshot(
+            timestamp=time.time(),
+            memory=MemoryInfo(total_mb=4096.0, available_mb=1500.0, used_percent=63.4),
+            cpu_temp=None,
+        )
+        out = snap.to_publish_dict()
+        assert out == {
+            "host_memory_percent": 63.4,
+            "host_memory_available_mb": 1500.0,
+        }
+
+    def test_to_publish_dict_emits_temp_only(self) -> None:
+        snap = ResourceSnapshot(
+            timestamp=time.time(),
+            memory=None,
+            cpu_temp=CpuTemperature(celsius=58.7, source="thermal_zone0:cpu-thermal"),
+        )
+        assert snap.to_publish_dict() == {"cpu_temp_c": 58.7}
+
+    def test_to_publish_dict_emits_both_when_available(self) -> None:
+        snap = ResourceSnapshot(
+            timestamp=time.time(),
+            memory=MemoryInfo(total_mb=4096.0, available_mb=200.0, used_percent=95.0),
+            cpu_temp=CpuTemperature(celsius=88.0, source="thermal_zone0:cpu-thermal"),
+        )
+        out = snap.to_publish_dict()
+        assert out == {
+            "host_memory_percent": 95.0,
+            "host_memory_available_mb": 200.0,
+            "cpu_temp_c": 88.0,
+        }
+
+    def test_to_publish_dict_does_not_leak_threshold_flags(self) -> None:
+        """Severity flags stay client-side so we have a single source of truth."""
+        snap = ResourceSnapshot(
+            timestamp=time.time(),
+            memory=MemoryInfo(total_mb=4096.0, available_mb=200.0, used_percent=95.0),
+            cpu_temp=CpuTemperature(celsius=88.0, source="thermal_zone0"),
+        )
+        out = snap.to_publish_dict()
+        # is_warning / is_critical must NOT be serialised — consumers re-evaluate
+        # the shared thresholds locally.
+        assert "is_warning" not in out
+        assert "is_critical" not in out
+
 
 # ---------------------------------------------------------------------------
 # read_memory_info
