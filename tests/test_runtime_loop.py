@@ -4,6 +4,7 @@ Covers:
   1. _reconcile_worker_watcher() — lazy creation, reuse, early returns, method calls
   2. run_runtime_loop() — periodic sync cadence, exception resilience
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -221,3 +222,57 @@ class TestRuntimeLoopSyncCadence:
         self._stop_after(2, monkeypatch)
 
         startup.run_runtime_loop()
+
+    def test_watchdog_pinged_each_cycle(self, monkeypatch):
+        """Verify the watchdog is pinged every reconcile cycle."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        ping_count = [0]
+
+        class FakeWatchdog:
+            def ping(self):
+                ping_count[0] += 1
+
+        self._stop_after(3, monkeypatch)
+        startup.run_runtime_loop(watchdog=FakeWatchdog())
+
+        assert ping_count[0] == 3
+
+    def test_resource_monitor_checked_each_cycle(self, monkeypatch):
+        """Verify the resource monitor is checked every reconcile cycle."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        check_count = [0]
+
+        class FakeResourceMonitor:
+            def check(self):
+                check_count[0] += 1
+                return None
+
+        self._stop_after(3, monkeypatch)
+        startup.run_runtime_loop(resource_monitor=FakeResourceMonitor())
+
+        assert check_count[0] == 3
+
+    def test_watchdog_exception_does_not_crash_loop(self, monkeypatch):
+        """Verify a watchdog exception doesn't take down the loop and that
+        the loop keeps trying to ping on subsequent cycles."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        ping_count = [0]
+
+        class FailingWatchdog:
+            def ping(self):
+                ping_count[0] += 1
+                raise RuntimeError("watchdog ping boom")
+
+        self._stop_after(2, monkeypatch)
+        startup.run_runtime_loop(watchdog=FailingWatchdog())
+
+        assert ping_count[0] == 2
