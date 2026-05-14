@@ -82,8 +82,10 @@ class TestSystemdWatchdog:
         sd.notify_stopping()
         assert "STOPPING=1" in sent
 
-    def test_sd_notify_skipped_when_pid_mismatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``_sd_notify`` must not send when this PID is not WATCHDOG_PID."""
+    def test_sd_notify_watchdog_skipped_when_pid_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``WATCHDOG=1`` is PID-restricted per ``sd_notify(3)``."""
         import cyberwave_edge_core.watchdog as wd_mod
 
         sent: list[bytes] = []
@@ -104,6 +106,66 @@ class TestSystemdWatchdog:
 
         wd_mod._sd_notify("WATCHDOG=1")
         assert sent == []
+
+    def test_sd_notify_stopping_skipped_when_pid_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``STOPPING=1`` is PID-restricted per ``sd_notify(3)``."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[bytes] = []
+
+        class FakeSocket:
+            def __init__(self, *a: object, **kw: object) -> None:
+                pass
+
+            def sendto(self, data: bytes, addr: object) -> None:
+                sent.append(data)
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid() + 1)
+        monkeypatch.setattr(wd_mod.socket, "socket", lambda *a, **kw: FakeSocket())
+
+        wd_mod._sd_notify("STOPPING=1")
+        assert sent == []
+
+    def test_sd_notify_ready_allowed_when_pid_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for 0.1.4.1459 → 0.1.4.1463: ``READY=1`` must NOT be PID-gated.
+
+        Under PyInstaller ``--onefile`` the bootloader holds ``MainPID``
+        (and therefore systemd's ``$WATCHDOG_PID``) while the actual
+        Python app runs in a forked child whose PID differs.  Per
+        ``sd_notify(3)`` only ``WATCHDOG=`` and ``STOPPING=`` are
+        PID-restricted; readiness is governed by ``NotifyAccess=`` and
+        is allowed from any permitted process.  The previous guard
+        dropped ``READY=1`` from the child and systemd ``Type=notify``
+        timed out at ``TimeoutStartSec=300``.
+        """
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[bytes] = []
+
+        class FakeSocket:
+            def __init__(self, *a: object, **kw: object) -> None:
+                pass
+
+            def sendto(self, data: bytes, addr: object) -> None:
+                sent.append(data)
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid() + 1)
+        monkeypatch.setattr(wd_mod.socket, "socket", lambda *a, **kw: FakeSocket())
+
+        wd_mod._sd_notify("READY=1")
+        assert sent == [b"READY=1"]
 
     def test_sd_notify_sends_when_pid_matches(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``_sd_notify`` sends when WATCHDOG_PID matches current PID."""
@@ -188,6 +250,97 @@ class TestProcessWatchdog:
         pw.ping()
         pw.stop()
 
+    def test_mark_ready_emits_ready_even_from_non_watchdog_pid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end regression: ``mark_ready`` must reach the notify socket
+        even when this process is **not** ``$WATCHDOG_PID``.
+
+        This is the bug that caused 0.1.4.1459 → 0.1.4.1463 to time out
+        under systemd ``Type=notify``: the PyInstaller ``--onefile``
+        bootloader is ``MainPID`` while the unpacked Python child sends
+        ``READY=1``.
+        """
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid() + 1)
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 30_000_000)
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        pw = ProcessWatchdog()
+        pw.mark_ready()
+
+        assert "READY=1" in sent
+
+    def test_mark_ready_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Calling :meth:`mark_ready` twice emits ``READY=1`` exactly once."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid())
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        pw = ProcessWatchdog()
+        pw.mark_ready()
+        pw.mark_ready()
+
+        assert sent.count("READY=1") == 1
+
+    def test_start_pinging_emits_first_watchdog_ping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """:meth:`start_pinging` opens the hardware layer and sends the first ping."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid())
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 30_000_000)
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        pw = ProcessWatchdog()
+        pw.start_pinging()
+
+        assert "WATCHDOG=1" in sent
+
+    def test_start_pinging_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repeated :meth:`start_pinging` calls don't re-open or double-log."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", None)
+
+        pw = ProcessWatchdog()
+        opens: list[int] = []
+        monkeypatch.setattr(pw.hardware, "open", lambda: opens.append(1) or False)
+        monkeypatch.setattr(pw, "ping", lambda: None)
+
+        pw.start_pinging()
+        pw.start_pinging()
+
+        assert len(opens) == 1, "hardware.open() must run at most once"
+
+    def test_start_wrapper_calls_both_phases(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Backwards-compat :meth:`start` runs both phases in order."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        order: list[str] = []
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", None)
+
+        pw = ProcessWatchdog()
+        monkeypatch.setattr(pw, "mark_ready", lambda: order.append("mark_ready"))
+        monkeypatch.setattr(
+            pw,
+            "start_pinging",
+            lambda *, ping_interval_seconds=None: order.append("start_pinging"),
+        )
+
+        pw.start()
+
+        assert order == ["mark_ready", "start_pinging"]
+
     def test_any_enabled_reflects_layers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import cyberwave_edge_core.watchdog as wd_mod
 
@@ -200,9 +353,7 @@ class TestProcessWatchdog:
         pw.hardware.enabled = True
         assert pw.any_enabled is True
 
-    def test_active_layers_empty_when_none_enabled(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_active_layers_empty_when_none_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import cyberwave_edge_core.watchdog as wd_mod
 
         monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)

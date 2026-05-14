@@ -95,12 +95,21 @@ def cli(ctx: click.Context) -> None:
         # first heartbeat instead of "metric absent" for ~30 s.
         resource_monitor.check()
 
-        if not run_startup_checks(
-            resource_monitor=resource_monitor, watchdog=watchdog
-        ):
+        if not run_startup_checks(resource_monitor=resource_monitor, watchdog=watchdog):
             sys.exit(1)
 
-        watchdog.start(ping_interval_seconds=LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
+        # Two-phase watchdog handoff: send READY=1 *immediately* after the
+        # blocking boot work (driver images pulled, MQTT connected, twin
+        # sync reconciled) so systemd transitions the unit to ``active``
+        # well within ``TimeoutStartSec``.  ``mark_ready`` is not
+        # PID-restricted, so it works even when this process is a
+        # PyInstaller --onefile child whose PID differs from systemd's
+        # ``MainPID`` / ``$WATCHDOG_PID`` (the silent-drop bug that
+        # caused the 0.1.4.1459 → 0.1.4.1463 start-timeout regression).
+        # Periodic ``WATCHDOG=1`` pings, which *are* PID-restricted, are
+        # then driven from the runtime loop in this same process.
+        watchdog.mark_ready()
+        watchdog.start_pinging(ping_interval_seconds=LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
         try:
             run_runtime_loop(
                 watchdog=watchdog,

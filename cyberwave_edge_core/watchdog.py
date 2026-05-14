@@ -62,25 +62,46 @@ if os.environ.get("WATCHDOG_PID"):
 def _is_designated_watchdog_pid() -> bool:
     """Return True when this process is the systemd-designated notifier.
 
-    Per ``sd_notify(3)``, ``WATCHDOG=1`` and related notifications should only
-    originate from the process whose PID matches ``$WATCHDOG_PID`` (defaulting
-    to the main service PID when unset).  This guards against subprocesses
-    that accidentally import this module from sending pings.
+    Per ``sd_notify(3)``, ``WATCHDOG=1`` and ``STOPPING=1`` should only
+    originate from the process whose PID matches ``$WATCHDOG_PID``
+    (defaulting to the main service PID when unset).  ``READY=1`` is **not**
+    PID-restricted by systemd and is allowed from any process the unit's
+    ``NotifyAccess=`` permits — see :func:`_sd_notify`.
     """
     if _WATCHDOG_PID is None:
         return True
     return _WATCHDOG_PID == os.getpid()
 
 
+# Notification states that systemd's sd_notify(3) restricts to the
+# WATCHDOG_PID process.  READY=1 is deliberately **not** in this set:
+# per sd_notify(3), only the periodic watchdog pings and the stopping
+# notification are PID-restricted; readiness is governed by the unit's
+# ``NotifyAccess=`` (which defaults to ``main`` and works as expected).
+_PID_RESTRICTED_PREFIXES: tuple[str, ...] = ("WATCHDOG=", "STOPPING=")
+
+
 def _sd_notify(state: str) -> None:
     """Send a notification to the systemd notify socket (best-effort).
 
-    Skipped silently when this process is not the systemd-designated notifier
-    (see :func:`_is_designated_watchdog_pid`).
+    PID-restricted notifications (``WATCHDOG=`` / ``STOPPING=``) are
+    skipped — and the skip is logged at DEBUG so misuse from a forked
+    child is at least diagnosable — when this process is not the
+    systemd-designated notifier.  ``READY=1`` is allowed from any PID
+    so the boot path works correctly when edge-core runs under a
+    PyInstaller ``--onefile`` bootloader (which forks the actual app
+    into a child whose PID differs from systemd's ``MainPID``) — see
+    :func:`_is_designated_watchdog_pid`.
     """
     if not _NOTIFY_SOCKET:
         return
-    if not _is_designated_watchdog_pid():
+    if state.startswith(_PID_RESTRICTED_PREFIXES) and not _is_designated_watchdog_pid():
+        logger.debug(
+            "Skipping %s from non-notifier pid %d (WATCHDOG_PID=%s)",
+            state.split("=", 1)[0],
+            os.getpid(),
+            _WATCHDOG_PID,
+        )
         return
     addr = _NOTIFY_SOCKET
     if addr.startswith("@"):
@@ -240,19 +261,40 @@ class HardwareWatchdog:
 class ProcessWatchdog:
     """Unified watchdog combining systemd and hardware watchdog layers.
 
-    Usage::
+    Usage (preferred — two-phase, safe under PyInstaller ``--onefile``)::
 
         wd = ProcessWatchdog()
-        wd.start()           # called once at startup
+        run_blocking_boot_work()      # docker pulls, MQTT, twin sync, ...
+        wd.mark_ready()               # READY=1 — not PID-restricted
+        wd.start_pinging()            # opens /dev/watchdog + first WATCHDOG=1
         while running:
             do_work()
-            wd.ping()        # called every reconcile cycle
-        wd.stop()            # called during graceful shutdown
+            wd.ping()                 # every reconcile cycle
+        wd.stop()                     # graceful shutdown
+
+    Splitting readiness from the periodic ping loop matters when the
+    process tree contains a parent that holds the systemd ``MainPID``
+    (and therefore ``$WATCHDOG_PID``) but is not the process that
+    actually finishes boot.  The canonical case is PyInstaller
+    ``--onefile`` binaries: the bootloader stays as ``MainPID``, while
+    the unpacked Python app runs in a forked child.  ``READY=1`` is not
+    PID-restricted by ``sd_notify(3)``, so :meth:`mark_ready` works
+    from any process the unit's ``NotifyAccess=`` permits; the
+    periodic ``WATCHDOG=1`` pings emitted by :meth:`start_pinging` /
+    :meth:`ping` *are* PID-restricted and must run in the WATCHDOG_PID
+    process (or a thread inside it).
+
+    The legacy :meth:`start` entry point combines both phases for
+    backwards compatibility; new callers should prefer the two-phase
+    form so a future regression of "readiness silently dropped from
+    a child PID" surfaces immediately.
     """
 
     def __init__(self, *, hardware_watchdog_timeout: int = 60) -> None:
         self.systemd = SystemdWatchdog()
         self.hardware = HardwareWatchdog(timeout_seconds=hardware_watchdog_timeout)
+        self._ready_signalled = False
+        self._pinging_started = False
 
     @property
     def any_enabled(self) -> bool:
@@ -275,21 +317,52 @@ class ProcessWatchdog:
             layers.append("hardware")
         return layers
 
-    def start(self, *, ping_interval_seconds: Optional[float] = None) -> None:
-        """Initialise both watchdog layers and signal readiness.
+    def mark_ready(self) -> None:
+        """Signal systemd that startup is complete (``READY=1``).
 
-        ``ping_interval_seconds`` is the cadence at which the caller intends
-        to invoke :meth:`ping`.  When supplied, it is compared against the
-        systemd-recommended interval (half of ``WatchdogSec``) and a warning
-        is logged if the caller pings too slowly — a useful sanity check
-        against future config drift where the runtime loop or
-        ``WatchdogSec`` are changed independently.
+        Idempotent.  Safe to call from any process the unit's
+        ``NotifyAccess=`` permits — including a process whose PID does
+        not match ``$WATCHDOG_PID`` (e.g. a PyInstaller ``--onefile``
+        child).  Must be invoked **after** all blocking boot work has
+        finished (Docker images pulled, MQTT connected, twin sync
+        reconciled) and **before** any branch that could fork/exec
+        into a deeper child whose readiness we'd otherwise miss.
+
+        Does **not** open ``/dev/watchdog`` and does **not** emit
+        ``WATCHDOG=1`` — use :meth:`start_pinging` for that, from the
+        ``WATCHDOG_PID`` process.
         """
-        self.hardware.open()
+        if self._ready_signalled:
+            return
         self.systemd.notify_ready()
+        self._ready_signalled = True
+
+    def start_pinging(self, *, ping_interval_seconds: Optional[float] = None) -> None:
+        """Open the hardware watchdog and emit the first ``WATCHDOG=1`` ping.
+
+        Must run in the systemd-designated ``WATCHDOG_PID`` process
+        (or a thread inside it).  Calling from a forked child is a
+        no-op for the systemd half because ``WATCHDOG=`` is
+        PID-restricted by :func:`_sd_notify`; the hardware half
+        still opens ``/dev/watchdog`` but the periodic
+        :meth:`ping` cadence would then need to come from the main
+        process anyway, so this is best avoided.
+
+        ``ping_interval_seconds`` is the cadence at which the caller
+        intends to invoke :meth:`ping`.  When supplied, it is compared
+        against the systemd-recommended interval (half of
+        ``WatchdogSec``) and a warning is logged if the caller pings
+        too slowly — a useful sanity check against future config drift
+        where the runtime loop or ``WatchdogSec`` change independently.
+
+        Idempotent.
+        """
+        if self._pinging_started:
+            return
+        self.hardware.open()
         layers = self.active_layers()
         if layers:
-            logger.info("Watchdog started (layers: %s)", ", ".join(layers))
+            logger.info("Watchdog ping loop started (layers: %s)", ", ".join(layers))
 
         if (
             ping_interval_seconds is not None
@@ -306,6 +379,20 @@ class ProcessWatchdog:
             )
 
         self.ping()
+        self._pinging_started = True
+
+    def start(self, *, ping_interval_seconds: Optional[float] = None) -> None:
+        """Initialise both watchdog layers and signal readiness.
+
+        Backwards-compatible wrapper around :meth:`mark_ready` followed
+        by :meth:`start_pinging`.  New callers should prefer the
+        two-phase form so readiness can be signalled before any
+        operation that could fork/exec a child (which would silently
+        drop the PID-restricted ``WATCHDOG=1`` pings — see the class
+        docstring).
+        """
+        self.mark_ready()
+        self.start_pinging(ping_interval_seconds=ping_interval_seconds)
 
     def ping(self) -> None:
         """Ping all active watchdog layers."""
