@@ -570,6 +570,7 @@ Coverage per platform:
 | `cpu_count` | `/proc/cpuinfo` (`processor:` records) | `sysctl hw.logicalcpu` → `hw.ncpu` | Logical CPU count on both platforms (after SMT expansion). |
 | `thermal_source` | first CPU thermal zone | omitted | Tracks the path the live publisher reads from. Darwin has no live thermal publisher today, so the field stays absent rather than claim a source that isn't sampled. |
 | `has_hardware_watchdog` | `/dev/watchdog` | always `false` | Linux-only kernel capability. |
+| `sdk_version`, `cli_version`, `edge_core_version` | `importlib.metadata` | `importlib.metadata` | Installed version of each `cyberwave` Python distribution on the edge; each independently omitted when the package isn't installed in the calling process. |
 
 ### Driver failure handling
 
