@@ -3334,17 +3334,30 @@ def _start_host_facts_keepalive(
     token: str,
     *,
     period_seconds: float = HOST_FACTS_KEEPALIVE_PERIOD_SECONDS,
+    fire_immediately: bool = True,
 ) -> bool:
-    """Spawn (once) a daemon thread that re-POSTs host facts every ~30 s.
+    """Spawn (once) a daemon thread that POSTs host facts to ``/discover``.
 
-    This is what powers the "Standby" state on the dashboard: the backend
-    bumps ``Edge.last_seen_at`` on every ``/discover`` call, and our
-    keepalive guarantees that signal stays fresh even when an edge has
-    no bound twins (so no MQTT ``edge_health`` is being published).
+    The thread fires its first tick **immediately** when
+    ``fire_immediately=True`` (the default), then every ``period_seconds``
+    after that. Returns ``True`` synchronously as soon as the thread is
+    scheduled — the caller never waits for the first POST.
 
-    The thread is idempotent — repeat calls return immediately if a
-    keepalive is already running. Returns ``True`` when the keepalive is
-    scheduled (either by this call or already running).
+    Doing the bootstrap POST in-thread (instead of synchronously on the
+    caller's stack) is critical for systemd ``Type=notify`` units: the
+    boot path can fire ``READY=1`` before any network I/O completes, so
+    ``systemctl restart`` returns in seconds rather than waiting for the
+    backend round-trip — important on slow / flaky links where the POST
+    can otherwise sit on its TCP timeout for tens of seconds and push
+    the unit past ``TimeoutStartSec``.
+
+    This is also what powers the "Standby" state on the dashboard: the
+    backend bumps ``Edge.last_seen_at`` on every ``/discover`` call, and
+    the keepalive guarantees that signal stays fresh even when an edge
+    has no bound twins (so no MQTT ``edge_health`` is being published).
+
+    Idempotent — repeat calls return immediately if a keepalive is
+    already running.
     """
     global _HOST_FACTS_KEEPALIVE_THREAD, _HOST_FACTS_KEEPALIVE_STOP
 
@@ -3357,9 +3370,20 @@ def _start_host_facts_keepalive(
         _HOST_FACTS_KEEPALIVE_STOP = stop_event
 
         def _loop() -> None:
-            # First tick comes after one period — the boot path already
-            # ran an upload in the foreground, no need to double-post on
-            # second 0.
+            # Bootstrap tick: do the first POST on entry when requested.
+            # We swallow exceptions both here and on subsequent ticks —
+            # a failed upload is recoverable on the next iteration, and
+            # propagating would kill the daemon thread silently.
+            if fire_immediately:
+                try:
+                    _post_host_facts_once(token)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Host facts bootstrap tick raised: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+
             while not stop_event.wait(timeout=period_seconds):
                 try:
                     _post_host_facts_once(token)
@@ -3379,9 +3403,10 @@ def _start_host_facts_keepalive(
         thread.start()
 
     logger.info(
-        "Started host-facts keepalive (period=%.0fs) — Edge.last_seen_at "
-        "will stay fresh independent of twin MQTT activity",
+        "Started host-facts keepalive (period=%.0fs, fire_immediately=%s) — "
+        "Edge.last_seen_at will stay fresh independent of twin MQTT activity",
         period_seconds,
+        fire_immediately,
     )
     return True
 
@@ -3401,25 +3426,33 @@ def _stop_host_facts_keepalive() -> None:
 
 
 def _upload_host_facts_on_startup(token: str) -> bool:
-    """Refresh ``Edge.metadata['host_facts']`` and start the REST keepalive.
+    """Schedule background host-facts upload and the 30 s REST keepalive.
 
-    Called once near the end of :func:`run_startup_checks` to:
+    Called once near the end of :func:`run_startup_checks`. Returns as
+    soon as the keepalive thread is *scheduled* — no network I/O happens
+    on the caller's stack. The first ``/discover`` POST is performed by
+    the keepalive thread itself on entry (see
+    :func:`_start_host_facts_keepalive`), and then again every
+    ``HOST_FACTS_KEEPALIVE_PERIOD_SECONDS``.
 
-    1. Synchronously POST host facts so the dashboard has fresh hardware
-       identity (CPU model, RAM total, watchdog presence, …) within the
-       startup pass — useful for the "Host facts ✓" startup log line.
-    2. Kick off a 30 s background keepalive that re-POSTs to ``/discover``
-       so the backend keeps ``Edge.last_seen_at`` fresh. That field is
-       what distinguishes "edge daemon alive, no twin work" (Standby)
-       from "edge daemon dead" (Offline) on the dashboard's three-state
-       pill.
+    Why off-stack:
 
-    Failure of the initial upload is non-fatal — the keepalive thread is
-    started regardless so the next tick re-attempts cleanly.
+    - Under systemd ``Type=notify``, ``run_startup_checks`` runs before
+      ``READY=1`` is sent. A blocking REST POST against a slow or flaky
+      backend can push past ``TimeoutStartSec`` and cause
+      ``systemctl restart`` to time out with a confusing "job failed"
+      error. Doing the bootstrap upload from a daemon thread means the
+      service signals ready in seconds even when the network is misbehaving.
+    - The previous synchronous-then-keepalive pattern had no upside —
+      both paths POSTed the exact same payload to the same endpoint,
+      so collapsing them into one in-thread bootstrap loses nothing.
+
+    The function always returns ``True`` because the upload outcome is
+    not known synchronously. Visibility of the upload result is via the
+    keepalive thread's logs.
     """
-    ok = _post_host_facts_once(token)
-    _start_host_facts_keepalive(token)
-    return ok
+    _start_host_facts_keepalive(token, fire_immediately=True)
+    return True
 
 
 def _build_cyberwave_client(token: str) -> Cyberwave:

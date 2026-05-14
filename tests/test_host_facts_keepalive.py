@@ -30,15 +30,17 @@ def _reset_keepalive_singleton():
 
 
 def test_start_keepalive_spawns_thread_that_ticks_repeatedly(monkeypatch):
-    """Successive ticks call ``_post_host_facts_once``; the thread is a daemon."""
+    """Successive ticks call ``_post_host_facts_once``; the thread is a daemon.
+
+    With ``fire_immediately=False`` we still get at least two ticks within
+    two periods, proving the periodic loop is alive without conflating it
+    with the bootstrap tick (covered separately below).
+    """
     calls: list[float] = []
     call_event = threading.Event()
 
     def fake_post(token: str) -> bool:
         calls.append(time.monotonic())
-        # Two ticks is enough to prove "this fires on a period, not just once".
-        # We don't tighten the count further because doing so would make the
-        # test flaky on slow CI without any extra coverage.
         if len(calls) >= 2:
             call_event.set()
         return True
@@ -48,7 +50,9 @@ def test_start_keepalive_spawns_thread_that_ticks_repeatedly(monkeypatch):
     # 50 ms period keeps the test under ~150 ms even on slow CI; the
     # production period (30 s) is the same code path with a different
     # constant, so we don't pay for it here.
-    assert startup._start_host_facts_keepalive("test-token", period_seconds=0.05)
+    assert startup._start_host_facts_keepalive(
+        "test-token", period_seconds=0.05, fire_immediately=False
+    )
 
     assert call_event.wait(timeout=2.0), (
         f"keepalive thread did not tick twice within 2 s "
@@ -75,20 +79,43 @@ def test_start_keepalive_is_idempotent(monkeypatch):
     )
 
 
-def test_upload_on_startup_posts_once_and_starts_keepalive(monkeypatch):
-    """Boot path = one foreground POST + background keepalive scheduled."""
-    posts: list[str] = []
+def test_upload_on_startup_is_non_blocking_and_posts_from_thread(monkeypatch):
+    """Boot path must not POST on the caller's stack.
+
+    This is the contract that lets systemd ``Type=notify`` services
+    signal ``READY=1`` quickly: ``run_startup_checks`` must return even
+    when the backend is unreachable / slow. We assert that:
+
+    1. ``_upload_host_facts_on_startup`` returns immediately (no I/O on
+       the caller's stack — verified by patching ``_post_host_facts_once``
+       to record which thread invoked it).
+    2. The keepalive thread is the one that performs the bootstrap POST.
+    """
+    calling_threads: list[int] = []
+    bootstrap_done = threading.Event()
 
     def fake_post(token: str) -> bool:
-        posts.append(token)
+        calling_threads.append(threading.get_ident())
+        bootstrap_done.set()
         return True
 
     monkeypatch.setattr(startup, "_post_host_facts_once", fake_post)
 
+    main_thread_id = threading.get_ident()
     result = startup._upload_host_facts_on_startup("test-token")
 
-    assert result is True
-    assert posts == ["test-token"], "boot path posts exactly once in the foreground"
+    assert result is True, "boot path returns True synchronously regardless of POST result"
+
+    assert bootstrap_done.wait(timeout=2.0), (
+        "bootstrap tick did not run within 2 s — keepalive thread is broken"
+    )
+
+    assert len(calling_threads) >= 1
+    assert main_thread_id not in calling_threads, (
+        "bootstrap POST must NOT execute on the caller's stack — systemd "
+        "Type=notify relies on run_startup_checks returning before any "
+        "network I/O completes"
+    )
 
     thread = startup._HOST_FACTS_KEEPALIVE_THREAD
     assert thread is not None and thread.is_alive(), (

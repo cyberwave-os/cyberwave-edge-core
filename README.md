@@ -558,7 +558,7 @@ Only the bootstrap publisher on the edge host injects these fields. Driver conta
 
 **Static (REST `POST /api/v1/edges/discover`, every ~30 s):**
 
-Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, and `/dev/watchdog` availability — into `Edge.metadata['host_facts']`. The first POST runs synchronously during startup so the dashboard sees the "what hardware is this" row immediately. A background daemon thread then re-POSTs the same payload every ~30 s. The call is idempotent (it upserts `Edge.metadata['host_facts']` and bumps `Edge.last_seen_at`), so the keepalive cost is one tiny round-trip per edge regardless of how many bound twins the edge has — or whether it has any at all.
+Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, and `/dev/watchdog` availability — into `Edge.metadata['host_facts']`. The first POST is performed by a background daemon thread as soon as it starts, then the same thread re-POSTs the same payload every ~30 s. Running the bootstrap POST off the main thread is deliberate: under systemd `Type=notify`, the service signals `READY=1` from the main thread, and we don't want a slow or unreachable backend to push past `TimeoutStartSec` (which would cause `systemctl restart cyberwave-edge-core` to fail). The call is idempotent (it upserts `Edge.metadata['host_facts']` and bumps `Edge.last_seen_at`), so the keepalive cost is one tiny round-trip per edge regardless of how many bound twins the edge has — or whether it has any at all.
 
 That `Edge.last_seen_at` field is what powers the three-state dashboard pill:
 
