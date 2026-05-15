@@ -140,6 +140,31 @@ class SystemdWatchdog:
         """Tell systemd that startup is complete (``READY=1``)."""
         _sd_notify("READY=1")
 
+    def notify_main_pid(self, pid: Optional[int] = None) -> None:
+        """Tell systemd the real ``MainPID`` is *pid* (default: current process).
+
+        Per ``sd_notify(3)`` ``MAINPID=`` is **not** PID-restricted; it
+        only requires that the unit's ``NotifyAccess=`` permits this
+        process (``all`` or ``exec`` work).  After systemd processes
+        the message, ``$WATCHDOG_PID`` is updated so subsequent
+        PID-restricted notifications (``WATCHDOG=`` / ``STOPPING=``)
+        from this process are accepted.
+
+        Refreshes the module-level ``_WATCHDOG_PID`` cache so the
+        in-process guard inside :func:`_sd_notify` agrees with what
+        systemd will see — otherwise the very next ``WATCHDOG=1`` call
+        from this same process would still be silently dropped by our
+        own guard.
+
+        Used by :meth:`ProcessWatchdog.claim_main_pid` to fix the
+        PyInstaller ``--onefile`` shape where the bootloader holds
+        ``MainPID`` while the actual app runs in a forked child.
+        """
+        global _WATCHDOG_PID
+        target = pid if pid is not None else os.getpid()
+        _sd_notify(f"MAINPID={target}")
+        _WATCHDOG_PID = target
+
     def ping(self) -> None:
         """Send ``WATCHDOG=1`` to the systemd notify socket."""
         if not self.enabled:
@@ -261,33 +286,40 @@ class HardwareWatchdog:
 class ProcessWatchdog:
     """Unified watchdog combining systemd and hardware watchdog layers.
 
-    Usage (preferred — two-phase, safe under PyInstaller ``--onefile``)::
+    Usage (preferred — three-phase, safe under PyInstaller ``--onefile``)::
 
         wd = ProcessWatchdog()
+        wd.claim_main_pid()           # MAINPID=<self> — fixes onefile fork
         run_blocking_boot_work()      # docker pulls, MQTT, twin sync, ...
-        wd.mark_ready()               # READY=1 — not PID-restricted
+        wd.mark_ready()               # READY=1
         wd.start_pinging()            # opens /dev/watchdog + first WATCHDOG=1
         while running:
             do_work()
             wd.ping()                 # every reconcile cycle
         wd.stop()                     # graceful shutdown
 
-    Splitting readiness from the periodic ping loop matters when the
-    process tree contains a parent that holds the systemd ``MainPID``
-    (and therefore ``$WATCHDOG_PID``) but is not the process that
-    actually finishes boot.  The canonical case is PyInstaller
-    ``--onefile`` binaries: the bootloader stays as ``MainPID``, while
-    the unpacked Python app runs in a forked child.  ``READY=1`` is not
-    PID-restricted by ``sd_notify(3)``, so :meth:`mark_ready` works
-    from any process the unit's ``NotifyAccess=`` permits; the
-    periodic ``WATCHDOG=1`` pings emitted by :meth:`start_pinging` /
-    :meth:`ping` *are* PID-restricted and must run in the WATCHDOG_PID
-    process (or a thread inside it).
+    The :meth:`claim_main_pid` call matters when the process tree
+    contains a parent that holds the systemd ``MainPID`` (and
+    therefore ``$WATCHDOG_PID``) but is not the process that actually
+    runs the ping loop.  The canonical case is PyInstaller
+    ``--onefile`` binaries: the bootloader stays as ``MainPID`` while
+    the unpacked Python app runs in a forked child.  ``MAINPID=`` is
+    not PID-restricted by ``sd_notify(3)``, so the child can rebind;
+    after that, the PID-restricted ``WATCHDOG=1`` pings emitted by
+    :meth:`start_pinging` / :meth:`ping` are accepted by systemd.
+    Requires the unit to set ``NotifyAccess=all`` (or ``exec``); the
+    systemd default (``main``) rejects ``MAINPID=`` from a non-main
+    PID.
 
-    The legacy :meth:`start` entry point combines both phases for
-    backwards compatibility; new callers should prefer the two-phase
-    form so a future regression of "readiness silently dropped from
-    a child PID" surfaces immediately.
+    ``READY=1`` is independent — it is never PID-restricted, so
+    :meth:`mark_ready` works from any process the unit's
+    ``NotifyAccess=`` permits, regardless of whether
+    :meth:`claim_main_pid` was called first.
+
+    The legacy :meth:`start` entry point combines readiness and
+    pinging for backwards compatibility; new callers should prefer
+    the three-phase form so a future regression of "WATCHDOG=1
+    silently dropped from a child PID" surfaces immediately.
     """
 
     def __init__(self, *, hardware_watchdog_timeout: int = 60) -> None:
@@ -317,6 +349,29 @@ class ProcessWatchdog:
             layers.append("hardware")
         return layers
 
+    def claim_main_pid(self) -> None:
+        """Tell systemd this process is the real ``MainPID`` (``MAINPID=``).
+
+        Required when the executable is a PyInstaller ``--onefile``
+        binary: the bootloader holds systemd's ``MainPID`` /
+        ``$WATCHDOG_PID`` while the actual Python app runs in a
+        forked child whose PID differs.  Without this rebind every
+        ``WATCHDOG=1`` ping from the child is silently dropped by
+        the PID guard inside :func:`_sd_notify`, the watchdog times
+        out at ``WatchdogSec``, and systemd ``SIGABRT``s the process
+        every minute (the 0.1.4.1463 regression).
+
+        ``MAINPID=`` is not itself PID-restricted, so this method is
+        safe to call from the forked child.  It does require the unit
+        to set ``NotifyAccess=all`` (or ``exec``); the default
+        ``main`` rejects ``MAINPID=`` from a non-main PID.
+
+        Idempotent and a no-op when there is no notify socket.  Must
+        be called **before** :meth:`mark_ready` and
+        :meth:`start_pinging`.
+        """
+        self.systemd.notify_main_pid()
+
     def mark_ready(self) -> None:
         """Signal systemd that startup is complete (``READY=1``).
 
@@ -330,7 +385,9 @@ class ProcessWatchdog:
 
         Does **not** open ``/dev/watchdog`` and does **not** emit
         ``WATCHDOG=1`` — use :meth:`start_pinging` for that, from the
-        ``WATCHDOG_PID`` process.
+        ``WATCHDOG_PID`` process (call :meth:`claim_main_pid` first
+        to make this process the ``WATCHDOG_PID`` when running under
+        PyInstaller ``--onefile``).
         """
         if self._ready_signalled:
             return

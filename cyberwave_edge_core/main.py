@@ -88,6 +88,24 @@ def cli(ctx: click.Context) -> None:
 
         protect_edge_core_oom()
         watchdog = ProcessWatchdog()
+        # Rebind systemd's ``MainPID`` to this process *before any other
+        # notify-socket traffic*. Under PyInstaller ``--onefile`` the
+        # bootloader holds the original ``MainPID`` / ``$WATCHDOG_PID``
+        # while we run in a forked child; without this rebind every
+        # subsequent PID-restricted notification (``WATCHDOG=`` /
+        # ``STOPPING=``) from this process is silently dropped by
+        # ``_sd_notify``'s own guard, the watchdog times out at
+        # ``WatchdogSec``, and systemd ``SIGABRT``s us every minute
+        # (the regression first observed on 0.1.4.1463). Doing this
+        # *before* ``run_startup_checks`` also means a future change
+        # that wants to ping the watchdog during boot (e.g. on slow
+        # Docker pulls > ``WatchdogSec``) can do so without further
+        # plumbing. Requires ``NotifyAccess=all`` on the unit; the
+        # default ``main`` would reject the ``MAINPID=`` rebind.
+        # ``READY=1`` is unaffected by this — it is never
+        # PID-restricted — and is emitted by ``mark_ready`` below
+        # only after the blocking boot work finishes.
+        watchdog.claim_main_pid()
         resource_monitor = SystemResourceMonitor()
 
         # Prime the monitor so the bootstrap edge_health publisher started
@@ -98,16 +116,12 @@ def cli(ctx: click.Context) -> None:
         if not run_startup_checks(resource_monitor=resource_monitor, watchdog=watchdog):
             sys.exit(1)
 
-        # Two-phase watchdog handoff: send READY=1 *immediately* after the
-        # blocking boot work (driver images pulled, MQTT connected, twin
-        # sync reconciled) so systemd transitions the unit to ``active``
-        # well within ``TimeoutStartSec``.  ``mark_ready`` is not
-        # PID-restricted, so it works even when this process is a
-        # PyInstaller --onefile child whose PID differs from systemd's
-        # ``MainPID`` / ``$WATCHDOG_PID`` (the silent-drop bug that
-        # caused the 0.1.4.1459 → 0.1.4.1463 start-timeout regression).
-        # Periodic ``WATCHDOG=1`` pings, which *are* PID-restricted, are
-        # then driven from the runtime loop in this same process.
+        # Send READY=1 immediately after the blocking boot work (driver
+        # images pulled, MQTT connected, twin sync reconciled) so
+        # systemd transitions the unit to ``active`` well within
+        # ``TimeoutStartSec``, then open ``/dev/watchdog`` and emit
+        # the first ``WATCHDOG=1`` ping; the runtime loop pings every
+        # reconcile cycle thereafter.
         watchdog.mark_ready()
         watchdog.start_pinging(ping_interval_seconds=LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
         try:

@@ -190,6 +190,59 @@ class TestSystemdWatchdog:
         wd_mod._sd_notify("WATCHDOG=1")
         assert sent == [b"WATCHDOG=1"]
 
+    def test_notify_main_pid_unblocks_watchdog_pings_from_pid_mismatched_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for the 0.1.4.1463 watchdog-loop kill.
+
+        Under PyInstaller ``--onefile`` the bootloader holds
+        ``$WATCHDOG_PID`` while the actual app runs in a forked child.
+        The pre-fix ``WATCHDOG=1`` from the child was silently dropped
+        by :func:`_sd_notify`'s PID guard, systemd's ``WatchdogSec``
+        elapsed, and the unit was ``SIGABRT``-killed every minute.
+        After :meth:`SystemdWatchdog.notify_main_pid` rebinds the
+        ``MAINPID`` to the current process, subsequent ``WATCHDOG=1``
+        notifications from the same process must reach the socket.
+        """
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[bytes] = []
+
+        class FakeSocket:
+            def __init__(self, *a: object, **kw: object) -> None:
+                pass
+
+            def sendto(self, data: bytes, addr: object) -> None:
+                sent.append(data)
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        # Simulate the onefile shape: $WATCHDOG_PID points at the
+        # bootloader, not us.
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid() + 1)
+        monkeypatch.setattr(wd_mod.socket, "socket", lambda *a, **kw: FakeSocket())
+
+        # Pre-rebind: PID-restricted notifications from us are dropped.
+        wd_mod._sd_notify("WATCHDOG=1")
+        assert sent == [], "guard should drop WATCHDOG=1 before MAINPID rebind"
+
+        # Go through ProcessWatchdog.claim_main_pid (the production
+        # caller) rather than SystemdWatchdog.notify_main_pid directly,
+        # so a regression that breaks the wrapper is also caught.
+        ProcessWatchdog().claim_main_pid()
+
+        # Post-rebind: the MAINPID datagram went out, the in-process
+        # cache was refreshed, and subsequent WATCHDOG=1 pings pass
+        # through the guard.
+        assert sent == [f"MAINPID={os.getpid()}".encode()]
+        assert wd_mod._WATCHDOG_PID == os.getpid()
+
+        sent.clear()
+        wd_mod._sd_notify("WATCHDOG=1")
+        assert sent == [b"WATCHDOG=1"]
+
 
 # ---------------------------------------------------------------------------
 # HardwareWatchdog
