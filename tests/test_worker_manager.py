@@ -304,7 +304,9 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
             worker_manager._run_container()
 
         docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
@@ -336,7 +338,6 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        monkeypatch.setattr(worker_manager, "_ensure_log_stream", lambda: None)
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
             lambda name, default=None: default,
@@ -344,7 +345,9 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
             assert worker_manager._run_container() is True
 
         docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
@@ -381,7 +384,9 @@ class TestWorkerManagerGPU:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
             worker_manager._run_container()
 
         docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
@@ -670,6 +675,9 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(
             WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True)
         )
+        monkeypatch.setattr(
+            WorkerManager, "_send_startup_failure_alert", lambda self, detail="": None
+        )
 
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
@@ -719,22 +727,259 @@ class TestWorkerManagerRunContainerFailures:
         self._setup_run(worker_manager, tmp_config, monkeypatch)
         monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        # Probe always returns "exited"
-        with patch.object(wm_module, "docker_container_status", return_value="exited"):
+        inspect_data = {
+            "State": {"Status": "exited", "ExitCode": 1, "Error": ""},
+            "RestartCount": 0,
+        }
+        with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
             assert worker_manager._run_container() is False
 
-    def test_returns_false_when_probe_window_exhausted_without_running(
+    def test_returns_true_when_probe_window_exhausted_without_running(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Probe timeout returns True (resilient) since Docker will keep trying."""
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+        inspect_data = {"State": {"Status": "created"}}
+        with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
+            assert worker_manager._run_container() is True
+
+
+class TestWorkerStartupProbeWindow:
+    """Startup probe window defaults to 30s and is configurable via env var."""
+
+    def _setup_run(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "worker.py").write_text("pass")
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+        monkeypatch.setattr(
+            WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True)
+        )
+        monkeypatch.setattr(
+            WorkerManager, "_send_startup_failure_alert", lambda self, detail="": None
+        )
+        monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+        monkeypatch.setattr("os.environ", {})
+
+    def test_default_probe_window_is_30_seconds(
         self,
         worker_manager: WorkerManager,
         tmp_config: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: default,
+        )
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+        inspect_data = {"State": {"Status": "created"}}
+        with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
+            worker_manager._run_container()
+
+        assert len(sleep_calls) == wm_module._DEFAULT_STARTUP_PROBE_SECONDS
+
+    def test_env_var_overrides_probe_window(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+
+        def fake_get_runtime_env_var(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS":
+                return "10"
+            return default
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            fake_get_runtime_env_var,
+        )
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+        inspect_data = {"State": {"Status": "created"}}
+        with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
+            worker_manager._run_container()
+
+        assert len(sleep_calls) == 10
+
+    def test_invalid_env_var_uses_default(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+
+        def fake_get_runtime_env_var(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS":
+                return "not-a-number"
+            return default
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            fake_get_runtime_env_var,
+        )
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+        inspect_data = {"State": {"Status": "created"}}
+        with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
+            worker_manager._run_container()
+
+        assert len(sleep_calls) == wm_module._DEFAULT_STARTUP_PROBE_SECONDS
+
+    def test_container_becomes_running_mid_probe(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: default,
+        )
         monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
-        # Container never reaches "running" or "exited" within the probe window.
-        with patch.object(wm_module, "docker_container_status", return_value="unknown"):
-            assert worker_manager._run_container() is False
+
+        inspect_results = [{"State": {"Status": "created"}}] * 10 + [
+            {"State": {"Status": "running"}}
+        ]
+        with patch.object(wm_module, "docker_inspect", side_effect=inspect_results):
+            assert worker_manager._run_container() is True
+
+    def test_restarting_container_keeps_waiting(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Container in 'restarting' state should not be treated as failure."""
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: (
+                "5" if name == "CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS" else default
+            ),
+        )
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+
+        inspect_results = [{"State": {"Status": "restarting"}}] * 3 + [
+            {"State": {"Status": "running"}}
+        ]
+        with patch.object(wm_module, "docker_inspect", side_effect=inspect_results):
+            assert worker_manager._run_container() is True
+
+    def test_exited_with_restarts_keeps_waiting(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exited container with RestartCount > 0 keeps waiting (Docker restart policy active)."""
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: (
+                "5" if name == "CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS" else default
+            ),
+        )
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+
+        inspect_results = [
+            {"State": {"Status": "exited", "ExitCode": 1, "Error": ""}, "RestartCount": 1},
+            {"State": {"Status": "restarting"}, "RestartCount": 1},
+            {"State": {"Status": "running"}, "RestartCount": 1},
+        ]
+        with patch.object(wm_module, "docker_inspect", side_effect=inspect_results):
+            assert worker_manager._run_container() is True
+
+    def test_sends_alert_on_probe_timeout(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Alert is sent when startup probe times out."""
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: (
+                "3" if name == "CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS" else default
+            ),
+        )
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+
+        alert_calls: list[str] = []
+        monkeypatch.setattr(
+            WorkerManager,
+            "_send_startup_failure_alert",
+            lambda self, detail="": alert_calls.append(detail),
+        )
+
+        inspect_data = {"State": {"Status": "created"}}
+        with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
+            result = worker_manager._run_container()
+
+        assert result is True
+        assert len(alert_calls) == 1
+        assert "timed out" in alert_calls[0]
+
+    def test_sends_alert_on_immediate_exit(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Alert is sent when container exits immediately with no restarts."""
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup.get_runtime_env_var",
+            lambda name, default=None: default,
+        )
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+
+        alert_calls: list[str] = []
+        monkeypatch.setattr(
+            WorkerManager,
+            "_send_startup_failure_alert",
+            lambda self, detail="": alert_calls.append(detail),
+        )
+
+        inspect_data = {
+            "State": {"Status": "exited", "ExitCode": 137, "Error": "OOMKilled"},
+            "RestartCount": 0,
+        }
+        with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
+            result = worker_manager._run_container()
+
+        assert result is False
+        assert len(alert_calls) == 1
+        assert "exit_code=137" in alert_calls[0]
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +1013,12 @@ class TestWorkerManagerStartHealthIntegration:
         monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
         monkeypatch.setattr("os.environ", {})
 
-        with patch.object(wm_module, "docker_container_status", side_effect=["none", "running"]):
+        with (
+            patch.object(wm_module, "docker_container_status", side_effect=["none"]),
+            patch.object(
+                wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+            ),
+        ):
             result = worker_manager.start()
 
         assert result is True
@@ -822,9 +1072,7 @@ class TestResolveWorkerImage:
         )
         assert wm_module.resolve_worker_image() == "cyberwaveos/edge-ml-worker:latest"
 
-    def test_explicit_override_wins_over_environment(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_explicit_override_wins_over_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Even when CYBERWAVE_ENVIRONMENT=dev (which would normally pick
         # ``:dev``), the operator-specified image must take precedence.
         # This is the path used by the `:local-gpu` SDK hot-fix loop —
@@ -839,10 +1087,7 @@ class TestResolveWorkerImage:
                 }
             ),
         )
-        assert (
-            wm_module.resolve_worker_image()
-            == "cyberwaveos/edge-ml-worker:local-gpu"
-        )
+        assert wm_module.resolve_worker_image() == "cyberwaveos/edge-ml-worker:local-gpu"
 
     def test_override_passes_through_third_party_registry(
         self, monkeypatch: pytest.MonkeyPatch
@@ -852,14 +1097,9 @@ class TestResolveWorkerImage:
         # bypassing the cyberwaveos/edge-ml-worker auto-suffix path).
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
-            self._runtime_env(
-                {"CYBERWAVE_WORKER_IMAGE": "myregistry.io:5000/cw/worker:custom"}
-            ),
+            self._runtime_env({"CYBERWAVE_WORKER_IMAGE": "myregistry.io:5000/cw/worker:custom"}),
         )
-        assert (
-            wm_module.resolve_worker_image()
-            == "myregistry.io:5000/cw/worker:custom"
-        )
+        assert wm_module.resolve_worker_image() == "myregistry.io:5000/cw/worker:custom"
 
     def test_blank_override_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Whitespace-only override falls through to the env-name path so a

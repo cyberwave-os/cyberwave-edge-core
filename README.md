@@ -301,6 +301,18 @@ The patched image survives every `docker rm`/`docker run` cycle from edge-core's
 
 When overriding to a registry outside `cyberwaveos/edge-ml-worker:*` (e.g. an internal mirror), include the `-gpu` suffix yourself if you need GPU access — the auto-suffix path in `_run_container` only triggers for the canonical `cyberwaveos/edge-ml-worker:` prefix.
 
+### Worker startup probe
+
+After `docker run --detach`, Edge Core polls the container status for up to 30 seconds (configurable via `CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS`) waiting for it to reach `running` state. The probe uses `docker inspect` to check the full container state, including restart count:
+
+- **`running`**: success — container is up.
+- **`exited`/`dead` with no prior restarts**: definitive failure — an alert is sent to all linked twins.
+- **`exited` with `RestartCount > 0`**: Docker's restart policy (`--restart=unless-stopped`) is active — the probe keeps waiting.
+- **`created`/`restarting`/other transient states**: Docker is still setting up the container — the probe keeps waiting.
+- **Probe window elapsed**: the container may still come up (Docker keeps trying via its restart policy), so Edge Core returns success and sends a `worker_start_failure` alert for visibility. The health monitor and periodic reconcile loop track the eventual outcome.
+
+This resilient approach ensures that slow container startups on resource-constrained devices (e.g. Raspberry Pi) do not block the rest of Edge Core's boot sequence.
+
 ### Worker health monitoring
 
 Edge Core continuously monitors the worker container for spontaneous exits and crash loops:
@@ -360,6 +372,7 @@ Edge Core monitors host memory usage and CPU temperature every ~30 seconds. When
 |---|---|---|
 | `CYBERWAVE_HARDWARE_WATCHDOG` | `true` | Enable/disable the hardware watchdog (`/dev/watchdog`) |
 | `CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT` | `true` | Enable/disable auto-detected memory limits on ≤4 GB hosts |
+| `CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS` | `30` | Seconds to wait for the worker container to reach `running` state after `docker run` |
 
 ### GPU support
 

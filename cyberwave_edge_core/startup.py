@@ -3210,9 +3210,7 @@ def _start_worker_after_drivers(
             image=resolve_worker_image(),
             resource_limits=load_worker_resource_limits(),
         )
-        ok = worker_manager.start()
-        if not ok:
-            _send_worker_start_failure_alerts(twin_uuids=twin_uuids)
+        worker_manager.start()
     except Exception as exc:
         logger.warning("Failed to start worker container after driver startup: %s", exc)
         _send_worker_start_failure_alerts(twin_uuids=twin_uuids, error=str(exc))

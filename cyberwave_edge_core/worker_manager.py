@@ -27,6 +27,7 @@ from .docker_helpers import (
     docker_available,
     docker_container_status,
     docker_has_nvidia_runtime,
+    docker_inspect,
     docker_rm,
     docker_stop,
 )
@@ -51,6 +52,8 @@ logger = logging.getLogger(__name__)
 _MUTABLE_TAG_BASENAMES = frozenset(
     {"latest", "dev", "local", "staging", "nightly", "edge", "main", "master"}
 )
+
+_DEFAULT_STARTUP_PROBE_SECONDS = 30
 
 
 def _image_tag_is_mutable(image: str) -> bool:
@@ -316,8 +319,10 @@ class WorkerManager:
     def start(self) -> bool:
         """Start the worker container if workers exist and it isn't already running.
 
-        Returns True if the container is running after this call (including
-        the case where it was already running).  Returns False only on error.
+        Returns True if the container is running (or is expected to reach
+        running state) after this call.  Returns False only on definitive
+        errors where the container cannot possibly come up (e.g. Docker
+        unavailable, image missing, container immediately exited/dead).
         """
         if not docker_available():
             logger.error("Docker is not available; cannot start worker container")
@@ -670,6 +675,23 @@ class WorkerManager:
             logger.error("Timed out pulling worker image %s after %ds", image, timeout)
             return False
 
+    def _send_startup_failure_alert(self, detail: str = "") -> None:
+        """Best-effort alert to all linked twins when worker startup fails."""
+        if not self._twin_uuids:
+            return
+        try:
+            from .startup import _send_worker_start_failure_alerts  # noqa: PLC0415
+
+            _send_worker_start_failure_alerts(
+                twin_uuids=self._twin_uuids,
+                error=detail,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to send worker-start-failure alert from WorkerManager",
+                exc_info=True,
+            )
+
     def _run_container(self) -> bool:
         """Pull (if needed) and run the worker container. Returns True on success."""
         from .startup import DEFAULT_ENVIRONMENT, get_runtime_env_var
@@ -743,8 +765,10 @@ class WorkerManager:
                 image = non_gpu_image
                 cmd[-1] = image
                 if not self._ensure_image_pulled(image):
+                    self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
                     return False
             else:
+                self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
                 return False
 
         try:
@@ -759,30 +783,91 @@ class WorkerManager:
             logger.error(
                 "Failed to start worker container %s: %s", self._container_name, exc.stderr
             )
+            self._send_startup_failure_alert(f"docker run failed: {exc.stderr}")
             return False
         except subprocess.TimeoutExpired:
             logger.error("Docker run timed out for worker container %s", self._container_name)
+            self._send_startup_failure_alert("docker run timed out after 60s")
             return False
 
-        for _ in range(5):
-            status = docker_container_status(self._container_name)
-            if status == "running":
+        probe_seconds = _DEFAULT_STARTUP_PROBE_SECONDS
+        probe_override = get_runtime_env_var("CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS")
+        if probe_override:
+            try:
+                probe_seconds = max(1, int(probe_override))
+            except ValueError:
+                logger.warning(
+                    "Invalid CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS=%r; using default %ds",
+                    probe_override,
+                    _DEFAULT_STARTUP_PROBE_SECONDS,
+                )
+
+        last_status = "unknown"
+        for i in range(probe_seconds):
+            inspect_data = docker_inspect(self._container_name)
+            if inspect_data is None:
+                last_status = "none"
+                time.sleep(1.0)
+                continue
+
+            state = inspect_data.get("State")
+            if not isinstance(state, dict):
+                last_status = "unknown"
+                time.sleep(1.0)
+                continue
+
+            last_status = str(state.get("Status", "unknown")).lower()
+
+            if last_status == "running":
                 logger.info("Worker container %s is running", self._container_name)
                 return True
-            if status in {"exited", "dead"}:
+
+            if last_status in {"exited", "dead"}:
+                error_msg = str(state.get("Error", "")).strip() or "none"
+                exit_code = state.get("ExitCode", "?")
+                restart_count = int(inspect_data.get("RestartCount", 0))
+                if restart_count > 0 and last_status == "exited":
+                    logger.debug(
+                        "Worker container %s exited (code=%s, restarts=%d); "
+                        "Docker restart policy may revive it — continuing probe",
+                        self._container_name,
+                        exit_code,
+                        restart_count,
+                    )
+                    time.sleep(1.0)
+                    continue
                 logger.error(
-                    "Worker container %s failed to start (status=%s)",
+                    "Worker container %s failed to start (status=%s, exit_code=%s, error=%s)",
                     self._container_name,
-                    status,
+                    last_status,
+                    exit_code,
+                    error_msg,
+                )
+                self._send_startup_failure_alert(
+                    f"status={last_status}, exit_code={exit_code}, error={error_msg}"
                 )
                 return False
+
             time.sleep(1.0)
 
-        logger.error(
-            "Worker container %s did not reach running state within startup probe window",
+        # Probe window elapsed without the container reaching "running".
+        # The container has --restart=unless-stopped so Docker will keep
+        # trying.  Return True (like driver containers) so the rest of
+        # edge-core startup is not blocked; the health monitor and periodic
+        # reconcile loop will track eventual state.
+        logger.warning(
+            "Worker container %s did not reach running state within "
+            "startup probe window (%ds, last_status=%s). The container "
+            "uses --restart=unless-stopped so Docker will keep trying. "
+            "Override probe duration with CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS.",
             self._container_name,
+            probe_seconds,
+            last_status,
         )
-        return False
+        self._send_startup_failure_alert(
+            f"startup probe timed out after {probe_seconds}s, last_status={last_status}"
+        )
+        return True
 
 
 def get_zenoh_env_vars() -> dict[str, str]:
