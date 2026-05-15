@@ -838,10 +838,17 @@ export CYBERWAVE_BASE_URL="https://yourbaseurl"
 cyberwave-edge-core
 ```
 
-Control log verbosity (default: `INFO`):
+Control log verbosity (default: `INFO`). Edge-core forwards any
+`CYBERWAVE_*` env var it sees in its own process environment into each
+worker container at `docker run` time, so the same knobs work whether
+they're set in the systemd unit, the CLI install env, or the shell:
 
 ```bash
+# Edge-core + edge drivers (camera/UGV/etc.)
 export CYBERWAVE_EDGE_LOG_LEVEL="DEBUG"
+# Worker containers only — wins over CYBERWAVE_EDGE_LOG_LEVEL when set,
+# so you can keep workers at INFO while a driver is at DEBUG (or vice versa).
+export CYBERWAVE_WORKER_LOG_LEVEL="INFO"
 cyberwave-edge-core
 ```
 
