@@ -11,8 +11,11 @@ Covers:
 - docker_ps_by_prefix: returns names, filters by prefix, handles errors,
   include_stopped passes -a flag
 - docker_has_nvidia_runtime: nvidia present, absent, empty output, bad JSON, errors
+- docker_prune_stopped_cyberwave_containers: removes stopped containers, skips running
+- docker_prune_unused_images: success, failure, docker unavailable
 - docker_logs_follow: returns Popen handle, docker unavailable, OSError on Popen
 """
+
 from __future__ import annotations
 
 import json
@@ -85,9 +88,7 @@ class TestDockerAvailable:
 
 
 class TestDockerRm:
-    def test_returns_false_when_docker_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: None)
         assert dh.docker_rm("my_container") is False
 
@@ -96,9 +97,7 @@ class TestDockerRm:
         monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed())
         assert dh.docker_rm("my_container") is True
 
-    def test_returns_true_on_called_process_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_true_on_called_process_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
 
         def raise_cpe(*a: Any, **kw: Any) -> None:
@@ -118,7 +117,9 @@ class TestDockerRm:
 
     def test_returns_false_on_os_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(OSError("not found")))
+        monkeypatch.setattr(
+            dh.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(OSError("not found"))
+        )
         assert dh.docker_rm("my_container") is False
 
     def test_passes_container_name_to_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,9 +138,7 @@ class TestDockerRm:
 
 
 class TestDockerStop:
-    def test_returns_false_when_docker_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: None)
         assert dh.docker_stop("my_container") is False
 
@@ -148,9 +147,7 @@ class TestDockerStop:
         monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed())
         assert dh.docker_stop("my_container") is True
 
-    def test_returns_true_on_called_process_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_true_on_called_process_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
 
         def raise_cpe(*a: Any, **kw: Any) -> None:
@@ -184,9 +181,7 @@ class TestDockerStop:
 
 
 class TestDockerInspect:
-    def test_returns_none_when_docker_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: None)
         assert dh.docker_inspect("c") is None
 
@@ -199,9 +194,7 @@ class TestDockerInspect:
         result = dh.docker_inspect("my_container")
         assert result == payload[0]
 
-    def test_returns_none_on_called_process_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_on_called_process_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
 
         def raise_cpe(*a: Any, **kw: Any) -> None:
@@ -221,16 +214,12 @@ class TestDockerInspect:
 
     def test_returns_none_on_invalid_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed("not-json")
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed("not-json"))
         assert dh.docker_inspect("c") is None
 
     def test_returns_none_on_empty_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed("[]")
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed("[]"))
         assert dh.docker_inspect("c") is None
 
     def test_returns_none_when_first_element_not_dict(
@@ -242,13 +231,9 @@ class TestDockerInspect:
         )
         assert dh.docker_inspect("c") is None
 
-    def test_returns_none_when_output_is_not_list(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_when_output_is_not_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed('{"Id": "abc"}')
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed('{"Id": "abc"}'))
         assert dh.docker_inspect("c") is None
 
 
@@ -258,9 +243,7 @@ class TestDockerInspect:
 
 
 class TestDockerImageExistsLocally:
-    def test_returns_false_when_docker_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: None)
         assert dh.docker_image_exists_locally("myimage:latest") is False
 
@@ -269,9 +252,7 @@ class TestDockerImageExistsLocally:
         monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed())
         assert dh.docker_image_exists_locally("myimage:latest") is True
 
-    def test_returns_false_on_called_process_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_on_called_process_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
 
         def raise_cpe(*a: Any, **kw: Any) -> None:
@@ -305,39 +286,27 @@ class TestDockerImageExistsLocally:
 
 
 class TestDockerContainerStatus:
-    def test_returns_none_when_inspect_returns_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_when_inspect_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh, "docker_inspect", lambda name: None)
         assert dh.docker_container_status("c") == "none"
 
     def test_returns_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            dh, "docker_inspect", lambda name: {"State": {"Status": "running"}}
-        )
+        monkeypatch.setattr(dh, "docker_inspect", lambda name: {"State": {"Status": "running"}})
         assert dh.docker_container_status("c") == "running"
 
     def test_returns_exited(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            dh, "docker_inspect", lambda name: {"State": {"Status": "exited"}}
-        )
+        monkeypatch.setattr(dh, "docker_inspect", lambda name: {"State": {"Status": "exited"}})
         assert dh.docker_container_status("c") == "exited"
 
-    def test_returns_unknown_when_state_not_dict(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_unknown_when_state_not_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh, "docker_inspect", lambda name: {"State": "bad"})
         assert dh.docker_container_status("c") == "unknown"
 
     def test_status_is_lowercased(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            dh, "docker_inspect", lambda name: {"State": {"Status": "Running"}}
-        )
+        monkeypatch.setattr(dh, "docker_inspect", lambda name: {"State": {"Status": "Running"}})
         assert dh.docker_container_status("c") == "running"
 
-    def test_returns_unknown_when_status_key_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_unknown_when_status_key_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh, "docker_inspect", lambda name: {"State": {}})
         assert dh.docker_container_status("c") == "unknown"
 
@@ -357,18 +326,14 @@ class TestDockerPsByPrefix:
     def test_returns_matching_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = "cw_worker_1\ncw_worker_2\n"
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed(output)
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed(output))
         result = dh.docker_ps_by_prefix("cw_")
         assert result == ["cw_worker_1", "cw_worker_2"]
 
     def test_strips_whitespace_from_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = "  cw_worker_1  \n  cw_worker_2  \n"
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed(output)
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed(output))
         result = dh.docker_ps_by_prefix("cw_")
         assert result == ["cw_worker_1", "cw_worker_2"]
 
@@ -381,9 +346,7 @@ class TestDockerPsByPrefix:
         monkeypatch.setattr(dh.subprocess, "run", raise_cpe)
         assert dh.docker_ps_by_prefix("cw_") == []
 
-    def test_include_stopped_adds_dash_a_flag(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_include_stopped_adds_dash_a_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
         captured: list[list[str]] = []
         monkeypatch.setattr(
@@ -419,9 +382,7 @@ class TestDockerPsByPrefix:
 
 
 class TestDockerHasNvidiaRuntime:
-    def test_returns_false_when_docker_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: None)
         assert dh.docker_has_nvidia_runtime() is False
 
@@ -443,21 +404,15 @@ class TestDockerHasNvidiaRuntime:
 
     def test_returns_false_on_empty_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed("")
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed(""))
         assert dh.docker_has_nvidia_runtime() is False
 
     def test_returns_false_on_invalid_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed("not-json")
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed("not-json"))
         assert dh.docker_has_nvidia_runtime() is False
 
-    def test_returns_false_on_called_process_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_on_called_process_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
 
         def raise_cpe(*a: Any, **kw: Any) -> None:
@@ -475,13 +430,9 @@ class TestDockerHasNvidiaRuntime:
         monkeypatch.setattr(dh.subprocess, "run", raise_timeout)
         assert dh.docker_has_nvidia_runtime() is False
 
-    def test_returns_false_when_output_is_not_dict(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_output_is_not_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
-        monkeypatch.setattr(
-            dh.subprocess, "run", lambda *a, **kw: _make_completed('["nvidia"]')
-        )
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed('["nvidia"]'))
         assert dh.docker_has_nvidia_runtime() is False
 
 
@@ -498,7 +449,8 @@ class TestDockerHasNvidiaDefaultRuntime:
         daemon_json.write_text(json.dumps({"default-runtime": "nvidia"}))
         monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
         monkeypatch.setattr(
-            dh, "docker_has_nvidia_default_runtime",
+            dh,
+            "docker_has_nvidia_default_runtime",
             lambda: json.loads(daemon_json.read_text()).get("default-runtime") == "nvidia",
         )
         assert dh.docker_has_nvidia_default_runtime() is True
@@ -507,13 +459,12 @@ class TestDockerHasNvidiaDefaultRuntime:
         monkeypatch.setattr(dh.platform, "system", lambda: "Darwin")
         assert dh.docker_has_nvidia_default_runtime() is False
 
-    def test_returns_false_when_daemon_json_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_daemon_json_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
         original = dh.docker_has_nvidia_default_runtime
 
         import builtins
+
         real_open = builtins.open
 
         def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
@@ -531,7 +482,8 @@ class TestDockerHasNvidiaDefaultRuntime:
         daemon_json.write_text(json.dumps({"default-runtime": "runc"}))
         monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
         monkeypatch.setattr(
-            dh, "docker_has_nvidia_default_runtime",
+            dh,
+            "docker_has_nvidia_default_runtime",
             lambda: json.loads(daemon_json.read_text()).get("default-runtime") == "nvidia",
         )
         assert dh.docker_has_nvidia_default_runtime() is False
@@ -543,9 +495,7 @@ class TestDockerHasNvidiaDefaultRuntime:
 
 
 class TestDockerLogsFollow:
-    def test_returns_none_when_docker_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.shutil, "which", lambda name: None)
         assert dh.docker_logs_follow("c") is None
 
@@ -578,3 +528,134 @@ class TestDockerLogsFollow:
         monkeypatch.setattr(dh.subprocess, "Popen", fake_popen)
         dh.docker_logs_follow("target_container")
         assert captured[0] == ["docker", "logs", "-f", "--tail", "50", "target_container"]
+
+
+# ---------------------------------------------------------------------------
+# docker_prune_stopped_cyberwave_containers
+# ---------------------------------------------------------------------------
+
+
+class TestDockerPruneStoppedCyberwaveContainers:
+    def test_returns_zero_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: False)
+        assert dh.docker_prune_stopped_cyberwave_containers() == 0
+
+    def test_returns_zero_when_no_stopped_containers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(
+            dh,
+            "docker_ps_by_prefix",
+            lambda prefix, include_stopped=False: (
+                ["cyberwave-driver-abc"] if include_stopped else ["cyberwave-driver-abc"]
+            ),
+        )
+        assert dh.docker_prune_stopped_cyberwave_containers() == 0
+
+    def test_removes_stopped_containers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        all_containers = [
+            "cyberwave-driver-abc",
+            "cyberwave-worker-def",
+            "cyberwave-zenoh-router-ghi",
+        ]
+        running_containers = ["cyberwave-driver-abc"]
+
+        def fake_ps(prefix: str, include_stopped: bool = False) -> list[str]:
+            return all_containers if include_stopped else running_containers
+
+        removed_names: list[str] = []
+
+        def fake_rm(name: str) -> bool:
+            removed_names.append(name)
+            return True
+
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh, "docker_ps_by_prefix", fake_ps)
+        monkeypatch.setattr(dh, "docker_rm", fake_rm)
+
+        result = dh.docker_prune_stopped_cyberwave_containers()
+        assert result == 2
+        assert "cyberwave-worker-def" in removed_names
+        assert "cyberwave-zenoh-router-ghi" in removed_names
+        assert "cyberwave-driver-abc" not in removed_names
+
+    def test_counts_failed_removals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_ps(prefix: str, include_stopped: bool = False) -> list[str]:
+            return ["cyberwave-a", "cyberwave-b"] if include_stopped else []
+
+        call_count = 0
+
+        def fake_rm(name: str) -> bool:
+            nonlocal call_count
+            call_count += 1
+            return call_count == 1
+
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh, "docker_ps_by_prefix", fake_ps)
+        monkeypatch.setattr(dh, "docker_rm", fake_rm)
+
+        assert dh.docker_prune_stopped_cyberwave_containers() == 1
+
+    def test_uses_custom_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_prefixes: list[str] = []
+
+        def fake_ps(prefix: str, include_stopped: bool = False) -> list[str]:
+            captured_prefixes.append(prefix)
+            return []
+
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh, "docker_ps_by_prefix", fake_ps)
+
+        dh.docker_prune_stopped_cyberwave_containers(prefix="my-prefix")
+        assert all(p == "my-prefix" for p in captured_prefixes)
+
+
+# ---------------------------------------------------------------------------
+# docker_prune_unused_images
+# ---------------------------------------------------------------------------
+
+
+class TestDockerPruneUnusedImages:
+    def test_returns_false_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: False)
+        assert dh.docker_prune_unused_images() is False
+
+    def test_returns_true_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed())
+        assert dh.docker_prune_unused_images() is True
+
+    def test_returns_false_on_called_process_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+
+        def raise_cpe(*a: Any, **kw: Any) -> None:
+            raise subprocess.CalledProcessError(1, "docker")
+
+        monkeypatch.setattr(dh.subprocess, "run", raise_cpe)
+        assert dh.docker_prune_unused_images() is False
+
+    def test_returns_false_on_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+
+        def raise_timeout(*a: Any, **kw: Any) -> None:
+            raise subprocess.TimeoutExpired("docker", 300)
+
+        monkeypatch.setattr(dh.subprocess, "run", raise_timeout)
+        assert dh.docker_prune_unused_images() is False
+
+    def test_returns_false_on_os_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+
+        def raise_os_error(*a: Any, **kw: Any) -> None:
+            raise OSError("not found")
+
+        monkeypatch.setattr(dh.subprocess, "run", raise_os_error)
+        assert dh.docker_prune_unused_images() is False
+
+    def test_passes_correct_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            dh.subprocess, "run", lambda cmd, **kw: captured.append(cmd) or _make_completed()
+        )
+        dh.docker_prune_unused_images()
+        assert captured[0] == ["docker", "image", "prune", "--all", "--force"]

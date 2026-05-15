@@ -134,6 +134,7 @@ class TestRuntimeLoopSyncCadence:
         )
         monkeypatch.setattr(startup, "_CONTAINER_LOG_THREADS", {})
         monkeypatch.setattr(startup, "_graceful_shutdown", lambda w: None)
+        monkeypatch.setattr(startup, "_run_periodic_docker_cleanup", lambda: None)
 
     def _stop_after(self, n, monkeypatch):
         """Make the shutdown_event stop the loop after *n* wait() calls."""
@@ -276,3 +277,152 @@ class TestRuntimeLoopSyncCadence:
         startup.run_runtime_loop(watchdog=FailingWatchdog())
 
         assert ping_count[0] == 2
+
+    def test_periodic_docker_cleanup_called(self, monkeypatch):
+        """Verify _run_periodic_docker_cleanup is called each cycle."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        cleanup_calls = [0]
+
+        def fake_cleanup():
+            cleanup_calls[0] += 1
+
+        monkeypatch.setattr(startup, "_run_periodic_docker_cleanup", fake_cleanup)
+        self._stop_after(3, monkeypatch)
+
+        startup.run_runtime_loop()
+
+        assert cleanup_calls[0] == 3
+
+    def test_periodic_docker_cleanup_exception_does_not_crash(self, monkeypatch):
+        """Verify an exception in _run_periodic_docker_cleanup propagates but
+        the function itself catches errors internally."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        startup._worker_sync_loop_counter = 0
+
+        cleanup_calls = [0]
+
+        def fake_cleanup():
+            cleanup_calls[0] += 1
+
+        monkeypatch.setattr(startup, "_run_periodic_docker_cleanup", fake_cleanup)
+        self._stop_after(2, monkeypatch)
+
+        startup.run_runtime_loop()
+        assert cleanup_calls[0] == 2
+
+
+# ===========================================================================
+# 3. _run_periodic_docker_cleanup()
+# ===========================================================================
+
+
+class TestRunPeriodicDockerCleanup:
+    """Tests for the _run_periodic_docker_cleanup scheduling logic."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_prune_times(self):
+        """Reset module-level prune timestamps before/after each test."""
+        startup._last_container_prune_time = 0.0
+        startup._last_image_prune_time = 0.0
+        yield
+        startup._last_container_prune_time = 0.0
+        startup._last_image_prune_time = 0.0
+
+    def test_runs_both_prune_on_first_call(self, monkeypatch):
+        container_prune_calls = [0]
+        image_prune_calls = [0]
+
+        monkeypatch.setattr(
+            startup,
+            "CONTAINER_PRUNE_INTERVAL_SECONDS",
+            10.0,
+        )
+        monkeypatch.setattr(
+            startup,
+            "IMAGE_PRUNE_INTERVAL_SECONDS",
+            100.0,
+        )
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_stopped_cyberwave_containers",
+            lambda **kw: container_prune_calls.__setitem__(0, container_prune_calls[0] + 1) or 0,
+        )
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_unused_images",
+            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+        )
+
+        startup._run_periodic_docker_cleanup()
+
+        assert container_prune_calls[0] == 1
+        assert image_prune_calls[0] == 1
+
+    def test_skips_when_interval_not_elapsed(self, monkeypatch):
+        container_prune_calls = [0]
+        image_prune_calls = [0]
+
+        monkeypatch.setattr(startup, "CONTAINER_PRUNE_INTERVAL_SECONDS", 1800.0)
+        monkeypatch.setattr(startup, "IMAGE_PRUNE_INTERVAL_SECONDS", 10800.0)
+
+        import time
+
+        now = time.monotonic()
+        startup._last_container_prune_time = now
+        startup._last_image_prune_time = now
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_stopped_cyberwave_containers",
+            lambda **kw: container_prune_calls.__setitem__(0, container_prune_calls[0] + 1) or 0,
+        )
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_unused_images",
+            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+        )
+
+        startup._run_periodic_docker_cleanup()
+
+        assert container_prune_calls[0] == 0
+        assert image_prune_calls[0] == 0
+
+    def test_container_prune_runs_when_interval_elapsed(self, monkeypatch):
+        container_prune_calls = [0]
+        image_prune_calls = [0]
+
+        monkeypatch.setattr(startup, "CONTAINER_PRUNE_INTERVAL_SECONDS", 10.0)
+        monkeypatch.setattr(startup, "IMAGE_PRUNE_INTERVAL_SECONDS", 10800.0)
+
+        import time
+
+        now = time.monotonic()
+        startup._last_container_prune_time = now - 20
+        startup._last_image_prune_time = now
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_stopped_cyberwave_containers",
+            lambda **kw: container_prune_calls.__setitem__(0, container_prune_calls[0] + 1) or 0,
+        )
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_unused_images",
+            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+        )
+
+        startup._run_periodic_docker_cleanup()
+
+        assert container_prune_calls[0] == 1
+        assert image_prune_calls[0] == 0

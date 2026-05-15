@@ -242,6 +242,13 @@ DRIVER_RESTART_LOOP_WINDOW_SECONDS = float(
     os.getenv("CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS", "60")
 )
 
+CONTAINER_PRUNE_INTERVAL_SECONDS = float(
+    os.getenv("CYBERWAVE_CONTAINER_PRUNE_INTERVAL_SECONDS", "1800")  # 30 minutes
+)
+IMAGE_PRUNE_INTERVAL_SECONDS = float(
+    os.getenv("CYBERWAVE_IMAGE_PRUNE_INTERVAL_SECONDS", "10800")  # 3 hours
+)
+
 
 def _atomic_write_json(path: Path, data: Any, *, mode: int = 0o600) -> None:
     """Atomically write *data* as JSON to *path* with restrictive permissions.
@@ -4936,6 +4943,37 @@ _WORKER_SYNC_INTERVAL_LOOPS = int(
 )
 _worker_sync_loop_counter = 0
 
+_last_container_prune_time: float = 0.0
+_last_image_prune_time: float = 0.0
+
+
+def _run_periodic_docker_cleanup() -> None:
+    """Prune stopped cyberwave containers and unused images on a schedule.
+
+    Container pruning runs every ``CONTAINER_PRUNE_INTERVAL_SECONDS`` (default
+    30 min). Image pruning runs every ``IMAGE_PRUNE_INTERVAL_SECONDS`` (default
+    3 h).  Both are no-ops when Docker is unavailable.
+    """
+    global _last_container_prune_time, _last_image_prune_time
+
+    from .docker_helpers import docker_prune_stopped_cyberwave_containers, docker_prune_unused_images
+
+    now = time.monotonic()
+
+    if now - _last_container_prune_time >= CONTAINER_PRUNE_INTERVAL_SECONDS:
+        try:
+            docker_prune_stopped_cyberwave_containers()
+        except Exception:
+            logger.exception("Unexpected error during stopped-container prune")
+        _last_container_prune_time = now
+
+    if now - _last_image_prune_time >= IMAGE_PRUNE_INTERVAL_SECONDS:
+        try:
+            docker_prune_unused_images()
+        except Exception:
+            logger.exception("Unexpected error during unused-image prune")
+        _last_image_prune_time = now
+
 
 def run_runtime_loop(
     *,
@@ -5089,6 +5127,9 @@ def run_runtime_loop(
                     )
             except Exception:
                 logger.exception("Unexpected error during worker sync reconcile")
+
+        # -- Periodic Docker cleanup (CYB-1996) ------------------------------
+        _run_periodic_docker_cleanup()
 
         # -- Watchdog and resource monitoring at end of each cycle -----------
         if watchdog is not None:

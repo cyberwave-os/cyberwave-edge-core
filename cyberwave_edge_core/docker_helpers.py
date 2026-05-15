@@ -202,6 +202,59 @@ def docker_has_nvidia_default_runtime() -> bool:
         return False
 
 
+def docker_prune_stopped_cyberwave_containers(prefix: str = "cyberwave") -> int:
+    """Remove all stopped containers whose name starts with *prefix*.
+
+    Returns the number of containers successfully removed.
+    """
+    if not docker_available():
+        return 0
+
+    stopped = docker_ps_by_prefix(prefix, include_stopped=True)
+    running = set(docker_ps_by_prefix(prefix, include_stopped=False))
+    to_remove = [name for name in stopped if name not in running]
+
+    if not to_remove:
+        logger.debug("No stopped cyberwave containers to prune")
+        return 0
+
+    removed = 0
+    for name in to_remove:
+        if docker_rm(name):
+            removed += 1
+            logger.debug("Pruned stopped container: %s", name)
+        else:
+            logger.warning("Failed to prune stopped container: %s", name)
+
+    logger.info("Pruned %d/%d stopped cyberwave container(s)", removed, len(to_remove))
+    return removed
+
+
+def docker_prune_unused_images() -> bool:
+    """Run ``docker image prune --all --force`` to remove all unused images.
+
+    Returns True on success.
+    """
+    if not docker_available():
+        return False
+    try:
+        subprocess.run(
+            ["docker", "image", "prune", "--all", "--force"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        logger.info("Docker unused image prune completed")
+        return True
+    except subprocess.CalledProcessError as exc:
+        logger.warning("Docker image prune failed: %s", exc)
+        return False
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Docker image prune error: %s", exc)
+        return False
+
+
 def docker_logs_follow(container_name: str) -> Optional[subprocess.Popen]:  # type: ignore[type-arg]
     """Start a ``docker logs -f`` process and return its Popen handle."""
     if not docker_available():
