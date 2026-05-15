@@ -7,12 +7,15 @@ Covers:
 - Existing .py file modified → restart triggered
 - .py file removed → restart triggered
 - Non-.py file changes → ignored
+- Model download failure alerts
+- Worker start failure alerts
 """
+
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from cyberwave_edge_core.worker_watcher import WorkerWatcher
 
@@ -261,3 +264,108 @@ class TestWorkerWatcherDirectoryHash:
         (workers_dir / "new.py").write_text("pass")
         h_after = watcher._compute_directory_hash()
         assert h_before != h_after
+
+
+class TestWorkerWatcherModelFailureAlerts:
+    def test_model_failure_alerts_sent_on_ensure_failures(self, tmp_path: Path) -> None:
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        worker_manager._twin_uuids = ["twin-uuid-1"]
+        model_manager.scan_worker_model_ids.return_value = ["yolov8n"]
+        model_manager.last_ensure_failures = {"yolov8n": "No download sources"}
+
+        watcher.reconcile_worker_files()  # baseline
+
+        with patch.object(watcher, "_send_model_failure_alerts") as mock_send:
+            (workers_dir / "detect.py").write_text('cw.models.load("yolov8n")')
+            watcher.reconcile_worker_files()
+
+            mock_send.assert_called_once()
+
+    def test_no_alerts_when_no_failures(self, tmp_path: Path) -> None:
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        worker_manager._twin_uuids = ["twin-uuid-1"]
+        model_manager.scan_worker_model_ids.return_value = ["yolov8n"]
+        model_manager.last_ensure_failures = {}
+
+        watcher.reconcile_worker_files()  # baseline
+
+        with patch.object(watcher, "_send_model_failure_alerts") as mock_send:
+            (workers_dir / "detect.py").write_text('cw.models.load("yolov8n")')
+            watcher.reconcile_worker_files()
+
+            mock_send.assert_called_once()
+
+    def test_send_model_failure_alerts_skips_when_no_failures(self, tmp_path: Path) -> None:
+        """_send_model_failure_alerts is a no-op when last_ensure_failures is empty."""
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        worker_manager._twin_uuids = ["twin-uuid-1"]
+        model_manager.last_ensure_failures = {}
+
+        # Should not raise even without startup being importable
+        watcher._send_model_failure_alerts()
+
+    def test_send_model_failure_alerts_skips_when_no_twin_uuids(self, tmp_path: Path) -> None:
+        """_send_model_failure_alerts is a no-op when no twin_uuids are available."""
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        worker_manager._twin_uuids = []
+        model_manager.last_ensure_failures = {"yolov8n": "No download sources"}
+
+        # Should not raise even without startup being importable
+        watcher._send_model_failure_alerts()
+
+
+class TestWorkerWatcherStartFailureAlerts:
+    def test_alert_sent_on_restart_failure(self, tmp_path: Path) -> None:
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        worker_manager._twin_uuids = ["twin-uuid-1"]
+        worker_manager.restart.return_value = False
+
+        watcher.reconcile_worker_files()  # baseline
+
+        with patch.object(watcher, "_send_worker_start_failure_alert") as mock_send:
+            (workers_dir / "detect.py").write_text("pass")
+            watcher.reconcile_worker_files()
+
+            mock_send.assert_called_once()
+
+    def test_no_alert_on_successful_restart(self, tmp_path: Path) -> None:
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        worker_manager._twin_uuids = ["twin-uuid-1"]
+        worker_manager.restart.return_value = True
+
+        watcher.reconcile_worker_files()  # baseline
+
+        with patch.object(watcher, "_send_worker_start_failure_alert") as mock_send:
+            (workers_dir / "detect.py").write_text("pass")
+            watcher.reconcile_worker_files()
+
+            mock_send.assert_not_called()
+
+    def test_send_worker_start_failure_alert_skips_when_no_twin_uuids(self, tmp_path: Path) -> None:
+        """_send_worker_start_failure_alert is a no-op when no twin_uuids are available."""
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        worker_manager._twin_uuids = []
+
+        # Should not raise even without startup being importable
+        watcher._send_worker_start_failure_alert()

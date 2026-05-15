@@ -259,6 +259,7 @@ class ModelManager:
         self._base_url = base_url.rstrip("/")
         self._manifest_path = cache_dir / MANIFEST_FILENAME
         self._manifest = _Manifest.load(self._manifest_path)
+        self.last_ensure_failures: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Core public methods
@@ -336,8 +337,13 @@ class ModelManager:
         Returns a mapping of ``model_id → local_path`` for every model that
         could be resolved. Models that fail to download are logged as
         warnings and omitted from the result rather than raising.
+
+        After this call, :attr:`last_ensure_failures` contains the mapping
+        of ``model_id → error_message`` for models that could not be
+        resolved, which callers can inspect to send alerts.
         """
         results: dict[str, Path] = {}
+        failures: dict[str, str] = {}
         for model_id in model_ids:
             try:
                 results[model_id] = self.ensure_model(model_id)
@@ -347,6 +353,8 @@ class ModelManager:
                     model_id,
                     exc,
                 )
+                failures[model_id] = str(exc)
+        self.last_ensure_failures = failures
         return results
 
     def list_cached_models(self) -> list[CachedModel]:

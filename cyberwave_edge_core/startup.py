@@ -3197,6 +3197,10 @@ def _start_worker_after_drivers(
                 base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
                 mm = ModelManager(cache_dir=models_dir, api_token=token, base_url=base_url)
                 mm.ensure_models(model_ids)
+                _send_model_failure_alerts(
+                    twin_uuids=twin_uuids,
+                    failures=mm.last_ensure_failures,
+                )
 
         worker_manager = WorkerManager(
             config_dir=CONFIG_DIR,
@@ -3206,9 +3210,12 @@ def _start_worker_after_drivers(
             image=resolve_worker_image(),
             resource_limits=load_worker_resource_limits(),
         )
-        worker_manager.start()
+        ok = worker_manager.start()
+        if not ok:
+            _send_worker_start_failure_alerts(twin_uuids=twin_uuids)
     except Exception as exc:
         logger.warning("Failed to start worker container after driver startup: %s", exc)
+        _send_worker_start_failure_alerts(twin_uuids=twin_uuids, error=str(exc))
 
 
 def _send_alert_for_twin(
@@ -3232,6 +3239,69 @@ def _send_alert_for_twin(
         alert_type=alert_type,
         source_type="edge",  # edge | cloud | workflow
     )
+
+
+def _send_model_failure_alerts(
+    *,
+    twin_uuids: list[str],
+    failures: dict[str, str],
+) -> None:
+    """Send a technical alert for each model that failed to download.
+
+    Alerts are sent to every twin associated with the current edge so
+    that operators can see the failure in each twin's alert feed.
+    """
+    if not failures:
+        return
+    for model_id, error_msg in failures.items():
+        for twin_uuid in twin_uuids:
+            try:
+                _send_alert_for_twin(
+                    twin_uuid,
+                    f"Model not available: {model_id}",
+                    (
+                        f"Failed to download model '{model_id}' required by an "
+                        f"active workflow. The worker will start without this "
+                        f"model; inference steps that depend on it will be "
+                        f"skipped. Error: {error_msg}"
+                    ),
+                    "model_download_failure",
+                    severity="warning",
+                )
+            except Exception as alert_exc:
+                logger.debug(
+                    "Failed to send model-download alert for twin %s, model %s: %s",
+                    twin_uuid,
+                    model_id,
+                    alert_exc,
+                )
+
+
+def _send_worker_start_failure_alerts(
+    *,
+    twin_uuids: list[str],
+    error: str = "",
+) -> None:
+    """Send a technical alert when the worker container fails to start."""
+    detail = f" Error: {error}" if error else ""
+    for twin_uuid in twin_uuids:
+        try:
+            _send_alert_for_twin(
+                twin_uuid,
+                "Worker container failed to start",
+                (
+                    f"The edge ML worker container could not be started. "
+                    f"Workflows will not run until this is resolved.{detail}"
+                ),
+                "worker_start_failure",
+                severity="warning",
+            )
+        except Exception as alert_exc:
+            logger.debug(
+                "Failed to send worker-start-failure alert for twin %s: %s",
+                twin_uuid,
+                alert_exc,
+            )
 
 
 # Re-exported from driver_selection for backward compat.

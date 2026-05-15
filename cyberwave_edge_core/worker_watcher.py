@@ -175,7 +175,9 @@ class WorkerWatcher:
         reason = "worker-files-changed"
         logger.info("Triggering worker container restart (reason=%r)", reason)
         self._ensure_models()
-        self._worker_manager.restart(reason=reason)
+        ok = self._worker_manager.restart(reason=reason)
+        if not ok:
+            self._send_worker_start_failure_alert()
 
         if self._on_restart:
             try:
@@ -215,7 +217,41 @@ class WorkerWatcher:
                 return
             logger.info("Ensuring models before worker restart: %s", model_ids)
             self._model_manager.ensure_models(model_ids)
+            self._send_model_failure_alerts()
         except Exception as exc:
             logger.warning(
                 "Model pre-download before worker restart failed (will continue): %s", exc
+            )
+
+    def _send_model_failure_alerts(self) -> None:
+        """Send alerts for any models that failed during the last ensure_models call."""
+        failures = getattr(self._model_manager, "last_ensure_failures", None)
+        if not failures:
+            return
+        twin_uuids = getattr(self._worker_manager, "_twin_uuids", [])
+        if not twin_uuids:
+            return
+        try:
+            from .startup import _send_model_failure_alerts
+
+            _send_model_failure_alerts(twin_uuids=twin_uuids, failures=failures)
+        except Exception:
+            logger.debug(
+                "Failed to send model-failure alerts from worker watcher",
+                exc_info=True,
+            )
+
+    def _send_worker_start_failure_alert(self) -> None:
+        """Send alerts when the worker container restart fails."""
+        twin_uuids = getattr(self._worker_manager, "_twin_uuids", [])
+        if not twin_uuids:
+            return
+        try:
+            from .startup import _send_worker_start_failure_alerts
+
+            _send_worker_start_failure_alerts(twin_uuids=twin_uuids)
+        except Exception:
+            logger.debug(
+                "Failed to send worker-start-failure alert from worker watcher",
+                exc_info=True,
             )

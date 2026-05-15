@@ -316,6 +316,32 @@ def test_ensure_models_isolates_per_model_failures(tmp_path: Path) -> None:
 def test_ensure_models_empty_list(tmp_path: Path) -> None:
     manager = _make_manager(tmp_path)
     assert manager.ensure_models([]) == {}
+    assert manager.last_ensure_failures == {}
+
+
+def test_ensure_models_tracks_failures(tmp_path: Path) -> None:
+    """last_ensure_failures should contain the model IDs that failed and their error messages."""
+    _write_fake_model(tmp_path, "yolov8n", b"good")
+    manager = _make_manager(tmp_path)
+
+    def _download_raises(model_id: str) -> Path:
+        raise RuntimeError("network error")
+
+    with patch.object(manager, "_download_model", side_effect=_download_raises):
+        manager.ensure_models(["yolov8n", "nonexistent"])
+
+    assert "nonexistent" in manager.last_ensure_failures
+    assert "network error" in manager.last_ensure_failures["nonexistent"]
+    assert "yolov8n" not in manager.last_ensure_failures
+
+
+def test_ensure_models_clears_previous_failures(tmp_path: Path) -> None:
+    """Each ensure_models call should reset last_ensure_failures."""
+    _write_fake_model(tmp_path, "yolov8n", b"good")
+    manager = _make_manager(tmp_path)
+    manager.last_ensure_failures = {"old_model": "old error"}
+    manager.ensure_models(["yolov8n"])
+    assert manager.last_ensure_failures == {}
 
 
 # ---------------------------------------------------------------------------
