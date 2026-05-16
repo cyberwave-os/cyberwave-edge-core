@@ -1428,6 +1428,29 @@ def _run_docker_image(
             _macos_camera_stream_url,
             usbip_active,
         )
+    elif platform.system() == "Darwin" and macos_bridge_mappings and not usbip_active:
+        logger.warning(
+            "macOS camera twin %s has no MJPEG stream URL configured. "
+            "The driver container will likely fail to open /dev/video* "
+            "because Docker Desktop does not expose host cameras. "
+            "Run: cyberwave edge install --reconfigure-camera",
+            twin_uuid[:8],
+        )
+        try:
+            _send_alert_for_twin(
+                twin_uuid,
+                "Camera not configured for macOS",
+                "This camera twin has no MJPEG stream URL configured. Docker "
+                "Desktop on macOS cannot pass /dev/video* devices to containers. "
+                "Run 'cyberwave edge install --reconfigure-camera' to set up "
+                "camera streaming.",
+                "macos_camera_not_configured",
+                severity="warning",
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not send macos_camera_not_configured alert: %s", exc
+            )
 
     if service_env:
         container_env.update(service_env)

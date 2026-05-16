@@ -8,6 +8,7 @@ publishes them to the MQTT ``driverlog`` topic.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,13 @@ _CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
 
 # Track when log streaming last ended per container so reattach uses --since.
 _CONTAINER_LOG_LAST_SEEN: dict[str, str] = {}
+
+# Containers for which a driver_runtime_error alert has already been sent
+# during the current log-follow session, to avoid alert spam.
+_CONTAINER_RUNTIME_ERROR_ALERTED: set[str] = set()
+
+# Pattern that catches Python RuntimeError tracebacks in driver logs.
+_RUNTIME_ERROR_PATTERN = re.compile(r"RuntimeError:\s*(.+)")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +211,48 @@ def _log_and_publish_driver_message(
         mqtt_topic=mqtt_topic,
         driver_image=driver_image,
     )
+
+
+def _send_runtime_error_alert(
+    twin_uuid: str,
+    container_name: str,
+    error_message: str,
+) -> None:
+    """Send a ``driver_runtime_error`` alert when a driver logs a RuntimeError.
+
+    Best-effort: failures are logged and never block log forwarding. Each
+    container only triggers one alert per log-follow session to prevent
+    spamming the twin's alert feed with repeated messages from restart
+    loops.
+    """
+    if container_name in _CONTAINER_RUNTIME_ERROR_ALERTED:
+        return
+    _CONTAINER_RUNTIME_ERROR_ALERTED.add(container_name)
+
+    try:
+        from .startup import _send_alert_for_twin
+
+        _send_alert_for_twin(
+            twin_uuid,
+            "Driver runtime error",
+            (
+                f"Container '{container_name}' reported a RuntimeError: "
+                f"{error_message[:500]}"
+            ),
+            "driver_runtime_error",
+            severity="error",
+        )
+        logger.info(
+            "Sent driver_runtime_error alert for container %s (twin %s)",
+            container_name,
+            twin_uuid[:8],
+        )
+    except Exception as exc:
+        logger.debug(
+            "Could not send driver_runtime_error alert for %s: %s",
+            container_name,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -445,12 +495,22 @@ def _follow_container_logs(
                         received_lines,
                         len(message),
                     )
+
+                if twin_uuid and container_name not in _CONTAINER_RUNTIME_ERROR_ALERTED:
+                    m = _RUNTIME_ERROR_PATTERN.search(message)
+                    if m:
+                        _send_runtime_error_alert(
+                            twin_uuid,
+                            container_name,
+                            m.group(1).strip(),
+                        )
     except Exception as exc:
         logger.warning("Error while streaming logs for %s: %s", container_name, exc)
     finally:
         _CONTAINER_LOG_LAST_SEEN[container_name] = datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
+        _CONTAINER_RUNTIME_ERROR_ALERTED.discard(container_name)
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
