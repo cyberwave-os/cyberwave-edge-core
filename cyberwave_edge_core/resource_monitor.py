@@ -30,12 +30,31 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from cyberwave.edge.host_metrics import (
-    read_host_cpu_temperature,
-    read_host_memory,
-)
-
 logger = logging.getLogger(__name__)
+
+try:
+    from cyberwave.edge.host_metrics import (
+        read_host_cpu_temperature,
+        read_host_memory,
+    )
+except ImportError as _exc:
+    # The host-metric readers were added in cyberwave SDK 0.4.8.  When edge-core
+    # runs against an older SDK wheel (mismatched venv, stale pinned wheel in a
+    # downstream image, etc.) we degrade to "metric unknown" instead of crashing
+    # the entire CLI on import — same robustness contract the underlying
+    # readers themselves promise on non-Linux hosts.
+    logger.warning(
+        "cyberwave.edge.host_metrics unavailable (%s); host memory/CPU-temp "
+        "metrics will be reported as unknown. Upgrade the cyberwave SDK to "
+        ">=0.4.8 to restore them.",
+        _exc,
+    )
+
+    def read_host_memory():  # type: ignore[no-redef]
+        return None
+
+    def read_host_cpu_temperature():  # type: ignore[no-redef]
+        return None
 
 # ---------------------------------------------------------------------------
 # Constants
