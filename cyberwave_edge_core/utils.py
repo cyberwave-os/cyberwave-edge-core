@@ -221,3 +221,114 @@ def _is_not_found_error(exc: BaseException) -> bool:
         except (TypeError, ValueError):
             continue
     return False
+
+
+# ---------------------------------------------------------------------------
+# Edge-core restart alert lifecycle
+# ---------------------------------------------------------------------------
+
+#: Phase strings recorded in ``Alert.metadata['phase']`` for the
+#: ``edge_core_restart`` lifecycle alert.  Mirrors the constants in
+#: ``src.app.api.edge_nodes`` on the backend — kept in lock-step via the
+#: integration tests, not via a shared module (the edge SDK must not
+#: import backend code).
+EDGE_CORE_RESTART_PHASE_IN_PROGRESS = "in_progress"
+EDGE_CORE_RESTART_PHASE_COMPLETED = "completed"
+EDGE_CORE_RESTART_PHASE_FAILED = "failed"
+
+
+class EdgeCoreRestartAlertContext:
+    """Patch the backend-created ``edge_core_restart`` alert through its
+    lifecycle (``in_progress`` → ``completed`` / ``failed``).
+
+    Unlike :class:`DriverStartingAlertContext`, this class does **not**
+    create the alert — the backend ``POST /api/v1/edges/{uuid}/restart-
+    core`` endpoint does that and ships the UUID inside the MQTT command
+    payload.  This context is purely an updater: given that UUID, it
+    patches ``metadata.phase`` (preserving the existing metadata) and
+    optionally resolves the alert on terminal phases.
+
+    All HTTP calls are best-effort.  Failure to update the alert never
+    blocks the actual restart — telemetry is nice, but a successful
+    restart whose alert is stuck in ``in_progress`` is strictly better
+    than a refused restart because the SDK round-trip flaked.  The
+    reaper on the backend will time out the alert eventually anyway.
+
+    Instantiated with ``alert_uuid=None`` it degrades to a no-op, which
+    is the right behaviour when the restart was triggered by something
+    other than the backend (CLI directly publishing MQTT, dev shell,
+    test harness) and there is no alert to update.
+    """
+
+    def __init__(self, *, alert_uuid: Optional[str]) -> None:
+        self.alert_uuid = alert_uuid or None
+
+    def _fetch_alert(self) -> Any:
+        """Build the SDK client and re-fetch the alert (best-effort).
+
+        Re-fetching on every transition is wasteful in theory but the
+        restart loop runs maybe twice per cycle (in_progress + final
+        phase) and re-reads catch any concurrent backend mutation —
+        including the reaper having flipped us to ``timed_out`` while
+        the restart was running.  Returning a fresh ``Alert`` instance
+        also lets the caller compose ``.update().resolve()`` without
+        carrying the SDK wrapper across method boundaries.
+
+        The ``startup`` import is lazy because ``startup`` imports this
+        module — same circular-resolution pattern as
+        :class:`DriverStartingAlertContext`.
+        """
+        from cyberwave.alerts import Alert, _get_alert
+
+        from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
+
+        base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+        token = load_token()
+        if not token:
+            return None
+        client = Cyberwave(base_url=base_url, api_key=token)
+        data = _get_alert(client, self.alert_uuid)
+        return Alert(client, data)
+
+    def transition(
+        self,
+        phase: str,
+        *,
+        resolve: bool,
+        extra_metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Set ``metadata.phase = phase`` and optionally resolve the alert.
+
+        ``extra_metadata`` is shallow-merged on top of the existing
+        metadata so the audit trail keeps growing rather than being
+        overwritten by each transition.
+        """
+        if not self.alert_uuid:
+            return
+        try:
+            alert = self._fetch_alert()
+            if alert is None:
+                return
+            metadata = alert.metadata if isinstance(alert.metadata, dict) else {}
+            merged = {**metadata, "phase": phase}
+            if extra_metadata:
+                merged.update(extra_metadata)
+            alert.update(metadata=merged)
+            if resolve:
+                alert.resolve()
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                # Alert was removed (operator deleted it, or the reaper
+                # raced us and concluded ``timed_out``).  Nothing to do.
+                logger.debug(
+                    "edge_core_restart alert %s no longer exists; skipping %s transition",
+                    self.alert_uuid,
+                    phase,
+                )
+                return
+            logger.warning(
+                "Could not transition edge_core_restart alert %s to %s: %s",
+                self.alert_uuid,
+                phase,
+                exc,
+            )
