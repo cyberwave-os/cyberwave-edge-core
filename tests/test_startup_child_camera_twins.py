@@ -151,6 +151,7 @@ def test_camera_child_twin_driver_is_skipped_and_passed_to_parent(monkeypatch) -
         service_name: str | None = None,
         command: list[str] | None = None,
         service_env: dict[str, str] | None = None,
+        driver_alert_ctx: object = None,
     ) -> bool:
         run_calls.append(
             {
@@ -243,6 +244,7 @@ def test_non_camera_child_twin_is_not_skipped(monkeypatch) -> None:
         service_name: str | None = None,
         command: list[str] | None = None,
         service_env: dict[str, str] | None = None,
+        driver_alert_ctx: object = None,
     ) -> bool:
         run_calls.append(
             {
@@ -335,6 +337,7 @@ def test_parent_driver_variant_selected_from_child_registry_id(monkeypatch) -> N
         service_name: str | None = None,
         command: list[str] | None = None,
         service_env: dict[str, str] | None = None,
+        driver_alert_ctx: object = None,
     ) -> bool:
         run_calls.append(
             {
@@ -426,6 +429,7 @@ def test_non_camera_child_with_unmatched_registry_id_runs_independently(monkeypa
         service_name: str | None = None,
         command: list[str] | None = None,
         service_env: dict[str, str] | None = None,
+        driver_alert_ctx: object = None,
     ) -> bool:
         run_calls.append(
             {

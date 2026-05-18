@@ -1137,12 +1137,18 @@ def _run_docker_image(
     service_name: str | None = None,
     command: list[str] | None = None,
     service_env: dict[str, str] | None = None,
+    driver_alert_ctx: Optional["DriverStartingAlertContext"] = None,
 ) -> bool:
     """Run a driver Docker container for a twin.
 
     When *skip_pull* is False (the default) the image is pulled first.
     Set *skip_pull* to True when images have already been fetched by an
     earlier parallel-pull phase.
+
+    *driver_alert_ctx*, when provided, reuses an alert that was already
+    created during the parallel-pull phase so the user sees a continuous
+    ``driver_starting`` lifecycle.  When ``None`` a fresh alert is
+    created (backwards-compatible with callers that skip the bulk pull).
 
     The container is started in detached mode with ``--restart unless-stopped``
     so it persists across reboots.  Environment variables are passed so the
@@ -1171,8 +1177,9 @@ def _run_docker_image(
         timeout=30,
     )
 
-    driver_alert_ctx = DriverStartingAlertContext(twin_uuid=twin_uuid, image=image)
-    driver_alert_ctx.create()
+    if driver_alert_ctx is None:
+        driver_alert_ctx = DriverStartingAlertContext(twin_uuid=twin_uuid, image=image)
+        driver_alert_ctx.create()
 
     if skip_pull:
         if not _docker_image_exists_locally(image):
@@ -2940,6 +2947,18 @@ def fetch_and_run_twin_drivers(
         ))
 
     # ------------------------------------------------------------------
+    # Pass 1b: Create driver_starting alerts *before* the pull so the
+    #          user sees "Downloading driver image …" during the actual
+    #          download, not only after it finishes.
+    # ------------------------------------------------------------------
+
+    alert_by_spec_index: dict[int, DriverStartingAlertContext] = {}
+    for idx, spec in enumerate(driver_specs):
+        ctx = DriverStartingAlertContext(twin_uuid=spec.twin_uuid, image=spec.driver_image)
+        ctx.create()
+        alert_by_spec_index[idx] = ctx
+
+    # ------------------------------------------------------------------
     # Pass 2: Pull all unique driver images in parallel.
     # ------------------------------------------------------------------
 
@@ -2948,6 +2967,15 @@ def fetch_and_run_twin_drivers(
         pull_results = _pull_driver_images_parallel(images_to_pull)
     else:
         pull_results = {}
+
+    # Update alert metadata now that the pull phase has finished so the
+    # dashboard shows "pull_complete" while the container is being created.
+    for idx, spec in enumerate(driver_specs):
+        ctx = alert_by_spec_index.get(idx)
+        if ctx is None:
+            continue
+        if pull_results.get(spec.driver_image, False):
+            ctx.update_metadata({"phase": "pull_complete"}, force=True)
 
     # If a Jetson-rewritten tag failed to pull, fall back to the
     # original (non-jetson) tag and re-pull.
@@ -2984,13 +3012,21 @@ def fetch_and_run_twin_drivers(
 
     results: List[Dict[str, Any]] = []
 
-    for spec in driver_specs:
+    for idx, spec in enumerate(driver_specs):
+        alert_ctx = alert_by_spec_index.get(idx)
+
         if not pull_results.get(spec.driver_image, False):
             logger.error(
                 "Skipping driver for twin '%s' — image %s not available",
                 spec.twin.name,
                 spec.driver_image,
             )
+            if alert_ctx is not None:
+                alert_ctx.mark_failed_and_resolve(
+                    f"Driver image '{spec.driver_image}' could not be pulled for twin "
+                    f"'{spec.twin.name}'.",
+                    phase="pull_failed",
+                )
             _send_alert_for_twin(
                 spec.twin_uuid,
                 "Driver image not available",
@@ -3030,6 +3066,7 @@ def fetch_and_run_twin_drivers(
                 service_name=spec.service_name,
                 command=spec.command,
                 service_env=spec.service_env,
+                driver_alert_ctx=alert_ctx,
             )
             result_entry: Dict[str, Any] = {
                 "twin_uuid": spec.twin_uuid,
