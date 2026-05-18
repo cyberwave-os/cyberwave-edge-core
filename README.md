@@ -571,6 +571,12 @@ Edge Core augments every `cyberwave/twin/{uuid}/edge_health` heartbeat with the 
 
 Only the bootstrap publisher on the edge host injects these fields. Driver containers see their container's `/proc`, not the host's, so they intentionally omit the host block and publish only stream-level health.
 
+**Per-stream config (CYB-2004):**
+
+Each entry under `streams[id]` may carry an optional `stream_config` block — a discriminated union keyed by `kind` (`camera` / `audio` / `lidar` / `imu`) describing the runtime-negotiated config for that stream. Drivers attach a block once at startup via `EdgeHealthCheck.register_stream_config(stream_id, config)` in the Python SDK; the publisher merges it into every heartbeat thereafter. The legacy top-level `camera_config` slot stays populated for one deprecation release for out-of-tree consumers and mirrors the lexicographically-first camera-kind `stream_config`. New consumers must read `streams[id].stream_config` instead — the legacy slot only ever describes one camera and is silent for audio / lidar / IMU streams.
+
+`reconcile_camera_config_drift` reads `cameras.json` mtime and `docker inspect` env vars only; it does not inspect any `edge_health` payload, so schema changes here are behaviourally invisible to it.
+
 **Static (REST `POST /api/v1/edges/discover`, every ~30 s):**
 
 Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, and `/dev/watchdog` availability — into `Edge.metadata['host_facts']`. The first POST is performed by a background daemon thread as soon as it starts, then the same thread re-POSTs the same payload every ~30 s. Running the bootstrap POST off the main thread is deliberate: under systemd `Type=notify`, the service signals `READY=1` from the main thread, and we don't want a slow or unreachable backend to push past `TimeoutStartSec` (which would cause `systemctl restart cyberwave-edge-core` to fail). The call is idempotent (it upserts `Edge.metadata['host_facts']` and bumps `Edge.last_seen_at`), so the keepalive cost is one tiny round-trip per edge regardless of how many bound twins the edge has — or whether it has any at all.

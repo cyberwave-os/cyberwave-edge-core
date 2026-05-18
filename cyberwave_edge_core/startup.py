@@ -2246,6 +2246,15 @@ def reconcile_camera_config_drift() -> bool:
     container is removed and edge-core re-runs driver startup so the new
     device is picked up — no full service restart required.
 
+    NOTE (CYB-2004): this function reads **only** ``cameras.json`` mtime
+    and ``docker inspect`` env vars.  It does not inspect any
+    ``edge_health`` payload, MQTT subscription, or per-stream
+    ``stream_config`` block.  Changes to the ``edge_health`` schema are
+    therefore behaviourally invisible here.  A regression test in
+    ``tests/test_startup_core.py`` pins this property so a future
+    refactor that would couple the two cannot land without an explicit
+    edit to that test.
+
     Returns True if a restart was triggered.
     """
     global _cameras_json_mtime

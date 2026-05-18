@@ -2211,6 +2211,59 @@ class TestReconcileCameraConfigDrift:
 
         assert startup.reconcile_camera_config_drift() is False
 
+    def test_does_not_inspect_edge_health_payloads(self):
+        """CYB-2004 regression: drift detection must stay decoupled from edge_health.
+
+        ``reconcile_camera_config_drift`` reads only ``cameras.json``
+        mtime and ``docker inspect`` env vars; the ``edge_health`` MQTT
+        payload (which carries per-stream ``stream_config`` blocks
+        post-CYB-2004) plays no role.  A future refactor that would
+        wire the two together — for example, gating restarts on the
+        running driver's actual ``stream_config.source`` rather than
+        the container env — would silently couple this function's
+        behaviour to the schema's evolution.  This test pins the
+        non-coupling at bytecode level so such a refactor cannot land
+        without an explicit, reviewed edit here.
+
+        We inspect the function's referenced names (``co_names``) and
+        any nested functions rather than raw source so the test does
+        not trip on the audit notes in the function's own docstring.
+        """
+
+        def _all_referenced_names(func) -> set[str]:
+            """Names this function references, including inside nested defs."""
+            code = func.__code__
+            collected: set[str] = set(code.co_names) | set(code.co_varnames)
+            collected |= set(code.co_freevars)
+            for const in code.co_consts:
+                # Nested function code objects show up as constants;
+                # recurse so the test catches "the coupling is hidden in
+                # a local helper" refactors too.
+                if hasattr(const, "co_names"):
+                    collected |= set(const.co_names)
+                    collected |= set(const.co_varnames)
+            return collected
+
+        referenced = _all_referenced_names(
+            startup.reconcile_camera_config_drift
+        )
+
+        forbidden = (
+            "edge_health",
+            "stream_config",
+            "_EDGE_HEALTH_CHECK",
+            "register_stream_config",
+            "_collect_host_metrics",
+        )
+        offenders = sorted(referenced & set(forbidden))
+        assert not offenders, (
+            "reconcile_camera_config_drift now references "
+            f"{offenders!r}; the CYB-2004 audit notes this function "
+            "must remain decoupled from edge_health.  If the coupling "
+            "is intentional, update the docstring and this test "
+            "together."
+        )
+
 
 class TestLoadSelectedCameraDevice:
     """Tests for _load_selected_camera_device()."""
