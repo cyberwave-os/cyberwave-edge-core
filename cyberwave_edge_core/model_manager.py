@@ -41,6 +41,14 @@ Resolution order for ``ensure_model(model_id)``
       ``metadata.download_url`` / ``metadata.artifact_url``). Used for public
       community checkpoints (e.g. official Ultralytics releases) that we did
       not mirror.
+   #. **Runtime-managed download** as a final fallback: when neither of the
+      above is set but the catalog entry's ``edge_runtime`` ships its own
+      weight resolver (today: ``ultralytics`` against its GitHub releases
+      hub), invoke it. The downloaded file is checksummed on disk and
+      cached as :data:`SOURCE_KIND_RUNTIME_MANAGED`, so subsequent runs hit
+      the warm cache without re-invoking the runtime. This is what lets
+      ``.pt`` catalog entries (YOLO26, YOLOE-26) work without a mirrored
+      ``download_url``.
 
    The first source that yields a checksum-verified download wins.
 
@@ -73,7 +81,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +127,15 @@ SOURCE_KIND_UPSTREAM = "download_url"
 #: Sidecar ``downloaded_from`` value for files that an operator pre-staged on
 #: disk (no Edge Core download involved). Set during disk reconciliation.
 SOURCE_KIND_PRESTAGED = "prestaged"
+
+#: Sidecar ``downloaded_from`` value for files that the configured edge
+#: runtime fetched from its own asset registry (e.g. Ultralytics resolving
+#: ``yoloe-26s-seg.pt`` against its GitHub releases hub). Used as a final
+#: fallback in :meth:`ModelManager._download_model` when the catalog entry
+#: has neither a backend-hosted artifact nor an upstream ``download_url``,
+#: so that runtimes which ship their own weight resolver do not require
+#: every catalog entry to mirror the upstream URL.
+SOURCE_KIND_RUNTIME_MANAGED = "runtime_managed"
 
 #: Regex that matches ``cw.models.load("model-id")`` or
 #: ``cw.models.load('model-id')`` calls in worker Python source files.
@@ -741,7 +758,26 @@ class ModelManager:
         if upstream_url:
             sources.append((SOURCE_KIND_UPSTREAM, upstream_url))
 
+        runtime = _extract_runtime(catalog_entry)
+
         if not sources:
+            # Last-resort: ask the configured runtime to fetch the file
+            # itself. Honors runtimes that ship their own weight resolver
+            # (e.g. Ultralytics → its GitHub releases hub for ``yolo*.pt``
+            # / ``yoloe-*.pt``) without forcing every catalog entry to
+            # mirror the upstream URL. The first inference call inside the
+            # worker would have triggered the same fetch anyway — we just
+            # do it eagerly so we can checksum it and serve future runs
+            # from the warm cache without re-invoking the runtime.
+            downloader = _RUNTIME_SELF_DOWNLOADERS.get(runtime or "")
+            if downloader is not None:
+                filename = _derive_filename(model_id, catalog_entry, "")
+                return self._download_runtime_managed(
+                    model_id=model_id,
+                    runtime=runtime,
+                    filename=filename,
+                    downloader=downloader,
+                )
             raise RuntimeError(
                 f"No download sources available for model '{model_id}': the backend "
                 f"reports no checkpoint at /mlmodels/{{uuid}}/weights and the catalog "
@@ -750,7 +786,6 @@ class ModelManager:
             )
 
         expected_checksum = _extract_checksum(catalog_entry)
-        runtime = _extract_runtime(catalog_entry)
         # The filename is independent of which mirror we ultimately
         # download from, so derive it from the first source's URL only.
         filename = _derive_filename(model_id, catalog_entry, sources[0][1])
@@ -863,6 +898,62 @@ class ModelManager:
             checksum[:12],
             source_kind,
         )
+
+    def _download_runtime_managed(
+        self,
+        *,
+        model_id: str,
+        runtime: Optional[str],
+        filename: str,
+        downloader: Callable[[str, Path], Path],
+    ) -> Path:
+        """Resolve a weight file via the configured runtime's own downloader.
+
+        Called when the catalog entry carries neither a backend-hosted
+        artifact nor an upstream ``download_url`` — but the runtime ships
+        a weight resolver of its own (e.g. Ultralytics' hub client). We
+        invoke it into the standard cache directory layout and record the
+        result in the manifest under :data:`SOURCE_KIND_RUNTIME_MANAGED`,
+        so future warm-cache hits do not re-invoke the runtime.
+
+        We record the on-disk checksum but do not validate against a
+        catalog hash — the runtime is authoritative here. Catalog refresh
+        probes still work: if a later release publishes an explicit
+        ``checksum_sha256`` that differs, the warm-cache fast path falls
+        through and re-triggers the runtime fetch.
+        """
+        model_dir = self._cache_dir / model_id
+        model_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Resolving model '%s' via runtime-managed downloader "
+            "(runtime=%s, filename=%s) → %s",
+            model_id,
+            runtime,
+            filename,
+            model_dir,
+        )
+        try:
+            dest_path = downloader(filename, model_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Runtime-managed download for model '{model_id}' failed: {exc}. "
+                f"Workarounds: (a) drop the weight file into {model_dir}/, "
+                f"(b) upload to /api/v1/mlmodels/{{uuid}}/weights, or "
+                f"(c) set metadata.download_url on the catalog entry."
+            ) from exc
+
+        actual_checksum = _sha256_file(dest_path)
+        self._record_successful_download(
+            model_id=model_id,
+            dest_path=dest_path,
+            checksum=actual_checksum,
+            runtime=runtime,
+            source_kind=SOURCE_KIND_RUNTIME_MANAGED,
+            source_url=None,
+            upstream_url=None,
+            filename=dest_path.name,
+        )
+        return dest_path
 
     # ------------------------------------------------------------------
     # Catalog + artifact endpoint clients
@@ -1210,14 +1301,23 @@ def _extract_checksum(entry: dict[str, Any]) -> Optional[str]:
 
 
 def _extract_runtime(entry: dict[str, Any]) -> Optional[str]:
-    """Extract runtime hint from a catalog response."""
-    for key in ("runtime", "framework"):
+    """Extract runtime hint from a catalog response.
+
+    Resolution order (first non-empty wins): top-level ``runtime``,
+    ``framework``, ``edge_runtime``, ``edge_package``; then the same set
+    of keys inside ``metadata``. ``edge_runtime`` is the canonical field
+    used by the backend seed catalog (`seed_models.py`) for edge-deployed
+    entries, so we accept it as a synonym for ``runtime``. Required for
+    the runtime-managed download fallback to recognize Ultralytics-style
+    entries whose checkpoint URL is not mirrored in the catalog.
+    """
+    for key in ("runtime", "framework", "edge_runtime", "edge_package"):
         value = entry.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     metadata = entry.get("metadata") or {}
     if isinstance(metadata, dict):
-        for key in ("runtime", "framework"):
+        for key in ("runtime", "framework", "edge_runtime", "edge_package"):
             value = metadata.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -1230,8 +1330,13 @@ def _derive_filename(model_id: str, entry: dict[str, Any], download_url: str) ->
     Uses (in order of preference):
 
     1. ``entry["filename"]`` or ``entry["metadata"]["filename"]``
-    2. Last path component of *download_url* (stripped of query string)
-    3. ``{model_id}.pt`` as fallback
+    2. ``entry["model_external_id"]`` when it looks like a filename. The
+       backend seed catalog populates this with the upstream artifact
+       name (``yolo26n.pt``, ``yoloe-26s-seg.pt`` …), which is the most
+       reliable hint for runtime-managed downloads where no URL is
+       available to parse.
+    3. Last path component of *download_url* (stripped of query string)
+    4. ``{model_id}.pt`` as fallback
     """
     explicit = entry.get("filename")
     if not isinstance(explicit, str) or not explicit.strip():
@@ -1242,12 +1347,110 @@ def _derive_filename(model_id: str, entry: dict[str, Any], download_url: str) ->
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
 
+    external_id = entry.get("model_external_id")
+    if isinstance(external_id, str) and external_id.strip() and "." in external_id:
+        return external_id.strip()
+
     url_path = download_url.split("?")[0]
     basename = url_path.rstrip("/").split("/")[-1]
     if basename and "." in basename:
         return basename
 
     return f"{model_id}.pt"
+
+
+# ---------------------------------------------------------------------------
+# Runtime-managed download registry
+# ---------------------------------------------------------------------------
+#
+# When the catalog entry has no checkpoint URL of any kind we fall back to
+# whatever weight resolver the configured runtime ships natively. Each entry
+# in :data:`_RUNTIME_SELF_DOWNLOADERS` is a callable
+# ``(filename, dest_dir) → Path`` that downloads *filename* into *dest_dir*
+# (preserving the filename the runtime expects) and returns the resulting
+# path. Implementations must raise on any failure — the caller turns that
+# into an actionable ``RuntimeError`` with operator workarounds.
+#
+# Only Ultralytics is registered today; ``hub_download`` /
+# ``hf_hub_download`` for HuggingFace and any future first-party loaders go
+# here too.
+
+
+def _ultralytics_self_download(filename: str, dest_dir: Path) -> Path:
+    """Resolve *filename* via Ultralytics' own hub client.
+
+    Runs in a subprocess so a missing or broken ``ultralytics`` install
+    surfaces as a clean error rather than blowing up edge-core itself.
+    Ultralytics' ``YOLO()`` constructor downloads any unresolved weight
+    file into the current working directory; we ``chdir`` into
+    *dest_dir* for the duration of the call so the artefact lands in the
+    canonical model cache layout.
+    """
+    import subprocess
+    import sys
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    snippet = (
+        "import os, sys\n"
+        f"os.chdir({str(dest_dir)!r})\n"
+        "from ultralytics import YOLO\n"
+        f"YOLO({filename!r})\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", snippet],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Cannot invoke Python interpreter for ultralytics self-download: {exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Ultralytics self-download for {filename!r} timed out after 600s"
+        ) from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            f"Ultralytics self-download for {filename!r} failed "
+            f"(exit={proc.returncode}): {detail}"
+        )
+
+    candidate = dest_dir / filename
+    if candidate.exists():
+        return candidate
+
+    # Ultralytics has been known to land on a slightly different filename
+    # depending on version (e.g. ``-seg`` suffix normalization). Pick the
+    # newest weight file in the dir as a defensive fallback so we don't
+    # error out on a successful download.
+    weight_files = sorted(
+        (
+            p
+            for p in dest_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".pt", ".pth")
+        ),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if weight_files:
+        return weight_files[0]
+
+    raise RuntimeError(
+        f"Ultralytics self-download for {filename!r} produced no weight file in {dest_dir}"
+    )
+
+
+#: Map runtime name → weight-resolver callable. See
+#: :data:`SOURCE_KIND_RUNTIME_MANAGED` for the contract.
+_RUNTIME_SELF_DOWNLOADERS: dict[str, Callable[[str, Path], Path]] = {
+    "ultralytics": _ultralytics_self_download,
+}
 
 
 # Module-level convenience alias so callers can use scan_worker_model_ids()

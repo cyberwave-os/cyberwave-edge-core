@@ -38,6 +38,22 @@ dev = [
 build = [
     "pyinstaller>=6.0.0",
 ]
+# Optional ML runtime extras for the runtime-managed download fallback in
+# ``model_manager._RUNTIME_SELF_DOWNLOADERS``. Without these, Edge Core
+# can still resolve weights via backend-hosted artifacts, upstream
+# ``download_url``, and operator-prestaged files — but catalog entries
+# that rely on the runtime's own weight resolver (today: Ultralytics
+# ``.pt`` checkpoints with no mirrored URL) will fail at download time
+# with an actionable error.
+#
+# Versions and transitive deps are owned by the ``cyberwave`` SDK
+# (``cyberwave-sdks/cyberwave-python/pyproject.toml`` → ``[tool.poetry.extras]``);
+# these entries are thin passthroughs so edge-core never has to bump
+# Ultralytics / Torch versions on its own.
+ml         = ["cyberwave[ml]"]
+ml-onnx    = ["cyberwave[ml-onnx]"]
+ml-tflite  = ["cyberwave[ml-tflite]"]
+ml-all     = ["cyberwave[ml-all]"]
 
 [project.scripts]
 cyberwave-edge-core = "cyberwave_edge_core.main:cli"

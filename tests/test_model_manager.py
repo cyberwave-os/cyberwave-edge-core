@@ -27,10 +27,12 @@ from unittest.mock import patch
 
 import pytest
 
+from cyberwave_edge_core import model_manager as _model_manager_mod
 from cyberwave_edge_core.model_manager import (
     MODEL_METADATA_FILENAME,
     SOURCE_KIND_ARTIFACT,
     SOURCE_KIND_PRESTAGED,
+    SOURCE_KIND_RUNTIME_MANAGED,
     SOURCE_KIND_UPSTREAM,
     CachedModel,
     ModelManager,
@@ -801,6 +803,178 @@ def test_download_raises_when_no_sources_available(tmp_path: Path) -> None:
     with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
         with pytest.raises(RuntimeError, match="No download sources"):
             manager.ensure_model("broken")
+
+
+# ---------------------------------------------------------------------------
+# Runtime-managed fallback: catalog has no URL but edge_runtime ships one
+# ---------------------------------------------------------------------------
+
+
+def test_download_runtime_managed_succeeds_when_no_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An Ultralytics entry with no download URL falls back to the runtime
+    downloader and records the result as SOURCE_KIND_RUNTIME_MANAGED."""
+    model_id = "yoloe-26s-seg"
+    content = b"fake yoloe weights"
+
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "name": "YOLOE-26 Small",
+        "edge_runtime": "ultralytics",
+        "model_external_id": "yoloe-26s-seg.pt",
+    }
+
+    def _fake_downloader(filename: str, dest_dir: Path) -> Path:
+        assert filename == "yoloe-26s-seg.pt"
+        out = dest_dir / filename
+        out.write_bytes(content)
+        return out
+
+    monkeypatch.setitem(
+        _model_manager_mod._RUNTIME_SELF_DOWNLOADERS,
+        "ultralytics",
+        _fake_downloader,
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        result = manager.ensure_model(model_id)
+
+    expected = tmp_path / model_id / "yoloe-26s-seg.pt"
+    assert result == expected
+    assert result.read_bytes() == content
+
+    sidecar = tmp_path / model_id / MODEL_METADATA_FILENAME
+    meta = json.loads(sidecar.read_text())
+    assert meta["downloaded_from"] == SOURCE_KIND_RUNTIME_MANAGED
+    assert meta["runtime"] == "ultralytics"
+    assert meta["filename"] == "yoloe-26s-seg.pt"
+    assert meta["source_url"] is None
+    assert meta["upstream_url"] is None
+    assert meta["checksum_sha256"] == hashlib.sha256(content).hexdigest()
+
+
+def test_download_runtime_managed_skipped_for_unsupported_runtime(
+    tmp_path: Path,
+) -> None:
+    """An entry with no URL and no self-downloading runtime still errors —
+    the runtime-managed fallback only fires for known runtimes."""
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "edge_runtime": "tflite",  # not in _RUNTIME_SELF_DOWNLOADERS
+        "model_external_id": "model.tflite",
+    }
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        with pytest.raises(RuntimeError, match="No download sources"):
+            manager.ensure_model("unsupported-runtime")
+
+
+def test_download_runtime_managed_failure_wraps_with_workarounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the runtime downloader raises, the RuntimeError tells the
+    operator how to recover (drop file / upload to backend / set
+    download_url)."""
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "edge_runtime": "ultralytics",
+        "model_external_id": "yoloe-26s-seg.pt",
+    }
+
+    def _fake_downloader(filename: str, dest_dir: Path) -> Path:
+        raise RuntimeError("ultralytics not installed")
+
+    monkeypatch.setitem(
+        _model_manager_mod._RUNTIME_SELF_DOWNLOADERS,
+        "ultralytics",
+        _fake_downloader,
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        with pytest.raises(RuntimeError) as excinfo:
+            manager.ensure_model("yoloe-26s-seg")
+
+    msg = str(excinfo.value)
+    assert "Runtime-managed download" in msg
+    assert "ultralytics not installed" in msg
+    # Operator workarounds must be discoverable from the error text alone.
+    assert "drop the weight file" in msg
+    assert "/api/v1/mlmodels/" in msg
+    assert "metadata.download_url" in msg
+
+
+def test_download_runtime_managed_warm_cache_skips_downloader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a runtime-managed download succeeds, subsequent ensure_model
+    calls must hit the warm cache and not re-invoke the runtime."""
+    model_id = "yoloe-26s-seg"
+    content = b"fake yoloe weights"
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "edge_runtime": "ultralytics",
+        "model_external_id": "yoloe-26s-seg.pt",
+    }
+
+    call_count = {"n": 0}
+
+    def _fake_downloader(filename: str, dest_dir: Path) -> Path:
+        call_count["n"] += 1
+        out = dest_dir / filename
+        out.write_bytes(content)
+        return out
+
+    monkeypatch.setitem(
+        _model_manager_mod._RUNTIME_SELF_DOWNLOADERS,
+        "ultralytics",
+        _fake_downloader,
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        manager.ensure_model(model_id)
+    assert call_count["n"] == 1
+
+    # Second instance picks up the manifest from disk and serves from cache.
+    manager2 = _make_manager(tmp_path)
+    with patch.object(
+        manager2, "_download_model", side_effect=AssertionError("must not re-download")
+    ):
+        path2 = manager2.ensure_model(model_id)
+    assert path2 == tmp_path / model_id / "yoloe-26s-seg.pt"
+    assert call_count["n"] == 1
+
+
+def test_extract_runtime_reads_edge_runtime() -> None:
+    """The seed catalog uses ``edge_runtime``; the resolver must honor it
+    as a synonym for ``runtime`` so the runtime-managed downloader can
+    fire on entries authored before this change."""
+    assert _extract_runtime({"edge_runtime": "ultralytics"}) == "ultralytics"
+    assert _extract_runtime({"metadata": {"edge_package": "ultralytics"}}) == "ultralytics"
+    # Explicit ``runtime`` still wins when both are set.
+    assert (
+        _extract_runtime({"runtime": "onnxruntime", "edge_runtime": "ultralytics"})
+        == "onnxruntime"
+    )
+
+
+def test_derive_filename_reads_model_external_id() -> None:
+    """When no explicit filename and no URL are available (runtime-managed
+    case), the catalog's ``model_external_id`` is used as the filename."""
+    entry = {"model_external_id": "yoloe-26s-seg.pt"}
+    assert _derive_filename("yoloe-26s-seg", entry, "") == "yoloe-26s-seg.pt"
+    # Explicit filename still wins.
+    entry_explicit = {
+        "filename": "custom.pt",
+        "model_external_id": "yoloe-26s-seg.pt",
+    }
+    assert _derive_filename("yoloe-26s-seg", entry_explicit, "") == "custom.pt"
+    # An external id without an extension must not be mistaken for a filename.
+    entry_no_ext = {"model_external_id": "openvla-foo-v1"}
+    assert _derive_filename("m", entry_no_ext, "") == "m.pt"
 
 
 # ---------------------------------------------------------------------------

@@ -144,8 +144,9 @@ For each required model, `ensure_model(model_id)` runs the following steps:
 5. **Download.** Sources are tried in priority order:
    1. **Cyberwave-hosted signed URL** from `GET /api/v1/mlmodels/{uuid}/weights` — used for checkpoints we have uploaded to our private GCS bucket (e.g. internally trained or mirrored models). Authenticated, served from infrastructure we control.
    2. **Upstream weights URL** from the catalog entry (`download_url` / `metadata.upstream_weights_url`) — used for community checkpoints we did not mirror.
+   3. **Runtime-managed download** as a final fallback: when neither URL is set but the catalog entry's `edge_runtime` ships its own weight resolver (today: `ultralytics` against its GitHub releases hub), Edge Core invokes it in a subprocess and caches the resulting file as `downloaded_from: runtime_managed`. This is what lets `.pt` catalog entries (YOLO26, YOLOE-26) work without a mirrored upstream URL. Requires the runtime to be installed on the edge host — see [ML runtime extras](#ml-runtime-extras).
 
-   The first source that yields a checksum-verified file wins. The sidecar records `downloaded_from` (`artifact_url` / `download_url` / `prestaged`), `source_url` (the public URL we fetched, or `null` for artifact downloads — the signed URL expires in minutes and is useless to persist), and `upstream_url` (provenance).
+   The first source that yields a checksum-verified file wins. The sidecar records `downloaded_from` (`artifact_url` / `download_url` / `runtime_managed` / `prestaged`), `source_url` (the public URL we fetched, or `null` for artifact and runtime-managed downloads — neither is a re-fetchable URL we want to persist), and `upstream_url` (provenance).
 6. **Fail-soft.** If every download attempt fails *and* the cached file is intact, Edge Core returns the cached path with a warning. This keeps workers running across transient network failures and on permanently air-gapped sites. If the cache is empty or corrupt, `RuntimeError` is raised.
 
 **Cache integrity:** SHA-256 checksums are verified on every `ensure_model` call when a checksum is recorded — on cold start, after every download, during disk reconciliation, and on every warm-cache hit. There is no shortcut. For multi-gigabyte checkpoints this is the dominant cost of the call, but `ensure_model` only runs when a worker file changes (rare) or the worker container restarts; in exchange we get unconditional bit-rot detection. A checksum mismatch on a downloaded artifact triggers a re-download attempt; a download whose checksum does not match the catalog is rejected and the partial file removed.
@@ -176,6 +177,22 @@ rm -rf ~/.cyberwave/models/yolov8n
 ```
 
 Provide a hand-written `metadata.json` (with `filename`, `checksum_sha256`, and `runtime`) when there are multiple weight files in the directory or when corruption detection should compare against a known-good hash.
+
+### ML runtime extras
+
+The default `pip install cyberwave-edge-core` keeps the runtime surface lean — no Torch, no Ultralytics, no ONNX. That's enough for workflows that resolve weights through a backend-hosted URL or pre-staged files. Catalog entries that rely on the **runtime-managed download** fallback (step 5.3 above) need the matching runtime installed on the edge host:
+
+```bash
+# Pull in Ultralytics so YOLO/YOLOE .pt entries can self-download
+pip install 'cyberwave-edge-core[ml]'
+
+# Other available extras (mirror the cyberwave SDK extras 1:1):
+pip install 'cyberwave-edge-core[ml-onnx]'    # onnxruntime
+pip install 'cyberwave-edge-core[ml-tflite]'  # tflite-runtime
+pip install 'cyberwave-edge-core[ml-all]'     # everything above
+```
+
+When a required runtime is missing, the resolver raises a `RuntimeError` that spells out the three workarounds: drop the weight file into `~/.cyberwave/models/{model_id}/`, upload to `/api/v1/mlmodels/{uuid}/weights`, or set `metadata.download_url` on the catalog entry.
 
 ## Worker container
 
