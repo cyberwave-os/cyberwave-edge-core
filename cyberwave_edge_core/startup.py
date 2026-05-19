@@ -41,7 +41,13 @@ from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 
 from . import __version__ as PACKAGE_EDGE_CORE_VERSION
-from .utils import DriverStartingAlertContext
+from .utils import (
+    EDGE_CORE_RESTART_PHASE_COMPLETED,
+    EDGE_CORE_RESTART_PHASE_FAILED,
+    EDGE_CORE_RESTART_PHASE_IN_PROGRESS,
+    DriverStartingAlertContext,
+    EdgeCoreRestartAlertContext,
+)
 from .zenoh_config import (
     ZenohConfig,
     build_zenoh_env_vars,
@@ -2842,7 +2848,8 @@ def fetch_and_run_twin_drivers(
                     twin_uuid,
                     "No drivers specified",
                     f"No drivers specified in asset metadata for twin '{twin.name}'",
-                    "error",
+                    "driver_start_failure",
+                    severity="error",
                 )
                 raise ValueError(
                     f"No drivers specified in asset metadata for paired twin '{twin.name}'"
@@ -2935,7 +2942,8 @@ def fetch_and_run_twin_drivers(
                 twin_uuid,
                 "No driver_docker_image in asset metadata",
                 f"No driver_docker_image in asset metadata for twin '{twin.name}'",
-                "error",
+                "driver_start_failure",
+                severity="error",
             )
             raise ValueError(
                 f"No drivers specified in asset metadata for paired twin '{twin.name}'"
@@ -3111,7 +3119,8 @@ def fetch_and_run_twin_drivers(
                 spec.twin_uuid,
                 "Failed to run driver docker image",
                 f"Failed to run driver docker image for twin '{spec.twin.name}': {exc}",
-                "error",
+                "driver_start_failure",
+                severity="error",
             )
             logger.error(
                 "Failed to run driver docker image %s for twin '%s': %s",
@@ -3727,8 +3736,39 @@ def _start_worker_container_after_restart(
         return False
 
 
-def _perform_edge_core_restart(token: str) -> dict[str, Any]:
-    """Execute restart workflow: cleanup local state and re-run driver startup."""
+def _utc_now_iso() -> str:
+    """ISO-8601 UTC timestamp string for ``Alert.metadata`` annotations.
+
+    Centralised so the edge-core side matches the backend (which uses
+    ``timezone.now().isoformat()``).  Mixing unix-epoch floats with
+    ISO strings inside the same ``metadata`` bag would force every
+    downstream reader (UI, analytics, CLI) to handle both — keep it
+    one shape, the ISO string.
+    """
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _perform_edge_core_restart(
+    token: str,
+    *,
+    restart_alert: EdgeCoreRestartAlertContext | None = None,
+) -> dict[str, Any]:
+    """Execute restart workflow: cleanup local state and re-run driver startup.
+
+    ``restart_alert`` is the lifecycle alert created by the backend.
+    When present, this function transitions it to ``in_progress`` at
+    entry and ``completed`` (with resolve) on a successful return.  The
+    ``failed`` transition is owned by the caller
+    (:func:`_run_edge_core_restart_worker`) because it needs the
+    exception object for the metadata annotation.
+    """
+    if restart_alert is not None:
+        restart_alert.transition(
+            EDGE_CORE_RESTART_PHASE_IN_PROGRESS,
+            resolve=False,
+            extra_metadata={"in_progress_at": _utc_now_iso()},
+        )
+
     # Capture the twins whose driver containers we are about to tear down so
     # we can clear any in-flight ``driver_starting`` alerts that would
     # otherwise be orphaned by the restart.  ``_stop_and_prune_driver_containers``
@@ -3820,18 +3860,57 @@ def _perform_edge_core_restart(token: str) -> dict[str, Any]:
     return summary
 
 
-def _run_edge_core_restart_worker(request_id: str) -> None:
-    """Execute restart flow in a background thread."""
+def _run_edge_core_restart_worker(
+    request_id: str, alert_uuid: Optional[str] = None
+) -> None:
+    """Execute restart flow in a background thread.
+
+    Owns the terminal phase transitions for the ``edge_core_restart``
+    alert created by the backend:
+
+    - ``completed`` (with resolve) on a clean return.
+    - ``failed``    (with resolve) when ``_perform_edge_core_restart``
+      raises.  The exception text is recorded under
+      ``metadata.error`` so operators can diagnose without combing
+      through journalctl.
+    - ``failed``    (with resolve, ``metadata.reason='concurrent_restart'``)
+      when another restart is already in flight in this process — without
+      this branch the new alert would orphan in ``requested`` until the
+      backend reaper times it out (5 min), confusing operators staring at
+      what looks like a stuck restart.
+
+    The ``in_progress`` transition lives inside
+    :func:`_perform_edge_core_restart` itself so it fires *after* we
+    have committed to doing work but *before* any side-effects, which
+    is the right semantic for "I have started".
+    """
     global _EDGE_RESTART_IN_PROGRESS
 
+    # Build the alert context before we touch the lock so we can use it
+    # in the "already in progress" branch below without holding the
+    # lock across HTTP calls (transition() reaches out to the backend).
+    restart_alert = EdgeCoreRestartAlertContext(alert_uuid=alert_uuid)
+
     with _EDGE_RESTART_LOCK:
-        if _EDGE_RESTART_IN_PROGRESS:
-            logger.info(
-                "Ignoring restart request %s: restart already in progress",
-                request_id or "no-request-id",
-            )
-            return
-        _EDGE_RESTART_IN_PROGRESS = True
+        already_in_progress = _EDGE_RESTART_IN_PROGRESS
+        if not already_in_progress:
+            _EDGE_RESTART_IN_PROGRESS = True
+
+    if already_in_progress:
+        logger.info(
+            "Ignoring restart request %s: restart already in progress",
+            request_id or "no-request-id",
+        )
+        restart_alert.transition(
+            EDGE_CORE_RESTART_PHASE_FAILED,
+            resolve=True,
+            extra_metadata={
+                "reason": "concurrent_restart",
+                "error": "another edge-core restart was already in progress",
+                "failed_at": _utc_now_iso(),
+            },
+        )
+        return
 
     try:
         token = load_token()
@@ -3840,12 +3919,29 @@ def _run_edge_core_restart_worker(request_id: str) -> None:
                 "Ignoring restart request %s: no token available",
                 request_id or "no-request-id",
             )
+            # Without a token we cannot transition the alert either —
+            # the backend reaper will eventually time it out.
             return
-        _perform_edge_core_restart(token)
-    except Exception:
-        logger.exception(
-            "Edge-core restart request %s failed",
-            request_id or "no-request-id",
+        try:
+            _perform_edge_core_restart(token, restart_alert=restart_alert)
+        except Exception as exc:
+            logger.exception(
+                "Edge-core restart request %s failed",
+                request_id or "no-request-id",
+            )
+            restart_alert.transition(
+                EDGE_CORE_RESTART_PHASE_FAILED,
+                resolve=True,
+                extra_metadata={
+                    "error": str(exc)[:500],
+                    "failed_at": _utc_now_iso(),
+                },
+            )
+            return
+        restart_alert.transition(
+            EDGE_CORE_RESTART_PHASE_COMPLETED,
+            resolve=True,
+            extra_metadata={"completed_at": _utc_now_iso()},
         )
     finally:
         with _EDGE_RESTART_LOCK:
@@ -3875,10 +3971,21 @@ def _handle_edge_command_message(*args: Any) -> None:
             return
         _HANDLED_EDGE_COMMAND_REQUEST_IDS.add(request_id)
 
-    logger.info("Received edge restart command request_id=%s", request_id or "none")
+    # ``alert_uuid`` is the lifecycle alert created by the backend in
+    # ``POST /api/v1/edges/{uuid}/restart-core``.  Missing when the
+    # restart was triggered by something other than that endpoint
+    # (direct CLI publish, smoke-test harness, …) — the worker treats
+    # the missing UUID as a no-op for alert updates.
+    alert_uuid = str(payload.get("alert_uuid", "")).strip() or None
+
+    logger.info(
+        "Received edge restart command request_id=%s alert=%s",
+        request_id or "none",
+        alert_uuid or "none",
+    )
     worker = threading.Thread(
         target=_run_edge_core_restart_worker,
-        args=(request_id,),
+        args=(request_id, alert_uuid),
         name=f"edge-core-restart-{(request_id or 'no-id')[:12]}",
         daemon=True,
     )
