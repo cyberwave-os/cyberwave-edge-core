@@ -1204,6 +1204,74 @@ class TestDriverStartingAlertLifecycle:
         spy.resolve.assert_called()
         spy.mark_failed_and_resolve.assert_not_called()
 
+    def test_fetch_and_run_clears_stale_alerts_before_creating_new_ones(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Orphan ``driver_starting`` alerts from a crashed boot must not
+        survive the next ``fetch_and_run_twin_drivers`` call."""
+        from tests.test_multi_camera_orchestration import (
+            FakeAsset,
+            FakeTwin,
+            TWIN_A,
+            _stub_client,
+        )
+
+        fingerprint = "edge-fp"
+        cam_asset = "asset-a-uuid"
+        twin = FakeTwin(
+            uuid=TWIN_A,
+            name="Camera",
+            asset_uuid=cam_asset,
+            metadata={
+                "edge_fingerprint": fingerprint,
+                "drivers": {"default": {"docker_image": "cyberwaveos/camera-driver"}},
+            },
+        )
+        fake_client = _stub_client([twin], {cam_asset: FakeAsset(metadata={})})
+
+        call_order: list[str] = []
+
+        class _FakeAlertCtx:
+            @staticmethod
+            def resolve_active_for_twin(twin_uuid: str) -> int:
+                call_order.append(f"resolve:{twin_uuid}")
+                return 1
+
+            def __init__(self, *, twin_uuid: str, image: str) -> None:
+                call_order.append(f"create:{twin_uuid}")
+
+            def create(self) -> None:
+                pass
+
+            def update_metadata(self, metadata_patch: dict, *, force: bool = False) -> None:
+                pass
+
+            def mark_failed_and_resolve(
+                self, description: str, *, phase: str = "pull_failed"
+            ) -> None:
+                pass
+
+        monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertCtx)
+        monkeypatch.setattr(
+            startup, "_check_and_alert_sensors_devices", lambda *args, **kwargs: None
+        )
+        monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *a, **kw: True)
+        monkeypatch.setattr(
+            startup,
+            "_pull_driver_images_parallel",
+            lambda images, **kw: {img: True for img in images},
+        )
+        monkeypatch.setattr(
+            startup,
+            "_run_docker_image",
+            lambda *a, **kw: True,
+        )
+
+        startup.fetch_and_run_twin_drivers("test-token", "env-uuid", fingerprint)
+
+        assert call_order.index(f"resolve:{TWIN_A}") < call_order.index(f"create:{TWIN_A}")
+
 
 class TestDriverSelection:
     def test_prefers_platform_specific_driver_by_machine(self, monkeypatch):
