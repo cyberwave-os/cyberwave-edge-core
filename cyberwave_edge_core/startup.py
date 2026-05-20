@@ -538,6 +538,87 @@ def _coerce_video_index(value: Any) -> Optional[int]:
         return None
 
 
+def _load_audio_streams_json() -> dict[str, Any]:
+    """Load ``audio_streams.json`` from the edge config directory."""
+    streams_file = CONFIG_DIR / "audio_streams.json"
+    if not streams_file.exists():
+        return {}
+    try:
+        with open(streams_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.debug("Could not read audio_streams.json")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_audio_stream_url_for_twin(twin_uuid: Optional[str]) -> Optional[str]:
+    """Return the host PCM bridge URL assigned to *twin_uuid* on macOS, if any."""
+    if not twin_uuid:
+        return None
+    mapping = _load_audio_streams_json().get("twin_to_stream_url") or {}
+    url = mapping.get(str(twin_uuid))
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
+
+
+def _load_audio_stream_capture_settings() -> tuple[Optional[int], Optional[int]]:
+    """Return ``(capture_sample_rate, channels)`` from ``audio_streams.json``, if set."""
+    data = _load_audio_streams_json()
+    sample_rate: Optional[int] = None
+    channels: Optional[int] = None
+    try:
+        if data.get("capture_sample_rate") is not None:
+            sample_rate = int(data["capture_sample_rate"])
+    except (TypeError, ValueError):
+        sample_rate = None
+    try:
+        if data.get("channels") is not None:
+            parsed = int(data["channels"])
+            if parsed in {1, 2}:
+                channels = parsed
+    except (TypeError, ValueError):
+        channels = None
+    return sample_rate, channels
+
+
+def _is_generic_microphone_driver_image(image: str) -> bool:
+    lowered = image.lower()
+    return "generic-microphone" in lowered or "microphone-driver" in lowered
+
+
+def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> list[str]:
+    """Append ALSA device passthrough for generic-microphone drivers on Linux."""
+    if platform.system() != "Linux" or not _is_generic_microphone_driver_image(image):
+        return params
+
+    updated = list(params)
+    mappings = _extract_docker_device_mappings(updated)
+    has_snd = any(
+        host.startswith("/dev/snd") or container.startswith("/dev/snd")
+        for host, container in mappings
+    )
+    if not has_snd:
+        updated.extend(["--device", "/dev/snd:/dev/snd"])
+
+    has_audio_group = False
+    idx = 0
+    while idx < len(updated):
+        token = updated[idx]
+        if token == "--group-add" and idx + 1 < len(updated):
+            if updated[idx + 1] == "audio":
+                has_audio_group = True
+            idx += 2
+            continue
+        if token == "--group-add=audio":
+            has_audio_group = True
+        idx += 1
+    if not has_audio_group:
+        updated.extend(["--group-add", "audio"])
+    return updated
+
+
 def _load_camera_stream_url_for_twin(twin_uuid: Optional[str]) -> Optional[str]:
     """Return the MJPEG stream URL assigned to *twin_uuid* on macOS, if any.
 
@@ -1172,6 +1253,7 @@ def _run_docker_image(
     else:
         container_name = f"cyberwave-driver-{twin_uuid[:8]}"
     image = _resolve_driver_image_tag(image)
+    params = _ensure_linux_microphone_docker_params(image, params)
     runtime_environment = (
         get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
     ).lower()
@@ -1309,6 +1391,7 @@ def _run_docker_image(
     #   2) ``CYBERWAVE_MACOS_CAMERA_STREAM_URL`` runtime env var — legacy
     #      single-camera fallback.
     _macos_camera_stream_url: Optional[str] = None
+    _macos_audio_stream_url: Optional[str] = None
     if platform.system() == "Darwin":
         _per_twin = _load_camera_stream_url_for_twin(twin_uuid)
         if _per_twin:
@@ -1317,6 +1400,14 @@ def _run_docker_image(
             _raw = get_runtime_env_var("CYBERWAVE_MACOS_CAMERA_STREAM_URL")
             if _raw and _raw.strip():
                 _macos_camera_stream_url = _raw.strip()
+
+        _per_twin_audio = _load_audio_stream_url_for_twin(twin_uuid)
+        if _per_twin_audio:
+            _macos_audio_stream_url = _per_twin_audio
+        else:
+            _raw_audio = get_runtime_env_var("CYBERWAVE_MACOS_AUDIO_STREAM_URL")
+            if _raw_audio and _raw_audio.strip():
+                _macos_audio_stream_url = _raw_audio.strip()
 
     macos_bridge_ok, macos_resolved_devices = _run_macos_device_bridge_commands(
         params=params,
@@ -1463,6 +1554,53 @@ def _run_docker_image(
         except Exception as exc:
             logger.debug(
                 "Could not send macos_camera_not_configured alert: %s", exc
+            )
+
+    if _macos_audio_stream_url:
+        container_env["CYBERWAVE_METADATA_AUDIO_DEVICE"] = _macos_audio_stream_url
+        logger.info(
+            "macOS audio stream URL override: %s",
+            _macos_audio_stream_url,
+        )
+        bridge_rate, bridge_channels = _load_audio_stream_capture_settings()
+        if (
+            bridge_rate is not None
+            and "CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE" not in explicit_params_env
+        ):
+            container_env.setdefault(
+                "CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE", str(bridge_rate)
+            )
+        if (
+            bridge_channels is not None
+            and "CYBERWAVE_METADATA_AUDIO_CHANNELS" not in explicit_params_env
+        ):
+            container_env.setdefault(
+                "CYBERWAVE_METADATA_AUDIO_CHANNELS", str(bridge_channels)
+            )
+    elif (
+        platform.system() == "Darwin"
+        and _is_generic_microphone_driver_image(image)
+        and "CYBERWAVE_METADATA_AUDIO_DEVICE" not in explicit_params_env
+    ):
+        logger.warning(
+            "macOS microphone twin %s has no host audio bridge URL configured. "
+            "Docker Desktop cannot pass CoreAudio into Linux containers. "
+            "Run: cyberwave edge install --reconfigure-microphone",
+            twin_uuid[:8],
+        )
+        try:
+            _send_alert_for_twin(
+                twin_uuid,
+                "Microphone not configured for macOS",
+                "This microphone twin has no host PCM stream URL. On macOS, "
+                "run 'cyberwave edge install --reconfigure-microphone' to start "
+                "the ffmpeg audio bridge, then restart edge-core.",
+                "macos_microphone_not_configured",
+                severity="warning",
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not send macos_microphone_not_configured alert: %s", exc
             )
 
     if service_env:
