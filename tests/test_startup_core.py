@@ -7,6 +7,7 @@ Covers the highest-priority untested areas:
   4. load_environment_uuid — retry logic
   5. _remove_cached_twin_json_files — protected files never deleted
 """
+
 from __future__ import annotations
 
 import io
@@ -56,9 +57,7 @@ class TestResolveConfigDir:
 
     def test_linux_sudo_uses_invoking_user_home(self, monkeypatch):
         monkeypatch.delenv("CYBERWAVE_EDGE_CONFIG_DIR", raising=False)
-        monkeypatch.setattr(
-            startup, "_resolve_sudo_user_home", lambda: startup.Path("/home/alice")
-        )
+        monkeypatch.setattr(startup, "_resolve_sudo_user_home", lambda: startup.Path("/home/alice"))
         monkeypatch.setattr(startup.Path, "home", lambda: startup.Path("/root"))
 
         assert startup._resolve_config_dir() == startup.Path("/home/alice/.cyberwave")
@@ -294,9 +293,7 @@ class TestWriteOrUpdateTwinJsonFileDeepMerge:
         existing = {"x": 1, "nested": {"a": 1, "b": 2}}
         (tmp_path / f"{self._TWIN_UUID}.json").write_text(json.dumps(existing))
 
-        startup.write_or_update_twin_json_file(
-            self._TWIN_UUID, {"x": 99, "nested": {"a": 42}}, {}
-        )
+        startup.write_or_update_twin_json_file(self._TWIN_UUID, {"x": 99, "nested": {"a": 42}}, {})
         written = json.loads((tmp_path / f"{self._TWIN_UUID}.json").read_text())
         assert written["x"] == 99
         assert written["nested"]["a"] == 42
@@ -774,8 +771,7 @@ class TestRunDockerImagePullFallback:
         def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
             if name == "CYBERWAVE_MACOS_DEVICE_BRIDGE_COMMAND":
                 return (
-                    "/bin/echo bridge "
-                    "{host_device} {container_device} {twin_uuid} {container_name}"
+                    "/bin/echo bridge {host_device} {container_device} {twin_uuid} {container_name}"
                 )
             return default
 
@@ -1031,7 +1027,10 @@ class TestRunDockerImagePullFallback:
         assert success is True
         docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
         env_map = self._extract_env_map(docker_run_cmd)
-        assert env_map["CYBERWAVE_METADATA_VIDEO_DEVICE"] == "rtsp://host.docker.internal:8554/cam-main"
+        assert (
+            env_map["CYBERWAVE_METADATA_VIDEO_DEVICE"]
+            == "rtsp://host.docker.internal:8554/cam-main"
+        )
         assert json.loads(env_map["CYBERWAVE_EDGE_VIDEO_DEVICE_MAP"]) == {
             "/dev/video0": "rtsp://host.docker.internal:8554/cam-main"
         }
@@ -1084,7 +1083,9 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        assert bridge_calls == [], "bridge command must NOT run for video devices when USB/IP is active"
+        assert bridge_calls == [], (
+            "bridge command must NOT run for video devices when USB/IP is active"
+        )
         docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
         assert "--pid=host" in docker_run_cmd
         env_map = self._extract_env_map(docker_run_cmd)
@@ -1147,8 +1148,10 @@ class TestRunDockerImagePullFallback:
         success = startup._run_docker_image(
             "cyberwave-step14-driver:latest",
             [
-                "--device", "/dev/ttyACM0:/dev/ttyACM0",
-                "--device", "/dev/video0:/dev/video0",
+                "--device",
+                "/dev/ttyACM0:/dev/ttyACM0",
+                "--device",
+                "/dev/video0:/dev/video0",
             ],
             twin_uuid=self._TWIN_UUID,
             token="test-token",
@@ -1582,8 +1585,9 @@ class TestStartupHeartbeatOrdering:
         monkeypatch.setattr(
             startup,
             "_list_linked_twin_uuids_for_fingerprint",
-            lambda token, env_uuid, fingerprint: call_order.append("list_linked_twins")
-            or ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"],
+            lambda token, env_uuid, fingerprint: (
+                call_order.append("list_linked_twins") or ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"]
+            ),
         )
         monkeypatch.setattr(
             startup,
@@ -1595,7 +1599,7 @@ class TestStartupHeartbeatOrdering:
         monkeypatch.setattr(
             startup,
             "fetch_and_run_twin_drivers",
-            lambda token, env_uuid, fingerprint: call_order.append("fetch_drivers") or [],
+            lambda token, env_uuid, fingerprint, **kw: call_order.append("fetch_drivers") or [],
         )
         # Skip step 7 (worker sync) so we're strictly exercising the
         # heartbeat-vs-drivers ordering contract this test is about.
@@ -1642,9 +1646,7 @@ class TestFixConfigDirOwnership:
         startup._fix_config_dir_ownership()
         assert lchown_calls == []
 
-    def test_noop_when_root_without_sudo_and_root_parent(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_noop_when_root_without_sudo_and_root_parent(self, tmp_path: Path, monkeypatch) -> None:
         """systemd-style: root without SUDO_UID and a root-owned parent → no-op."""
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
         monkeypatch.setattr(startup.os, "getuid", lambda: 0)
@@ -1673,7 +1675,8 @@ class TestFixConfigDirOwnership:
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         # Simulate a user-owned parent — helper returns that user's uid/gid.
         monkeypatch.setattr(
-            startup, "resolve_config_owner_uid_gid",
+            startup,
+            "resolve_config_owner_uid_gid",
             lambda: (target_uid, target_gid),
         )
 
@@ -1682,16 +1685,26 @@ class TestFixConfigDirOwnership:
         def fake_lstat(path):
             result = original_lstat(path)
             return os.stat_result(
-                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
-                 0, 0,
-                 result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    0,
+                    0,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
             )
 
         monkeypatch.setattr(startup.os, "lstat", fake_lstat)
 
         lchown_calls: list[tuple] = []
         monkeypatch.setattr(
-            startup.os, "lchown",
+            startup.os,
+            "lchown",
             lambda p, u, g: lchown_calls.append((p, u, g)),
         )
 
@@ -1729,21 +1742,40 @@ class TestFixConfigDirOwnership:
             result = original_lstat(path)
             if str(path) in root_owned_paths:
                 return os.stat_result(
-                    (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
-                     0, 0,
-                     result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                    (
+                        result.st_mode,
+                        result.st_ino,
+                        result.st_dev,
+                        result.st_nlink,
+                        0,
+                        0,
+                        result.st_size,
+                        result.st_atime,
+                        result.st_mtime,
+                        result.st_ctime,
+                    )
                 )
             return os.stat_result(
-                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
-                 target_uid, target_gid,
-                 result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    target_uid,
+                    target_gid,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
             )
 
         monkeypatch.setattr(startup.os, "lstat", fake_lstat)
 
         lchown_calls: list[tuple] = []
         monkeypatch.setattr(
-            startup.os, "lchown",
+            startup.os,
+            "lchown",
             lambda p, u, g: lchown_calls.append((p, u, g)),
         )
 
@@ -1775,15 +1807,26 @@ class TestFixConfigDirOwnership:
         def fake_lstat(path):
             result = original_lstat(path)
             return os.stat_result(
-                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
-                 0, 0, result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    0,
+                    0,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
             )
 
         monkeypatch.setattr(startup.os, "lstat", fake_lstat)
 
         lchown_calls: list[tuple] = []
         monkeypatch.setattr(
-            startup.os, "lchown",
+            startup.os,
+            "lchown",
             lambda p, u, g: lchown_calls.append((p, u, g)),
         )
 
@@ -1806,22 +1849,31 @@ class TestFixConfigDirOwnership:
         def fake_lstat(path):
             result = original_lstat(path)
             return os.stat_result(
-                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
-                 0, 0, result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    0,
+                    0,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
             )
 
         monkeypatch.setattr(startup.os, "lstat", fake_lstat)
         monkeypatch.setattr(
-            startup.os, "lchown",
+            startup.os,
+            "lchown",
             lambda p, u, g: (_ for _ in ()).throw(PermissionError("Operation not permitted")),
         )
 
         # Should not raise
         startup._fix_config_dir_ownership()
 
-    def test_sudo_gid_defaults_to_sudo_uid_when_absent(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_sudo_gid_defaults_to_sudo_uid_when_absent(self, tmp_path: Path, monkeypatch) -> None:
         (tmp_path / "file.json").write_text("{}")
 
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
@@ -1835,15 +1887,26 @@ class TestFixConfigDirOwnership:
         def fake_lstat(path):
             result = original_lstat(path)
             return os.stat_result(
-                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
-                 0, 0, result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    0,
+                    0,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
             )
 
         monkeypatch.setattr(startup.os, "lstat", fake_lstat)
 
         lchown_calls: list[tuple] = []
         monkeypatch.setattr(
-            startup.os, "lchown",
+            startup.os,
+            "lchown",
             lambda p, u, g: lchown_calls.append((p, u, g)),
         )
 
@@ -1861,9 +1924,7 @@ class TestFixConfigDirOwnership:
 
 
 class TestEnsureConfigSubdirs:
-    def test_creates_workers_and_models_non_root(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_creates_workers_and_models_non_root(self, tmp_path: Path, monkeypatch) -> None:
         """Non-root caller (macOS dev, Linux user): subdirs get created, no chown."""
         cfg_dir = tmp_path / ".cyberwave"
         monkeypatch.setattr(startup, "CONFIG_DIR", cfg_dir)
@@ -1871,7 +1932,8 @@ class TestEnsureConfigSubdirs:
 
         chown_calls: list[tuple] = []
         monkeypatch.setattr(
-            startup.os, "chown",
+            startup.os,
+            "chown",
             lambda p, u, g: chown_calls.append((p, u, g)),
         )
 
@@ -1882,14 +1944,13 @@ class TestEnsureConfigSubdirs:
         assert (cfg_dir / "models").is_dir()
         assert chown_calls == []
 
-    def test_chowns_created_subdirs_under_systemd(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_chowns_created_subdirs_under_systemd(self, tmp_path: Path, monkeypatch) -> None:
         """Root caller with a user-owned parent chowns created subdirs."""
         cfg_dir = tmp_path / ".cyberwave"
         monkeypatch.setattr(startup, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(
-            startup, "resolve_config_owner_uid_gid",
+            startup,
+            "resolve_config_owner_uid_gid",
             lambda: (1000, 1000),
         )
 
@@ -1898,16 +1959,26 @@ class TestEnsureConfigSubdirs:
         def fake_stat(self):
             result = original_stat(self)
             return os.stat_result(
-                (result.st_mode, result.st_ino, result.st_dev, result.st_nlink,
-                 0, 0,
-                 result.st_size, result.st_atime, result.st_mtime, result.st_ctime)
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    0,
+                    0,
+                    result.st_size,
+                    result.st_atime,
+                    result.st_mtime,
+                    result.st_ctime,
+                )
             )
 
         monkeypatch.setattr(Path, "stat", fake_stat)
 
         chown_calls: list[tuple] = []
         monkeypatch.setattr(
-            startup.os, "chown",
+            startup.os,
+            "chown",
             lambda p, u, g: chown_calls.append((str(p), u, g)),
         )
 
@@ -1944,7 +2015,8 @@ class TestEnsureConfigSubdirs:
 
         chown_calls: list[tuple] = []
         monkeypatch.setattr(
-            startup.os, "chown",
+            startup.os,
+            "chown",
             lambda p, u, g: chown_calls.append((p, u, g)),
         )
 
@@ -2019,17 +2091,20 @@ class TestReconcileCameraConfigDrift:
         }
 
         monkeypatch.setattr(
-            startup, "_list_running_driver_containers",
+            startup,
+            "_list_running_driver_containers",
             lambda: ["cyberwave-driver-abc12345"],
         )
         monkeypatch.setattr(
-            startup, "_inspect_driver_container",
+            startup,
+            "_inspect_driver_container",
             lambda name: fake_inspect,
         )
 
         restart_calls: list[str] = []
         monkeypatch.setattr(
-            startup, "_perform_edge_core_restart",
+            startup,
+            "_perform_edge_core_restart",
             lambda token: restart_calls.append(token) or {},
         )
         monkeypatch.setattr(startup, "load_token", lambda: "test-token")
@@ -2054,11 +2129,13 @@ class TestReconcileCameraConfigDrift:
         }
 
         monkeypatch.setattr(
-            startup, "_list_running_driver_containers",
+            startup,
+            "_list_running_driver_containers",
             lambda: ["cyberwave-driver-abc12345"],
         )
         monkeypatch.setattr(
-            startup, "_inspect_driver_container",
+            startup,
+            "_inspect_driver_container",
             lambda name: fake_inspect,
         )
 
@@ -2081,20 +2158,20 @@ class TestReconcileCameraConfigDrift:
         }
 
         monkeypatch.setattr(
-            startup, "_list_running_driver_containers",
+            startup,
+            "_list_running_driver_containers",
             lambda: ["cyberwave-driver-abc12345"],
         )
         monkeypatch.setattr(
-            startup, "_inspect_driver_container",
+            startup,
+            "_inspect_driver_container",
             lambda name: fake_inspect,
         )
         monkeypatch.setattr(startup, "load_token", lambda: None)
 
         assert startup.reconcile_camera_config_drift() is False
 
-    def test_per_twin_mapping_triggers_restart_for_mismatched_twin(
-        self, tmp_path, monkeypatch
-    ):
+    def test_per_twin_mapping_triggers_restart_for_mismatched_twin(self, tmp_path, monkeypatch):
         """A twin whose mapping no longer matches its container should trigger a restart."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
@@ -2244,9 +2321,7 @@ class TestReconcileCameraConfigDrift:
                     collected |= set(const.co_varnames)
             return collected
 
-        referenced = _all_referenced_names(
-            startup.reconcile_camera_config_drift
-        )
+        referenced = _all_referenced_names(startup.reconcile_camera_config_drift)
 
         forbidden = (
             "edge_health",
@@ -2275,9 +2350,7 @@ class TestLoadSelectedCameraDevice:
 
     def test_falls_back_to_selected_device(self, tmp_path, monkeypatch):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-        (tmp_path / "cameras.json").write_text(
-            json.dumps({"selected_device": 3})
-        )
+        (tmp_path / "cameras.json").write_text(json.dumps({"selected_device": 3}))
         assert startup._load_selected_camera_device() == "/dev/video3"
         assert startup._load_selected_camera_device("twin-without-mapping") == "/dev/video3"
 
@@ -2321,13 +2394,7 @@ class TestLoadCameraStreamUrlForTwin:
     def test_returns_none_without_twin_uuid(self, tmp_path, monkeypatch):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         (tmp_path / "camera_streams.json").write_text(
-            json.dumps(
-                {
-                    "twin_to_stream_url": {
-                        "twin-a": "http://host.docker.internal:8091"
-                    }
-                }
-            )
+            json.dumps({"twin_to_stream_url": {"twin-a": "http://host.docker.internal:8091"}})
         )
         assert startup._load_camera_stream_url_for_twin(None) is None
         assert startup._load_camera_stream_url_for_twin("") is None
@@ -2345,12 +2412,10 @@ class TestLoadCameraStreamUrlForTwin:
             )
         )
         assert (
-            startup._load_camera_stream_url_for_twin("twin-a")
-            == "http://host.docker.internal:8091"
+            startup._load_camera_stream_url_for_twin("twin-a") == "http://host.docker.internal:8091"
         )
         assert (
-            startup._load_camera_stream_url_for_twin("twin-b")
-            == "http://host.docker.internal:8092"
+            startup._load_camera_stream_url_for_twin("twin-b") == "http://host.docker.internal:8092"
         )
         assert startup._load_camera_stream_url_for_twin("twin-c") is None
 
@@ -2436,9 +2501,7 @@ class TestStartWorkerContainerAfterRestart:
         the documented recovery path."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         self._seed_active_workflow(tmp_path)
-        monkeypatch.setattr(
-            startup, "_resolve_worker_sync_twin_uuids", lambda *_: ["twin-a"]
-        )
+        monkeypatch.setattr(startup, "_resolve_worker_sync_twin_uuids", lambda *_: ["twin-a"])
         monkeypatch.setattr(startup, "_start_worker_after_drivers", lambda **_kw: None)
 
         def boom(*_a, **_kw):
@@ -2468,7 +2531,7 @@ class TestPerformEdgeCoreRestart:
             "stop_zenoh_router": lambda _e: None,
             "start_zenoh_router": lambda _cfg, _env: events.append("start_zenoh") or True,
             "fetch_and_run_twin_drivers": (
-                lambda _t, _e, _f: events.append("start_drivers") or [{"success": True}]
+                lambda _t, _e, _f, **kw: events.append("start_drivers") or [{"success": True}]
             ),
             "_stop_bootstrap_edge_health_publisher": lambda: None,
             "_start_worker_container_after_restart": (

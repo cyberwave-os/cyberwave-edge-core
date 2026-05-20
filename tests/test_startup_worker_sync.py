@@ -8,6 +8,7 @@ Covers:
      — environment.json is authoritative; fingerprint discovery is only
      a fallback for installs that predate the ``twin_uuids`` field.
 """
+
 from __future__ import annotations
 
 import json
@@ -170,9 +171,7 @@ class TestSyncWorkersForTwins:
         constructed_args: list[dict] = []
 
         class FakeEdgeSyncClient:
-            def __init__(
-                self, *, workers_dir, base_url, token, previously_missing=None
-            ):
+            def __init__(self, *, workers_dir, base_url, token, previously_missing=None):
                 constructed_args.append(
                     {
                         "workers_dir": workers_dir,
@@ -201,10 +200,7 @@ class TestSyncWorkersForTwins:
         assert constructed_args[0]["token"] == "tok"
         # Persistent module-level set is passed in so two-strikes
         # cleanup state survives across periodic-sync cycles.
-        assert (
-            constructed_args[0]["previously_missing"]
-            is startup._WORKER_SYNC_PREVIOUSLY_MISSING
-        )
+        assert constructed_args[0]["previously_missing"] is startup._WORKER_SYNC_PREVIOUSLY_MISSING
 
 
 # ===========================================================================
@@ -245,9 +241,7 @@ class TestStartupWorkerSyncStep:
             "_list_linked_twin_uuids_for_fingerprint",
             lambda *a: linked_twins or [],
         )
-        effective_selected = (
-            selected_twins if selected_twins is not None else (linked_twins or [])
-        )
+        effective_selected = selected_twins if selected_twins is not None else (linked_twins or [])
         monkeypatch.setattr(
             startup,
             "_resolve_worker_sync_twin_uuids",
@@ -261,7 +255,7 @@ class TestStartupWorkerSyncStep:
         monkeypatch.setattr(
             startup,
             "fetch_and_run_twin_drivers",
-            lambda *a: [],
+            lambda *a, **kw: [],
         )
         monkeypatch.setattr(
             startup,
@@ -283,8 +277,9 @@ class TestStartupWorkerSyncStep:
         monkeypatch.setattr(
             startup,
             "_sync_workers_for_twins",
-            lambda **kw: sync_calls.append(kw)
-            or {"twin-aaa": _ZERO_SUMMARY, "twin-bbb": _ZERO_SUMMARY},
+            lambda **kw: (
+                sync_calls.append(kw) or {"twin-aaa": _ZERO_SUMMARY, "twin-bbb": _ZERO_SUMMARY}
+            ),
         )
 
         result = startup.run_startup_checks()
@@ -362,9 +357,7 @@ class TestLoadSelectedTwinUuids:
 
     def test_empty_list_is_an_explicit_selection(self, env_file):
         """An empty list means 'nothing selected', not 'fall back to fingerprint'."""
-        env_file.write_text(
-            json.dumps({"uuid": "env-1", "twin_uuids": []}), encoding="utf-8"
-        )
+        env_file.write_text(json.dumps({"uuid": "env-1", "twin_uuids": []}), encoding="utf-8")
         assert startup.load_selected_twin_uuids() == []
 
     def test_returns_cleaned_selection(self, env_file):
@@ -380,17 +373,13 @@ class TestResolveWorkerSyncTwinUuids:
     """Selection wins; fingerprint discovery is only a legacy-install fallback."""
 
     def test_selected_list_wins_over_fingerprint_discovery(self, monkeypatch):
-        monkeypatch.setattr(
-            startup, "load_selected_twin_uuids", lambda: ["twin-picked"]
-        )
+        monkeypatch.setattr(startup, "load_selected_twin_uuids", lambda: ["twin-picked"])
         monkeypatch.setattr(
             startup,
             "_list_linked_twin_uuids_for_fingerprint",
             lambda *a: ["twin-from-metadata"],
         )
-        assert startup._resolve_worker_sync_twin_uuids(
-            "tok", "env-uuid", "fp"
-        ) == ["twin-picked"]
+        assert startup._resolve_worker_sync_twin_uuids("tok", "env-uuid", "fp") == ["twin-picked"]
 
     def test_explicit_empty_selection_blocks_fallback(self, monkeypatch):
         """Empty selection means "user picked nothing" — don't resurrect the
@@ -401,10 +390,7 @@ class TestResolveWorkerSyncTwinUuids:
             "_list_linked_twin_uuids_for_fingerprint",
             lambda *a: ["twin-from-metadata"],
         )
-        assert (
-            startup._resolve_worker_sync_twin_uuids("tok", "env-uuid", "fp")
-            == []
-        )
+        assert startup._resolve_worker_sync_twin_uuids("tok", "env-uuid", "fp") == []
 
     def test_falls_back_to_fingerprint_when_field_absent(self, monkeypatch):
         """Backward compat for edges installed before ``twin_uuids`` existed."""
@@ -414,6 +400,4 @@ class TestResolveWorkerSyncTwinUuids:
             "_list_linked_twin_uuids_for_fingerprint",
             lambda token, env, fp: ["twin-legacy"],
         )
-        assert startup._resolve_worker_sync_twin_uuids(
-            "tok", "env-uuid", "fp"
-        ) == ["twin-legacy"]
+        assert startup._resolve_worker_sync_twin_uuids("tok", "env-uuid", "fp") == ["twin-legacy"]

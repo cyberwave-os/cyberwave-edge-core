@@ -1747,18 +1747,27 @@ def _pull_driver_images_parallel(
     images: list[str],
     *,
     timeout: int = 600,
+    watchdog: Optional[Any] = None,
 ) -> dict[str, bool]:
     """Pull unique driver images in parallel with periodic progress logging.
 
     Returns a mapping of image -> success boolean.  Images that are already
     present locally are not re-pulled (but ``docker pull`` is still attempted
     to pick up newer tags — failure with a local copy is treated as success).
+
+    When *watchdog* is provided (a :class:`ProcessWatchdog` instance), the
+    heartbeat loop sends ``EXTEND_TIMEOUT_USEC`` and ``STATUS=`` notifications
+    to systemd every 5 s.  This prevents ``TimeoutStartSec`` from killing the
+    service while a large image (hundreds of MB) is still downloading — the
+    root cause of CYB-2049.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     unique_images = list(dict.fromkeys(images))
     if not unique_images:
         return {}
+
+    _HEARTBEAT_EXTEND_SECONDS = 30.0
 
     results: dict[str, bool] = {}
 
@@ -1796,7 +1805,6 @@ def _pull_driver_images_parallel(
 
         pending = set(futures_map.keys())
         while pending:
-            # Log a dot-style heartbeat while pulls are in progress.
             done_batch: set[Any] = set()
             for future in list(pending):
                 if future.done():
@@ -1820,7 +1828,15 @@ def _pull_driver_images_parallel(
             else:
                 pulling_names = [futures_map[f] for f in pending]
                 logger.info("Still pulling: %s ...", ", ".join(pulling_names))
+                if watchdog is not None:
+                    watchdog.extend_timeout(_HEARTBEAT_EXTEND_SECONDS)
+                    watchdog.notify_status(
+                        f"Pulling driver images: {', '.join(pulling_names)}"
+                    )
                 time.sleep(5)
+
+    if watchdog is not None:
+        watchdog.notify_status("Driver image pull complete")
 
     pulled_count = sum(1 for v in results.values() if v)
     failed_count = len(results) - pulled_count
@@ -2663,6 +2679,8 @@ def fetch_and_run_twin_drivers(
     token: str,
     environment_uuid: str,
     fingerprint: str,
+    *,
+    watchdog: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch twins for the environment, match by edge fingerprint, and run drivers.
 
@@ -2670,6 +2688,10 @@ def fetch_and_run_twin_drivers(
     matches the local fingerprint, this function fetches the twin's asset,
     looks for a ``driver_docker_image`` key in the asset metadata, and starts
     the corresponding Docker container.
+
+    When *watchdog* is provided, it is forwarded to the parallel image pull
+    so that ``EXTEND_TIMEOUT_USEC`` keeps the systemd start timeout alive
+    during large downloads.
 
     Returns a list of result dicts with twin info and whether the container
     started successfully.
@@ -2981,7 +3003,7 @@ def fetch_and_run_twin_drivers(
 
     if driver_specs:
         images_to_pull = [spec.driver_image for spec in driver_specs]
-        pull_results = _pull_driver_images_parallel(images_to_pull)
+        pull_results = _pull_driver_images_parallel(images_to_pull, watchdog=watchdog)
     else:
         pull_results = {}
 
@@ -3017,7 +3039,9 @@ def fetch_and_run_twin_drivers(
 
         if fallback_needed:
             fallback_images = [img for _, img in fallback_needed]
-            fallback_results = _pull_driver_images_parallel(fallback_images)
+            fallback_results = _pull_driver_images_parallel(
+                fallback_images, watchdog=watchdog
+            )
             for spec, original_image in fallback_needed:
                 if fallback_results.get(original_image, False):
                     pull_results[original_image] = True
@@ -4848,7 +4872,9 @@ def run_startup_checks(
                     )
 
             _t0 = time.perf_counter()
-            results = fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
+            results = fetch_and_run_twin_drivers(
+                token, environment_uuid, fingerprint, watchdog=watchdog
+            )
             _elapsed = time.perf_counter() - _t0
             if not results:
                 console.print(

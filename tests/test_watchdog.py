@@ -71,6 +71,39 @@ class TestSystemdWatchdog:
         sd.notify_ready()
         assert "READY=1" in sent
 
+    def test_notify_extend_timeout_sends_usec(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        sd = SystemdWatchdog()
+        sd.notify_extend_timeout(30_000_000)
+        assert "EXTEND_TIMEOUT_USEC=30000000" in sent
+
+    def test_notify_extend_timeout_skips_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        sd = SystemdWatchdog()
+        sd.notify_extend_timeout(0)
+        assert sent == []
+
+    def test_notify_status_sends_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        sd = SystemdWatchdog()
+        sd.notify_status("Pulling driver images: foo:latest")
+        assert "STATUS=Pulling driver images: foo:latest" in sent
+
     def test_notify_stopping_sends_stopping(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import cyberwave_edge_core.watchdog as wd_mod
 
@@ -393,6 +426,54 @@ class TestProcessWatchdog:
         pw.start()
 
         assert order == ["mark_ready", "start_pinging"]
+
+    def test_extend_timeout_delegates_to_systemd(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``extend_timeout`` converts seconds to microseconds and delegates."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        pw = ProcessWatchdog()
+        pw.extend_timeout(30.0)
+        assert "EXTEND_TIMEOUT_USEC=30000000" in sent
+
+    def test_notify_status_delegates_to_systemd(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[str] = []
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_sd_notify", lambda state: sent.append(state))
+
+        pw = ProcessWatchdog()
+        pw.notify_status("test status")
+        assert "STATUS=test status" in sent
+
+    def test_extend_timeout_not_pid_restricted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``EXTEND_TIMEOUT_USEC=`` must not be PID-restricted like ``WATCHDOG=``."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sent: list[bytes] = []
+
+        class FakeSocket:
+            def __init__(self, *a: object, **kw: object) -> None:
+                pass
+
+            def sendto(self, data: bytes, addr: object) -> None:
+                sent.append(data)
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_PID", os.getpid() + 1)
+        monkeypatch.setattr(wd_mod.socket, "socket", lambda *a, **kw: FakeSocket())
+
+        wd_mod._sd_notify("EXTEND_TIMEOUT_USEC=30000000")
+        assert sent == [b"EXTEND_TIMEOUT_USEC=30000000"]
 
     def test_any_enabled_reflects_layers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import cyberwave_edge_core.watchdog as wd_mod

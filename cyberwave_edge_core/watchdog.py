@@ -172,6 +172,25 @@ class SystemdWatchdog:
         _sd_notify("WATCHDOG=1")
         self._last_ping = time.monotonic()
 
+    def notify_extend_timeout(self, usec: int) -> None:
+        """Ask systemd to extend the current start/stop/watchdog timeout.
+
+        ``EXTEND_TIMEOUT_USEC=`` is **not** PID-restricted (governed
+        only by ``NotifyAccess=``).  Sending it during a long-running
+        startup operation (e.g. Docker image pull) resets the
+        ``TimeoutStartSec`` countdown so the unit is not killed while
+        genuine progress is being made.
+        """
+        if usec > 0:
+            _sd_notify(f"EXTEND_TIMEOUT_USEC={usec}")
+
+    def notify_status(self, status: str) -> None:
+        """Set a free-form status string visible in ``systemctl status``.
+
+        ``STATUS=`` is **not** PID-restricted.
+        """
+        _sd_notify(f"STATUS={status}")
+
     def notify_stopping(self) -> None:
         """Tell systemd we are shutting down (``STOPPING=1``)."""
         _sd_notify("STOPPING=1")
@@ -450,6 +469,20 @@ class ProcessWatchdog:
         """
         self.mark_ready()
         self.start_pinging(ping_interval_seconds=ping_interval_seconds)
+
+    def extend_timeout(self, seconds: float) -> None:
+        """Ask systemd to extend the current timeout by *seconds*.
+
+        Safe to call during startup (extends ``TimeoutStartSec``) and
+        during runtime (extends ``WatchdogSec``).  No-op when there is
+        no notify socket.
+        """
+        usec = int(seconds * 1_000_000)
+        self.systemd.notify_extend_timeout(usec)
+
+    def notify_status(self, status: str) -> None:
+        """Set a free-form status string visible in ``systemctl status``."""
+        self.systemd.notify_status(status)
 
     def ping(self) -> None:
         """Ping all active watchdog layers."""
