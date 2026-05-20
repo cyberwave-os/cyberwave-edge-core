@@ -34,7 +34,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from cyberwave import Cyberwave
 from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
 from cyberwave.fingerprint import generate_fingerprint
@@ -2659,6 +2659,40 @@ def _stop_bootstrap_edge_health_publisher() -> None:
             logger.info("Stopped bootstrap edge health publisher (drivers running)")
 
 
+def _clear_stale_driver_starting_alerts(
+    twin_uuids: Iterable[str],
+    *,
+    log_context: str,
+) -> int:
+    """Resolve orphan ``driver_starting`` alerts for the given twins.
+
+    Best-effort: failures are logged and never raised.  Returns the number
+    of alerts resolved.  *twin_uuids* may contain duplicates; each twin is
+    processed at most once.
+    """
+    seen: set[str] = set()
+    cleared = 0
+    for twin_uuid in twin_uuids:
+        if not twin_uuid or twin_uuid in seen:
+            continue
+        seen.add(twin_uuid)
+        try:
+            cleared += DriverStartingAlertContext.resolve_active_for_twin(twin_uuid)
+        except Exception:
+            logger.debug(
+                "Failed to clear stale driver_starting alerts for twin %s",
+                twin_uuid,
+                exc_info=True,
+            )
+    if cleared:
+        logger.info(
+            "Cleared %d stale driver_starting alert(s) before %s",
+            cleared,
+            log_context,
+        )
+    return cleared
+
+
 def fetch_and_run_twin_drivers(
     token: str,
     environment_uuid: str,
@@ -2962,6 +2996,19 @@ def fetch_and_run_twin_drivers(
             prefer_gpu=driver_prefer_gpu,
             gpu_spec=driver_gpu_spec,
         ))
+
+    # ------------------------------------------------------------------
+    # Pass 1a: Drop orphan ``driver_starting`` alerts left by interrupted
+    #          prior attempts (watchdog kill, crash loop, OOM, etc.).
+    #          Fresh alerts are created with ``force=True`` in pass 1b, so
+    #          without this cleanup the dashboard keeps stale "Downloading
+    #          driver image …" banners after a successful recovery boot.
+    # ------------------------------------------------------------------
+
+    _clear_stale_driver_starting_alerts(
+        (spec.twin_uuid for spec in driver_specs),
+        log_context="driver startup",
+    )
 
     # ------------------------------------------------------------------
     # Pass 1b: Create driver_starting alerts *before* the pull so the
@@ -3781,22 +3828,10 @@ def _perform_edge_core_restart(
     removed_json_files = _remove_cached_twin_json_files()
     removed_containers = _stop_and_prune_driver_containers()
 
-    if twin_uuids_to_clear:
-        cleared = 0
-        for twin_uuid in twin_uuids_to_clear:
-            try:
-                cleared += DriverStartingAlertContext.resolve_active_for_twin(twin_uuid)
-            except Exception:
-                logger.debug(
-                    "Failed to clear stale driver_starting alerts for twin %s",
-                    twin_uuid,
-                    exc_info=True,
-                )
-        if cleared:
-            logger.info(
-                "Cleared %d stale driver_starting alert(s) before edge-core restart",
-                cleared,
-            )
+    _clear_stale_driver_starting_alerts(
+        twin_uuids_to_clear,
+        log_context="edge-core restart",
+    )
 
     environment_uuid = load_environment_uuid(retries=5, retry_delay_seconds=0.2)
 
