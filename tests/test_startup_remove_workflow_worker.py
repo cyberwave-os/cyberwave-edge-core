@@ -241,6 +241,78 @@ class TestHandleTwinCommandDispatch:
         assert captured["target"] is startup._run_immediate_worker_sync
         assert captured["started"] is True
 
+    def test_dedupes_sync_workflows_on_request_id(self, monkeypatch):
+        """The shared dedupe also covers ``sync_workflows`` — repeated
+        deliveries (QoS retries, broker re-publishes) must not spawn a
+        second immediate-sync thread."""
+        thread_calls: list[dict] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args=(), name="", daemon=False):
+                thread_calls.append({"target": target})
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(startup.threading, "Thread", FakeThread)
+
+        payload = {
+            "command": "sync_workflows",
+            "request_id": "sync-dup-1",
+            "requested_at": "...",
+        }
+        startup._handle_twin_command_message(payload)
+        startup._handle_twin_command_message(payload)
+
+        assert len(thread_calls) == 1
+        assert thread_calls[0]["target"] is startup._run_immediate_worker_sync
+
+    def test_sync_workflows_without_request_id_is_not_deduped(self, monkeypatch):
+        """Backward-compat: ``sync_workflows`` payloads without a
+        ``request_id`` (older CLIs / hand-crafted publishes) must still
+        route through to the immediate sync every time."""
+        thread_calls: list[dict] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args=(), name="", daemon=False):
+                thread_calls.append({"target": target})
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(startup.threading, "Thread", FakeThread)
+
+        payload = {"command": "sync_workflows", "requested_at": "..."}
+        startup._handle_twin_command_message(payload)
+        startup._handle_twin_command_message(payload)
+
+        assert len(thread_calls) == 2
+
+    def test_dedupe_is_shared_between_commands_with_same_request_id(
+        self, monkeypatch
+    ):
+        """A pathological broker that publishes the same ``request_id``
+        across two different command kinds gets deduped on the second
+        delivery — by design, since the dedupe is a global FIFO."""
+        thread_calls: list[dict] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args=(), name="", daemon=False):
+                thread_calls.append({"target": target})
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(startup.threading, "Thread", FakeThread)
+
+        startup._handle_twin_command_message(
+            {"command": "sync_workflows", "request_id": "shared", "requested_at": ""}
+        )
+        startup._handle_twin_command_message(_payload(request_id="shared"))
+
+        assert len(thread_calls) == 1
+        assert thread_calls[0]["target"] is startup._run_immediate_worker_sync
+
 
 class TestImmediateWorkerSyncChainsLifecycle:
     """``_run_immediate_worker_sync`` chains

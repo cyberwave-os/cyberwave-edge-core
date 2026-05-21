@@ -350,9 +350,10 @@ _SUBSCRIBED_TWIN_COMMAND_UUIDS: set[str] = set()
 _TWIN_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 TWIN_COMMAND_SYNC_WORKFLOWS = "sync_workflows"
 TWIN_COMMAND_REMOVE_WORKFLOW_WORKER = "remove_workflow_worker"
-# Bounded dedupe for twin commands carrying a ``request_id``. FIFO
-# eviction; ``in`` is O(n=1024). At human cadence 1024 entries cover
-# many hours of lifecycle events.
+# Bounded dedupe for every twin command carrying a ``request_id``
+# (``sync_workflows`` and ``remove_workflow_worker``). FIFO eviction;
+# ``in`` is O(n=1024). At human cadence 1024 entries cover many hours
+# of lifecycle events.
 _HANDLED_TWIN_COMMAND_REQUEST_IDS: deque[str] = deque(maxlen=1024)
 # ``remove_workflow_worker`` filenames: ``wf_`` + 1-32 hex + ``.py``.
 # Covers both 8-char legacy and 12-char assembler outputs; rejects
@@ -4271,6 +4272,27 @@ def _handle_twin_command_message(*args: Any) -> None:
         return
 
     command = str(payload.get("command", "")).strip().lower()
+
+    # Shared dedupe across every known twin command. MQTT QoS retries and
+    # broker re-publishes can deliver the same message multiple times, and
+    # ``sync_workflows`` (cheap but not free — spawns a thread, hits the
+    # backend) benefits from the same idempotency that ``remove_workflow_worker``
+    # needs for correctness on duplicate filenames.
+    if command in {
+        TWIN_COMMAND_SYNC_WORKFLOWS,
+        TWIN_COMMAND_REMOVE_WORKFLOW_WORKER,
+    }:
+        request_id = str(payload.get("request_id", "")).strip()
+        if request_id:
+            if request_id in _HANDLED_TWIN_COMMAND_REQUEST_IDS:
+                logger.debug(
+                    "Skipping duplicate %s command request_id=%s",
+                    command,
+                    request_id,
+                )
+                return
+            _HANDLED_TWIN_COMMAND_REQUEST_IDS.append(request_id)
+
     if command == TWIN_COMMAND_SYNC_WORKFLOWS:
         logger.info(
             "Received %s command via MQTT — triggering immediate worker sync",
@@ -4285,21 +4307,11 @@ def _handle_twin_command_message(*args: Any) -> None:
         return
 
     if command == TWIN_COMMAND_REMOVE_WORKFLOW_WORKER:
-        request_id = str(payload.get("request_id", "")).strip()
-        if request_id:
-            if request_id in _HANDLED_TWIN_COMMAND_REQUEST_IDS:
-                logger.debug(
-                    "Skipping duplicate %s command request_id=%s",
-                    command,
-                    request_id,
-                )
-                return
-            _HANDLED_TWIN_COMMAND_REQUEST_IDS.append(request_id)
         logger.info(
             "Received %s command via MQTT — surgical worker file removal "
             "request_id=%s workflow=%s",
             command,
-            request_id or "none",
+            str(payload.get("request_id", "")).strip() or "none",
             payload.get("workflow_uuid") or "unknown",
         )
         worker = threading.Thread(
