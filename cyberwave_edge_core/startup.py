@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -351,6 +352,16 @@ _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 _SUBSCRIBED_TWIN_COMMAND_UUIDS: set[str] = set()
 _TWIN_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 TWIN_COMMAND_SYNC_WORKFLOWS = "sync_workflows"
+TWIN_COMMAND_REMOVE_WORKFLOW_WORKER = "remove_workflow_worker"
+# Bounded dedupe for every twin command carrying a ``request_id``
+# (``sync_workflows`` and ``remove_workflow_worker``). FIFO eviction;
+# ``in`` is O(n=1024). At human cadence 1024 entries cover many hours
+# of lifecycle events.
+_HANDLED_TWIN_COMMAND_REQUEST_IDS: deque[str] = deque(maxlen=1024)
+# ``remove_workflow_worker`` filenames: ``wf_`` + 1-32 hex + ``.py``.
+# Covers both 8-char legacy and 12-char assembler outputs; rejects
+# path separators and traversal implicitly.
+_REMOVE_WORKER_FILENAME_RE = re.compile(r"^wf_[a-f0-9]{1,32}\.py$")
 _TWIN_FILE_CHECKSUMS: dict[str, str] = {}
 _CONTAINER_LAST_RESTART_COUNT: dict[str, int] = {}
 _CONTAINER_RESTART_HISTORY: dict[str, deque[float]] = {}
@@ -4315,21 +4326,67 @@ def _handle_twin_command_message(*args: Any) -> None:
         return
 
     command = str(payload.get("command", "")).strip().lower()
-    if command != TWIN_COMMAND_SYNC_WORKFLOWS:
-        logger.debug("Ignoring unknown twin command: %s", command)
+
+    # Shared dedupe across every known twin command. MQTT QoS retries and
+    # broker re-publishes can deliver the same message multiple times, and
+    # ``sync_workflows`` (cheap but not free — spawns a thread, hits the
+    # backend) benefits from the same idempotency that ``remove_workflow_worker``
+    # needs for correctness on duplicate filenames.
+    if command in {
+        TWIN_COMMAND_SYNC_WORKFLOWS,
+        TWIN_COMMAND_REMOVE_WORKFLOW_WORKER,
+    }:
+        request_id = str(payload.get("request_id", "")).strip()
+        if request_id:
+            if request_id in _HANDLED_TWIN_COMMAND_REQUEST_IDS:
+                logger.debug(
+                    "Skipping duplicate %s command request_id=%s",
+                    command,
+                    request_id,
+                )
+                return
+            _HANDLED_TWIN_COMMAND_REQUEST_IDS.append(request_id)
+
+    if command == TWIN_COMMAND_SYNC_WORKFLOWS:
+        logger.info(
+            "Received %s command via MQTT — triggering immediate worker sync",
+            command,
+        )
+        worker = threading.Thread(
+            target=_run_immediate_worker_sync,
+            name="twin-cmd-sync-workflows",
+            daemon=True,
+        )
+        worker.start()
         return
 
-    logger.info("Received %s command via MQTT — triggering immediate worker sync", command)
-    worker = threading.Thread(
-        target=_run_immediate_worker_sync,
-        name="twin-cmd-sync-workflows",
-        daemon=True,
-    )
-    worker.start()
+    if command == TWIN_COMMAND_REMOVE_WORKFLOW_WORKER:
+        logger.info(
+            "Received %s command via MQTT — surgical worker file removal "
+            "request_id=%s workflow=%s",
+            command,
+            str(payload.get("request_id", "")).strip() or "none",
+            payload.get("workflow_uuid") or "unknown",
+        )
+        worker = threading.Thread(
+            target=_run_remove_workflow_worker,
+            args=(payload,),
+            name="twin-cmd-remove-workflow-worker",
+            daemon=True,
+        )
+        worker.start()
+        return
+
+    logger.debug("Ignoring unknown twin command: %s", command)
 
 
 def _run_immediate_worker_sync() -> None:
-    """Run an immediate worker sync in a background thread."""
+    """Run an immediate worker sync, then reconcile the container lifecycle.
+
+    Chains :func:`reconcile_worker_lifecycle` so the container starts
+    or stops *now* rather than on the next periodic tick. Skipped on
+    sync errors to avoid churning on transient backend failures.
+    """
     try:
         summary = reconcile_worker_sync()
         logger.info(
@@ -4341,6 +4398,93 @@ def _run_immediate_worker_sync() -> None:
         )
     except Exception:
         logger.exception("Immediate worker sync failed")
+        return
+
+    if summary.get("errors"):
+        return
+
+    try:
+        reconcile_worker_lifecycle(summary)
+    except Exception:
+        logger.exception(
+            "Worker lifecycle reconcile after immediate sync failed"
+        )
+
+
+def _run_remove_workflow_worker(payload: dict) -> None:
+    """Surgically unlink the ``wf_*.py`` file(s) named in *payload*.
+
+    Handler for the backend ``remove_workflow_worker`` MQTT command.
+    Idempotent: ``unlink(missing_ok=True)`` plus the ``request_id``
+    dedupe in :func:`_handle_twin_command_message` make duplicate
+    deliveries safe. Always reconciles container lifecycle so the
+    worker container stops the moment the directory is empty.
+    """
+    workers_dir = CONFIG_DIR / "workers"
+
+    raw_filenames = payload.get("worker_filenames") or []
+    if not isinstance(raw_filenames, list):
+        logger.warning(
+            "Ignoring remove_workflow_worker with non-list worker_filenames: %r",
+            raw_filenames,
+        )
+        return
+
+    removed_any = False
+    for raw_filename in raw_filenames:
+        if not isinstance(raw_filename, str):
+            logger.warning(
+                "Skipping non-string worker_filename in remove_workflow_worker: %r",
+                raw_filename,
+            )
+            continue
+
+        filename = raw_filename.strip()
+        if not _REMOVE_WORKER_FILENAME_RE.match(filename):
+            logger.warning(
+                "Refusing remove_workflow_worker filename outside wf_<hex>.py shape: %r",
+                filename,
+            )
+            continue
+
+        target = workers_dir / filename
+        try:
+            existed = target.exists()
+            target.unlink(missing_ok=True)
+            # Clear the bulk-sync two-strikes record so the next
+            # periodic tick doesn't emit a bogus stale-file warning.
+            _WORKER_SYNC_PREVIOUSLY_MISSING.discard(filename)
+            if existed:
+                removed_any = True
+                logger.info(
+                    "remove_workflow_worker unlinked %s",
+                    filename,
+                )
+            else:
+                logger.info(
+                    "remove_workflow_worker no-op (already absent): %s",
+                    filename,
+                )
+        except OSError:
+            logger.exception(
+                "remove_workflow_worker failed to unlink %s",
+                filename,
+            )
+
+    # Reconcile is idempotent: stops the container only when the
+    # workers directory is now empty.
+    summary = {
+        "written": 0,
+        "removed": 1 if removed_any else 0,
+        "unchanged": 0,
+        "errors": 0,
+    }
+    try:
+        reconcile_worker_lifecycle(summary)
+    except Exception:
+        logger.exception(
+            "Worker lifecycle reconcile after remove_workflow_worker failed"
+        )
 
 
 def ensure_twin_command_subscriptions() -> bool:
