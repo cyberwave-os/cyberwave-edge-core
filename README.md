@@ -201,7 +201,7 @@ pip install 'cyberwave-edge-core[ml]'
 # Other available extras (mirror the cyberwave SDK extras 1:1):
 pip install 'cyberwave-edge-core[ml-onnx]'    # onnxruntime
 pip install 'cyberwave-edge-core[ml-tflite]'  # tflite-runtime
-pip install 'cyberwave-edge-core[ml-all]'     # everything above
+pip install 'cyberwave-edge-core[ml-all]'     # vision + wakeword + whisper.cpp + faster-whisper
 ```
 
 When a required runtime is missing, the resolver raises a `RuntimeError` that spells out the three workarounds: drop the weight file into `~/.cyberwave/models/{model_id}/`, upload to `/api/v1/mlmodels/{uuid}/weights`, or set `metadata.download_url` on the catalog entry.
