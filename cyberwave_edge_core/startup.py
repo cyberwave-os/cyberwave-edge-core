@@ -25,7 +25,6 @@ import shlex
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -35,6 +34,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
 from cyberwave import Cyberwave
 from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
 from cyberwave.fingerprint import generate_fingerprint
@@ -205,11 +205,14 @@ CYBERWAVE_SDK_VERSION = _resolve_package_version(
 
 # Re-exported from driver_logs for backward compat and in-module use.
 from .driver_logs import (  # noqa: E402
-    _build_driver_log_payload,
     _CONTAINER_LOG_LAST_SEEN,
     _CONTAINER_LOG_THREADS,
-    _log_and_publish_driver_message,
+    _build_driver_log_payload,  # noqa: F401 — re-export consumed by tests
+    _DockerPullProgress,
+    _log_and_publish_driver_message,  # noqa: F401 — re-export consumed by tests
     _pull_docker_image_with_progress,
+    _pull_docker_image_with_progress_multi,
+    _PullDeliveryContext,
     _stream_container_logs,
     reconcile_driver_log_streams,
 )
@@ -1073,7 +1076,6 @@ def get_or_create_fingerprint() -> Optional[str]:
 # Re-exported from docker_args for backward compat.
 from .docker_args import (  # noqa: E402
     _build_driver_network_args,
-    _docker_params_include_add_host,
     _extract_docker_device_mappings,
     _extract_docker_env_map,
     _is_video_device_path,
@@ -1886,47 +1888,60 @@ def _pull_driver_images_parallel(
     *,
     timeout: int = 600,
     watchdog: Optional[Any] = None,
+    pull_contexts_by_image: Optional[dict[str, list[_PullDeliveryContext]]] = None,
+    token: Optional[str] = None,
+    heartbeat_interval_seconds: float = 5.0,
+    heartbeat_extend_seconds: float = 30.0,
 ) -> dict[str, bool]:
-    """Pull unique driver images in parallel with periodic progress logging.
+    """Pull unique driver images in parallel with byte-aware progress logging.
 
-    Returns a mapping of image -> success boolean.  Images that are already
-    present locally are not re-pulled (but ``docker pull`` is still attempted
-    to pick up newer tags — failure with a local copy is treated as success).
+    Returns ``image -> success``.  Images already present locally are
+    still re-pulled to pick up newer tags, but a failure with a local
+    copy on disk is treated as success.
 
-    When *watchdog* is provided (a :class:`ProcessWatchdog` instance), the
-    heartbeat loop sends ``EXTEND_TIMEOUT_USEC`` and ``STATUS=`` notifications
-    to systemd every 5 s.  This prevents ``TimeoutStartSec`` from killing the
-    service while a large image (hundreds of MB) is still downloading — the
-    root cause of CYB-2049.
+    When *pull_contexts_by_image* is provided, byte-level progress
+    is fanned out to every twin sharing the image (alert metadata +
+    ``driverlog`` MQTT topic).  When *watchdog* is provided, the
+    heartbeat sends ``EXTEND_TIMEOUT_USEC`` and a phase-aware
+    ``STATUS=`` notification on every interval; that's what keeps
+    ``TimeoutStartSec`` from killing the service mid-download (CYB-2049).
+
+    *heartbeat_interval_seconds* / *heartbeat_extend_seconds* are
+    exposed for tests; production defaults (5 s / 30 s) are unchanged.
     """
     from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import replace
 
     unique_images = list(dict.fromkeys(images))
     if not unique_images:
         return {}
 
-    _HEARTBEAT_EXTEND_SECONDS = 30.0
-
     results: dict[str, bool] = {}
+    contexts_map = pull_contexts_by_image or {}
+
+    # Worker threads write a *snapshot* (not the live tracker dataclass)
+    # under ``progress_lock`` so the heartbeat thread can never see a
+    # torn read of e.g. ``downloaded_bytes`` paired with ``total_bytes``
+    # from the next update.
+    progress_lock = threading.Lock()
+    progress_by_image: dict[str, _DockerPullProgress] = {}
 
     def _pull_one(image: str) -> tuple[str, bool]:
+        def _record(progress: _DockerPullProgress) -> None:
+            snapshot = replace(progress)
+            with progress_lock:
+                progress_by_image[image] = snapshot
+
         try:
-            process = subprocess.Popen(
-                ["docker", "pull", image],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+            _pull_docker_image_with_progress_multi(
+                image,
+                contexts=contexts_map.get(image, []),
+                token=token,
+                timeout=timeout,
+                on_progress=_record,
             )
-            process.wait(timeout=timeout)
-            return image, process.returncode == 0
-        except subprocess.TimeoutExpired:
-            process.kill()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            return image, False
-        except OSError:
+            return image, True
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
             return image, False
 
     logger.info(
@@ -1965,13 +1980,19 @@ def _pull_driver_images_parallel(
                         results[img_name] = False
             else:
                 pulling_names = [futures_map[f] for f in pending]
-                logger.info("Still pulling: %s ...", ", ".join(pulling_names))
+                with progress_lock:
+                    summaries = [
+                        progress_by_image[img].format_summary()
+                        if img in progress_by_image
+                        else f"{img} starting"
+                        for img in pulling_names
+                    ]
+                status_line = "; ".join(summaries)
+                logger.info("Still pulling: %s", status_line)
                 if watchdog is not None:
-                    watchdog.extend_timeout(_HEARTBEAT_EXTEND_SECONDS)
-                    watchdog.notify_status(
-                        f"Pulling driver images: {', '.join(pulling_names)}"
-                    )
-                time.sleep(5)
+                    watchdog.extend_timeout(heartbeat_extend_seconds)
+                    watchdog.notify_status(f"Pulling: {status_line}")
+                time.sleep(heartbeat_interval_seconds)
 
     if watchdog is not None:
         watchdog.notify_status("Driver image pull complete")
@@ -3188,7 +3209,23 @@ def fetch_and_run_twin_drivers(
 
     if driver_specs:
         images_to_pull = [spec.driver_image for spec in driver_specs]
-        pull_results = _pull_driver_images_parallel(images_to_pull, watchdog=watchdog)
+        # Fan-out map so progress on a shared image lands on every twin's
+        # alert + ``driverlog`` topic, not just the first to claim it.
+        pull_contexts_by_image: dict[str, list[_PullDeliveryContext]] = {}
+        for idx, spec in enumerate(driver_specs):
+            pull_contexts_by_image.setdefault(spec.driver_image, []).append(
+                _PullDeliveryContext(
+                    twin_uuid=spec.twin_uuid,
+                    container_name=f"cyberwave-driver-{spec.twin_uuid[:8]}",
+                    driver_alert_ctx=alert_by_spec_index.get(idx),
+                )
+            )
+        pull_results = _pull_driver_images_parallel(
+            images_to_pull,
+            watchdog=watchdog,
+            pull_contexts_by_image=pull_contexts_by_image,
+            token=token,
+        )
     else:
         pull_results = {}
 
@@ -3224,8 +3261,23 @@ def fetch_and_run_twin_drivers(
 
         if fallback_needed:
             fallback_images = [img for _, img in fallback_needed]
+            # Reuse the same alert + MQTT fan-out so alerts don't go silent
+            # during the fallback round.
+            fallback_contexts_by_image: dict[str, list[_PullDeliveryContext]] = {}
+            for spec, original_image in fallback_needed:
+                idx = driver_specs.index(spec)
+                fallback_contexts_by_image.setdefault(original_image, []).append(
+                    _PullDeliveryContext(
+                        twin_uuid=spec.twin_uuid,
+                        container_name=f"cyberwave-driver-{spec.twin_uuid[:8]}",
+                        driver_alert_ctx=alert_by_spec_index.get(idx),
+                    )
+                )
             fallback_results = _pull_driver_images_parallel(
-                fallback_images, watchdog=watchdog
+                fallback_images,
+                watchdog=watchdog,
+                pull_contexts_by_image=fallback_contexts_by_image,
+                token=token,
             )
             for spec, original_image in fallback_needed:
                 if fallback_results.get(original_image, False):
@@ -3597,7 +3649,9 @@ def _send_worker_start_failure_alerts(
 
 
 # Re-exported from driver_selection for backward compat.
-from .driver_selection import _get_best_driver_image_and_params as _get_best_driver_image_and_params  # noqa: E402
+from .driver_selection import (
+    _get_best_driver_image_and_params as _get_best_driver_image_and_params,  # noqa: E402
+)
 from .driver_selection import _get_driver_services as _get_driver_services  # noqa: E402
 
 
@@ -5133,7 +5187,9 @@ def run_startup_checks(
                         "startup; will retry."
                     )
                 else:
-                    from .worker_manager import resolve_worker_image as _resolve_worker_image  # noqa: PLC0415
+                    from .worker_manager import (
+                        resolve_worker_image as _resolve_worker_image,  # noqa: PLC0415
+                    )
 
                     logger.info(
                         "No active workflows for any of the %d connected twin(s); "
@@ -5331,7 +5387,10 @@ def _run_periodic_docker_cleanup() -> None:
     """
     global _last_container_prune_time, _last_image_prune_time
 
-    from .docker_helpers import docker_prune_stopped_cyberwave_containers, docker_prune_unused_images
+    from .docker_helpers import (
+        docker_prune_stopped_cyberwave_containers,
+        docker_prune_unused_images,
+    )
 
     now = time.monotonic()
 

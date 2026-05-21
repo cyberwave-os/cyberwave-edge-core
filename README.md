@@ -103,6 +103,8 @@ The restart is intended to preserve durable state where possible. If connectivit
 
 Each driver startup attempt creates a `driver_starting` twin alert that tracks the in-flight startup (image pull, container launch, post-launch health probe). The alert is automatically resolved once the driver container is observed `running`, and is annotated and resolved with a failure phase if the attempt fails. The alert is therefore guaranteed to clear when the driver has restarted; longer-lived failure conditions are surfaced through separate `driver_start_failure` alerts created by the orchestrator.
 
+While `docker pull` is running, edge-core writes byte-aggregated progress directly onto the alert's `metadata` (`progress_percent`, `downloaded_bytes` / `total_bytes`, `downloaded_human` / `total_human`, `phase`) so the workbench renders e.g. `Downloading driver image (cyberwaveos/ugv-driver:dev) — 745 MB of 1.55 GB (47%)` instead of a stale "Still pulling" spinner. The same summary feeds the systemd watchdog (`systemctl status cyberwave-edge-core` shows `Pulling: <image> 745 MB of 1.55 GB (47%)`) and extends `TimeoutStartSec` while bytes are still arriving (CYB-2049). The parser, fan-out worker, and tests live in [`cyberwave_edge_core/driver_logs.py`](cyberwave_edge_core/driver_logs.py) and [`tests/test_docker_pull_progress.py`](tests/test_docker_pull_progress.py).
+
 ## Model Manager (ML model cache)
 
 Edge Core includes a `ModelManager` that resolves ML model weights into a local cache before starting the worker container. It is designed for both online deployments and air-gapped sites: it prefers fresh weights from Cyberwave when the network is available, falls back to upstream public mirrors, and finally to whatever is already on disk.
