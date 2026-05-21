@@ -367,6 +367,138 @@ def test_evict_model_nonexistent_returns_false(tmp_path: Path) -> None:
     assert manager.evict_model("nonexistent") is False
 
 
+def test_evict_model_removes_orphan_directory_without_manifest_entry(
+    tmp_path: Path,
+) -> None:
+    """``evict_model`` must clean up a wedged ``cache_dir/{id}/`` directory
+    even when there is no manifest entry — this is the recovery path
+    for hosts that hit the ``IsADirectoryError`` wedge described in
+    ``_download_runtime_managed`` / ``_download_model``."""
+    model_id = "yoloe-26m-seg.pt"
+    orphan = tmp_path / model_id
+    orphan.mkdir()
+    (orphan / "metadata.json").write_text("{}")
+
+    manager = _make_manager(tmp_path)
+    # Defeat the startup auto-sweep so we exercise the evict_model path
+    # explicitly: re-create the orphan after __init__ ran.
+    orphan.mkdir(exist_ok=True)
+    (orphan / "metadata.json").write_text("{}")
+
+    removed = manager.evict_model(model_id)
+    assert removed is True
+    assert not orphan.exists()
+
+
+def test_evict_model_explicit_call_overrides_conservative_sweep(
+    tmp_path: Path,
+) -> None:
+    """An explicit ``evict_model`` is a stronger operator-intent signal
+    than the conservative startup sweep. The sweep skips dirs with
+    non-cruft content, but ``evict_model`` deletes them — if someone
+    called evict, they want the cache slot cleared.
+
+    Companion to ``test_prune_orphan_staging_dirs_at_init_preserves_operator_files``,
+    which exercises the conservative path."""
+    model_id = "yoloe-26m-seg.pt"
+    orphan = tmp_path / model_id
+    orphan.mkdir()
+    (orphan / "metadata.json").write_text("{}")
+    (orphan / "operator-weights.pt").write_bytes(b"hand-staged")
+
+    manager = _make_manager(tmp_path)
+    # The startup sweep does NOT touch this directory because of the
+    # operator file — verify the sweep was conservative.
+    assert orphan.exists()
+    assert (orphan / "operator-weights.pt").exists()
+
+    removed = manager.evict_model(model_id)
+    assert removed is True
+    assert not orphan.exists()
+
+
+# ---------------------------------------------------------------------------
+# Startup orphan-directory sweep
+# ---------------------------------------------------------------------------
+
+
+def test_prune_orphan_staging_dirs_at_init_removes_empty_dir(
+    tmp_path: Path,
+) -> None:
+    """``ModelManager.__init__`` self-heals hosts that came up with an
+    empty ``cache_dir/{id}/`` directory left over from a previously
+    failed download — without it the SDK would crash on
+    ``torch.load(<dir>)`` on every restart."""
+    orphan = tmp_path / "yoloe-26m-seg.pt"
+    orphan.mkdir()
+
+    _make_manager(tmp_path)
+    assert not orphan.exists()
+
+
+def test_prune_orphan_staging_dirs_at_init_removes_metadata_only_dir(
+    tmp_path: Path,
+) -> None:
+    """Dir containing only a metadata sidecar counts as orphan cruft."""
+    orphan = tmp_path / "yoloe-26m-seg.pt"
+    orphan.mkdir()
+    (orphan / MODEL_METADATA_FILENAME).write_text('{"model_id": "yoloe-26m-seg.pt"}')
+
+    _make_manager(tmp_path)
+    assert not orphan.exists()
+
+
+def test_prune_orphan_staging_dirs_at_init_removes_partial_download(
+    tmp_path: Path,
+) -> None:
+    """Dir containing only a ``.dl_*.part`` partial download is orphan cruft."""
+    orphan = tmp_path / "yoloe-26m-seg.pt"
+    orphan.mkdir()
+    (orphan / ".dl_abc123.part").write_bytes(b"partial")
+
+    _make_manager(tmp_path)
+    assert not orphan.exists()
+
+
+def test_prune_orphan_staging_dirs_at_init_preserves_operator_files(
+    tmp_path: Path,
+) -> None:
+    """Operator-staged content (any unexpected file) blocks the sweep —
+    a human's hand-staged work always wins over the self-heal."""
+    operator_dir = tmp_path / "yoloe-26m-seg.pt"
+    operator_dir.mkdir()
+    (operator_dir / "operator-weights.pt").write_bytes(b"hand-staged")
+
+    _make_manager(tmp_path)
+    assert operator_dir.exists()
+    assert (operator_dir / "operator-weights.pt").exists()
+
+
+def test_prune_orphan_staging_dirs_at_init_preserves_manifest_tracked_dir(
+    tmp_path: Path,
+) -> None:
+    """A directory tracked in the manifest must never be considered
+    orphan, even if it transiently looks empty (e.g. between an
+    operator delete and a re-stage)."""
+    model_id = "tracked-model"
+    tracked_dir = tmp_path / model_id
+    tracked_dir.mkdir()
+    # Pre-populate the manifest pointing at this directory.
+    manifest = _Manifest()
+    manifest.set(
+        CachedModel(
+            model_id=model_id,
+            local_path=str(tracked_dir / "weights.pt"),
+            size_bytes=0,
+            downloaded_at="2026-01-01T00:00:00Z",
+        )
+    )
+    manifest.save(tmp_path / "manifest.json")
+
+    _make_manager(tmp_path)
+    assert tracked_dir.exists()
+
+
 def test_evict_model_directory(tmp_path: Path) -> None:
     model_id = "big-model"
     model_dir = tmp_path / model_id
@@ -904,6 +1036,124 @@ def test_download_runtime_managed_failure_wraps_with_workarounds(
     assert "drop the weight file" in msg
     assert "/api/v1/mlmodels/" in msg
     assert "metadata.download_url" in msg
+
+
+def test_download_runtime_managed_failure_prunes_orphan_staging_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the ``IsADirectoryError`` wedge: a failed
+    runtime-managed download must NOT leave an empty staging directory
+    behind, otherwise the SDK's path resolver in the worker container
+    would later route the directory into ``torch.load`` and crash on
+    every restart."""
+    model_id = "yoloe-26s-seg"
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "edge_runtime": "ultralytics",
+        "model_external_id": "yoloe-26s-seg.pt",
+    }
+
+    def _fake_downloader(filename: str, dest_dir: Path) -> Path:
+        # Touch a temp partial-download file the way the real
+        # ``_stream_download`` would, then bail out — simulates an
+        # interrupted Ultralytics hub fetch.
+        (dest_dir / ".dl_xyz.part").write_bytes(b"partial")
+        raise RuntimeError("ultralytics hub returned 404 for yoloe-26s-seg.pt")
+
+    monkeypatch.setitem(
+        _model_manager_mod._RUNTIME_SELF_DOWNLOADERS,
+        "ultralytics",
+        _fake_downloader,
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        with pytest.raises(RuntimeError, match="Runtime-managed download"):
+            manager.ensure_model(model_id)
+
+    # The empty / cruft-only staging dir must be gone after the failure.
+    assert not (tmp_path / model_id).exists(), (
+        "orphan staging directory must be pruned after a failed download "
+        "so the SDK's path resolver does not later mistake it for a model file"
+    )
+
+
+def test_download_runtime_managed_failure_preserves_dir_with_operator_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Self-heal must NOT delete operator-staged content. If the staging
+    directory contains a non-cruft file (e.g. an operator-dropped
+    README + a partial weight file), the prune is skipped — human
+    always wins.
+
+    Two non-cruft files are used so that
+    :meth:`_resolve_prestaged_weight_file` returns ``None`` (it requires
+    *exactly one* candidate to claim a directory as pre-staged) and the
+    flow reaches the download path, where the prune logic gets
+    exercised.
+    """
+    model_id = "yoloe-26s-seg"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir()
+    (model_dir / "operator-weights.pt").write_bytes(b"hand-staged")
+    (model_dir / "operator-notes.txt").write_text("staged by ops on 2026-05-19")
+
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "edge_runtime": "ultralytics",
+        "model_external_id": "yoloe-26s-seg.pt",
+    }
+
+    def _fake_downloader(filename: str, dest_dir: Path) -> Path:
+        raise RuntimeError("network down")
+
+    monkeypatch.setitem(
+        _model_manager_mod._RUNTIME_SELF_DOWNLOADERS,
+        "ultralytics",
+        _fake_downloader,
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        with pytest.raises(RuntimeError, match="Runtime-managed download"):
+            manager.ensure_model(model_id)
+
+    assert model_dir.exists()
+    assert (model_dir / "operator-weights.pt").read_bytes() == b"hand-staged"
+    assert (model_dir / "operator-notes.txt").exists()
+
+
+def test_download_model_checksum_mismatch_prunes_orphan_staging_dir(
+    tmp_path: Path,
+) -> None:
+    """A signed-URL / upstream-URL download that fails checksum
+    verification must also leave the cache in a clean state."""
+    model_id = "bad-model"
+    good_content = b"real weights"
+    bad_checksum = hashlib.sha256(b"different").hexdigest()
+
+    catalog_entry: dict[str, Any] = {
+        "download_url": "https://dl.example.com/bad-model.pt",
+        "checksum_sha256": bad_checksum,
+        "filename": "bad-model.pt",
+    }
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(good_content)
+
+    manager = _make_manager(tmp_path)
+    with (
+        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
+        patch.object(manager, "_stream_download", side_effect=_fake_stream),
+    ):
+        with pytest.raises(RuntimeError, match="Checksum mismatch"):
+            manager.ensure_model(model_id)
+
+    # The weight file is unlinked by the checksum-mismatch branch and the
+    # now-empty staging directory must also be removed by the self-heal
+    # at the end of ``_download_model``.
+    assert not (tmp_path / model_id).exists()
 
 
 def test_download_runtime_managed_warm_cache_skips_downloader(

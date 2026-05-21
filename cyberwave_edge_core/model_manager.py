@@ -144,6 +144,65 @@ _CW_MODELS_LOAD_RE = re.compile(
     re.MULTILINE,
 )
 
+
+def _is_orphan_staging_dir(model_dir: Path) -> bool:
+    """Return ``True`` iff *model_dir* is an empty / cruft-only staging dir.
+
+    "Orphan" here means a per-model cache subdirectory left behind by a
+    previously failed download — the `mkdir(parents=True, exist_ok=True)`
+    on the download path runs *before* the network fetch, so any error
+    in the downloader leaves the directory in place. We treat the
+    directory as safely-deletable iff every entry inside is either:
+
+    * The metadata sidecar (``MODEL_METADATA_FILENAME``), or
+    * A partial streaming temp file (``.dl_*.part`` — the prefix used by
+      :func:`_stream_download`).
+
+    Any other entry (a half-written weight file with an unexpected
+    extension, an operator-staged file, a sub-directory) blocks the
+    prune, so a human always wins over the self-heal.
+    """
+    if not model_dir.is_dir():
+        return False
+    try:
+        entries = list(model_dir.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.is_file():
+            return False
+        name = entry.name
+        if name == MODEL_METADATA_FILENAME:
+            continue
+        if name.startswith(".dl_") and name.endswith(".part"):
+            continue
+        return False
+    return True
+
+
+def _prune_orphan_staging_dir(model_dir: Path, *, reason: str) -> bool:
+    """Best-effort ``rmtree`` of a confirmed-orphan staging directory.
+
+    Returns ``True`` iff the directory was removed. Caller is expected
+    to have confirmed orphan status via :func:`_is_orphan_staging_dir`
+    before calling — this helper does **not** re-check, so misuse can
+    delete an operator-curated directory. Logs at WARNING because a
+    prune always reflects a previously-failed Edge Core operation; the
+    operator should be able to find it by grepping logs.
+    """
+    try:
+        shutil.rmtree(model_dir, ignore_errors=True)
+    except Exception as exc:  # pragma: no cover - rmtree(ignore_errors) shouldn't raise
+        logger.debug("Failed to rmtree orphan staging dir %s: %s", model_dir, exc)
+        return False
+    logger.warning(
+        "Pruned orphan model staging directory at %s (reason=%s).",
+        model_dir,
+        reason,
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -277,6 +336,14 @@ class ModelManager:
         self._manifest_path = cache_dir / MANIFEST_FILENAME
         self._manifest = _Manifest.load(self._manifest_path)
         self.last_ensure_failures: dict[str, str] = {}
+        # Self-heal hosts that came up with an orphan staging directory
+        # left by a previously failed download. Without this sweep the
+        # SDK in the worker container would see ``cache_dir/{id}/`` as a
+        # poison-pill directory on every restart and crash with
+        # ``IsADirectoryError`` inside ``torch.load``. We run this once
+        # at construction time so subsequent ``ensure_model`` /
+        # ``evict_model`` calls operate on a clean cache.
+        self._prune_orphan_staging_dirs()
 
     # ------------------------------------------------------------------
     # Core public methods
@@ -390,9 +457,35 @@ class ModelManager:
 
         Deletes the cached file (or sub-directory) and removes the manifest
         entry. Returns ``True`` if something was evicted.
+
+        Also handles the **orphan-directory** case: when ``model_id`` has
+        no manifest entry but ``cache_dir/{model_id}/`` exists on disk
+        (left by a previously failed Edge Core download), the directory
+        is removed and ``True`` is returned. This makes manual operator
+        recovery possible without shell access to the host — a future
+        remote-eviction surface can call this method to unstick a
+        wedged worker.
         """
         cached = self._manifest.get(model_id)
         if cached is None:
+            # Manifest entry missing — check for an orphan directory at
+            # the canonical staging location and prune it if present.
+            orphan_dir = self._cache_dir / model_id
+            if orphan_dir.is_dir():
+                try:
+                    shutil.rmtree(orphan_dir)
+                    logger.info(
+                        "Evicted orphan model directory '%s' at %s "
+                        "(no manifest entry, likely left by a failed prior download)",
+                        model_id,
+                        orphan_dir,
+                    )
+                    return True
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove orphan model dir %s: %s", orphan_dir, exc
+                    )
+                    return False
             logger.debug("evict_model: '%s' not in manifest", model_id)
             return False
 
@@ -412,6 +505,40 @@ class ModelManager:
                 logger.info("Evicted model file '%s' at %s", model_id, local_path)
             except OSError as exc:
                 logger.warning("Failed to remove model file %s: %s", local_path, exc)
+
+        # The cached weight file usually lives at ``cache_dir/{id}/{filename}``,
+        # so the per-model directory still hangs around after we unlink
+        # the file. Remove it (best-effort) when it has become an empty
+        # / cruft-only orphan — otherwise an operator who tried to fix
+        # the wedge via ``evict_model`` would still have to remove the
+        # directory by hand to let the next ``ensure_model`` re-stage
+        # cleanly.
+        #
+        # We check both the canonical location (``cache_dir/{model_id}/``)
+        # and the parent of ``cached.local_path`` so that legacy entries
+        # whose ``local_path`` was not laid out under ``cache_dir/{id}/``
+        # still get the same cleanup. The candidates must be inside
+        # ``_cache_dir`` (verified via ``relative_to``) so we never
+        # rmtree outside the cache.
+        canonical_dir = self._cache_dir / model_id
+        candidate_dirs: list[Path] = [canonical_dir]
+        if local_path.parent != canonical_dir:
+            candidate_dirs.append(local_path.parent)
+        cache_root_resolved = self._cache_dir.resolve()
+        for candidate in candidate_dirs:
+            if not candidate.is_dir():
+                continue
+            try:
+                candidate.resolve().relative_to(cache_root_resolved)
+            except (OSError, ValueError):
+                continue
+            if candidate.resolve() == cache_root_resolved:
+                continue
+            if _is_orphan_staging_dir(candidate):
+                _prune_orphan_staging_dir(
+                    candidate,
+                    reason=f"evict_model('{model_id}') post-unlink cleanup",
+                )
 
         self._manifest.remove(model_id)
         self._manifest.save(self._manifest_path)
@@ -596,6 +723,58 @@ class ModelManager:
     # ------------------------------------------------------------------
     # Disk reconciliation (pre-staged / air-gapped support)
     # ------------------------------------------------------------------
+
+    def _prune_orphan_staging_dirs(self) -> None:
+        """Remove orphan per-model staging directories at startup.
+
+        An "orphan" is a top-level subdirectory of ``cache_dir/`` that
+        is **not** tracked in the manifest **and** contains no
+        recognized weight file (see :func:`_is_orphan_staging_dir` for
+        the exact predicate — only empty dirs or dirs with metadata /
+        ``.dl_*.part`` partial-download cruft qualify).
+
+        These are left behind by previously failed downloads (Edge
+        Core's :meth:`_download_model` / :meth:`_download_runtime_managed`
+        ``mkdir`` the directory *before* the network fetch). Without
+        this sweep the SDK in the worker container would later route
+        the directory into ``torch.load`` and die with
+        ``IsADirectoryError`` on every restart. The sweep is conservative:
+        a directory that contains a manifest-tracked file, an unexpected
+        artefact, or a nested directory is left alone so an operator
+        always wins over the self-heal.
+        """
+        if not self._cache_dir.is_dir():
+            return
+        manifest_dirs: set[str] = set()
+        for entry in self._manifest.entries.values():
+            local_path = entry.get("local_path") if isinstance(entry, dict) else None
+            if isinstance(local_path, str) and local_path:
+                try:
+                    relative = Path(local_path).resolve().relative_to(
+                        self._cache_dir.resolve()
+                    )
+                except (OSError, ValueError):
+                    continue
+                if relative.parts:
+                    manifest_dirs.add(relative.parts[0])
+
+        try:
+            children = list(self._cache_dir.iterdir())
+        except OSError as exc:
+            logger.debug("Cannot scan cache dir %s for orphans: %s", self._cache_dir, exc)
+            return
+
+        for child in children:
+            if not child.is_dir():
+                continue
+            if child.name in manifest_dirs:
+                continue
+            if not _is_orphan_staging_dir(child):
+                continue
+            _prune_orphan_staging_dir(
+                child,
+                reason="startup sweep — no manifest entry, no recognizable weight file",
+            )
 
     def _reconcile_disk_for(self, model_id: str) -> None:
         """Rebuild the manifest entry for *model_id* from on-disk state.
@@ -794,58 +973,77 @@ class ModelManager:
         model_dir.mkdir(parents=True, exist_ok=True)
         dest_path = model_dir / filename
 
-        last_exc: Optional[Exception] = None
-        for source_kind, fetch_url in sources:
-            logger.info(
-                "Downloading model '%s' from %s (%s) → %s",
-                model_id,
-                source_kind,
-                _redact_url(fetch_url),
-                dest_path,
-            )
-            try:
-                self._download_with_retries(fetch_url, dest_path)
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(
-                    "Download from %s failed for model '%s': %s — trying next source",
-                    source_kind,
+        # Self-heal: any path out of the download loop that does not
+        # return a usable file leaves the ``model_dir`` behind. The SDK's
+        # path resolver would later mistake that orphan directory for a
+        # model file and crash with ``IsADirectoryError`` inside
+        # ``torch.load``. Wrap the loop in a ``try`` block so every exit
+        # path (early checksum-mismatch raise, fallthrough after all
+        # sources failed) gets the same conservative ``rmtree`` pass.
+        try:
+            last_exc: Optional[Exception] = None
+            for source_kind, fetch_url in sources:
+                logger.info(
+                    "Downloading model '%s' from %s (%s) → %s",
                     model_id,
-                    exc,
+                    source_kind,
+                    _redact_url(fetch_url),
+                    dest_path,
                 )
-                continue
+                try:
+                    self._download_with_retries(fetch_url, dest_path)
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "Download from %s failed for model '%s': %s — trying next source",
+                        source_kind,
+                        model_id,
+                        exc,
+                    )
+                    continue
 
-            actual_checksum = _sha256_file(dest_path)
-            if expected_checksum and actual_checksum != expected_checksum:
-                dest_path.unlink(missing_ok=True)
-                last_exc = RuntimeError(
-                    f"Checksum mismatch for model '{model_id}' from {source_kind}: "
-                    f"expected {expected_checksum}, got {actual_checksum}. "
-                    f"Downloaded file removed."
+                actual_checksum = _sha256_file(dest_path)
+                if expected_checksum and actual_checksum != expected_checksum:
+                    dest_path.unlink(missing_ok=True)
+                    last_exc = RuntimeError(
+                        f"Checksum mismatch for model '{model_id}' from {source_kind}: "
+                        f"expected {expected_checksum}, got {actual_checksum}. "
+                        f"Downloaded file removed."
+                    )
+                    logger.warning("%s", last_exc)
+                    if (source_kind, fetch_url) == sources[-1]:
+                        raise last_exc
+                    continue
+
+                # For artifact downloads the signed URL is ephemeral; record
+                # None so the manifest does not pretend it can re-fetch.
+                persisted_source = None if source_kind == SOURCE_KIND_ARTIFACT else fetch_url
+                self._record_successful_download(
+                    model_id=model_id,
+                    dest_path=dest_path,
+                    checksum=actual_checksum,
+                    runtime=runtime,
+                    source_kind=source_kind,
+                    source_url=persisted_source,
+                    upstream_url=upstream_url,
+                    filename=filename,
                 )
-                logger.warning("%s", last_exc)
-                if (source_kind, fetch_url) == sources[-1]:
-                    raise last_exc
-                continue
+                return dest_path
 
-            # For artifact downloads the signed URL is ephemeral; record
-            # None so the manifest does not pretend it can re-fetch.
-            persisted_source = None if source_kind == SOURCE_KIND_ARTIFACT else fetch_url
-            self._record_successful_download(
-                model_id=model_id,
-                dest_path=dest_path,
-                checksum=actual_checksum,
-                runtime=runtime,
-                source_kind=source_kind,
-                source_url=persisted_source,
-                upstream_url=upstream_url,
-                filename=filename,
-            )
-            return dest_path
-
-        raise RuntimeError(
-            f"All download sources failed for model '{model_id}': {last_exc}"
-        ) from last_exc
+            raise RuntimeError(
+                f"All download sources failed for model '{model_id}': {last_exc}"
+            ) from last_exc
+        except Exception:
+            # All non-success exit paths land here. Prune the now-orphan
+            # ``model_dir`` (only if it is genuinely empty / cruft-only,
+            # so any operator-staged content is preserved) before
+            # re-raising the original exception unchanged.
+            if _is_orphan_staging_dir(model_dir):
+                _prune_orphan_staging_dir(
+                    model_dir,
+                    reason=f"download failed for '{model_id}'",
+                )
+            raise
 
     def _record_successful_download(
         self,
@@ -935,6 +1133,17 @@ class ModelManager:
         try:
             dest_path = downloader(filename, model_dir)
         except Exception as exc:
+            # Self-heal: a failed downloader leaves the staging directory
+            # behind, which would later confuse the SDK's path resolver
+            # (it would return the directory and ``torch.load`` would
+            # die with ``IsADirectoryError``). Prune it now while we
+            # know it is in a half-initialised state and only contains
+            # the artefacts this run produced.
+            if _is_orphan_staging_dir(model_dir):
+                _prune_orphan_staging_dir(
+                    model_dir,
+                    reason=f"runtime-managed download for '{model_id}' failed",
+                )
             raise RuntimeError(
                 f"Runtime-managed download for model '{model_id}' failed: {exc}. "
                 f"Workarounds: (a) drop the weight file into {model_dir}/, "

@@ -178,6 +178,18 @@ rm -rf ~/.cyberwave/models/yolov8n
 
 Provide a hand-written `metadata.json` (with `filename`, `checksum_sha256`, and `runtime`) when there are multiple weight files in the directory or when corruption detection should compare against a known-good hash.
 
+### Self-healing the model cache
+
+A failed download leaves an empty `cache_dir/{model_id}/` directory behind — the `mkdir` on the download path runs *before* the network fetch, and any error in the downloader (HTTP timeout, missing upstream weight, runtime self-download crash) skips the cleanup. Without intervention, the SDK in the worker container would later route that directory into `torch.load` and crash with `IsADirectoryError` on every restart.
+
+Edge Core handles this in three layers:
+
+* **Per-download cleanup** (conservative). If `_download_model` or `_download_runtime_managed` raises, the staging directory is removed before the exception propagates, provided it contains only an `.dl_*.part` partial-download file, a `metadata.json` sidecar, or nothing at all. Operator-staged content blocks the prune.
+* **Startup sweep** (conservative). `ModelManager()` walks `cache_dir/` once at construction time and prunes any per-model subdirectory that is not tracked in the manifest *and* contains only orphan cruft. This catches hosts that were already wedged before this code shipped. Operator-staged content blocks the prune.
+* **`evict_model('foo')`** (decisive). When there is no manifest entry but `cache_dir/foo/` exists on disk, the directory is removed **unconditionally** and `True` is returned. This is the recovery hook for a remote eviction API to call without shell access to the host; an explicit `evict` is treated as a stronger operator-intent signal than the conservative auto-sweeps.
+
+For the two conservative layers, a directory containing an unexpected file (an operator's `README.md`, a hand-staged weight file with an unusual name, a sub-directory) is preserved untouched — "human always wins". Use `evict_model` explicitly when you mean to clear the slot regardless of contents.
+
 ### ML runtime extras
 
 The default `pip install cyberwave-edge-core` keeps the runtime surface lean — no Torch, no Ultralytics, no ONNX. That's enough for workflows that resolve weights through a backend-hosted URL or pre-staged files. Catalog entries that rely on the **runtime-managed download** fallback (step 5.3 above) need the matching runtime installed on the edge host:
