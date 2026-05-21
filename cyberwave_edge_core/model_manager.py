@@ -1458,6 +1458,7 @@ _RUNTIME_BY_EXTENSION: dict[str, str] = {
     ".engine": "tensorrt",
     ".trt": "tensorrt",
     ".xml": "opencv",
+    ".hef": "hailo",
 }
 
 

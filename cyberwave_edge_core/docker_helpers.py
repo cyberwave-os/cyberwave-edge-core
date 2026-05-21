@@ -159,6 +159,31 @@ def docker_ps_by_prefix(prefix: str, *, include_stopped: bool = False) -> list[s
         return []
 
 
+def group_gid(group_name: str) -> Optional[int]:
+    """Return the numeric GID for *group_name* on the host, or None when absent.
+
+    Used to derive the ``--group-add <gid>`` flag for ``docker run`` when a
+    host hardware accelerator's device node is restricted to a specific Unix
+    group (e.g. older HailoRT installs use ``hailo`` as the device group; v4.20+
+    instead ships ``/dev/hailo0`` with 0666 permissions and no group, so the
+    flag is unnecessary on those systems and this helper returns None).
+
+    Linux-only. On other platforms — and when the ``grp`` module is unavailable
+    (CPython on Windows builds) — this returns None so callers can skip the
+    group-add step unconditionally.
+    """
+    if platform.system() != "Linux":
+        return None
+    try:
+        import grp  # noqa: PLC0415
+    except ImportError:
+        return None
+    try:
+        return int(grp.getgrnam(group_name).gr_gid)
+    except KeyError:
+        return None
+
+
 def docker_has_nvidia_runtime() -> bool:
     """Return True when the NVIDIA container runtime is available on this host."""
     if not docker_available():

@@ -1708,6 +1708,7 @@ def test_signed_url_403_falls_through_to_upstream(
         ("model.tflite", "tflite"),
         ("model.pth", "torch"),
         ("model.xml", "opencv"),
+        ("model.hef", "hailo"),
     ],
 )
 def test_reconcile_infers_runtime_from_extension(

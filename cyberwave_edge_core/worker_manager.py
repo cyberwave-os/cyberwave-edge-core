@@ -30,6 +30,7 @@ from .docker_helpers import (
     docker_inspect,
     docker_rm,
     docker_stop,
+    group_gid,
 )
 from .docker_args import (
     _rewrite_macos_container_base_url,
@@ -144,6 +145,68 @@ def _ensure_dir_writable_by_container_user(path: Path) -> None:
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
 _WORKER_IMAGE_BASE = "cyberwaveos/edge-ml-worker"
 DEFAULT_WORKER_IMAGE = f"{_WORKER_IMAGE_BASE}:latest"
+
+#: Host device node exposed by the Hailo PCIe driver (HailoRT). Presence of
+#: this path is the cheapest way to detect a Hailo accelerator on the host
+#: without paying the cost of forking ``hailortcli``.
+HAILO_DEVICE_PATH = "/dev/hailo0"
+
+#: Env var read by the Hailo worker image's entrypoint. Listed device paths
+#: that don't exist inside the container cause the entrypoint to exit
+#: with a clear "Gate 4" message instead of crashing inside HailoRT.
+_REQUIRED_DEVICES_ENV = "CYBERWAVE_REQUIRED_DEVICES"
+
+
+def _hailo_device_present() -> bool:
+    """Return True when ``/dev/hailo0`` exists on the host.
+
+    Linux-only check (the device node is only created by the Hailo PCIe
+    kernel driver). Operators on macOS / Windows never get the Hailo
+    passthrough, which matches reality: HailoRT only supports Linux.
+    """
+    if platform.system() != "Linux":
+        return False
+    return Path(HAILO_DEVICE_PATH).exists()
+
+
+def _apply_hailo_image_tag(image: str) -> str:
+    """Append ``-hailo`` to the worker image tag when applicable.
+
+    Mirrors the ``-gpu`` rewrite in :meth:`WorkerManager._run_container`:
+    only ``cyberwaveos/edge-ml-worker:<tag>`` references are rewritten,
+    and only when the tag is not already a Hailo variant. Custom
+    operator overrides (``CYBERWAVE_WORKER_IMAGE``) and the ``-gpu``
+    fork are left untouched — Hailo + NVIDIA on the same host is not
+    a supported combination and ``-gpu`` wins because it's the
+    higher-priority accelerator for the rest of the catalog.
+    """
+    if not image.startswith(f"{_WORKER_IMAGE_BASE}:"):
+        return image
+    if image.endswith("-hailo") or image.endswith("-gpu"):
+        return image
+    return f"{image}-hailo"
+
+
+def _build_hailo_passthrough_args() -> list[str]:
+    """Return the ``docker run`` flags that expose ``/dev/hailo0`` to the worker.
+
+    Always emits the ``--device`` flag and the ``CYBERWAVE_REQUIRED_DEVICES``
+    env var (consumed by the Hailo image's entrypoint for Gate 4).
+    Conditionally adds ``--group-add <gid>`` for the ``hailo`` group
+    when it exists on the host: HailoRT versions <4.20 ship the device
+    node with ``hailo``-group ownership, while 4.20+ make it
+    world-accessible (0666) and the group isn't created. ``group_gid``
+    returns ``None`` in the latter case and we skip the flag.
+    """
+    args: list[str] = [
+        "--device",
+        f"{HAILO_DEVICE_PATH}:{HAILO_DEVICE_PATH}:rwm",
+    ]
+    gid = group_gid("hailo")
+    if gid is not None:
+        args += ["--group-add", str(gid)]
+    args += ["-e", f"{_REQUIRED_DEVICES_ENV}={HAILO_DEVICE_PATH}"]
+    return args
 
 
 def resolve_worker_image() -> str:
@@ -725,6 +788,26 @@ class WorkerManager:
             else:
                 logger.info("NVIDIA runtime detected; adding --gpus all to worker container")
 
+        hailo_args: list[str] = []
+        non_hailo_image: str | None = None
+        if _hailo_device_present() and not gpu_args:
+            hailo_args = _build_hailo_passthrough_args()
+            rewritten = _apply_hailo_image_tag(image)
+            if rewritten != image:
+                non_hailo_image = image
+                image = rewritten
+                logger.info(
+                    "Hailo accelerator detected at %s; using Hailo image %s",
+                    HAILO_DEVICE_PATH,
+                    image,
+                )
+            else:
+                logger.info(
+                    "Hailo accelerator detected at %s; adding device passthrough to %s",
+                    HAILO_DEVICE_PATH,
+                    image,
+                )
+
         resource_args: list[str] = []
         resource_env_args: list[str] = []
         if self._resource_limits is not None:
@@ -750,6 +833,7 @@ class WorkerManager:
             "--name",
             self._container_name,
             *gpu_args,
+            *hailo_args,
             *resource_args,
             *volume_args,
             *env_args,
@@ -763,6 +847,22 @@ class WorkerManager:
             if non_gpu_image:
                 logger.warning("GPU image %s unavailable; falling back to %s", image, non_gpu_image)
                 image = non_gpu_image
+                cmd[-1] = image
+                if not self._ensure_image_pulled(image):
+                    self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
+                    return False
+            elif non_hailo_image:
+                # The Hailo image hasn't been published / is unreachable; fall
+                # back to the base image. The --device flag stays in place
+                # (harmless when hailo_platform isn't installed; the worker
+                # will fail loudly at HailoRuntime.is_available() instead of
+                # silently swallowing the user's .hef-selecting workflow).
+                logger.warning(
+                    "Hailo image %s unavailable; falling back to %s",
+                    image,
+                    non_hailo_image,
+                )
+                image = non_hailo_image
                 cmd[-1] = image
                 if not self._ensure_image_pulled(image):
                     self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
