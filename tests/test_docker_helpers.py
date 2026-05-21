@@ -68,6 +68,39 @@ class TestBuildUserArgs:
 
 
 # ---------------------------------------------------------------------------
+# group_gid
+# ---------------------------------------------------------------------------
+
+
+class TestGroupGid:
+    def test_returns_gid_when_group_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import grp
+
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+
+        class _FakeGroup:
+            gr_gid = 1010
+
+        monkeypatch.setattr(grp, "getgrnam", lambda name: _FakeGroup())
+        assert dh.group_gid("hailo") == 1010
+
+    def test_returns_none_when_group_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import grp
+
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+
+        def _raise(name: str) -> Any:
+            raise KeyError(name)
+
+        monkeypatch.setattr(grp, "getgrnam", _raise)
+        assert dh.group_gid("hailo") is None
+
+    def test_returns_none_on_non_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Darwin")
+        assert dh.group_gid("hailo") is None
+
+
+# ---------------------------------------------------------------------------
 # docker_available
 # ---------------------------------------------------------------------------
 

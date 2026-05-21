@@ -394,6 +394,257 @@ class TestWorkerManagerGPU:
         assert "--gpus" not in docker_run_cmd
 
 
+def _stub_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Common stubs for ``_run_container`` tests that bypass real env / docker."""
+    monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+    monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
+    monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+    monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        "cyberwave_edge_core.startup.get_runtime_env_var",
+        lambda name, default=None: default,
+    )
+    monkeypatch.setattr("cyberwave_edge_core.startup.load_credentials_envs", lambda: {})
+    monkeypatch.setattr("os.environ", {})
+
+
+class TestWorkerManagerHailo:
+    """Verify Hailo accelerator device passthrough + image tag rewrite.
+
+    The host-side signal is the presence of ``/dev/hailo0`` (created by
+    HailoRT's PCIe kernel driver). When detected on a worker that's about
+    to start the standard ``edge-ml-worker:<tag>`` image, edge-core
+    rewrites the tag to the Hailo sibling (``<tag>-hailo``) and adds the
+    device + group + Gate-4 env var passthrough.
+    """
+
+    def _stub_docker_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_calls: list[list[str]],
+    ) -> None:
+        def fake_run(cmd: list, **kwargs: object) -> MagicMock:
+            run_calls.append(cmd)
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+
+    def test_hailo_device_passthrough_when_device_present(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: True)
+        monkeypatch.setattr(wm_module, "group_gid", lambda name: 1010 if name == "hailo" else None)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--device" in docker_run_cmd
+        assert "/dev/hailo0:/dev/hailo0:rwm" in docker_run_cmd
+        assert "--group-add" in docker_run_cmd
+        assert "1010" in docker_run_cmd
+        assert "CYBERWAVE_REQUIRED_DEVICES=/dev/hailo0" in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-hailo"
+
+    def test_hailo_skips_group_add_when_group_missing(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """HailoRT 4.20+ ships /dev/hailo0 as 0666 and creates no group."""
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: True)
+        monkeypatch.setattr(wm_module, "group_gid", lambda name: None)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--device" in docker_run_cmd
+        assert "/dev/hailo0:/dev/hailo0:rwm" in docker_run_cmd
+        assert "--group-add" not in docker_run_cmd
+        assert "CYBERWAVE_REQUIRED_DEVICES=/dev/hailo0" in docker_run_cmd
+
+    def test_no_hailo_args_when_device_absent(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--device" not in docker_run_cmd
+        assert "CYBERWAVE_REQUIRED_DEVICES=/dev/hailo0" not in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest"
+
+    def test_gpu_takes_precedence_over_hailo(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """NVIDIA + Hailo on the same host is unsupported; GPU wins."""
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: True)
+        monkeypatch.setattr(wm_module, "group_gid", lambda name: 1010)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--gpus" in docker_run_cmd
+        assert "--device" not in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-gpu"
+
+    def test_hailo_image_not_double_suffixed_when_already_selected(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        worker_manager._image = "cyberwaveos/edge-ml-worker:latest-hailo"
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: True)
+        monkeypatch.setattr(wm_module, "group_gid", lambda name: None)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--device" in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-hailo"
+
+    def test_custom_image_override_left_untouched(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``CYBERWAVE_WORKER_IMAGE``-style operator overrides are not rewritten.
+
+        Mirrors the GPU behaviour: device passthrough is added, but the image
+        ref is left alone since the operator explicitly chose it.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        worker_manager._image = "myregistry.local/cyberwave/custom-worker:dev"
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: True)
+        monkeypatch.setattr(wm_module, "group_gid", lambda name: None)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--device" in docker_run_cmd
+        assert docker_run_cmd[-1] == "myregistry.local/cyberwave/custom-worker:dev"
+
+
+class TestHailoHelpers:
+    """Pure-function tests for the Hailo helpers (no docker subprocess)."""
+
+    def test_apply_hailo_image_tag_rewrites_known_tag(self) -> None:
+        assert (
+            wm_module._apply_hailo_image_tag("cyberwaveos/edge-ml-worker:latest")
+            == "cyberwaveos/edge-ml-worker:latest-hailo"
+        )
+        assert (
+            wm_module._apply_hailo_image_tag("cyberwaveos/edge-ml-worker:dev")
+            == "cyberwaveos/edge-ml-worker:dev-hailo"
+        )
+
+    def test_apply_hailo_image_tag_leaves_existing_hailo_alone(self) -> None:
+        assert (
+            wm_module._apply_hailo_image_tag("cyberwaveos/edge-ml-worker:dev-hailo")
+            == "cyberwaveos/edge-ml-worker:dev-hailo"
+        )
+
+    def test_apply_hailo_image_tag_leaves_gpu_alone(self) -> None:
+        assert (
+            wm_module._apply_hailo_image_tag("cyberwaveos/edge-ml-worker:latest-gpu")
+            == "cyberwaveos/edge-ml-worker:latest-gpu"
+        )
+
+    def test_apply_hailo_image_tag_leaves_custom_image_alone(self) -> None:
+        assert (
+            wm_module._apply_hailo_image_tag("myregistry.local/cyberwave/custom:dev")
+            == "myregistry.local/cyberwave/custom:dev"
+        )
+
+    def test_build_hailo_passthrough_args_with_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "group_gid", lambda name: 1010)
+        args = wm_module._build_hailo_passthrough_args()
+        assert args[:2] == ["--device", "/dev/hailo0:/dev/hailo0:rwm"]
+        assert "--group-add" in args
+        assert "1010" in args
+        assert args[-1] == "CYBERWAVE_REQUIRED_DEVICES=/dev/hailo0"
+
+    def test_build_hailo_passthrough_args_without_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wm_module, "group_gid", lambda name: None)
+        args = wm_module._build_hailo_passthrough_args()
+        assert "--group-add" not in args
+        assert "--device" in args
+        assert "CYBERWAVE_REQUIRED_DEVICES=/dev/hailo0" in args
+
+
 class TestGetZenohEnvVars:
     def test_data_backend_always_zenoh(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
