@@ -201,9 +201,17 @@ The default `pip install cyberwave-edge-core` keeps the runtime surface lean —
 pip install 'cyberwave-edge-core[ml]'
 
 # Other available extras (mirror the cyberwave SDK extras 1:1):
-pip install 'cyberwave-edge-core[ml-onnx]'    # onnxruntime
-pip install 'cyberwave-edge-core[ml-tflite]'  # tflite-runtime
-pip install 'cyberwave-edge-core[ml-all]'     # vision + wakeword + whisper.cpp + faster-whisper
+pip install 'cyberwave-edge-core[ml-onnx]'       # onnxruntime
+pip install 'cyberwave-edge-core[ml-tflite]'     # tflite-runtime
+pip install 'cyberwave-edge-core[ml-wakeword]'   # openwakeword + onnxruntime
+pip install 'cyberwave-edge-core[ml-stt]'         # pywhispercpp (Whisper.cpp GGML)
+pip install 'cyberwave-edge-core[ml-stt-faster]'  # faster-whisper (CTranslate2)
+pip install 'cyberwave-edge-core[ml-audio]'      # silero-vad + torchaudio (Audio Assistant)
+pip install 'cyberwave-edge-core[fuzzy-match]'   # rapidfuzz (Fuzzy Matcher)
+pip install 'cyberwave-edge-core[microphone]'    # host mic capture (Audio Track trigger)
+pip install 'cyberwave-edge-core[ml-all-vision]'  # YOLO / ONNX / TFLite only
+pip install 'cyberwave-edge-core[ml-all-audio]'   # all speech extras (avoid on Pi — pick ml-stt / ml-stt-faster per model)
+pip install 'cyberwave-edge-core[ml-all]'         # CI/dev fat bundle only
 ```
 
 When a required runtime is missing, the resolver raises a `RuntimeError` that spells out the three workarounds: drop the weight file into `~/.cyberwave/models/{model_id}/`, upload to `/api/v1/mlmodels/{uuid}/weights`, or set `metadata.download_url` on the catalog entry.

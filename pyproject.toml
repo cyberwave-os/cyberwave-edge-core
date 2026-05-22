@@ -53,7 +53,15 @@ build = [
 ml         = ["cyberwave[ml]"]
 ml-onnx    = ["cyberwave[ml-onnx]"]
 ml-tflite  = ["cyberwave[ml-tflite]"]
+ml-wakeword = ["cyberwave[ml-wakeword]"]
+ml-stt     = ["cyberwave[ml-stt]"]
+ml-stt-faster = ["cyberwave[ml-stt-faster]"]
+ml-audio   = ["cyberwave[ml-audio]"]
+microphone = ["cyberwave[microphone]"]
+ml-all-vision = ["cyberwave[ml-all-vision]"]
+ml-all-audio = ["cyberwave[ml-all-audio]"]
 ml-all     = ["cyberwave[ml-all]"]
+fuzzy-match = ["cyberwave[fuzzy-match]"]
 
 [project.scripts]
 cyberwave-edge-core = "cyberwave_edge_core.main:cli"
