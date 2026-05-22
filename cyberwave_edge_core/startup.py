@@ -344,6 +344,21 @@ _EDGE_COMMAND_SUBSCRIBED = False
 _EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 _EDGE_RESTART_LOCK = threading.Lock()
 _EDGE_RESTART_IN_PROGRESS = False
+
+
+def _edge_core_restart_in_progress() -> bool:
+    """Thread-safe read of the edge-core restart flag.
+
+    Used by the worker health monitor's ``expected_running_probe`` to
+    suppress the spontaneous-exit warning while a restart is tearing
+    the worker container down and bringing it back. Read under the
+    lock so the watcher doesn't race with the start/end transitions
+    in :func:`_run_edge_core_restart_worker`.
+    """
+    with _EDGE_RESTART_LOCK:
+        return _EDGE_RESTART_IN_PROGRESS
+
+
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 # Twin UUIDs whose ``cyberwave/twin/{uuid}/command`` topic is currently
 # subscribed. Tracked as a set rather than a boolean so that twins paired
@@ -5808,8 +5823,35 @@ def _reconcile_worker_watcher(
             resource_limits=load_worker_resource_limits(),
         )
         # Attach health monitor so that restarts are accounted and rate-limited.
+        # The probe lets the monitor downgrade "exited spontaneously" to INFO
+        # for two cross-instance deliberate-stop paths that don't share this
+        # monitor and therefore can't pre-empt the detector via
+        # ``record_stop``:
+        #
+        #   1. Workflow deactivation (frontend / CLI / API): the backend
+        #      publishes ``remove_workflow_worker``, the edge unlinks
+        #      ``wf_*.py``, and ``reconcile_worker_lifecycle`` drives a
+        #      fresh ``WorkerManager`` (no monitor) through ``.stop()``.
+        #      Probe leg: workers dir is empty after the unlink.
+        #   2. "Restart edge core" (frontend Restart button, MQTT edge
+        #      command): ``_perform_edge_core_restart`` calls
+        #      ``_stop_worker_container_for_restart`` through another
+        #      fresh ``WorkerManager`` (no monitor) before re-running
+        #      drivers and bringing the worker back up. Probe leg:
+        #      ``_edge_core_restart_in_progress()``.
+        #
+        # Either leg returning False means "we don't expect this
+        # container to be running right now" → suppress WARN, log INFO.
+        # Any *other* running→exited transition (real crash, manual
+        # ``docker stop`` while workflows are active, OOM kill) still
+        # warns because the probe says "should be running".
         health_monitor = WorkerHealthMonitor(
             container_name=worker_manager.container_name,
+            expected_running_probe=lambda: (
+                workers_dir.is_dir()
+                and any(workers_dir.glob("*.py"))
+                and not _edge_core_restart_in_progress()
+            ),
         )
         worker_manager.set_health_monitor(health_monitor)
 

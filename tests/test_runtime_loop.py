@@ -60,7 +60,34 @@ class TestReconcileWorkerWatcher:
 
         assert result is mock_watcher_instance
         mock_wm_cls.assert_called_once()
-        mock_hm_cls.assert_called_once_with(container_name="cyberwave-worker-test")
+        mock_hm_cls.assert_called_once()
+        hm_call = mock_hm_cls.call_args
+        assert hm_call.kwargs["container_name"] == "cyberwave-worker-test"
+        # The watcher must wire ``expected_running_probe`` so the
+        # monitor can self-suppress the spontaneous-exit warning when
+        # the workers dir is empty (deactivation path: the stop is
+        # driven by a different ``WorkerManager`` instance that
+        # doesn't share this monitor).
+        probe = hm_call.kwargs.get("expected_running_probe")
+        assert callable(probe)
+        # Empty/nonexistent dir → probe returns False (workflow
+        # deactivation leg).
+        assert probe() is False
+
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir(exist_ok=True)
+        (workers_dir / "wf_aaaaaaaaaaaa.py").write_text("# x", encoding="utf-8")
+        # Populated dir, no restart in flight → probe returns True
+        # (the normal "worker should be up" steady state).
+        assert probe() is True
+
+        # Populated dir, restart in flight → probe returns False so the
+        # "Restart edge core" flow doesn't trigger a false-positive
+        # crash-loop WARN between the stop and the subsequent start.
+        # ``monkeypatch`` auto-restores the flag at teardown, so no
+        # manual ``finally`` is needed to reset it.
+        monkeypatch.setattr(startup, "_EDGE_RESTART_IN_PROGRESS", True)
+        assert probe() is False
         mock_wm_instance.set_health_monitor.assert_called_once()
         mock_watcher_cls.assert_called_once()
         mock_watcher_instance.check_health.assert_called_once()

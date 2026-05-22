@@ -8,7 +8,13 @@ Provides:
 
 Design goals
 ~~~~~~~~~~~~
-* Non-blocking: every public method completes quickly and never raises.
+* Cheap and non-raising: every public method swallows its own errors and
+  completes in microseconds at the monitor layer itself.  The optional
+  ``readiness_probe`` / ``expected_running_probe`` callables are
+  caller-supplied and the monitor only guarantees that probe exceptions
+  are caught — keeping the probes themselves fast is the caller's
+  responsibility (the default wiring in ``startup.py`` uses local-FS
+  stat calls and a single in-process lock acquisition).
 * Decoupled: no direct import of startup.py; wired in by the reconcile loop.
 * Persistent across reconcile cycles: the monitor is instantiated once by
   ``_reconcile_worker_watcher`` and retained across calls.
@@ -129,6 +135,19 @@ class WorkerHealthMonitor:
     readiness_probe:
         Optional callable that returns True when the container is considered
         ready (e.g. a health endpoint check).  If None, readiness = running.
+    expected_running_probe:
+        Optional callable that returns True when the container is
+        *expected* to be running.  Consulted by
+        :meth:`_detect_spontaneous_exit` to distinguish a real crash
+        from a deliberate stop driven by a separate component (workflow
+        deactivation through ``reconcile_worker_lifecycle``, edge-core
+        restart through ``_perform_edge_core_restart``) that owns a
+        different ``WorkerManager`` instance and therefore can't reach
+        this monitor via :meth:`record_stop`.  When the probe returns
+        False, the running→exited transition is logged at INFO instead
+        of WARN.  Probe exceptions are caught and treated as "True"
+        (i.e. fall back to the warn-on-exit behavior) so an
+        instrumentation bug never masks a real crash loop.
     """
 
     def __init__(
@@ -138,11 +157,21 @@ class WorkerHealthMonitor:
         restart_window_seconds: float = DEFAULT_RESTART_WINDOW_SECONDS,
         max_restarts_in_window: int = DEFAULT_MAX_RESTARTS_IN_WINDOW,
         readiness_probe: Optional[Callable[[], bool]] = None,
+        expected_running_probe: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._container_name = container_name
         self._restart_window = restart_window_seconds
         self._max_restarts = max_restarts_in_window
         self._readiness_probe = readiness_probe
+        # Returns True when the worker is *expected* to be running (e.g. the
+        # workers directory has at least one ``wf_*.py``). Used to suppress
+        # the spontaneous-exit warning when the container exited because it
+        # had nothing left to run — the deactivation / remove_workflow_worker
+        # flow drives that case through a fresh ``WorkerManager`` instance
+        # that doesn't share this monitor, so we can't catch it via
+        # :meth:`record_stop`; this probe lets the monitor figure it out
+        # for itself.
+        self._expected_running_probe = expected_running_probe
 
         self._restart_records: list[RestartRecord] = []
         self._circuit_breaker_tripped: bool = False
@@ -182,6 +211,29 @@ class WorkerHealthMonitor:
     def record_start(self) -> None:
         """Record that the container was intentionally started (not restarted)."""
         self._last_start_time = time.time()
+
+    def record_stop(self, *, reason: str) -> None:
+        """Record that the container was intentionally stopped.
+
+        Pre-empts the next :meth:`check` from logging a spurious
+        "exited spontaneously" warning by seeding
+        ``_last_container_status`` with a non-running value, so the
+        detector no longer sees a ``running → exited`` transition.
+
+        Wire this in from any code path that issues a deliberate stop
+        AND holds the monitor handle (e.g. ``WorkerManager.stop``). For
+        deliberate stops driven by another component without monitor
+        access (the ``reconcile_worker_lifecycle`` / deactivation
+        path), the ``expected_running_probe`` is the suppression
+        channel instead.
+        """
+        self._last_container_status = "exited"
+        self._last_start_time = None
+        logger.info(
+            "Worker stop recorded: container=%s reason=%r",
+            self._container_name,
+            reason,
+        )
 
     def check(self, container_status: Optional[str] = None) -> WorkerHealthState:
         """Probe the current container state and return a health snapshot.
@@ -297,14 +349,46 @@ class WorkerHealthMonitor:
             )
 
     def _detect_spontaneous_exit(self, current_status: str) -> None:
-        """Log a warning when the container exits without a deliberate restart."""
-        if self._last_container_status == "running" and current_status in {"exited", "dead"}:
-            logger.warning(
-                "Worker container %s exited spontaneously (status=%s); "
-                "this may indicate a crash loop",
-                self._container_name,
-                current_status,
-            )
+        """Log a warning when the container exits without a deliberate restart.
+
+        When an ``expected_running_probe`` is configured and reports
+        ``False``, the exit is treated as deliberate (the worker had
+        nothing left to run — e.g. the last active workflow was
+        deactivated and the file watcher cleared the dir) and is
+        downgraded to INFO so operators still see a trace without
+        getting paged on the "may indicate a crash loop" wording.
+        """
+        if not (self._last_container_status == "running" and current_status in {"exited", "dead"}):
+            return
+
+        if self._expected_running_probe is not None:
+            try:
+                expected = bool(self._expected_running_probe())
+            except Exception:
+                # Probe blew up; play it safe and warn (matches prior
+                # behaviour rather than silently swallowing a real crash).
+                logger.debug(
+                    "expected_running_probe raised for %s; defaulting to warn",
+                    self._container_name,
+                    exc_info=True,
+                )
+                expected = True
+            if not expected:
+                logger.info(
+                    "Worker container %s transitioned running → %s; "
+                    "suppressing spontaneous-exit warning because no "
+                    "worker files are present (deliberate deactivation, "
+                    "not a crash).",
+                    self._container_name,
+                    current_status,
+                )
+                return
+
+        logger.warning(
+            "Worker container %s exited spontaneously (status=%s); this may indicate a crash loop",
+            self._container_name,
+            current_status,
+        )
 
     def _run_readiness_probe(self) -> bool:
         """Run the readiness probe; returns True if none is configured."""

@@ -360,7 +360,11 @@ Edge Core continuously monitors the worker container for spontaneous exits and c
 
 - **Restart accounting**: every restart is recorded with a timestamp and reason.
 - **Sliding-window rate limiting**: if more than 5 restarts occur within 5 minutes, the circuit-breaker trips and automatic restarts are suppressed. The breaker resets automatically once the window clears.
-- **Spontaneous exit detection**: if the container exits without a deliberate restart, a warning is logged so operators can investigate.
+- **Spontaneous exit detection**: if the container exits without a deliberate restart, a warning is logged so operators can investigate. The detector recognises deliberate stops via two channels:
+  - Same-instance callers that hold the monitor (e.g. `WorkerManager.stop`) notify it via `record_stop()`.
+  - For cross-instance stops driven by other components (workflow deactivation routes through `reconcile_worker_lifecycle.stop()`; the "Restart edge core" flow routes through `_stop_worker_container_for_restart`), the monitor consults an "expected to be running" probe that returns False when either the workers directory is empty (deactivation) or an edge-core restart is in flight. Both cases downgrade the log to INFO.
+
+  The "may indicate a crash loop" wording is reserved for exits that look unexpected — real crashes, OOM kills, or manual `docker stop` while workflows are active.
 
 Use `cyberwave-edge-core worker health` to inspect the full restart history and circuit-breaker state.
 

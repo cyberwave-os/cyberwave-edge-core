@@ -409,7 +409,7 @@ class WorkerManager:
             self._health_monitor.record_start()
         return ok
 
-    def stop(self) -> bool:
+    def stop(self, *, reason: str = "requested") -> bool:
         """Gracefully stop the worker container without removing it.
 
         Leaves the container in ``exited`` state so operators can still
@@ -423,6 +423,14 @@ class WorkerManager:
         already stopped). The destructive ``docker rm`` happens later,
         only inside :meth:`_run_container`, so the next start always gets
         a freshly-created container.
+
+        When a ``WorkerHealthMonitor`` is attached AND ``docker_stop``
+        actually transitioned a running container, ``record_stop()``
+        is called so the next health probe doesn't false-positive on
+        the running→exited transition. The short-circuit paths
+        (container already non-running) skip the notification because
+        there's no transition to suppress. *reason* is logged on the
+        monitor for traceability.
         """
         if not docker_available():
             return True
@@ -437,11 +445,15 @@ class WorkerManager:
             return True
 
         logger.info(
-            "Stopping worker container %s (status=%s)",
+            "Stopping worker container %s (status=%s) reason=%r",
             self._container_name,
             current_status,
+            reason,
         )
-        return docker_stop(self._container_name)
+        ok = docker_stop(self._container_name)
+        if ok and self._health_monitor is not None:
+            self._health_monitor.record_stop(reason=reason)
+        return ok
 
     def restart(self, *, reason: str = "requested") -> bool:
         """Stop and re-start the worker container.

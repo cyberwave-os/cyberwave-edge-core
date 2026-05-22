@@ -625,9 +625,7 @@ class TestHailoHelpers:
             == "myregistry.local/cyberwave/custom:dev"
         )
 
-    def test_build_hailo_passthrough_args_with_group(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_build_hailo_passthrough_args_with_group(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(wm_module, "group_gid", lambda name: 1010)
         args = wm_module._build_hailo_passthrough_args()
         assert args[:2] == ["--device", "/dev/hailo0:/dev/hailo0:rwm"]
@@ -736,6 +734,75 @@ class TestWorkerManagerStop:
         monkeypatch.setattr(wm_module, "docker_container_status", lambda _n: "running")
         monkeypatch.setattr(wm_module, "docker_stop", lambda _name, **_kw: False)
         assert worker_manager.stop() is False
+
+    def test_notifies_health_monitor_on_successful_stop(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A successful ``docker_stop`` must call
+        ``WorkerHealthMonitor.record_stop`` so the next health probe
+        doesn't false-positive on the running→exited transition. The
+        reason flows through so log greps can correlate the stop with
+        the upstream trigger (deactivation, edge restart, etc.).
+        """
+        from unittest.mock import MagicMock
+
+        monitor = MagicMock()
+        worker_manager.set_health_monitor(monitor)
+        self._patch_calls(monkeypatch, "running")
+
+        assert worker_manager.stop(reason="workers-dir-empty") is True
+        monitor.record_stop.assert_called_once_with(reason="workers-dir-empty")
+
+    def test_does_not_notify_monitor_when_docker_stop_fails(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed stop must not pre-empt the spontaneous-exit
+        detector — if docker_stop returned False the container is
+        likely still running, and a later real crash should still
+        warn.
+        """
+        from unittest.mock import MagicMock
+
+        monitor = MagicMock()
+        worker_manager.set_health_monitor(monitor)
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda _n: "running")
+        monkeypatch.setattr(wm_module, "docker_stop", lambda _name, **_kw: False)
+
+        assert worker_manager.stop() is False
+        monitor.record_stop.assert_not_called()
+
+    @pytest.mark.parametrize("status", ["none", "exited", "created"])
+    def test_does_not_notify_monitor_on_short_circuit_paths(
+        self,
+        worker_manager: WorkerManager,
+        monkeypatch: pytest.MonkeyPatch,
+        status: str,
+    ) -> None:
+        """The short-circuit branches (already non-running) skip the
+        notification — there's no running→exited transition to
+        suppress, so calling ``record_stop`` would mask a future real
+        crash on the next start cycle.
+        """
+        from unittest.mock import MagicMock
+
+        monitor = MagicMock()
+        worker_manager.set_health_monitor(monitor)
+        self._patch_calls(monkeypatch, status)
+
+        assert worker_manager.stop() is True
+        monitor.record_stop.assert_not_called()
+
+    def test_stop_works_without_monitor_attached(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``reconcile_worker_lifecycle`` constructs a fresh
+        ``WorkerManager`` without a monitor and calls stop() on it.
+        That path must not blow up trying to ``record_stop`` on None.
+        """
+        self._patch_calls(monkeypatch, "running")
+        # No set_health_monitor() call — _health_monitor is None.
+        assert worker_manager.stop() is True
 
 
 # ---------------------------------------------------------------------------

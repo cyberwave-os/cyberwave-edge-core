@@ -7,6 +7,16 @@ Covers:
 - Circuit-breaker resets when window drains
 - is_restart_allowed() respects circuit-breaker state
 - Spontaneous exit detection (running → exited)
+- ``expected_running_probe`` downgrades the spontaneous-exit warning to
+  INFO when the workers dir has been emptied — the deactivation flow
+  drives ``reconcile_worker_lifecycle.stop()`` through a *different*
+  ``WorkerManager`` instance, so the watcher's long-lived monitor can't
+  catch the stop via ``record_stop`` and the probe is the suppression
+  channel for that cross-instance case.
+- ``record_stop`` pre-empts the next spontaneous-exit detection for
+  same-instance callers (``WorkerManager.stop`` is the canonical
+  wirer-upper), and resets the uptime baseline so the next start
+  re-anchors cleanly.
 - Readiness probe integration
 - reset() clears all state
 - RestartRecord fields are populated correctly
@@ -236,6 +246,105 @@ class TestWorkerhealthMonitorSpontaneousExit:
         with caplog.at_level(logging.WARNING):
             monitor.check(container_status="running")
         assert not any("exited spontaneously" in m for m in caplog.messages)
+
+    def test_probe_returning_false_suppresses_warning_and_logs_info(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Deactivation path: the ``reconcile_worker_lifecycle`` stop
+        empties the workers dir and shuts the container down through a
+        different ``WorkerManager`` instance (no monitor attached). On
+        the watcher's next probe the long-lived monitor sees
+        running→exited; the dir-empty probe must downgrade the log to
+        INFO so operators aren't paged on a deliberate deactivation.
+        """
+        import logging
+
+        workers_present = True
+
+        def probe() -> bool:
+            return workers_present
+
+        monitor = WorkerHealthMonitor(
+            container_name="cyberwave-worker-test",
+            expected_running_probe=probe,
+        )
+        monitor.check(container_status="running")
+
+        workers_present = False
+        with caplog.at_level(logging.INFO):
+            monitor.check(container_status="exited")
+
+        assert not any("exited spontaneously" in msg for msg in caplog.messages)
+        assert any("suppressing spontaneous-exit warning" in msg for msg in caplog.messages)
+
+    def test_probe_returning_true_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """If the workers dir is non-empty (worker SHOULD be running)
+        and the container exits, that IS a crash-loop signal — the
+        probe must not swallow it.
+        """
+        import logging
+
+        monitor = WorkerHealthMonitor(
+            container_name="cyberwave-worker-test",
+            expected_running_probe=lambda: True,
+        )
+        monitor.check(container_status="running")
+        with caplog.at_level(logging.WARNING):
+            monitor.check(container_status="exited")
+        assert any("exited spontaneously" in msg for msg in caplog.messages)
+
+    def test_probe_raising_falls_back_to_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Probe failure must not silently swallow a real exit. We
+        prefer a false-positive WARN over missing a real crash loop.
+        """
+        import logging
+
+        def boom() -> bool:
+            raise RuntimeError("filesystem down")
+
+        monitor = WorkerHealthMonitor(
+            container_name="cyberwave-worker-test",
+            expected_running_probe=boom,
+        )
+        monitor.check(container_status="running")
+        with caplog.at_level(logging.WARNING):
+            monitor.check(container_status="exited")
+        assert any("exited spontaneously" in msg for msg in caplog.messages)
+
+    def test_record_stop_suppresses_next_spontaneous_exit_warning(
+        self, monitor: WorkerHealthMonitor, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Same-instance path: any caller that holds the monitor and
+        issues a deliberate stop (``WorkerManager.stop`` is the
+        canonical wirer-upper) can call ``record_stop`` to pre-empt
+        the false-positive warning even when no probe is configured.
+        """
+        import logging
+
+        monitor.check(container_status="running")
+        monitor.record_stop(reason="test")
+        with caplog.at_level(logging.WARNING):
+            monitor.check(container_status="exited")
+        assert not any("exited spontaneously" in msg for msg in caplog.messages)
+
+    def test_record_stop_logs_info_with_reason(
+        self, monitor: WorkerHealthMonitor, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            monitor.record_stop(reason="workers-dir-empty")
+        assert any(
+            "Worker stop recorded" in msg and "workers-dir-empty" in msg for msg in caplog.messages
+        )
+
+    def test_record_stop_clears_uptime_baseline(self, monitor: WorkerHealthMonitor) -> None:
+        """Uptime should reset on a deliberate stop so the next
+        ``record_start`` re-baselines cleanly."""
+        monitor.record_start()
+        monitor.record_stop(reason="test")
+        state = monitor.check(container_status="running")
+        assert state.uptime_seconds is None
 
 
 # ---------------------------------------------------------------------------
