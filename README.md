@@ -361,8 +361,8 @@ Edge Core continuously monitors the worker container for spontaneous exits and c
 - **Restart accounting**: every restart is recorded with a timestamp and reason.
 - **Sliding-window rate limiting**: if more than 5 restarts occur within 5 minutes, the circuit-breaker trips and automatic restarts are suppressed. The breaker resets automatically once the window clears.
 - **Spontaneous exit detection**: if the container exits without a deliberate restart, a warning is logged so operators can investigate. The detector recognises deliberate stops via two channels:
-  - Same-instance callers that hold the monitor (e.g. `WorkerManager.stop`) notify it via `record_stop()`.
-  - For cross-instance stops driven by other components (workflow deactivation routes through `reconcile_worker_lifecycle.stop()`; the "Restart edge core" flow routes through `_stop_worker_container_for_restart`), the monitor consults an "expected to be running" probe that returns False when either the workers directory is empty (deactivation) or an edge-core restart is in flight. Both cases downgrade the log to INFO.
+  - Callers that hold the monitored `WorkerManager` (e.g. `WorkerManager.stop`) notify it via `record_stop()`. The steady-state workflow deactivation path (`reconcile_worker_lifecycle`) reuses the watcher's monitored manager so this channel covers it directly.
+  - For cross-instance stops driven by managers without the shared monitor (the "Restart edge core" flow's `_stop_worker_container_for_restart`, and cold-boot MQTT command handlers that fire before the watcher's first tick), the monitor consults an "expected to be running" probe that returns False when either the workers directory is empty or an edge-core restart is in flight. Both cases downgrade the log to INFO.
 
   The "may indicate a crash loop" wording is reserved for exits that look unexpected — real crashes, OOM kills, or manual `docker stop` while workflows are active.
 

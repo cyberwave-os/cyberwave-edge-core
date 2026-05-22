@@ -92,6 +92,10 @@ class TestReconcileWorkerWatcher:
         mock_watcher_cls.assert_called_once()
         mock_watcher_instance.check_health.assert_called_once()
         mock_watcher_instance.reconcile_worker_files.assert_called_once()
+        # Manager registered so ``reconcile_worker_lifecycle`` can
+        # reuse it and route deliberate stops through ``record_stop``.
+        assert startup._get_monitored_worker_manager() is mock_wm_instance
+        startup._set_monitored_worker_manager(None)
 
     def test_reuses_existing_watcher(self, monkeypatch, tmp_path):
         monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env-uuid")

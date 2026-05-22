@@ -359,6 +359,36 @@ def _edge_core_restart_in_progress() -> bool:
         return _EDGE_RESTART_IN_PROGRESS
 
 
+# Shared handle to the watcher's monitored ``WorkerManager``.
+#
+# ``_reconcile_worker_watcher`` creates the manager + attaches the
+# health monitor on its first run and registers the instance here.
+# ``reconcile_worker_lifecycle`` (and any other deliberate-stop path
+# that runs after the watcher has booted) reuses it so a ``.stop()``
+# call fires ``record_stop()`` on the monitor and the next health
+# check doesn't false-positive on a deliberate deactivation.
+#
+# ``None`` until the runtime loop's first ``_reconcile_worker_watcher``
+# tick. Callers that may run before then (MQTT command handlers on
+# cold boot) fall back to a fresh, monitor-less ``WorkerManager`` —
+# the ``expected_running_probe`` keeps that leg covered as a safety net.
+_MONITORED_WORKER_MANAGER_LOCK = threading.Lock()
+_MONITORED_WORKER_MANAGER: Optional[Any] = None
+
+
+def _set_monitored_worker_manager(manager: Optional[Any]) -> None:
+    """Register the watcher's monitored ``WorkerManager`` for reuse."""
+    global _MONITORED_WORKER_MANAGER
+    with _MONITORED_WORKER_MANAGER_LOCK:
+        _MONITORED_WORKER_MANAGER = manager
+
+
+def _get_monitored_worker_manager() -> Optional[Any]:
+    """Return the registered monitored ``WorkerManager``, if any."""
+    with _MONITORED_WORKER_MANAGER_LOCK:
+        return _MONITORED_WORKER_MANAGER
+
+
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 # Twin UUIDs whose ``cyberwave/twin/{uuid}/command`` topic is currently
 # subscribed. Tracked as a set rather than a boolean so that twins paired
@@ -5482,6 +5512,13 @@ def reconcile_worker_lifecycle(sync_summary: dict[str, int]) -> None:
     states (already running / already stopped), so the periodic call is
     cheap. We bail out early when sync reported any errors to avoid
     churning the worker on transient API failures (CYB-1766).
+
+    Reuses the watcher's monitored ``WorkerManager`` when the watcher has
+    booted (the steady-state case). ``.stop()`` then routes through
+    ``record_stop()`` on the shared health monitor so the next watcher
+    tick doesn't false-positive on the deliberate ``running → exited``
+    transition. Falls back to a fresh, monitor-less manager on cold-boot
+    MQTT-driven calls; the ``expected_running_probe`` covers that leg.
     """
     if sync_summary.get("errors"):
         return
@@ -5509,21 +5546,23 @@ def reconcile_worker_lifecycle(sync_summary: dict[str, int]) -> None:
     workers_dir = CONFIG_DIR / "workers"
     has_files = workers_dir.is_dir() and any(workers_dir.glob("*.py"))
 
-    from .worker_manager import WorkerManager, resolve_worker_image  # noqa: PLC0415
+    worker_manager = _get_monitored_worker_manager()
+    if worker_manager is None:
+        from .worker_manager import WorkerManager, resolve_worker_image  # noqa: PLC0415
 
-    worker_manager = WorkerManager(
-        config_dir=CONFIG_DIR,
-        environment_uuid=environment_uuid,
-        token=token,
-        twin_uuids=twin_uuids,
-        image=resolve_worker_image(),
-        resource_limits=load_worker_resource_limits(),
-    )
+        worker_manager = WorkerManager(
+            config_dir=CONFIG_DIR,
+            environment_uuid=environment_uuid,
+            token=token,
+            twin_uuids=twin_uuids,
+            image=resolve_worker_image(),
+            resource_limits=load_worker_resource_limits(),
+        )
 
     if has_files:
         worker_manager.start()
     else:
-        worker_manager.stop()
+        worker_manager.stop(reason="workers-dir-empty")
 
 
 # Interval at which worker sync reconciliation runs (every N runtime loops).
@@ -5823,28 +5862,20 @@ def _reconcile_worker_watcher(
             resource_limits=load_worker_resource_limits(),
         )
         # Attach health monitor so that restarts are accounted and rate-limited.
-        # The probe lets the monitor downgrade "exited spontaneously" to INFO
-        # for two cross-instance deliberate-stop paths that don't share this
-        # monitor and therefore can't pre-empt the detector via
-        # ``record_stop``:
+        # The probe is the cross-instance suppression channel for deliberate
+        # stops driven through a *different* ``WorkerManager``:
         #
-        #   1. Workflow deactivation (frontend / CLI / API): the backend
-        #      publishes ``remove_workflow_worker``, the edge unlinks
-        #      ``wf_*.py``, and ``reconcile_worker_lifecycle`` drives a
-        #      fresh ``WorkerManager`` (no monitor) through ``.stop()``.
-        #      Probe leg: workers dir is empty after the unlink.
-        #   2. "Restart edge core" (frontend Restart button, MQTT edge
-        #      command): ``_perform_edge_core_restart`` calls
-        #      ``_stop_worker_container_for_restart`` through another
-        #      fresh ``WorkerManager`` (no monitor) before re-running
-        #      drivers and bringing the worker back up. Probe leg:
-        #      ``_edge_core_restart_in_progress()``.
+        #   * Edge-core restart (``_stop_worker_container_for_restart``)
+        #     uses a fresh, monitor-less manager — probe leg:
+        #     ``_edge_core_restart_in_progress()``.
+        #   * Pre-boot MQTT command handlers (``_run_remove_workflow_worker``,
+        #     ``_run_immediate_worker_sync``) that fire before the runtime
+        #     loop has ticked once — probe leg: workers dir is empty.
         #
-        # Either leg returning False means "we don't expect this
-        # container to be running right now" → suppress WARN, log INFO.
-        # Any *other* running→exited transition (real crash, manual
-        # ``docker stop`` while workflows are active, OOM kill) still
-        # warns because the probe says "should be running".
+        # The dominant steady-state deactivation path
+        # (``reconcile_worker_lifecycle`` from the runtime loop) reuses
+        # *this* manager via the shared handle below, so it pre-empts the
+        # detector with ``record_stop`` directly.
         health_monitor = WorkerHealthMonitor(
             container_name=worker_manager.container_name,
             expected_running_probe=lambda: (
@@ -5854,6 +5885,7 @@ def _reconcile_worker_watcher(
             ),
         )
         worker_manager.set_health_monitor(health_monitor)
+        _set_monitored_worker_manager(worker_manager)
 
         model_manager = ModelManager(
             cache_dir=CONFIG_DIR / "models",

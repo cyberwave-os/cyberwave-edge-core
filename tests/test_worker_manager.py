@@ -796,9 +796,11 @@ class TestWorkerManagerStop:
     def test_stop_works_without_monitor_attached(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``reconcile_worker_lifecycle`` constructs a fresh
-        ``WorkerManager`` without a monitor and calls stop() on it.
-        That path must not blow up trying to ``record_stop`` on None.
+        """The fallback path of ``reconcile_worker_lifecycle`` (cold
+        boot, watcher hasn't ticked yet) and ``_stop_worker_container_for_restart``
+        construct a fresh ``WorkerManager`` without a monitor and
+        call stop() on it. That path must not blow up trying to
+        ``record_stop`` on None.
         """
         self._patch_calls(monkeypatch, "running")
         # No set_health_monitor() call — _health_monitor is None.

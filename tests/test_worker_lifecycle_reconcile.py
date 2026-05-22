@@ -166,3 +166,59 @@ class TestReconcileWorkerLifecycle:
         fake_class.assert_not_called()
         fake_instance.start.assert_not_called()
         fake_instance.stop.assert_not_called()
+
+
+class TestReconcileWorkerLifecycleUsesSharedManager:
+    """When the watcher has registered its monitored ``WorkerManager``,
+    reconcile must reuse it so ``stop()`` routes through ``record_stop``
+    on the shared monitor and the next health check stays silent on the
+    deliberate ``running → exited`` transition.
+    """
+
+    @pytest.fixture
+    def shared_manager(self):
+        mgr = MagicMock(name="SharedWorkerManager")
+        startup._set_monitored_worker_manager(mgr)
+        yield mgr
+        startup._set_monitored_worker_manager(None)
+
+    def test_uses_shared_manager_for_stop_with_reason(
+        self, configured_edge, stub_worker_manager_module, shared_manager
+    ):
+        fake_class, fresh_instance = stub_worker_manager_module
+        startup.reconcile_worker_lifecycle(
+            {"written": 0, "removed": 1, "unchanged": 0, "errors": 0}
+        )
+        fake_class.assert_not_called()
+        fresh_instance.stop.assert_not_called()
+        shared_manager.stop.assert_called_once_with(reason="workers-dir-empty")
+        shared_manager.start.assert_not_called()
+
+    def test_uses_shared_manager_for_start(
+        self, configured_edge, stub_worker_manager_module, shared_manager
+    ):
+        fake_class, fresh_instance = stub_worker_manager_module
+        workers_dir = configured_edge / "workers"
+        workers_dir.mkdir()
+        (workers_dir / "wf_demo.py").write_text("# generated\n")
+
+        startup.reconcile_worker_lifecycle(
+            {"written": 1, "removed": 0, "unchanged": 0, "errors": 0}
+        )
+        fake_class.assert_not_called()
+        fresh_instance.start.assert_not_called()
+        shared_manager.start.assert_called_once_with()
+        shared_manager.stop.assert_not_called()
+
+    def test_falls_back_when_no_shared_manager_registered(
+        self, configured_edge, stub_worker_manager_module
+    ):
+        """Cold-boot MQTT-driven path (watcher hasn't ticked yet)."""
+        fake_class, fresh_instance = stub_worker_manager_module
+        assert startup._get_monitored_worker_manager() is None
+
+        startup.reconcile_worker_lifecycle(
+            {"written": 0, "removed": 1, "unchanged": 0, "errors": 0}
+        )
+        fake_class.assert_called_once()
+        fresh_instance.stop.assert_called_once_with(reason="workers-dir-empty")
