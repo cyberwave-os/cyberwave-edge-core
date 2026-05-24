@@ -83,6 +83,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from cyberwave_edge_core.hailo_preflight import preflight_hailo_arch
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -921,8 +923,24 @@ class ModelManager:
         #. Upstream weights URL from the catalog entry.
 
         The first source that yields a checksum-verified file wins.
+
+        Hailo HEFs run through a Gate 3 preflight before any bytes hit
+        the wire: if the catalog declares a ``hw_arch`` and the host's
+        connected accelerator reports a different arch via
+        ``hailortcli``, the download is short-circuited with a
+        :class:`~cyberwave_edge_core.hailo_preflight.HailoArchMismatchError`
+        that names the correct sibling slug. See
+        :mod:`cyberwave_edge_core.hailo_preflight` for the silent-skip
+        rules (non-Hailo model, no device on host, hailortcli missing,
+        catalog metadata missing).
         """
         catalog_entry = self._fetch_catalog_entry(model_id)
+
+        # Gate 3: fail fast on a known Hailo HEF / accelerator arch
+        # mismatch before incurring the download cost. Silent no-op
+        # for every non-Hailo model and for every situation where we
+        # cannot make a confident negative determination.
+        preflight_hailo_arch(catalog_entry, model_id)
 
         upstream_url = _extract_download_url(catalog_entry, model_id)
         artifact_url = self._fetch_artifact_url_safe(catalog_entry)
