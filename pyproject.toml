@@ -26,6 +26,13 @@ dependencies = [
     "httpx>=0.25.0",
     "rich>=13.0.0",
     "cyberwave>=0.4.4",
+    # Engine HTTP API client. Required for byte-level docker pull progress
+    # (the CLI suppresses byte deltas on a non-TTY pipe, so the subprocess
+    # path can only ever surface coarse layer-count progress). driver_logs
+    # falls back to the subprocess path on ImportError or daemon-unreachable
+    # so a broken install doesn't break pulls — but absence of the SDK
+    # silently degrades the progress UX.
+    "docker>=6.0",
 ]
 
 [project.optional-dependencies]
