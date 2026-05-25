@@ -306,7 +306,7 @@ def _suggest_sibling_slug(model_id: str, device_arch: str) -> str:
     """Best-effort recommendation for the correct sibling slug.
 
     The seed catalog suffixes Hailo entries with ``_h8`` / ``_h8l`` (see
-    ``seed_models._yolov8_hailo_catalog_entries``). When the operator
+    ``seed_models._yolo_hailo_catalog_entries``). When the operator
     picked the wrong sibling we can usually flip the suffix in-place;
     when the slug doesn't match the convention we return an empty
     string and the error message degrades gracefully.
