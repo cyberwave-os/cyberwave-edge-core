@@ -324,6 +324,20 @@ class ModelManager:
         Cyberwave API token used for catalog API calls.
     base_url:
         Cyberwave REST API base URL (e.g. ``https://api.cyberwave.com``).
+    owner_uid_gid:
+        Optional ``(uid, gid)`` to apply to every file and directory this
+        manager creates under ``cache_dir`` (``mkdir``, downloaded weight
+        files, ``manifest.json``, per-model ``metadata.json`` sidecars).
+        Pass the result of
+        :func:`cyberwave_edge_core.startup.resolve_config_owner_uid_gid`
+        when Edge Core may be running as root via ``systemd``: the
+        worker container is launched with ``--user $UID:$GID`` for the
+        invoking host user, so root-owned cache entries are unreadable
+        from inside the worker and crash ``cw.models.load`` with
+        ``PermissionError`` on ``iterdir``. ``None`` (the default)
+        disables the chown — appropriate when Edge Core runs as the same
+        user that owns the worker container, or on platforms without
+        ``os.lchown``.
     """
 
     def __init__(
@@ -331,11 +345,16 @@ class ModelManager:
         cache_dir: Path,
         api_token: str,
         base_url: str,
+        *,
+        owner_uid_gid: Optional[tuple[int, int]] = None,
     ) -> None:
         self._cache_dir = cache_dir
         self._api_token = api_token
         self._base_url = base_url.rstrip("/")
         self._manifest_path = cache_dir / MANIFEST_FILENAME
+        self._owner_uid_gid: Optional[tuple[int, int]] = (
+            owner_uid_gid if owner_uid_gid is not None and hasattr(os, "lchown") else None
+        )
         self._manifest = _Manifest.load(self._manifest_path)
         self.last_ensure_failures: dict[str, str] = {}
         # Self-heal hosts that came up with an orphan staging directory
@@ -346,6 +365,72 @@ class ModelManager:
         # at construction time so subsequent ``ensure_model`` /
         # ``evict_model`` calls operate on a clean cache.
         self._prune_orphan_staging_dirs()
+
+    # ------------------------------------------------------------------
+    # Container-user ownership helpers
+    # ------------------------------------------------------------------
+
+    def _chown(self, path: Path) -> None:
+        """Best-effort ``lchown`` of *path* to :attr:`_owner_uid_gid`.
+
+        No-op when ``owner_uid_gid`` was not supplied (the typical case
+        when Edge Core runs as the same user that owns the worker
+        container) or when the entry already has the target ownership.
+        Failures are logged at DEBUG and swallowed — the caller's
+        write succeeded, so we never want a chown failure to crash the
+        primary operation.
+
+        See :meth:`__init__` for the systemd ↔ worker container
+        rationale.
+        """
+        if self._owner_uid_gid is None:
+            return
+        target_uid, target_gid = self._owner_uid_gid
+        try:
+            st = path.lstat()
+        except OSError:
+            return
+        if st.st_uid == target_uid and st.st_gid == target_gid:
+            return
+        try:
+            os.lchown(path, target_uid, target_gid)
+        except OSError as exc:
+            logger.debug(
+                "Cannot chown %s to %d:%d: %s", path, target_uid, target_gid, exc
+            )
+
+    def _chown_tree(self, root: Path) -> None:
+        """Recursively apply :meth:`_chown` to *root* and every entry under it.
+
+        Used after operations that may have touched multiple files
+        inside a per-model staging directory (downloaded weight,
+        ``.dl_*.part`` leftovers, metadata sidecar) so the container
+        user can read everything regardless of which internal code
+        path produced it.
+        """
+        if self._owner_uid_gid is None:
+            return
+        self._chown(root)
+        if not root.is_dir():
+            return
+        try:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                self._chown(Path(dirpath))
+                for name in filenames:
+                    self._chown(Path(dirpath) / name)
+        except OSError as exc:
+            logger.debug("Cannot walk %s for chown: %s", root, exc)
+
+    def _save_manifest(self) -> None:
+        """Persist the in-memory manifest and re-apply container-user ownership.
+
+        Centralises the chown so every call site that mutates the
+        manifest (``ensure_model`` → ``_record_successful_download``,
+        ``evict_model``, ``_reconcile_disk_for``, ``_restamp_if_prestaged``)
+        keeps ``manifest.json`` readable from the worker container.
+        """
+        self._manifest.save(self._manifest_path)
+        self._chown(self._manifest_path)
 
     # ------------------------------------------------------------------
     # Core public methods
@@ -543,7 +628,7 @@ class ModelManager:
                 )
 
         self._manifest.remove(model_id)
-        self._manifest.save(self._manifest_path)
+        self._save_manifest()
         return removed_file
 
     def cache_size_bytes(self) -> int:
@@ -677,6 +762,7 @@ class ModelManager:
         meta["size_bytes"] = new_size
         meta["downloaded_at"] = new_at
         _write_json_safe(sidecar_path, meta)
+        self._chown(sidecar_path)
 
         self._manifest.set(
             CachedModel(
@@ -690,7 +776,7 @@ class ModelManager:
                 downloaded_from=SOURCE_KIND_PRESTAGED,
             )
         )
-        self._manifest.save(self._manifest_path)
+        self._save_manifest()
         return True
 
     def _catalog_indicates_refresh(self, model_id: str, cached: CachedModel) -> bool:
@@ -862,7 +948,7 @@ class ModelManager:
             downloaded_from=SOURCE_KIND_PRESTAGED,
         )
         self._manifest.set(cached)
-        self._manifest.save(self._manifest_path)
+        self._save_manifest()
 
         if not sidecar_path.exists():
             _write_json_safe(
@@ -877,6 +963,7 @@ class ModelManager:
                     "downloaded_from": SOURCE_KIND_PRESTAGED,
                 },
             )
+            self._chown(sidecar_path)
 
         logger.info(
             "Reconciled pre-staged model '%s' from %s (sha256=%s…)",
@@ -989,6 +1076,7 @@ class ModelManager:
 
         model_dir = self._cache_dir / model_id
         model_dir.mkdir(parents=True, exist_ok=True)
+        self._chown(model_dir)
         dest_path = model_dir / filename
 
         # Self-heal: any path out of the download loop that does not
@@ -1079,8 +1167,9 @@ class ModelManager:
         stat = dest_path.stat()
         downloaded_at = _utc_iso_now()
 
+        sidecar_path = dest_path.parent / MODEL_METADATA_FILENAME
         _write_json_safe(
-            dest_path.parent / MODEL_METADATA_FILENAME,
+            sidecar_path,
             {
                 "model_id": model_id,
                 "runtime": runtime,
@@ -1093,6 +1182,14 @@ class ModelManager:
                 "upstream_url": upstream_url,
             },
         )
+        # ``_stream_download`` writes the weight via ``tempfile.mkstemp`` →
+        # ``os.replace``, which keeps the file owned by the current process
+        # (root, under systemd). Re-apply the container-user ownership
+        # here so a downstream worker container can read both the weight
+        # file and its sidecar.
+        self._chown(sidecar_path)
+        self._chown(dest_path)
+        self._chown(dest_path.parent)
 
         cached = CachedModel(
             model_id=model_id,
@@ -1105,7 +1202,7 @@ class ModelManager:
             downloaded_from=source_kind,
         )
         self._manifest.set(cached)
-        self._manifest.save(self._manifest_path)
+        self._save_manifest()
         logger.info(
             "Model '%s' cached at %s (%d bytes, sha256=%s…, source=%s)",
             model_id,
@@ -1140,6 +1237,7 @@ class ModelManager:
         """
         model_dir = self._cache_dir / model_id
         model_dir.mkdir(parents=True, exist_ok=True)
+        self._chown(model_dir)
         logger.info(
             "Resolving model '%s' via runtime-managed downloader "
             "(runtime=%s, filename=%s) → %s",
@@ -1168,6 +1266,15 @@ class ModelManager:
                 f"(b) upload to /api/v1/mlmodels/{{uuid}}/weights, or "
                 f"(c) set metadata.download_url on the catalog entry."
             ) from exc
+
+        # The downloader runs a subprocess that inherits this process's
+        # uid (root under systemd), so the resulting weight file — plus
+        # any siblings the runtime may have written (e.g. ultralytics
+        # cache files) — would be root-owned. Walk the whole staging
+        # directory so the worker container can read every artefact,
+        # not just the canonical ``dest_path`` that
+        # ``_record_successful_download`` chowns explicitly.
+        self._chown_tree(model_dir)
 
         actual_checksum = _sha256_file(dest_path)
         self._record_successful_download(

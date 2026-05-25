@@ -1852,3 +1852,208 @@ def test_downloaded_file_round_trips_downloaded_from_through_manifest(
     cached = manager_b._manifest.get(model_id)
     assert cached is not None
     assert cached.downloaded_from == SOURCE_KIND_UPSTREAM
+
+
+# ---------------------------------------------------------------------------
+# Container-user ownership (systemd-root → non-root worker container)
+# ---------------------------------------------------------------------------
+#
+# When edge-core runs as root (via systemd), files it writes under
+# ``~/.cyberwave/models/`` are root-owned with mode 0700. The worker
+# container starts with ``--user $UID:$GID`` for the invoking host user
+# and would crash ``cw.models.load`` with ``PermissionError`` on
+# ``iterdir`` when traversing root-owned per-model directories. The
+# ``owner_uid_gid`` parameter wires up a best-effort chown on every
+# mkdir / write so the worker stays able to read the cache.
+#
+# Tests use ``patch("os.lchown")`` because chowning to a foreign uid
+# requires real root privileges; we verify the calls happen, not that
+# they succeed against a real filesystem owner change.
+
+
+def _make_owned_manager(tmp_path: Path, *, owner: tuple[int, int]) -> ModelManager:
+    return ModelManager(
+        cache_dir=tmp_path,
+        api_token="tok",
+        base_url="https://api.test",
+        owner_uid_gid=owner,
+    )
+
+
+def test_chown_noop_when_owner_uid_gid_is_unset(tmp_path: Path) -> None:
+    """The default (no ``owner_uid_gid``) must not call ``os.lchown`` at all.
+
+    Without this property, every SDK ``ModelManager()`` constructed
+    inside the worker container — running as the right user already —
+    would do gratuitous chown work on every save.
+    """
+    manager = _make_manager(tmp_path)
+    assert manager._owner_uid_gid is None
+    with patch("os.lchown") as lchown:
+        manager._chown(tmp_path)
+        manager._chown_tree(tmp_path)
+        manager._save_manifest()
+    lchown.assert_not_called()
+
+
+def test_chown_skips_when_target_ownership_already_matches(tmp_path: Path) -> None:
+    """Re-chowning to the existing uid/gid is a wasted syscall — skip it."""
+    st = tmp_path.stat()
+    manager = _make_owned_manager(tmp_path, owner=(st.st_uid, st.st_gid))
+    with patch("os.lchown") as lchown:
+        manager._chown(tmp_path)
+    lchown.assert_not_called()
+
+
+def test_chown_invokes_lchown_when_target_uid_differs(tmp_path: Path) -> None:
+    """A foreign owner triggers ``os.lchown`` once with the target uid/gid."""
+    st = tmp_path.stat()
+    foreign_uid = st.st_uid + 1
+    foreign_gid = st.st_gid + 1
+    manager = _make_owned_manager(tmp_path, owner=(foreign_uid, foreign_gid))
+    with patch("os.lchown") as lchown:
+        manager._chown(tmp_path)
+    lchown.assert_called_once_with(tmp_path, foreign_uid, foreign_gid)
+
+
+def test_chown_swallows_oserror_so_primary_write_succeeds(tmp_path: Path) -> None:
+    """A failing ``lchown`` (EPERM in tests) must never break the caller's write."""
+    st = tmp_path.stat()
+    foreign_uid = st.st_uid + 1
+    manager = _make_owned_manager(tmp_path, owner=(foreign_uid, st.st_gid))
+    with patch("os.lchown", side_effect=PermissionError("EPERM")) as lchown:
+        manager._chown(tmp_path)  # must not raise
+    lchown.assert_called_once()
+
+
+def test_chown_tree_walks_files_and_directories(tmp_path: Path) -> None:
+    """Recursive helper must hit every entry under the root, in any order."""
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    leaf_file = nested_dir / "leaf.bin"
+    leaf_file.write_bytes(b"data")
+    root_file = tmp_path / "manifest.json"
+    root_file.write_text("{}")
+
+    st = tmp_path.stat()
+    foreign_uid = st.st_uid + 1
+    manager = _make_owned_manager(tmp_path, owner=(foreign_uid, st.st_gid))
+
+    with patch("os.lchown") as lchown:
+        manager._chown_tree(tmp_path)
+
+    chowned_paths = {call.args[0] for call in lchown.call_args_list}
+    assert tmp_path in chowned_paths
+    assert nested_dir in chowned_paths
+    assert leaf_file in chowned_paths
+    assert root_file in chowned_paths
+
+
+def test_save_manifest_chowns_manifest_file(tmp_path: Path) -> None:
+    """Every ``_save_manifest`` call must chown ``manifest.json`` to the owner."""
+    st = tmp_path.stat()
+    foreign_uid = st.st_uid + 1
+    manager = _make_owned_manager(tmp_path, owner=(foreign_uid, st.st_gid))
+
+    with patch("os.lchown") as lchown:
+        manager._save_manifest()
+
+    assert manager._manifest_path.exists()
+    chowned = [call.args[0] for call in lchown.call_args_list]
+    assert manager._manifest_path in chowned
+
+
+def test_record_successful_download_chowns_weight_and_sidecar(tmp_path: Path) -> None:
+    """End-to-end: a fresh download leaves weight + sidecar + manifest chowned.
+
+    Mirrors the full ``_record_successful_download`` write surface so a
+    regression that introduces a new write site without a matching chown
+    will be caught by the missing path in ``chowned_paths``.
+    """
+    st = tmp_path.stat()
+    foreign_uid = st.st_uid + 1
+    manager = _make_owned_manager(tmp_path, owner=(foreign_uid, st.st_gid))
+
+    model_id = "yolov8n"
+    model_dir = tmp_path / model_id
+    model_dir.mkdir()
+    weight_path = model_dir / "yolov8n.pt"
+    weight_path.write_bytes(b"weights")
+
+    with patch("os.lchown") as lchown:
+        manager._record_successful_download(
+            model_id=model_id,
+            dest_path=weight_path,
+            checksum="deadbeef",
+            runtime="ultralytics",
+            source_kind=SOURCE_KIND_UPSTREAM,
+            source_url="https://example.com/yolov8n.pt",
+            upstream_url="https://example.com/yolov8n.pt",
+            filename="yolov8n.pt",
+        )
+
+    chowned_paths = {call.args[0] for call in lchown.call_args_list}
+    assert weight_path in chowned_paths
+    assert weight_path.parent in chowned_paths
+    assert (model_dir / MODEL_METADATA_FILENAME) in chowned_paths
+    assert manager._manifest_path in chowned_paths
+
+
+def test_download_model_chowns_staging_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful end-to-end download must leave the staging dir chowned.
+
+    Catches the original bug verbatim: edge-core (as root) created
+    ``cache_dir/{model_id}/`` and the worker container could not read
+    into it.
+    """
+    model_id = "yolov8n"
+    content = b"fake-weights"
+    catalog_entry: dict[str, Any] = {
+        "download_url": "https://upstream.example.com/yolov8n.pt",
+        "checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "runtime": "ultralytics",
+        "filename": "yolov8n.pt",
+    }
+
+    def _fake_stream(url: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+    st = tmp_path.stat()
+    foreign_uid = st.st_uid + 1
+    manager = _make_owned_manager(tmp_path, owner=(foreign_uid, st.st_gid))
+
+    with (
+        patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry),
+        patch.object(manager, "_stream_download", side_effect=_fake_stream),
+        patch("os.lchown") as lchown,
+    ):
+        manager.ensure_model(model_id)
+
+    chowned_paths = {call.args[0] for call in lchown.call_args_list}
+    model_dir = tmp_path / model_id
+    assert model_dir in chowned_paths, (
+        f"model_dir must be chowned; got: {sorted(str(p) for p in chowned_paths)}"
+    )
+    assert (model_dir / "yolov8n.pt") in chowned_paths
+    assert (model_dir / MODEL_METADATA_FILENAME) in chowned_paths
+
+
+def test_owner_uid_gid_ignored_when_os_lchown_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drop ``owner_uid_gid`` on platforms without ``os.lchown`` (e.g. Windows).
+
+    Prevents an ``AttributeError`` if someone constructs ModelManager
+    with an explicit owner on a platform where ``os.lchown`` is absent.
+    """
+    monkeypatch.delattr("os.lchown", raising=False)
+    manager = ModelManager(
+        cache_dir=tmp_path,
+        api_token="tok",
+        base_url="https://api.test",
+        owner_uid_gid=(1234, 5678),
+    )
+    assert manager._owner_uid_gid is None

@@ -133,6 +133,8 @@ Override with `CYBERWAVE_EDGE_CONFIG_DIR`.
 
 `~/.cyberwave/models/` and `~/.cyberwave/workers/` are created eagerly on Edge Core startup (even before any worker runs), with ownership matching the invoking user, so operators can drop pre-staged weights into `~/.cyberwave/models/{model_id}/` from a regular shell.
 
+On `systemd` deployments where Edge Core itself runs as root, every per-model staging directory, downloaded weight, sidecar `metadata.json`, and the top-level `manifest.json` is also chowned to the invoking host user at write time — not just at startup. This keeps the cache both readable and **writable** from inside the worker container (which launches with `--user $UID:$GID`); without it, `cw.models.load` crashes with `PermissionError: [Errno 13]`. Writability matters because the SDK's `UltralyticsRuntime` sandboxes lazy secondary-asset downloads (e.g. the MobileCLIP text encoder for YOLOE / YOLO-World text prompts) into the weight directory. The wiring lives in `ModelManager(owner_uid_gid=resolve_config_owner_uid_gid())`.
+
 ### Resolution order
 
 For each required model, `ensure_model(model_id)` runs the following steps:

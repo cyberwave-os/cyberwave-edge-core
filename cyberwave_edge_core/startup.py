@@ -3597,7 +3597,14 @@ def _start_worker_after_drivers(
             if model_ids:
                 logger.info("Pre-downloading %d model(s) before worker startup: %s", len(model_ids), model_ids)
                 base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-                mm = ModelManager(cache_dir=models_dir, api_token=token, base_url=base_url)
+                mm = ModelManager(
+                    cache_dir=models_dir,
+                    api_token=token,
+                    base_url=base_url,
+                    # Keep new cache entries readable from the worker container
+                    # when edge-core itself runs as root (systemd).
+                    owner_uid_gid=resolve_config_owner_uid_gid(),
+                )
                 mm.ensure_models(model_ids)
                 _send_model_failure_alerts(
                     twin_uuids=twin_uuids,
@@ -5891,6 +5898,8 @@ def _reconcile_worker_watcher(
             cache_dir=CONFIG_DIR / "models",
             api_token=token,
             base_url=get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL,
+            # Same rationale as _start_worker_after_drivers above.
+            owner_uid_gid=resolve_config_owner_uid_gid(),
         )
         mqtt_publish: Optional[Any] = None
         mqtt_health_topic: Optional[str] = None
