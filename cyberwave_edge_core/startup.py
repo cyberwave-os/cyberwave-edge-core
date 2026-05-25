@@ -389,6 +389,21 @@ def _get_monitored_worker_manager() -> Optional[Any]:
         return _MONITORED_WORKER_MANAGER
 
 
+_ACTIVE_WORKER_WATCHER_LOCK = threading.Lock()
+_ACTIVE_WORKER_WATCHER: Optional[Any] = None
+
+
+def _set_active_worker_watcher(watcher: Optional[Any]) -> None:
+    global _ACTIVE_WORKER_WATCHER
+    with _ACTIVE_WORKER_WATCHER_LOCK:
+        _ACTIVE_WORKER_WATCHER = watcher
+
+
+def _get_active_worker_watcher() -> Optional[Any]:
+    with _ACTIVE_WORKER_WATCHER_LOCK:
+        return _ACTIVE_WORKER_WATCHER
+
+
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: set[str] = set()
 # Twin UUIDs whose ``cyberwave/twin/{uuid}/command`` topic is currently
 # subscribed. Tracked as a set rather than a boolean so that twins paired
@@ -3602,7 +3617,9 @@ def _start_worker_after_drivers(
                     api_token=token,
                     base_url=base_url,
                     # Keep new cache entries readable from the worker container
-                    # when edge-core itself runs as root (systemd).
+                    # when edge-core itself runs as root (systemd). Without this,
+                    # root-owned per-model directories crash ``cw.models.load``
+                    # with ``PermissionError`` on ``iterdir`` inside the worker.
                     owner_uid_gid=resolve_config_owner_uid_gid(),
                 )
                 mm.ensure_models(model_ids)
@@ -4461,6 +4478,54 @@ def _run_immediate_worker_sync() -> None:
         logger.exception(
             "Worker lifecycle reconcile after immediate sync failed"
         )
+        return
+
+    try:
+        _hot_reload_running_worker(summary, reason="immediate-worker-sync")
+    except Exception:
+        logger.exception("Worker hot-reload after immediate sync failed")
+
+
+def _hot_reload_running_worker(
+    summary: dict[str, int], *, reason: str
+) -> None:
+    """Bounce an already-running worker container so new ``wf_*.py`` load.
+
+    ``reconcile_worker_lifecycle`` only calls ``WorkerManager.start()``,
+    which is a no-op while the container is already running — without
+    this the MQTT-driven sync leaves stale modules loaded until the
+    next file-watch tick (~15 s + 10 s cool-down). Routes through
+    :meth:`WorkerWatcher.force_restart` so model pre-download, failure
+    alerts, and watcher state-sync happen the same way as the file-watch
+    restart path. No-op when nothing changed, no watcher is registered
+    yet (cold-boot), or the container is not currently ``running``.
+    """
+    from .docker_helpers import docker_container_status  # noqa: PLC0415
+
+    if not summary.get("written") and not summary.get("removed"):
+        return
+
+    watcher = _get_active_worker_watcher()
+    if watcher is None:
+        return
+
+    try:
+        status = docker_container_status(watcher.worker_manager.container_name)
+    except Exception:
+        logger.debug("Worker container status lookup failed", exc_info=True)
+        return
+
+    if status != "running":
+        return
+
+    logger.info(
+        "Hot-reloading worker container %s (reason=%r, written=%d, removed=%d)",
+        watcher.worker_manager.container_name,
+        reason,
+        summary.get("written", 0),
+        summary.get("removed", 0),
+    )
+    watcher.force_restart(reason=reason)
 
 
 def _run_remove_workflow_worker(payload: dict) -> None:
@@ -4537,6 +4602,14 @@ def _run_remove_workflow_worker(payload: dict) -> None:
         logger.exception(
             "Worker lifecycle reconcile after remove_workflow_worker failed"
         )
+
+    if removed_any:
+        try:
+            _hot_reload_running_worker(summary, reason="remove-workflow-worker")
+        except Exception:
+            logger.exception(
+                "Worker hot-reload after remove_workflow_worker failed"
+            )
 
 
 def ensure_twin_command_subscriptions() -> bool:
@@ -5898,7 +5971,9 @@ def _reconcile_worker_watcher(
             cache_dir=CONFIG_DIR / "models",
             api_token=token,
             base_url=get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL,
-            # Same rationale as _start_worker_after_drivers above.
+            # See _start_worker_container_after_drivers for rationale: keeps
+            # systemd-root-written cache entries readable by the worker
+            # container (which runs as the invoking user via ``--user``).
             owner_uid_gid=resolve_config_owner_uid_gid(),
         )
         mqtt_publish: Optional[Any] = None
@@ -5920,6 +5995,7 @@ def _reconcile_worker_watcher(
             mqtt_publish=mqtt_publish,
             mqtt_health_topic=mqtt_health_topic,
         )
+        _set_active_worker_watcher(existing_watcher)
         logger.debug("Worker file watcher + health monitor initialised for %s", workers_dir)
 
     # Run health probe each cycle to detect spontaneous exits / crash loops.

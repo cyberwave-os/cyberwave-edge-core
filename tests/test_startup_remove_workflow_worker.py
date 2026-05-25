@@ -362,3 +362,69 @@ class TestImmediateWorkerSyncChainsLifecycle:
         )
 
         startup._run_immediate_worker_sync()
+
+
+class TestHotReload:
+    """Covers the gap where ``reconcile_worker_lifecycle.start()`` is a
+    no-op for an already-running container, leaving stale ``wf_*.py``
+    modules loaded until the next file-watch tick."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_handles(self, monkeypatch):
+        monkeypatch.setattr(startup, "_MONITORED_WORKER_MANAGER", None)
+        monkeypatch.setattr(startup, "_ACTIVE_WORKER_WATCHER", None)
+        yield
+
+    def _stub_running(self, monkeypatch, *, status: str = "running"):
+        watcher = MagicMock()
+        watcher.worker_manager.container_name = "cyberwave-worker"
+        monkeypatch.setattr(startup, "_get_active_worker_watcher", lambda: watcher)
+
+        from cyberwave_edge_core import docker_helpers
+
+        monkeypatch.setattr(docker_helpers, "docker_container_status", lambda _: status)
+        return watcher
+
+    def test_restarts_running_container_via_watcher(self, monkeypatch):
+        watcher = self._stub_running(monkeypatch)
+
+        startup._hot_reload_running_worker(
+            {"written": 1, "removed": 0, "unchanged": 0, "errors": 0},
+            reason="immediate-worker-sync",
+        )
+
+        watcher.force_restart.assert_called_once_with(reason="immediate-worker-sync")
+
+    def test_noop_when_container_not_running(self, monkeypatch):
+        watcher = self._stub_running(monkeypatch, status="exited")
+
+        startup._hot_reload_running_worker(
+            {"written": 1, "removed": 0, "unchanged": 0, "errors": 0},
+            reason="immediate-worker-sync",
+        )
+
+        watcher.force_restart.assert_not_called()
+
+    def test_immediate_worker_sync_wires_through(self, monkeypatch):
+        summary = {"written": 1, "removed": 0, "unchanged": 0, "errors": 0}
+        monkeypatch.setattr(startup, "reconcile_worker_sync", lambda: summary)
+        monkeypatch.setattr(startup, "reconcile_worker_lifecycle", MagicMock())
+        hot_reload = MagicMock()
+        monkeypatch.setattr(startup, "_hot_reload_running_worker", hot_reload)
+
+        startup._run_immediate_worker_sync()
+
+        hot_reload.assert_called_once_with(summary, reason="immediate-worker-sync")
+
+    def test_remove_workflow_worker_wires_through(self, workers_dir, monkeypatch):
+        (workers_dir / "wf_eeeeeeeeeeee.py").write_text("# stale\n", encoding="utf-8")
+        monkeypatch.setattr(startup, "reconcile_worker_lifecycle", MagicMock())
+        hot_reload = MagicMock()
+        monkeypatch.setattr(startup, "_hot_reload_running_worker", hot_reload)
+
+        startup._run_remove_workflow_worker(
+            _payload(worker_filenames=["wf_eeeeeeeeeeee.py"])
+        )
+
+        hot_reload.assert_called_once()
+        assert hot_reload.call_args.kwargs["reason"] == "remove-workflow-worker"

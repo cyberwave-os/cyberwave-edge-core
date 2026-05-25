@@ -369,3 +369,32 @@ class TestWorkerWatcherStartFailureAlerts:
 
         # Should not raise even without startup being importable
         watcher._send_worker_start_failure_alert()
+
+
+class TestForceRestart:
+    def test_pre_downloads_models_restarts_and_blocks_next_reconcile(
+        self, tmp_path: Path
+    ) -> None:
+        """``force_restart`` matches the file-watch restart phase
+        (ensure_models → restart) and re-baselines state so the next
+        periodic reconcile is a no-op even if files changed mid-flight."""
+        workers_dir = tmp_path / "workers"
+        workers_dir.mkdir()
+        (workers_dir / "wf_aaaa.py").write_text("pass")
+
+        watcher, worker_manager, model_manager = _make_watcher(workers_dir)
+        watcher.reconcile_worker_files()  # baseline
+
+        (workers_dir / "wf_bbbb.py").write_text("pass")
+        worker_manager.restart.reset_mock()
+        model_manager.scan_worker_model_ids.reset_mock()
+
+        watcher.force_restart(reason="immediate-worker-sync")
+
+        model_manager.scan_worker_model_ids.assert_called_once()
+        worker_manager.restart.assert_called_once_with(
+            reason="immediate-worker-sync"
+        )
+        worker_manager.restart.reset_mock()
+        assert watcher.reconcile_worker_files() is False
+        worker_manager.restart.assert_not_called()

@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Optional
 from unittest.mock import patch
 
@@ -985,6 +987,49 @@ def test_download_runtime_managed_succeeds_when_no_url(
     assert meta["source_url"] is None
     assert meta["upstream_url"] is None
     assert meta["checksum_sha256"] == hashlib.sha256(content).hexdigest()
+
+
+def test_download_runtime_managed_faster_whisper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """faster-whisper STT entries resolve via catalog model_external_id."""
+    model_id = "tiny.en"
+    catalog_entry: dict[str, Any] = {
+        "uuid": "12345678-1234-1234-1234-123456789abc",
+        "edge_runtime": "faster_whisper",
+        "model_external_id": "tiny.en",
+        "metadata": {
+            "faster_whisper_model_id": "tiny.en",
+            "edge_runtime": "faster_whisper",
+        },
+    }
+
+    class _FakeWhisperModel:
+        def __init__(self, fw_id: str, **kwargs: Any) -> None:
+            self.fw_id = fw_id
+            self.kwargs = kwargs
+
+    fake_module = ModuleType("faster_whisper")
+    fake_module.WhisperModel = _FakeWhisperModel
+
+    monkeypatch.setitem(
+        sys.modules,
+        "faster_whisper",
+        fake_module,
+    )
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_fetch_catalog_entry", return_value=catalog_entry):
+        result = manager.ensure_model(model_id)
+
+    marker = tmp_path / model_id / ".faster_whisper_ready"
+    assert result == marker
+    assert marker.read_text(encoding="utf-8") == "tiny.en"
+
+    sidecar = tmp_path / model_id / MODEL_METADATA_FILENAME
+    meta = json.loads(sidecar.read_text())
+    assert meta["downloaded_from"] == SOURCE_KIND_RUNTIME_MANAGED
+    assert meta["runtime"] == "faster_whisper"
 
 
 def test_download_runtime_managed_skipped_for_unsupported_runtime(

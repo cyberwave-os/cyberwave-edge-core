@@ -1783,8 +1783,41 @@ def _ultralytics_self_download(filename: str, dest_dir: Path) -> Path:
 
 #: Map runtime name → weight-resolver callable. See
 #: :data:`SOURCE_KIND_RUNTIME_MANAGED` for the contract.
+def _faster_whisper_self_download(filename: str, dest_dir: Path) -> Path:
+    """Download CTranslate2 weights via faster-whisper into *dest_dir*.
+
+    *filename* is the HuggingFace model id (e.g. ``tiny.en``) from the catalog
+    ``model_external_id`` / ``metadata.faster_whisper_model_id``.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "faster-whisper is not installed on the edge host. "
+            "Install cyberwave-edge-core[ml-stt-faster] or ensure the "
+            "edge-ml-worker image includes the ml-stt-faster extra."
+        ) from exc
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    fw_id = filename.strip()
+    if not fw_id:
+        raise RuntimeError("faster-whisper self-download requires a non-empty model id")
+
+    WhisperModel(
+        fw_id,
+        device="cpu",
+        compute_type="int8",
+        download_root=str(dest_dir),
+    )
+
+    marker = dest_dir / ".faster_whisper_ready"
+    marker.write_text(fw_id, encoding="utf-8")
+    return marker
+
+
 _RUNTIME_SELF_DOWNLOADERS: dict[str, Callable[[str, Path], Path]] = {
     "ultralytics": _ultralytics_self_download,
+    "faster_whisper": _faster_whisper_self_download,
 }
 
 
