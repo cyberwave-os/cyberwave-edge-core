@@ -235,10 +235,7 @@ def _send_runtime_error_alert(
         _send_alert_for_twin(
             twin_uuid,
             "Driver runtime error",
-            (
-                f"Container '{container_name}' reported a RuntimeError: "
-                f"{error_message[:500]}"
-            ),
+            (f"Container '{container_name}' reported a RuntimeError: {error_message[:500]}"),
             "driver_runtime_error",
             severity="error",
         )
@@ -292,11 +289,20 @@ _PULL_PHASE_DOWNLOADING = "downloading"
 _PULL_PHASE_INSTALLING = "installing"
 _PULL_PHASE_COMPLETE = "pull_complete"
 
+
+class _EngineAPIUnavailableError(RuntimeError):
+    """SDK missing or daemon unreachable; dispatcher falls back to subprocess."""
+
+
 # ``docker pull`` prints SI-scaled byte counts (1 kB = 1000 B); both
 # ``kB`` and ``KB`` show up depending on docker version.
 _BYTE_UNITS: dict[str, int] = {
-    "B": 1, "kB": 10**3, "KB": 10**3,
-    "MB": 10**6, "GB": 10**9, "TB": 10**12,
+    "B": 1,
+    "kB": 10**3,
+    "KB": 10**3,
+    "MB": 10**6,
+    "GB": 10**9,
+    "TB": 10**12,
 }
 
 # Layer line shape: ``<id>: <rest>``.  ``id`` is usually a 12+ hex sha
@@ -324,6 +330,13 @@ _LAYER_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("waiting", "waiting"),
 )
 
+# Drives ``layers_active`` for the subprocess path: docker CLI suppresses
+# byte progress on a non-TTY pipe, so the formatter would otherwise plateau
+# on ``starting`` until the very end of a multi-GB pull.
+_LAYER_ACTIVE_STATES: frozenset[str] = frozenset(
+    {"downloading", "verifying", "downloaded", "extracting", "complete"}
+)
+
 
 def _format_bytes(n: int) -> str:
     """Render a byte count as ``"745 MB"`` / ``"1.55 GB"``."""
@@ -349,6 +362,7 @@ class _DockerPullProgress:
     total_bytes: int = 0
     layers_total: int = 0
     layers_complete: int = 0
+    layers_active: int = 0
     phase: str = _PULL_PHASE_STARTED
     last_line: str = ""
 
@@ -364,8 +378,7 @@ class _DockerPullProgress:
         if self.phase == _PULL_PHASE_INSTALLING:
             if self.layers_total > 0:
                 return (
-                    f"{self.image} installing "
-                    f"({self.layers_complete}/{self.layers_total} layers)"
+                    f"{self.image} installing ({self.layers_complete}/{self.layers_total} layers)"
                 )
             return f"{self.image} installing"
         if self.total_bytes > 0:
@@ -373,6 +386,8 @@ class _DockerPullProgress:
                 f"{self.image} {_format_bytes(self.downloaded_bytes)} of "
                 f"{_format_bytes(self.total_bytes)} ({self.percent()}%)"
             )
+        if self.layers_total > 0:
+            return f"{self.image} pulling ({self.layers_active}/{self.layers_total} layers)"
         return f"{self.image} starting"
 
     def to_metadata(self) -> dict[str, Any]:
@@ -385,11 +400,10 @@ class _DockerPullProgress:
             "downloaded_human": (
                 _format_bytes(self.downloaded_bytes) if self.total_bytes > 0 else None
             ),
-            "total_human": (
-                _format_bytes(self.total_bytes) if self.total_bytes > 0 else None
-            ),
+            "total_human": (_format_bytes(self.total_bytes) if self.total_bytes > 0 else None),
             "layers_total": self.layers_total,
             "layers_complete": self.layers_complete,
+            "layers_active": self.layers_active,
             "last_docker_pull_line": self.last_line[:500],
         }
 
@@ -460,12 +474,61 @@ class _DockerPullTracker:
         # "pending" / "waiting" / "verifying" → no byte delta
         self._recompute()
 
+    def feed_event(self, evt: Any) -> bool:
+        """Engine-API analogue of :meth:`feed`. Returns True on visible change."""
+        if not isinstance(evt, dict):
+            return False
+        status = (evt.get("status") or "").strip()
+        if not status:
+            return False
+        layer_id_raw = evt.get("id")
+        layer_id = str(layer_id_raw).strip() if layer_id_raw is not None else None
+        detail = evt.get("progressDetail") or {}
+
+        if layer_id and status:
+            self.progress.last_line = f"{layer_id}: {status}"[:500]
+        else:
+            self.progress.last_line = status[:500]
+
+        if status.startswith("Status:"):
+            for lid, total in self._layer_total.items():
+                self._layer_downloaded[lid] = total
+            self._recompute(force_phase=_PULL_PHASE_COMPLETE)
+            return self._refresh_signature()
+
+        # Top-level events with no layer id (``Digest:``, bare ``Pulling from``).
+        if not layer_id:
+            return False
+
+        state = _match_layer_keyword(status)
+        if state is None:
+            return False
+
+        self._layer_state[layer_id] = state
+        if state in ("downloading", "extracting"):
+            cur = _coerce_int(detail.get("current"))
+            tot = _coerce_int(detail.get("total"))
+            if tot > 0:
+                self._layer_total[layer_id] = tot
+            if cur > 0:
+                self._layer_downloaded[layer_id] = cur
+        elif state in ("downloaded", "complete"):
+            self._layer_downloaded[layer_id] = self._layer_total.get(
+                layer_id,
+                self._layer_downloaded.get(layer_id, 0),
+            )
+        self._recompute()
+        return self._refresh_signature()
+
     def _recompute(self, *, force_phase: Optional[str] = None) -> None:
         self.progress.downloaded_bytes = sum(self._layer_downloaded.values())
         self.progress.total_bytes = sum(self._layer_total.values())
         self.progress.layers_total = len(self._layer_state)
         self.progress.layers_complete = sum(
             1 for s in self._layer_state.values() if s == "complete"
+        )
+        self.progress.layers_active = sum(
+            1 for s in self._layer_state.values() if s in _LAYER_ACTIVE_STATES
         )
 
         if force_phase is not None:
@@ -488,6 +551,7 @@ class _DockerPullTracker:
             self.progress.percent(),
             self.progress.layers_total,
             self.progress.layers_complete,
+            self.progress.layers_active,
         )
         changed = sig != self._signature
         self._signature = sig
@@ -509,6 +573,32 @@ def _decode_bytes(match: "re.Match[str]") -> tuple[int, int]:
         return int(curr), int(total)
     except (ValueError, KeyError):
         return 0, 0
+
+
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _format_pull_event_for_log(evt: Any) -> str:
+    """Render an engine-API event as a CLI-shaped line for the driverlog feed.
+
+    Error events are filtered out by the caller before reaching this
+    function (they raise ``CalledProcessError`` instead).
+    """
+    if not isinstance(evt, dict):
+        return ""
+    status = (evt.get("status") or "").strip()
+    if not status:
+        return ""
+    layer_id = evt.get("id")
+    detail = evt.get("progressDetail") or {}
+    cur = _coerce_int(detail.get("current"))
+    tot = _coerce_int(detail.get("total"))
+    bar = f" {_format_bytes(cur)} / {_format_bytes(tot)}" if cur and tot else ""
+    return f"{layer_id}: {status}{bar}" if layer_id else status
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +694,10 @@ def _pull_docker_image_with_progress_multi(
     Per-line MQTT publishes go to each twin's ``driverlog`` topic; byte
     progress lands on each twin's ``driver_starting`` alert metadata.
     The journal only gets the start/finish/failure event lines.
+
+    Engine API is the primary path (per-layer byte deltas regardless
+    of TTY); subprocess is the fallback when the docker SDK is missing
+    or the daemon socket is unreachable.
     """
     contexts_list = _resolve_pull_delivery_contexts(contexts, token=token)
     tracker = _DockerPullTracker(image)
@@ -617,12 +711,64 @@ def _pull_docker_image_with_progress_multi(
     )
 
     try:
-        process = subprocess.Popen(
-            ["docker", "pull", image],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+        try:
+            _drive_pull_via_engine_api(
+                image,
+                tracker=tracker,
+                contexts_list=contexts_list,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
+        except _EngineAPIUnavailableError as exc:
+            logger.info(
+                "Falling back to docker CLI subprocess for pull of %s (%s)",
+                image,
+                exc,
+            )
+            _drive_pull_via_subprocess(
+                image,
+                tracker=tracker,
+                contexts_list=contexts_list,
+                timeout=timeout,
+                on_progress=on_progress,
+            )
+    except subprocess.TimeoutExpired:
+        for ctx in contexts_list:
+            if ctx.driver_alert_ctx:
+                ctx.driver_alert_ctx.update_metadata(
+                    {
+                        "phase": "pull_timed_out",
+                        "last_message": f"docker pull timed out for {image}",
+                    },
+                    force=True,
+                )
+        _broadcast_pull_event(
+            contexts_list,
+            f"docker pull timed out for image {image}",
+            image=image,
         )
+        raise
+    except subprocess.CalledProcessError as exc:
+        error_output = (
+            (exc.stderr or "").strip()
+            or tracker.progress.last_line
+            or f"docker pull exited with code {exc.returncode}"
+        )
+        for ctx in contexts_list:
+            if ctx.driver_alert_ctx:
+                ctx.driver_alert_ctx.update_metadata(
+                    {
+                        "phase": "pull_exit_error",
+                        "last_error": str(error_output)[:500],
+                    },
+                    force=True,
+                )
+        _broadcast_pull_event(
+            contexts_list,
+            f"docker pull failed for image {image}: {error_output}",
+            image=image,
+        )
+        raise
     except OSError as exc:
         for ctx in contexts_list:
             if ctx.driver_alert_ctx:
@@ -636,6 +782,152 @@ def _pull_docker_image_with_progress_multi(
             image=image,
         )
         raise
+
+    tracker.mark_finished()
+    final = tracker.progress
+    # Frontend's post-pull gate keys off ``pull_stream_finished``.
+    finished_patch = {
+        **final.to_metadata(),
+        "phase": "pull_stream_finished",
+        "last_message": f"docker pull completed for {image}",
+    }
+    for ctx in contexts_list:
+        if ctx.driver_alert_ctx:
+            ctx.driver_alert_ctx.update_metadata(finished_patch, force=True)
+    if on_progress is not None:
+        try:
+            on_progress(final)
+        except Exception:
+            logger.debug(
+                "on_progress callback raised for image %s",
+                image,
+                exc_info=True,
+            )
+    _broadcast_pull_event(
+        contexts_list,
+        f"docker pull completed for image {image}",
+        image=image,
+    )
+    return final
+
+
+def _drive_pull_via_engine_api(
+    image: str,
+    *,
+    tracker: _DockerPullTracker,
+    contexts_list: list[_PullDeliveryContext],
+    timeout: int,
+    on_progress: Optional[Callable[[_DockerPullProgress], None]],
+) -> None:
+    """Stream the pull via the Docker Engine HTTP API.
+
+    Maps docker-py errors to the ``subprocess.*`` types the dispatcher
+    already handles; raises :class:`_EngineAPIUnavailableError` only
+    when the SDK can't be loaded at all.
+    """
+    try:
+        import docker  # type: ignore[import-untyped]
+        from docker.errors import APIError, DockerException  # type: ignore[import-untyped]
+        from docker.utils import parse_repository_tag  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise _EngineAPIUnavailableError(f"docker python SDK not installed: {exc}") from exc
+
+    # Socket-level stall watchdog: per-HTTP-read timeout the SDK applies
+    # to the streaming pull. The application-level per-event deadline in
+    # the loop below is the higher-level watchdog.
+    try:
+        client = docker.from_env(timeout=timeout)
+    except DockerException as exc:
+        raise _EngineAPIUnavailableError(f"docker daemon not reachable: {exc}") from exc
+
+    repo, tag = parse_repository_tag(image)
+
+    try:
+        stream = client.api.pull(repo, tag=tag, stream=True, decode=True)
+    except APIError as exc:
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["docker", "pull", image],
+            stderr=str(exc),
+        ) from exc
+    except DockerException as exc:
+        raise OSError(f"docker engine API pull failed for {image}: {exc}") from exc
+
+    # ``timeout`` is a per-event stall watchdog, not a wall-clock cap on
+    # the whole pull: a multi-GB image on a slow link can legitimately
+    # take an hour, but no single read should ever stall for ``timeout``
+    # seconds. Reset ``deadline`` whenever the engine yields anything.
+    deadline = time.monotonic() + timeout
+    try:
+        for evt in stream:
+            if time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired(
+                    cmd=["docker", "pull", image],
+                    timeout=timeout,
+                )
+            deadline = time.monotonic() + timeout
+
+            if isinstance(evt, dict) and "error" in evt:
+                err_msg = str(evt.get("error") or "unknown docker pull error")
+                raise subprocess.CalledProcessError(
+                    returncode=1,
+                    cmd=["docker", "pull", image],
+                    stderr=err_msg,
+                )
+
+            # Throttle every fan-out (MQTT line, alert metadata,
+            # on_progress callback) to ``feed_event``'s signature so a
+            # high-cadence engine-API stream doesn't hammer subscribers
+            # on sub-percent byte deltas.
+            if not tracker.feed_event(evt):
+                continue
+
+            line = _format_pull_event_for_log(evt)
+            if line:
+                _publish_pull_line_to_mqtt(
+                    contexts_list,
+                    f"docker pull: {line}",
+                    image=image,
+                )
+            _apply_progress_to_alerts(contexts_list, tracker.progress)
+            if on_progress is not None:
+                try:
+                    on_progress(tracker.progress)
+                except Exception:
+                    logger.debug(
+                        "on_progress callback raised for image %s",
+                        image,
+                        exc_info=True,
+                    )
+    except APIError as exc:
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["docker", "pull", image],
+            stderr=str(exc),
+        ) from exc
+    except DockerException as exc:
+        raise OSError(f"docker engine API stream failed for {image}: {exc}") from exc
+
+
+def _drive_pull_via_subprocess(
+    image: str,
+    *,
+    tracker: _DockerPullTracker,
+    contexts_list: list[_PullDeliveryContext],
+    timeout: int,
+    on_progress: Optional[Callable[[_DockerPullProgress], None]],
+) -> None:
+    """Fallback: ``docker pull`` subprocess + stdout parser.
+
+    Docker's CLI suppresses byte progress on a non-TTY pipe, so this
+    path only surfaces layer-count progress via ``layers_active``.
+    """
+    process = subprocess.Popen(
+        ["docker", "pull", image],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
     last_message: Optional[str] = None
     try:
@@ -668,74 +960,15 @@ def _pull_docker_image_with_progress_multi(
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             pass
-        for ctx in contexts_list:
-            if ctx.driver_alert_ctx:
-                ctx.driver_alert_ctx.update_metadata(
-                    {
-                        "phase": "pull_timed_out",
-                        "last_message": f"docker pull timed out for {image}",
-                    },
-                    force=True,
-                )
-        _broadcast_pull_event(
-            contexts_list,
-            f"docker pull timed out for image {image}",
-            image=image,
-        )
         raise
 
     if return_code != 0:
-        error_output = (
-            tracker.progress.last_line
-            or f"docker pull exited with code {return_code}"
-        )
-        for ctx in contexts_list:
-            if ctx.driver_alert_ctx:
-                ctx.driver_alert_ctx.update_metadata(
-                    {
-                        "phase": "pull_exit_error",
-                        "last_error": error_output[:500],
-                    },
-                    force=True,
-                )
-        _broadcast_pull_event(
-            contexts_list,
-            f"docker pull failed for image {image}: {error_output}",
-            image=image,
-        )
+        error_output = tracker.progress.last_line or f"docker pull exited with code {return_code}"
         raise subprocess.CalledProcessError(
             return_code,
             ["docker", "pull", image],
             stderr=error_output,
         )
-
-    tracker.mark_finished()
-    final = tracker.progress
-    # Preserve the historical ``pull_stream_finished`` sentinel so the
-    # frontend's existing "post-pull" gate keeps working.
-    finished_patch = {
-        **final.to_metadata(),
-        "phase": "pull_stream_finished",
-        "last_message": f"docker pull completed for {image}",
-    }
-    for ctx in contexts_list:
-        if ctx.driver_alert_ctx:
-            ctx.driver_alert_ctx.update_metadata(finished_patch, force=True)
-    if on_progress is not None:
-        try:
-            on_progress(final)
-        except Exception:
-            logger.debug(
-                "on_progress callback raised for image %s",
-                image,
-                exc_info=True,
-            )
-    _broadcast_pull_event(
-        contexts_list,
-        f"docker pull completed for image {image}",
-        image=image,
-    )
-    return final
 
 
 def _pull_docker_image_with_progress(
@@ -792,9 +1025,7 @@ def _follow_container_logs(
     )
     if mqtt_topic:
         logger.info("Driver logs for %s will be published to %s", container_name, mqtt_topic)
-        driver_image = _resolve_container_driver_image(
-            _inspect_driver_container(container_name)
-        )
+        driver_image = _resolve_container_driver_image(_inspect_driver_container(container_name))
 
     cmd = ["docker", "logs", "-f"]
     since_ts = _CONTAINER_LOG_LAST_SEEN.get(container_name)
