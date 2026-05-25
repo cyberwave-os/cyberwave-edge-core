@@ -187,6 +187,31 @@ class WorkerWatcher:
 
         return True
 
+    def force_restart(self, *, reason: str) -> bool:
+        """Restart the worker container now, mirroring the file-watch path.
+
+        Pre-downloads referenced models, restarts via :class:`WorkerManager`,
+        fires the start-failure alert + ``on_restart`` callback exactly like
+        :meth:`reconcile_worker_files`, and resyncs the watcher's hash
+        baseline + cool-down timer so the next periodic tick is a no-op.
+
+        State is synced **before** the restart so a concurrent watcher tick
+        cannot fire a duplicate restart while this one is in flight.
+        """
+        self._last_hash = self._compute_directory_hash()
+        self._last_restart_at = time.time()
+        self._pending_restart = False
+        self._ensure_models()
+        ok = self._worker_manager.restart(reason=reason)
+        if not ok:
+            self._send_worker_start_failure_alert()
+        if self._on_restart:
+            try:
+                self._on_restart()
+            except Exception as exc:
+                logger.warning("on_restart callback failed: %s", exc)
+        return ok
+
     def _compute_directory_hash(self) -> str:
         """Return a stable hash of all *.py files (names + mtimes + sizes)."""
         h = hashlib.sha256()
