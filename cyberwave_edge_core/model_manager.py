@@ -77,6 +77,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -138,6 +139,24 @@ SOURCE_KIND_PRESTAGED = "prestaged"
 #: so that runtimes which ship their own weight resolver do not require
 #: every catalog entry to mirror the upstream URL.
 SOURCE_KIND_RUNTIME_MANAGED = "runtime_managed"
+
+
+class _RuntimeManagedDeferred(Exception):
+    """Pre-download of a runtime-managed weight is impossible on this host.
+
+    Raised by the ``_RUNTIME_SELF_DOWNLOADERS`` callables when they cannot
+    spawn a usable Python interpreter (today: edge-core running as a
+    PyInstaller ``--onefile`` binary, where ``sys.executable`` points at
+    the Click CLI wrapper and ``subprocess.run([sys.executable, "-c", ...])``
+    is rejected by Click as an unknown option).
+
+    Caught by :meth:`ModelManager.ensure_models` and treated as a non-
+    fatal deferral — **not** a download failure. The worker container,
+    which bundles the runtime, will resolve the weight on its first
+    inference call. Logging it as a failure would surface a misleading
+    ``model_download_failure`` alert while the workflow runs fine
+    (CYB-2103).
+    """
 
 #: Regex that matches ``cw.models.load("model-id")`` or
 #: ``cw.models.load('model-id')`` calls in worker Python source files.
@@ -512,12 +531,23 @@ class ModelManager:
         After this call, :attr:`last_ensure_failures` contains the mapping
         of ``model_id → error_message`` for models that could not be
         resolved, which callers can inspect to send alerts.
+
+        :class:`_RuntimeManagedDeferred` is **not** a failure: it means
+        the edge host cannot pre-download a runtime-managed weight (e.g.
+        frozen PyInstaller binary) but the worker container will resolve
+        it on first inference. Such models are omitted from both the
+        result and ``last_ensure_failures`` so they do not trigger a
+        misleading ``model_download_failure`` alert (CYB-2103).
         """
         results: dict[str, Path] = {}
         failures: dict[str, str] = {}
         for model_id in model_ids:
             try:
                 results[model_id] = self.ensure_model(model_id)
+            except _RuntimeManagedDeferred as exc:
+                logger.info(
+                    "Model '%s' deferred to worker runtime: %s", model_id, exc
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to ensure model '%s': %s — worker will handle gracefully",
@@ -1248,6 +1278,19 @@ class ModelManager:
         )
         try:
             dest_path = downloader(filename, model_dir)
+        except _RuntimeManagedDeferred:
+            # The downloader cannot run on this host (e.g. frozen
+            # PyInstaller binary; see _ultralytics_self_download). Clean
+            # up the empty staging dir and re-raise unchanged so
+            # ``ensure_models`` can distinguish a deferral from a real
+            # failure and skip the misleading ``model_download_failure``
+            # alert (CYB-2103).
+            if _is_orphan_staging_dir(model_dir):
+                _prune_orphan_staging_dir(
+                    model_dir,
+                    reason=f"runtime-managed download for '{model_id}' deferred",
+                )
+            raise
         except Exception as exc:
             # Self-heal: a failed downloader leaves the staging directory
             # behind, which would later confuse the SDK's path resolver
@@ -1720,9 +1763,21 @@ def _ultralytics_self_download(filename: str, dest_dir: Path) -> Path:
     file into the current working directory; we ``chdir`` into
     *dest_dir* for the duration of the call so the artefact lands in the
     canonical model cache layout.
+
+    On a frozen PyInstaller binary ``sys.executable`` is the Click CLI
+    wrapper, not a Python interpreter, so the ``-c`` subprocess cannot
+    work. Defer to the worker container's runtime in that case
+    (CYB-2103).
     """
     import subprocess
-    import sys
+
+    if getattr(sys, "frozen", False):
+        raise _RuntimeManagedDeferred(
+            f"Edge-core is running as a frozen PyInstaller binary; "
+            f"cannot spawn an ultralytics subprocess for {filename!r}. "
+            f"The worker container's ultralytics install will resolve "
+            f"this weight on first inference."
+        )
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1788,7 +1843,19 @@ def _faster_whisper_self_download(filename: str, dest_dir: Path) -> Path:
 
     *filename* is the HuggingFace model id (e.g. ``tiny.en``) from the catalog
     ``model_external_id`` / ``metadata.faster_whisper_model_id``.
+
+    On a frozen PyInstaller binary the bundled interpreter does not have
+    ``faster_whisper`` available even when the host system Python does;
+    defer to the worker container, which bundles the runtime (CYB-2103).
     """
+    if getattr(sys, "frozen", False):
+        raise _RuntimeManagedDeferred(
+            f"Edge-core is running as a frozen PyInstaller binary; "
+            f"cannot import faster_whisper to fetch {filename!r}. "
+            f"The worker container's faster_whisper install will "
+            f"resolve this weight on first inference."
+        )
+
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:

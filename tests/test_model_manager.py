@@ -349,6 +349,43 @@ def test_ensure_models_clears_previous_failures(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Runtime-managed deferral on frozen PyInstaller binaries (CYB-2103)
+# ---------------------------------------------------------------------------
+
+
+def test_ultralytics_self_download_defers_on_frozen_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen PyInstaller binary cannot spawn ``[sys.executable, "-c", ...]``
+    because ``sys.executable`` is the Click CLI wrapper. The downloader must
+    raise ``_RuntimeManagedDeferred`` so callers can treat it as non-fatal."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    with pytest.raises(_model_manager_mod._RuntimeManagedDeferred):
+        _model_manager_mod._ultralytics_self_download("yoloe-26x-seg-pf.pt", tmp_path)
+
+
+def test_ensure_models_omits_runtime_managed_deferrals_from_failures(
+    tmp_path: Path,
+) -> None:
+    """A ``_RuntimeManagedDeferred`` from ``ensure_model`` must NOT land in
+    ``last_ensure_failures`` — otherwise edge-core would surface a misleading
+    ``model_download_failure`` alert (CYB-2103) for a model the worker
+    container will resolve on first inference."""
+    manager = _make_manager(tmp_path)
+
+    def _ensure_raises_deferred(model_id: str) -> Path:
+        raise _model_manager_mod._RuntimeManagedDeferred(
+            f"frozen-binary deferral for {model_id}"
+        )
+
+    with patch.object(manager, "ensure_model", side_effect=_ensure_raises_deferred):
+        result = manager.ensure_models(["yoloe-26x-seg-pf.pt"])
+
+    assert result == {}
+    assert manager.last_ensure_failures == {}
+
+
+# ---------------------------------------------------------------------------
 # evict_model
 # ---------------------------------------------------------------------------
 

@@ -218,6 +218,8 @@ pip install 'cyberwave-edge-core[ml-all]'         # CI/dev fat bundle only
 
 When a required runtime is missing, the resolver raises a `RuntimeError` that spells out the three workarounds: drop the weight file into `~/.cyberwave/models/{model_id}/`, upload to `/api/v1/mlmodels/{uuid}/weights`, or set `metadata.download_url` on the catalog entry.
 
+On a **frozen PyInstaller binary** (`cyberwave edge install --channel dev|staging`), `sys.executable` is the edge-core CLI wrapper rather than a Python interpreter, so the runtime-managed downloaders cannot spawn the subprocess they need. In that case `ensure_model` raises `_RuntimeManagedDeferred`, which `ensure_models` treats as **non-fatal**: the model is omitted from `last_ensure_failures` and the worker container — which bundles the runtime — resolves the weight on its first inference call. This prevents a misleading `model_download_failure` alert from firing while the workflow runs fine (CYB-2103).
+
 ## Worker container
 
 Edge Core manages one ML worker container per edge device (container name: `cyberwave-worker-{env_uuid[:8]}`). The worker container runs Python worker scripts from the local workers directory and has access to cached model weights.
