@@ -652,7 +652,7 @@ Coverage per platform:
 | `cpu_count` | `/proc/cpuinfo` (`processor:` records) | `sysctl hw.logicalcpu` → `hw.ncpu` | Logical CPU count on both platforms (after SMT expansion). |
 | `thermal_source` | first CPU thermal zone | omitted | Tracks the path the live publisher reads from. Darwin has no live thermal publisher today, so the field stays absent rather than claim a source that isn't sampled. |
 | `has_hardware_watchdog` | `/dev/watchdog` | always `false` | Linux-only kernel capability. |
-| `sdk_version`, `cli_version`, `edge_core_version` | `importlib.metadata` | `importlib.metadata` | Installed version of each `cyberwave` Python distribution on the edge; each independently omitted when the package isn't installed in the calling process. |
+| `sdk_version`, `edge_core_version` | in-process `__version__` → `importlib.metadata` | in-process `__version__` → `importlib.metadata` | Version of the SDK and Edge Core **actually loaded** by the running daemon. The in-process lookup preserves the `BUILD_VERSION` stamp injected by CI for `.deb` builds and pre-release wheels, and survives PyInstaller binaries that ship without `.dist-info`, so the Edges tab agrees with `cyberwave-edge-core --version`. CLI version is intentionally not part of `host_facts` — the CLI ships as a separate PyInstaller binary, so Edge Core cannot observe it from its own Python process; `cyberwave --version` remains the source of truth for the CLI an operator is running locally. |
 
 ### Driver failure handling
 
