@@ -283,6 +283,14 @@ The worker container is brought up and torn down based on whether any active wor
 - **MQTT command dedupe:** both `sync_workflows` and `remove_workflow_worker` carry a `request_id`; Edge Core keeps a bounded FIFO of the last 1024 IDs it has handled per process and drops repeats. QoS retries and broker re-publishes therefore don't spawn duplicate sync threads or repeat unlink operations.
 - **Sync errors:** if a sync cycle reports any errors, the lifecycle reconcile is skipped to avoid churning a healthy worker on transient API failures. The next successful sync re-evaluates state.
 
+#### How this is tested
+
+Reconcile branching, watcher debouncing, and MQTT command handling are unit-tested with mocked Docker in `tests/test_worker_lifecycle_reconcile.py`, `tests/test_worker_watcher.py`, `tests/test_worker_health.py`, and `tests/test_startup_remove_workflow_worker.py`. `ResourceLimits` argv assembly is covered in `tests/test_worker_health.py` (`TestResourceLimits`).
+
+**Tier 1 — scripted lifecycle integration** (`tests/integration/test_worker_lifecycle_docker.py`, marker: `docker`): 14 deterministic phases exercise the real Docker daemon — cold start, add/remove worker files, restart-in-place, surgical remove, edge-core process restart, cooldown enforcement, image pull policy, `request_id` dedupe for both `remove_workflow_worker` and `sync_workflows`, health-monitor `record_stop` wiring, spontaneous-exit detection, hot-reload through `WorkerWatcher.force_restart`, and a full activate→deactivate→reactivate operator cycle. The suite auto-skips when Docker is unavailable and uses a session-built `cyberwave-worker-stub` image so it never pulls the real `cyberwaveos/edge-ml-worker`.
+
+**Tier 2 — Hypothesis chaos** (`tests/integration/test_worker_lifecycle_chaos.py`, marker: `docker`): a `RuleBasedStateMachine` drives the same surface (`WorkerManager`, `reconcile_worker_lifecycle`, `_run_remove_workflow_worker`, `WorkerWatcher`) with randomized operation interleavings against the real Docker daemon, asserting eight cross-cutting invariants after every step (state consistency, no spurious `docker rm`, container-name stability, `request_id` dedupe, immutable-tag pull-at-most-once, `record_stop` count matches `running→exited` transitions, cooldown respected, no orphan containers). PR CI runs with `max_examples=20, stateful_step_count=30, derandomize=True` (deterministic, ≤ 3 min); the nightly workflow (`.github/workflows/edge-core-nightly-chaos.yml`) runs with `max_examples=200, stateful_step_count=100` and a random seed, filing a Linear issue on failure without blocking PRs. Monotonic timing for cooldown and health windows goes through `cyberwave_edge_core._clock.now_monotonic()` so tests can advance time without sleeping.
+
 ### Worker image refresh policy
 
 `WorkerManager._ensure_image_pulled` decides whether to issue `docker pull` before each worker (re)start:

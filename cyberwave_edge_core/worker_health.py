@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import time
+from ._clock import now_monotonic
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -193,13 +194,13 @@ class WorkerHealthMonitor:
         triggering a restart so that the monitor can account for it.
         """
         record = RestartRecord(
-            timestamp=time.time(),
+            timestamp=now_monotonic(),
             reason=reason,
             success=success,
         )
         self._restart_records.append(record)
         if success:
-            self._last_start_time = time.time()
+            self._last_start_time = now_monotonic()
         logger.info(
             "Worker restart recorded: container=%s reason=%r success=%s",
             self._container_name,
@@ -210,7 +211,7 @@ class WorkerHealthMonitor:
 
     def record_start(self) -> None:
         """Record that the container was intentionally started (not restarted)."""
-        self._last_start_time = time.time()
+        self._last_start_time = now_monotonic()
 
     def record_stop(self, *, reason: str) -> None:
         """Record that the container was intentionally stopped.
@@ -252,7 +253,7 @@ class WorkerHealthMonitor:
         self._detect_spontaneous_exit(container_status)
         self._last_container_status = container_status
 
-        now = time.time()
+        now = now_monotonic()
         recent = self._restarts_in_window(now)
 
         # Reset circuit-breaker when the window has drained.
@@ -283,7 +284,7 @@ class WorkerHealthMonitor:
             restart_records=list(self._restart_records),
             circuit_breaker_tripped=self._circuit_breaker_tripped,
             circuit_breaker_tripped_at=self._circuit_breaker_tripped_at,
-            observed_at=now,
+            observed_at=time.time(),
             uptime_seconds=uptime,
         )
 
@@ -295,7 +296,7 @@ class WorkerHealthMonitor:
         if not self._circuit_breaker_tripped:
             return True
         # Re-evaluate: maybe the window has cleared.
-        now = time.time()
+        now = now_monotonic()
         recent = self._restarts_in_window(now)
         if recent < self._max_restarts:
             self._circuit_breaker_tripped = False
@@ -335,7 +336,7 @@ class WorkerHealthMonitor:
 
     def _update_circuit_breaker(self) -> None:
         """Trip the circuit-breaker if too many restarts occurred recently."""
-        now = time.time()
+        now = now_monotonic()
         recent = self._restarts_in_window(now)
         if recent >= self._max_restarts and not self._circuit_breaker_tripped:
             self._circuit_breaker_tripped = True

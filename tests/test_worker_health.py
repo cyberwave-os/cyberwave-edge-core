@@ -123,7 +123,7 @@ class TestWorkerhealthMonitorRestartAccounting:
         assert state.restart_count == 1
 
     def test_record_restart_populates_record_fields(self, monitor: WorkerHealthMonitor) -> None:
-        before = time.time()
+        before = time.monotonic()  # RestartRecord.timestamp uses now_monotonic()
         monitor.record_restart(reason="worker-files-changed", success=True)
         records = monitor.check(container_status="running").restart_records
         assert len(records) == 1
@@ -165,7 +165,7 @@ class TestWorkerhealthMonitorCircuitBreaker:
         assert state.circuit_breaker_tripped is False
 
     def test_circuit_breaker_tripped_at_is_set(self, monitor: WorkerHealthMonitor) -> None:
-        before = time.time()
+        before = time.monotonic()  # circuit_breaker_tripped_at uses now_monotonic()
         for _ in range(3):
             monitor.record_restart(reason="crash", success=True)
         state = monitor.check(container_status="running")

@@ -29,9 +29,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
+
+from ._clock import now_monotonic
 
 if TYPE_CHECKING:
     from .model_manager import ModelManager
@@ -158,7 +159,7 @@ class WorkerWatcher:
             return False
 
         # Enforce cool-down between restarts.
-        now = time.time()
+        now = now_monotonic()
         if self._last_restart_at is not None:
             elapsed = now - self._last_restart_at
             if elapsed < self._min_restart_interval:
@@ -199,7 +200,7 @@ class WorkerWatcher:
         cannot fire a duplicate restart while this one is in flight.
         """
         self._last_hash = self._compute_directory_hash()
-        self._last_restart_at = time.time()
+        self._last_restart_at = now_monotonic()
         self._pending_restart = False
         self._ensure_models()
         ok = self._worker_manager.restart(reason=reason)
