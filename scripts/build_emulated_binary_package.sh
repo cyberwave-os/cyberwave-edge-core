@@ -78,7 +78,7 @@ Maintainer: Cyberwave <info@cyberwave.com>
 Description: cyberwave-edge-core compiled binary package
 EOF
 
-dpkg-deb --build "${PKG_DIR}"
+dpkg-deb -Zgzip --build "${PKG_DIR}"
 
 mkdir -p "${OUTPUT_DIR}"
 mv "${PKG_DIR}.deb" "${OUTPUT_DIR}/"

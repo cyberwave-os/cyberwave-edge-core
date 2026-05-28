@@ -146,7 +146,7 @@ jobs:
           VARIANT="${{ matrix.variant }}"
           PKG_DIR="${PACKAGE_NAME}_${VERSION}_${VARIANT}"
 
-          dpkg-deb --build "${PKG_DIR}"
+          dpkg-deb -Zgzip --build "${PKG_DIR}"
           echo "✅ Debian package built"
           ls -la *.deb
 
