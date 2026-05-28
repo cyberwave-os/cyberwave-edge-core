@@ -280,6 +280,26 @@ def docker_prune_unused_images() -> bool:
         return False
 
 
+def is_sd_card_root() -> bool:
+    """Return True when the root filesystem is on an SD card (mmcblk device).
+
+    SD cards appear as ``/dev/mmcblkN`` block devices on Linux.  Detecting this
+    lets callers avoid heavy disk I/O (e.g. periodic Docker image pruning) that
+    accelerates wear on flash storage.
+    """
+    if platform.system() != "Linux":
+        return False
+    try:
+        with open("/proc/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "/":
+                    return "mmcblk" in parts[0]
+    except OSError:
+        pass
+    return False
+
+
 def docker_logs_follow(container_name: str) -> Optional[subprocess.Popen]:  # type: ignore[type-arg]
     """Start a ``docker logs -f`` process and return its Popen handle."""
     if not docker_available():

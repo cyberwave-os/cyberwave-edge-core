@@ -5654,6 +5654,43 @@ _worker_sync_loop_counter = 0
 
 _last_container_prune_time: float = 0.0
 _last_image_prune_time: float = 0.0
+_docker_cleanup_disabled: bool | None = None
+
+
+def _is_periodic_docker_cleanup_disabled() -> bool:
+    """Return True when periodic Docker cleanup should be skipped.
+
+    Cleanup is disabled when:
+    - ``CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP=1`` is set, OR
+    - the root filesystem lives on an SD card (``/dev/mmcblk*``),
+      to avoid accelerating flash wear from repeated prune/pull cycles.
+
+    The result is cached after the first call.
+    """
+    global _docker_cleanup_disabled
+
+    if _docker_cleanup_disabled is not None:
+        return _docker_cleanup_disabled
+
+    env_val = os.getenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", "").strip()
+    if env_val in {"1", "true", "yes"}:
+        logger.info(
+            "Periodic Docker cleanup disabled via CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP"
+        )
+        _docker_cleanup_disabled = True
+        return True
+
+    from .docker_helpers import is_sd_card_root
+
+    if is_sd_card_root():
+        logger.info(
+            "Periodic Docker cleanup disabled: root filesystem is on an SD card"
+        )
+        _docker_cleanup_disabled = True
+        return True
+
+    _docker_cleanup_disabled = False
+    return False
 
 
 def _run_periodic_docker_cleanup() -> None:
@@ -5661,8 +5698,12 @@ def _run_periodic_docker_cleanup() -> None:
 
     Container pruning runs every ``CONTAINER_PRUNE_INTERVAL_SECONDS`` (default
     30 min). Image pruning runs every ``IMAGE_PRUNE_INTERVAL_SECONDS`` (default
-    3 h).  Both are no-ops when Docker is unavailable.
+    3 h).  Both are no-ops when Docker is unavailable or when the root
+    filesystem is on an SD card (to avoid flash wear).
     """
+    if _is_periodic_docker_cleanup_disabled():
+        return
+
     global _last_container_prune_time, _last_image_prune_time
 
     from .docker_helpers import (

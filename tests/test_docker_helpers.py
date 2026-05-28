@@ -14,6 +14,7 @@ Covers:
 - docker_prune_stopped_cyberwave_containers: removes stopped containers, skips running
 - docker_prune_unused_images: success, failure, docker unavailable
 - docker_logs_follow: returns Popen handle, docker unavailable, OSError on Popen
+- is_sd_card_root: detects mmcblk root device on Linux
 """
 
 from __future__ import annotations
@@ -692,3 +693,94 @@ class TestDockerPruneUnusedImages:
         )
         dh.docker_prune_unused_images()
         assert captured[0] == ["docker", "image", "prune", "--all", "--force"]
+
+
+# ---------------------------------------------------------------------------
+# is_sd_card_root
+# ---------------------------------------------------------------------------
+
+
+class TestIsSdCardRoot:
+    def test_returns_false_on_non_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Darwin")
+        assert dh.is_sd_card_root() is False
+
+    def test_returns_true_when_root_on_mmcblk(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        mounts = tmp_path / "mounts"
+        mounts.write_text(
+            "/dev/mmcblk0p2 / ext4 rw,relatime 0 0\n"
+            "tmpfs /tmp tmpfs rw 0 0\n"
+        )
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+            if str(path) == "/proc/mounts":
+                return real_open(str(mounts), *a, **kw)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        assert dh.is_sd_card_root() is True
+
+    def test_returns_false_when_root_on_ssd(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        mounts = tmp_path / "mounts"
+        mounts.write_text(
+            "/dev/sda1 / ext4 rw,relatime 0 0\n"
+            "tmpfs /tmp tmpfs rw 0 0\n"
+        )
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+            if str(path) == "/proc/mounts":
+                return real_open(str(mounts), *a, **kw)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        assert dh.is_sd_card_root() is False
+
+    def test_returns_false_when_proc_mounts_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+            if str(path) == "/proc/mounts":
+                raise OSError("No such file")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        assert dh.is_sd_card_root() is False
+
+    def test_returns_false_when_no_root_entry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        mounts = tmp_path / "mounts"
+        mounts.write_text("tmpfs /tmp tmpfs rw 0 0\n")
+        monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+            if str(path) == "/proc/mounts":
+                return real_open(str(mounts), *a, **kw)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        assert dh.is_sd_card_root() is False

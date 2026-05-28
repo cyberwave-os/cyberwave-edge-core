@@ -671,6 +671,15 @@ Optional environment variables to tune restart behavior:
 - `CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS` (default: `60`)
 - `CYBERWAVE_DRIVER_TROUBLESHOOTING_URL` (default: `https://docs.cyberwave.com`)
 
+#### Periodic Docker cleanup
+
+Edge Core periodically prunes stopped `cyberwave-*` containers (every 30 min) and unused Docker images (every 3 h) to reclaim disk space. The intervals are configurable:
+
+- `CYBERWAVE_CONTAINER_PRUNE_INTERVAL_SECONDS` (default: `1800`)
+- `CYBERWAVE_IMAGE_PRUNE_INTERVAL_SECONDS` (default: `10800`)
+
+**SD card protection:** when the root filesystem is on an SD card (`/dev/mmcblk*`), periodic Docker cleanup is automatically disabled to avoid accelerating flash wear from repeated prune/pull cycles. You can also disable it explicitly by setting `CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP=1`.
+
 #### Driver revival and orphan containers
 
 When a managed driver exits cleanly (Docker's `--restart unless-stopped` policy does not auto-revive clean exits), Edge Core's revival reconciler re-runs driver startup so the missing container is recreated. Revival is restricted to driver containers this Edge Core process is currently managing — i.e. whose twin is still linked to this edge's fingerprint.

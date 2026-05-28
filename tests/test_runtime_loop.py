@@ -355,13 +355,18 @@ class TestRunPeriodicDockerCleanup:
     """Tests for the _run_periodic_docker_cleanup scheduling logic."""
 
     @pytest.fixture(autouse=True)
-    def _reset_prune_times(self):
-        """Reset module-level prune timestamps before/after each test."""
+    def _reset_prune_times(self, monkeypatch):
+        """Reset module-level prune timestamps and cleanup flag before/after each test."""
         startup._last_container_prune_time = 0.0
         startup._last_image_prune_time = 0.0
+        startup._docker_cleanup_disabled = None
+        monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
+        import cyberwave_edge_core.docker_helpers as _dh
+        monkeypatch.setattr(_dh, "is_sd_card_root", lambda: False)
         yield
         startup._last_container_prune_time = 0.0
         startup._last_image_prune_time = 0.0
+        startup._docker_cleanup_disabled = None
 
     def test_runs_both_prune_on_first_call(self, monkeypatch):
         container_prune_calls = [0]
@@ -457,3 +462,99 @@ class TestRunPeriodicDockerCleanup:
 
         assert container_prune_calls[0] == 1
         assert image_prune_calls[0] == 0
+
+    def test_skips_cleanup_when_env_var_set(self, monkeypatch):
+        """Cleanup is skipped when CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP=1."""
+        startup._docker_cleanup_disabled = None
+        monkeypatch.setenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", "1")
+
+        container_prune_calls = [0]
+        image_prune_calls = [0]
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_stopped_cyberwave_containers",
+            lambda **kw: container_prune_calls.__setitem__(0, container_prune_calls[0] + 1) or 0,
+        )
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_unused_images",
+            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+        )
+
+        startup._run_periodic_docker_cleanup()
+
+        assert container_prune_calls[0] == 0
+        assert image_prune_calls[0] == 0
+        startup._docker_cleanup_disabled = None
+
+    def test_skips_cleanup_on_sd_card(self, monkeypatch):
+        """Cleanup is skipped when root filesystem is on an SD card."""
+        startup._docker_cleanup_disabled = None
+        monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(_dh, "is_sd_card_root", lambda: True)
+
+        container_prune_calls = [0]
+        image_prune_calls = [0]
+
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_stopped_cyberwave_containers",
+            lambda **kw: container_prune_calls.__setitem__(0, container_prune_calls[0] + 1) or 0,
+        )
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_unused_images",
+            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+        )
+
+        startup._run_periodic_docker_cleanup()
+
+        assert container_prune_calls[0] == 0
+        assert image_prune_calls[0] == 0
+        startup._docker_cleanup_disabled = None
+
+    def test_runs_cleanup_when_not_sd_card_and_no_env_var(self, monkeypatch):
+        """Cleanup runs normally when not on SD card and env var not set."""
+        startup._docker_cleanup_disabled = None
+        monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
+
+        monkeypatch.setattr(
+            startup,
+            "CONTAINER_PRUNE_INTERVAL_SECONDS",
+            10.0,
+        )
+        monkeypatch.setattr(
+            startup,
+            "IMAGE_PRUNE_INTERVAL_SECONDS",
+            100.0,
+        )
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(_dh, "is_sd_card_root", lambda: False)
+
+        container_prune_calls = [0]
+        image_prune_calls = [0]
+
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_stopped_cyberwave_containers",
+            lambda **kw: container_prune_calls.__setitem__(0, container_prune_calls[0] + 1) or 0,
+        )
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_unused_images",
+            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+        )
+
+        startup._run_periodic_docker_cleanup()
+
+        assert container_prune_calls[0] == 1
+        assert image_prune_calls[0] == 1
+        startup._docker_cleanup_disabled = None
