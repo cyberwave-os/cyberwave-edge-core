@@ -2486,6 +2486,8 @@ def reconcile_driver_revival(
 
 
 _cameras_json_mtime: Optional[float] = None
+_CAMERA_DRIFT_RESTART_LOCK = threading.Lock()
+_CAMERA_DRIFT_RESTART_IN_PROGRESS = False
 
 
 def _get_container_env_var(inspect_data: dict[str, Any], key: str) -> Optional[str]:
@@ -2495,6 +2497,51 @@ def _get_container_env_var(inspect_data: dict[str, Any], key: str) -> Optional[s
         if isinstance(entry, str) and entry.startswith(f"{key}="):
             return entry.split("=", 1)[1]
     return None
+
+
+def _run_camera_config_drift_restart_worker(token: str) -> None:
+    """Restart drivers in the background after a ``cameras.json`` change."""
+    global _EDGE_RESTART_IN_PROGRESS, _CAMERA_DRIFT_RESTART_IN_PROGRESS
+
+    with _EDGE_RESTART_LOCK:
+        if _EDGE_RESTART_IN_PROGRESS:
+            logger.info(
+                "Skipping camera config drift restart: edge restart already in progress"
+            )
+            return
+        _EDGE_RESTART_IN_PROGRESS = True
+
+    try:
+        try:
+            _perform_edge_core_restart(token)
+        except Exception:
+            logger.exception("Camera config drift restart failed")
+    finally:
+        with _EDGE_RESTART_LOCK:
+            _EDGE_RESTART_IN_PROGRESS = False
+        with _CAMERA_DRIFT_RESTART_LOCK:
+            _CAMERA_DRIFT_RESTART_IN_PROGRESS = False
+
+
+def _start_camera_config_drift_restart(token: str) -> None:
+    """Schedule a background driver restart to apply a camera config change."""
+    global _CAMERA_DRIFT_RESTART_IN_PROGRESS
+
+    with _CAMERA_DRIFT_RESTART_LOCK:
+        if _CAMERA_DRIFT_RESTART_IN_PROGRESS:
+            logger.info(
+                "Camera config drift restart already scheduled; skipping duplicate"
+            )
+            return
+        _CAMERA_DRIFT_RESTART_IN_PROGRESS = True
+
+    worker = threading.Thread(
+        target=_run_camera_config_drift_restart_worker,
+        args=(token,),
+        name="camera-config-drift-restart",
+        daemon=True,
+    )
+    worker.start()
 
 
 def reconcile_camera_config_drift() -> bool:
@@ -2514,7 +2561,7 @@ def reconcile_camera_config_drift() -> bool:
     refactor that would couple the two cannot land without an explicit
     edit to that test.
 
-    Returns True if a restart was triggered.
+    Returns True if a background restart was scheduled.
     """
     global _cameras_json_mtime
 
@@ -2591,7 +2638,7 @@ def reconcile_camera_config_drift() -> bool:
         logger.warning("Cannot restart drivers for camera config change: no token")
         return False
 
-    _perform_edge_core_restart(token)
+    _start_camera_config_drift_restart(token)
     return True
 
 
@@ -3137,9 +3184,7 @@ def fetch_and_run_twin_drivers(
                     "driver_start_failure",
                     severity="error",
                 )
-                raise ValueError(
-                    f"No drivers specified in asset metadata for paired twin '{twin.name}'"
-                )
+                continue
             else:
                 logger.warning(
                     (
@@ -3231,9 +3276,7 @@ def fetch_and_run_twin_drivers(
                 "driver_start_failure",
                 severity="error",
             )
-            raise ValueError(
-                f"No drivers specified in asset metadata for paired twin '{twin.name}'"
-            )
+            continue
 
         driver_image = _resolve_driver_image_tag(driver_image)
         driver_image = _maybe_rewrite_jetson_tag(driver_image, twin.name)
@@ -5203,7 +5246,11 @@ def run_startup_checks(
     """Execute every boot-time check in sequence.
 
     Prints a Rich-formatted report to the console.
-    Returns ``True`` only when **all** checks pass.
+    Returns ``True`` when startup may proceed (fatal checks passed).
+    Returns ``False`` only for missing credentials, invalid token, or
+    failed edge registration — conditions that make edge-core unusable.
+    Non-fatal issues (MQTT, environment link, drivers, workers) are
+    reported as warnings but do not block boot.
 
     ``resource_monitor`` and ``watchdog``, when provided, are folded into
     the bootstrap ``edge_health`` publisher so the very first heartbeat
@@ -5213,6 +5260,8 @@ def run_startup_checks(
     """
     _fix_config_dir_ownership()
     _ensure_config_subdirs()
+
+    had_warnings = False
 
     console.print("\n[bold]Cyberwave Edge Core — Startup Checks[/bold]\n")
 
@@ -5256,6 +5305,7 @@ def run_startup_checks(
             f"  [green]✓[/green] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
         )
     else:
+        had_warnings = True
         console.print(f"  [red]✗[/red] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
         console.print("  [red]Could not connect to the MQTT broker.[/red]")
         console.print("  [dim]Check network connectivity and MQTT configuration.[/dim]")
@@ -5283,6 +5333,7 @@ def run_startup_checks(
     if host_facts_ok:
         console.print(f"  [green]✓[/green] Host facts [dim]({elapsed:.3f}s)[/dim]")
     else:
+        had_warnings = True
         console.print(f"  [yellow]⚠[/yellow] Host facts [dim]({elapsed:.3f}s)[/dim]")
 
     # 5 — linked environment
@@ -5294,6 +5345,7 @@ def run_startup_checks(
             f"  [green]✓[/green] Environment [dim]({environment_uuid}, {_elapsed:.3f}s)[/dim]"
         )
     else:
+        had_warnings = True
         console.print(
             f"  [yellow]⚠[/yellow] Environment [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
         )
@@ -5304,6 +5356,7 @@ def run_startup_checks(
     if environment_uuid:
         fingerprint = get_or_create_fingerprint()
         if not fingerprint:
+            had_warnings = True
             console.print("  [red]✗[/red] Edge fingerprint")
             console.print("  [red]Could not determine edge fingerprint.[/red]")
         else:
@@ -5333,6 +5386,7 @@ def run_startup_checks(
                     )
                 )
             else:
+                had_warnings = True
                 console.print(f"  [yellow]⚠[/yellow] Edge heartbeat [dim]({elapsed:.3f}s)[/dim]")
                 console.print(
                     "  [dim]Could not start early edge heartbeat; continuing startup.[/dim]"
@@ -5344,6 +5398,7 @@ def run_startup_checks(
             zenoh_icon = "[green]✓[/green]" if zenoh_cfg.is_zenoh else "[yellow]⚠[/yellow]"
             console.print(f"  {zenoh_icon} Zenoh [dim]({zenoh_diag.mode})[/dim]")
             for w in zenoh_diag.warnings:
+                had_warnings = True
                 console.print(f"  [yellow]  ↳ {w}[/yellow]")
 
             # 6c — optional Zenoh router container (must start before drivers)
@@ -5358,6 +5413,7 @@ def run_startup_checks(
                         f"[dim]({container_name}, {elapsed:.3f}s)[/dim]"
                     )
                 else:
+                    had_warnings = True
                     console.print(
                         f"  [yellow]⚠[/yellow] Zenoh router "
                         f"[dim](failed to start, {elapsed:.3f}s)[/dim]"
@@ -5368,17 +5424,32 @@ def run_startup_checks(
                     )
 
             _t0 = time.perf_counter()
-            results = fetch_and_run_twin_drivers(
-                token, environment_uuid, fingerprint, watchdog=watchdog
-            )
+            try:
+                results = fetch_and_run_twin_drivers(
+                    token, environment_uuid, fingerprint, watchdog=watchdog
+                )
+            except Exception as exc:
+                had_warnings = True
+                logger.exception("Twin driver startup failed")
+                console.print(
+                    f"  [yellow]⚠[/yellow] Twin drivers "
+                    f"[dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+                )
+                console.print(
+                    f"  [yellow]Driver startup failed: {exc}[/yellow]"
+                )
+                results = []
             _elapsed = time.perf_counter() - _t0
             if not results:
+                had_warnings = True
                 console.print(
                     f"  [yellow]⚠[/yellow] Twin drivers [dim]({_elapsed:.3f}s)[/dim]"
                 )
                 console.print("  [dim]No twins with driver images matched this edge.[/dim]")
             else:
                 started = sum(1 for r in results if r["success"])
+                if started < len(results):
+                    had_warnings = True
                 console.print(
                     f"  [green]✓[/green] Twin drivers "
                     f"[dim]({started}/{len(results)}, {_elapsed:.3f}s)[/dim]"
@@ -5414,6 +5485,7 @@ def run_startup_checks(
                 total_errors = sum(r["errors"] for r in sync_summary.values())
                 elapsed = time.perf_counter() - _t0
                 if total_errors:
+                    had_warnings = True
                     console.print(
                         f"  [yellow]⚠[/yellow] Worker sync "
                         f"[dim](written={total_written}, removed={total_removed}, errors={total_errors}, {elapsed:.3f}s)[/dim]"
@@ -5445,6 +5517,7 @@ def run_startup_checks(
                         twin_uuids=sync_twin_uuids,
                     )
                 elif total_errors:
+                    had_warnings = True
                     logger.warning(
                         "Could not determine active workflows due to %d sync "
                         "error(s); worker container not started. Will retry on "
@@ -5471,7 +5544,12 @@ def run_startup_checks(
                         "worker container not started.[/dim]"
                     )
 
-    console.print("\n[green]All startup checks passed.[/green]\n")
+    if had_warnings:
+        console.print(
+            "\n[yellow]Startup checks completed with warnings.[/yellow]\n"
+        )
+    else:
+        console.print("\n[green]All startup checks passed.[/green]\n")
     return True
 
 
@@ -5827,8 +5905,7 @@ def run_runtime_loop(
         )
 
         try:
-            if reconcile_camera_config_drift():
-                continue
+            reconcile_camera_config_drift()
         except Exception:
             logger.exception("Unexpected error in camera config drift reconciliation")
 

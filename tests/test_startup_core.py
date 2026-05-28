@@ -17,6 +17,7 @@ import logging
 import os
 import stat
 import subprocess
+import threading
 import uuid as _uuid_module
 from pathlib import Path
 from unittest.mock import patch
@@ -2172,8 +2173,8 @@ class TestReconcileCameraConfigDrift:
         restart_calls: list[str] = []
         monkeypatch.setattr(
             startup,
-            "_perform_edge_core_restart",
-            lambda token: restart_calls.append(token) or {},
+            "_start_camera_config_drift_restart",
+            lambda token: restart_calls.append(token),
         )
         monkeypatch.setattr(startup, "load_token", lambda: "test-token")
 
@@ -2294,8 +2295,8 @@ class TestReconcileCameraConfigDrift:
         restart_calls: list[str] = []
         monkeypatch.setattr(
             startup,
-            "_perform_edge_core_restart",
-            lambda token: restart_calls.append(token) or {},
+            "_start_camera_config_drift_restart",
+            lambda token: restart_calls.append(token),
         )
         monkeypatch.setattr(startup, "load_token", lambda: "test-token")
 
@@ -2355,6 +2356,53 @@ class TestReconcileCameraConfigDrift:
         )
 
         assert startup.reconcile_camera_config_drift() is False
+
+    def test_drift_restart_runs_in_background_worker(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = self._write_cameras_json(tmp_path, 0)
+        old_mtime = cameras_file.stat().st_mtime - 10
+        monkeypatch.setattr(startup, "_cameras_json_mtime", old_mtime)
+        cameras_file.write_text(json.dumps({"selected_device": 2}))
+
+        fake_inspect = {
+            "Config": {
+                "Env": ["CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video0"],
+            },
+        }
+        monkeypatch.setattr(
+            startup,
+            "_list_running_driver_containers",
+            lambda: ["cyberwave-driver-abc12345"],
+        )
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda name: fake_inspect,
+        )
+        monkeypatch.setattr(startup, "load_token", lambda: "test-token")
+
+        restart_calls: list[str] = []
+        started_threads: list[threading.Thread] = []
+        real_thread = threading.Thread
+
+        class _ImmediateThread(real_thread):
+            def start(self):
+                started_threads.append(self)
+                self.run()
+
+        monkeypatch.setattr(
+            startup,
+            "_perform_edge_core_restart",
+            lambda token: restart_calls.append(token) or {},
+        )
+        monkeypatch.setattr(startup.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(startup, "_CAMERA_DRIFT_RESTART_IN_PROGRESS", False)
+
+        assert startup.reconcile_camera_config_drift() is True
+        assert len(started_threads) == 1
+        assert restart_calls == ["test-token"]
 
     def test_does_not_inspect_edge_health_payloads(self):
         """CYB-2004 regression: drift detection must stay decoupled from edge_health.

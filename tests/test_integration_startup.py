@@ -300,10 +300,17 @@ class TestRunStartupChecksFailurePaths:
         monkeypatch.setattr(startup, "FINGERPRINT_FILE", tmp_path / "fingerprint.json")
         monkeypatch.setattr(startup, "Cyberwave", FakeCyberwave.factory(mqtt_connected=False))
         monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: _FINGERPRINT)
+        printed: list[str] = []
+        monkeypatch.setattr(
+            startup.console,
+            "print",
+            lambda msg="", **kwargs: printed.append(str(msg)),
+        )
 
         result = startup.run_startup_checks()
 
         assert result is True
+        assert any("Startup checks completed with warnings" in line for line in printed)
 
     def test_returns_true_when_environment_not_linked(self, tmp_path, monkeypatch):
         """Missing environment.json is a warning, not a fatal error."""
@@ -454,3 +461,38 @@ class TestFetchAndRunTwinDriversIntegration:
         assert run_docker.call_count == 1
         _, kwargs = run_docker.call_args
         assert kwargs["macos_bridge_device_candidates"] == ["/dev/video0"]
+
+    def test_missing_drivers_skips_twin_without_aborting(self, tmp_path, monkeypatch):
+        """A paired twin with no driver metadata must not abort startup for others."""
+        self._patch_common(tmp_path, monkeypatch)
+        good_twin = _make_fake_twin(
+            uuid="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            name="good-twin",
+        )
+        bad_twin = SimpleNamespace(
+            uuid="dddddddd-dddd-dddd-dddd-dddddddddddd",
+            name="bad-twin",
+            asset_uuid=_ASSET_UUID,
+            asset_id=_ASSET_UUID,
+            metadata={"edge_fingerprint": _FINGERPRINT},
+        )
+        client = self._make_client([good_twin, bad_twin])
+        client.assets.get = MagicMock(
+            return_value=SimpleNamespace(
+                metadata={},
+                registry_id="",
+                universal_schema=None,
+            )
+        )
+
+        monkeypatch.setattr(startup, "Cyberwave", lambda *a, **k: client)
+        monkeypatch.setattr(startup, "_send_alert_for_twin", MagicMock())
+        run_docker = MagicMock(return_value=True)
+        monkeypatch.setattr(startup, "_run_docker_image", run_docker)
+
+        results = startup.fetch_and_run_twin_drivers(_TOKEN, _ENV_UUID, _FINGERPRINT)
+
+        assert len(results) == 1
+        assert results[0]["twin_uuid"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        assert results[0]["success"] is True
+        assert run_docker.call_count == 1
