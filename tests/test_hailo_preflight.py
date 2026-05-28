@@ -213,12 +213,20 @@ class TestIsHailoModel:
 # ---------------------------------------------------------------------------
 
 
-def _hailo_entry(*, hw_arch: str = "hailo8", slug: str = "yolov8s.hef") -> dict[str, Any]:
-    return {
+def _hailo_entry(
+    *,
+    hw_arch: str = "hailo8",
+    slug: str = "yolov8s.hef",
+    catalog_slug: str = "",
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
         "edge_runtime": "hailo",
         "filename": slug,
         "metadata": {"hw_arch": hw_arch, "edge_model_path": slug},
     }
+    if catalog_slug:
+        entry["slug"] = catalog_slug
+    return entry
 
 
 class TestPreflightHailoArch:
@@ -295,6 +303,29 @@ class TestPreflightHailoArch:
         msg = str(excinfo.value)
         assert "hailo8" in msg and "hailo8l" in msg
 
+    def test_raises_with_sibling_hint_derived_from_catalog_slug(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: codegen emits cw.models.load("yolov8m.hef") so
+        # model_id is the bare filename, not the catalog slug. The
+        # catalog entry carries slug="ultralytics/models/yolov8m_h8l"
+        # which has the _h8l suffix; preflight should use that slug to
+        # name the correct sibling ("ultralytics/models/yolov8m_h8").
+        monkeypatch.setattr(hp, "host_hailo_device_present", lambda: True)
+        monkeypatch.setattr(hp, "host_hailo_arch", lambda: "hailo8")
+        with pytest.raises(HailoArchMismatchError) as excinfo:
+            preflight_hailo_arch(
+                _hailo_entry(
+                    hw_arch="hailo8l",
+                    slug="yolov8m.hef",
+                    catalog_slug="ultralytics/models/yolov8m_h8l",
+                ),
+                "yolov8m.hef",
+            )
+        msg = str(excinfo.value)
+        assert "hailo8l" in msg and "hailo8" in msg
+        assert "ultralytics/models/yolov8m_h8" in msg
+
     def test_honors_explicit_sibling_slug_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(hp, "host_hailo_device_present", lambda: True)
         monkeypatch.setattr(hp, "host_hailo_arch", lambda: "hailo8l")
@@ -319,8 +350,14 @@ class TestSuggestSiblingSlug:
             ("yolov8s_h8", "hailo8l", "yolov8s_h8l"),
             ("yolov8s_h8l", "hailo8", "yolov8s_h8"),
             ("yolov6n_h8", "hailo8l", "yolov6n_h8l"),
+            # Full catalog slug (workspace/models/<entity>_h8l) — the path
+            # separators are fine because rpartition("_") still finds the suffix.
+            ("ultralytics/models/yolov8m_h8l", "hailo8", "ultralytics/models/yolov8m_h8"),
+            ("ultralytics/models/yolov8m_h8", "hailo8l", "ultralytics/models/yolov8m_h8l"),
             # No suffix → no useful suggestion.
             ("custom-model", "hailo8", ""),
+            # Bare .hef filename → no suffix match → empty (preflight uses catalog slug instead).
+            ("yolov8m.hef", "hailo8", ""),
             # Wrong-direction suggestion would be silly.
             ("yolov8s_h8", "hailo8", ""),
         ],

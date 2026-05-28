@@ -287,7 +287,14 @@ def preflight_hailo_arch(
         return
 
     if device_arch != hef_arch:
-        sibling = sibling_slug_hint or _suggest_sibling_slug(model_id, device_arch)
+        # Prefer the catalog entry's own slug over the bare model_id when
+        # deriving the sibling hint. The codegen often emits the raw
+        # edge_model_path ("yolov8m.hef") as the load key; that string has no
+        # _h8/_h8l suffix so _suggest_sibling_slug would return "". The
+        # catalog slug ("ultralytics/models/yolov8m_h8l") carries the suffix
+        # and lets us name the exact replacement entry in the error message.
+        catalog_slug = catalog_entry.get("slug") or ""
+        sibling = sibling_slug_hint or _suggest_sibling_slug(catalog_slug or model_id, device_arch)
         raise HailoArchMismatchError(
             f"Hailo HEF '{model_id}' was compiled for {hef_arch!r}, but the "
             f"connected accelerator at {HAILO_DEVICE_PATH} reports {device_arch!r}. "
