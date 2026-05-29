@@ -242,6 +242,7 @@ CONFIG_DIR = _resolve_config_dir()
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 FINGERPRINT_FILE = CONFIG_DIR / "fingerprint.json"
 ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
+EDGE_JSON_FILE = CONFIG_DIR / "edge.json"
 DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
@@ -339,6 +340,7 @@ _PROTECTED_CONFIG_JSON_FILES = {
     "credentials.json",
     "fingerprint.json",
     "environment.json",
+    "edge.json",
 }
 _EDGE_COMMAND_SUBSCRIBED = False
 _EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
@@ -589,8 +591,42 @@ def _resolve_macos_camera_bridge_candidates(asset: Any, twin_metadata: dict[str,
     return list(dict.fromkeys(candidate_devices))
 
 
+def write_or_update_edge_json_file(edge_data: dict) -> bool:
+    """Write the edge API record to ``edge.json`` atomically.
+
+    Callers are expected to pass a plain-dict representation (e.g. from
+    ``json.loads(edge.to_json())``) so all values are already JSON-serializable.
+
+    Returns True on success.
+    """
+    try:
+        _atomic_write_json(EDGE_JSON_FILE, edge_data)
+        return True
+    except Exception as exc:
+        logger.warning("Could not write edge.json: %s", exc)
+        return False
+
+
+def _read_edge_json() -> Optional[dict]:
+    """Return the cached edge API record from ``edge.json``, or ``None``."""
+    if not EDGE_JSON_FILE.exists():
+        return None
+    try:
+        with open(EDGE_JSON_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.debug("Could not read edge.json")
+        return None
+
+
 def _read_cameras_config() -> Optional[dict]:
-    """Return the raw ``cameras.json`` payload, or ``None`` when unavailable."""
+    """Return the camera config dict, preferring ``edge.json`` over ``cameras.json``."""
+    edge_data = _read_edge_json()
+    if edge_data:
+        cameras = (edge_data.get("metadata") or {}).get("cameras")
+        if isinstance(cameras, dict) and cameras:
+            return cameras
+
     cameras_file = CONFIG_DIR / "cameras.json"
     if not cameras_file.exists():
         return None
@@ -1811,6 +1847,7 @@ def reconcile_driver_revival(
 
 
 _cameras_json_mtime: Optional[float] = None
+_edge_json_mtime: Optional[float] = None
 _CAMERA_DRIFT_RESTART_LOCK = threading.Lock()
 _CAMERA_DRIFT_RESTART_IN_PROGRESS = False
 
@@ -1877,8 +1914,8 @@ def reconcile_camera_config_drift() -> bool:
     container is removed and edge-core re-runs driver startup so the new
     device is picked up — no full service restart required.
 
-    NOTE (CYB-2004): this function reads **only** ``cameras.json`` mtime
-    and ``docker inspect`` env vars.  It does not inspect any
+    NOTE (CYB-2004): this function reads ``edge.json`` and ``cameras.json``
+    mtimes alongside ``docker inspect`` env vars.  It does not inspect any
     ``edge_health`` payload, MQTT subscription, or per-stream
     ``stream_config`` block.  Changes to the ``edge_health`` schema are
     therefore behaviourally invisible here.  A regression test in
@@ -1888,28 +1925,41 @@ def reconcile_camera_config_drift() -> bool:
 
     Returns True if a background restart was scheduled.
     """
-    global _cameras_json_mtime
+    global _cameras_json_mtime, _edge_json_mtime
 
     if platform.system() != "Linux":
         return False
 
+    changed = False
+
     cameras_file = CONFIG_DIR / "cameras.json"
-    if not cameras_file.exists():
+    if cameras_file.exists():
+        try:
+            current_mtime = cameras_file.stat().st_mtime
+            if _cameras_json_mtime is None:
+                _cameras_json_mtime = current_mtime
+            elif current_mtime != _cameras_json_mtime:
+                _cameras_json_mtime = current_mtime
+                changed = True
+        except OSError:
+            pass
+
+    if EDGE_JSON_FILE.exists():
+        try:
+            current_mtime = EDGE_JSON_FILE.stat().st_mtime
+            if _edge_json_mtime is None:
+                _edge_json_mtime = current_mtime
+            elif current_mtime != _edge_json_mtime:
+                _edge_json_mtime = current_mtime
+                changed = True
+        except OSError:
+            pass
+
+    if not changed:
         return False
 
-    try:
-        current_mtime = cameras_file.stat().st_mtime
-    except OSError:
+    if not cameras_file.exists() and not EDGE_JSON_FILE.exists():
         return False
-
-    if _cameras_json_mtime is None:
-        _cameras_json_mtime = current_mtime
-        return False
-
-    if current_mtime == _cameras_json_mtime:
-        return False
-
-    _cameras_json_mtime = current_mtime
 
     # Fallback to the legacy global device when no per-twin mapping exists;
     # otherwise each container is compared against the device its twin is
@@ -3118,6 +3168,11 @@ def register_edge(token: str) -> bool:
         )
         if edge:
             logger.info("Edge registered successfully")
+            try:
+                edge_dict = json.loads(edge.to_json()) if hasattr(edge, "to_json") else dict(edge)
+                write_or_update_edge_json_file(edge_dict)
+            except Exception as exc:
+                logger.debug("Could not persist edge.json after registration: %s", exc)
         else:
             logger.warning("Edge registration returned falsy response")
         return bool(edge)
@@ -5055,9 +5110,61 @@ _WORKER_SYNC_INTERVAL_LOOPS = int(
 )
 _worker_sync_loop_counter = 0
 
+# Edge JSON sync: refresh edge record from backend every ~5 minutes (same cadence).
+_EDGE_JSON_SYNC_INTERVAL_LOOPS = int(
+    os.getenv("CYBERWAVE_EDGE_JSON_SYNC_INTERVAL_LOOPS", "20")
+)
+_edge_json_sync_loop_counter = 0
+
 _last_container_prune_time: float = 0.0
 _last_image_prune_time: float = 0.0
 _docker_cleanup_disabled: bool | None = None
+
+
+def reconcile_edge_json_file_sync() -> bool:
+    """Fetch the current edge record from the backend and refresh ``edge.json``.
+
+    Uses the UUID already stored in ``edge.json`` for a direct lookup when
+    available; falls back to scanning all edges by fingerprint on first run.
+
+    Only writes the file when ``metadata.cameras`` has changed, to avoid
+    spurious mtime updates that would trigger unnecessary drift checks.
+
+    Returns True when the file was written.
+    """
+    token = load_token()
+    if not token:
+        return False
+    fingerprint = get_or_create_fingerprint()
+    if not fingerprint:
+        return False
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    try:
+        client = Cyberwave(base_url=base_url, api_key=token)
+        existing = _read_edge_json() or {}
+        edge_uuid = existing.get("uuid", "")
+        edge = None
+        if edge_uuid:
+            try:
+                edge = client.edges.get(edge_uuid)
+            except Exception:
+                edge = None
+        if edge is None:
+            for e in client.edges.list():
+                if getattr(e, "fingerprint", None) == fingerprint:
+                    edge = e
+                    break
+        if edge is None:
+            return False
+        edge_dict = json.loads(edge.to_json()) if hasattr(edge, "to_json") else dict(edge)
+        new_cameras = (edge_dict.get("metadata") or {}).get("cameras")
+        old_cameras = (existing.get("metadata") or {}).get("cameras")
+        if new_cameras == old_cameras:
+            return False
+        return write_or_update_edge_json_file(edge_dict)
+    except Exception as exc:
+        logger.debug("Edge JSON sync failed: %s", exc)
+    return False
 
 
 def _is_periodic_docker_cleanup_disabled() -> bool:
@@ -5149,7 +5256,7 @@ def run_runtime_loop(
         to check host memory/temperature each cycle and log warnings
         when resources are critically low.
     """
-    global _worker_sync_loop_counter
+    global _worker_sync_loop_counter, _edge_json_sync_loop_counter
 
     logger.info(
         "Entering edge-core runtime loop (interval=%.1fs)",
@@ -5249,6 +5356,15 @@ def run_runtime_loop(
             ensure_twin_command_subscriptions()
         except Exception:
             logger.exception("Unexpected error while ensuring twin command subscriptions")
+
+        # Periodically refresh edge.json from the backend.
+        _edge_json_sync_loop_counter += 1
+        if _edge_json_sync_loop_counter >= _EDGE_JSON_SYNC_INTERVAL_LOOPS:
+            _edge_json_sync_loop_counter = 0
+            try:
+                reconcile_edge_json_file_sync()
+            except Exception:
+                logger.exception("Unexpected error during edge JSON sync")
 
         # Periodically pull updated generated worker files from the backend.
         _worker_sync_loop_counter += 1
