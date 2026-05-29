@@ -22,6 +22,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from .docker_args import (
+    _rewrite_macos_container_base_url,
+    _rewrite_macos_container_hostname,
+)
 from .docker_helpers import (
     build_user_args,
     docker_available,
@@ -31,10 +35,6 @@ from .docker_helpers import (
     docker_rm,
     docker_stop,
     group_gid,
-)
-from .docker_args import (
-    _rewrite_macos_container_base_url,
-    _rewrite_macos_container_hostname,
 )
 from .zenoh_config import ZenohConfig, build_zenoh_env_vars
 
@@ -779,7 +779,11 @@ class WorkerManager:
         if ":" not in image and runtime_environment != "production":
             image = f"{image}:{runtime_environment}"
 
-        docker_rm(self._container_name)
+        if not docker_rm(self._container_name):
+            logger.warning(
+                "docker rm timed out for %s; will recover on conflict if needed",
+                self._container_name,
+            )
 
         env_vars = self._build_env_vars()
         env_args: list[str] = []
@@ -892,11 +896,36 @@ class WorkerManager:
                 timeout=60,
             )
         except subprocess.CalledProcessError as exc:
-            logger.error(
-                "Failed to start worker container %s: %s", self._container_name, exc.stderr
-            )
-            self._send_startup_failure_alert(f"docker run failed: {exc.stderr}")
-            return False
+            stderr = exc.stderr or ""
+            if "already in use" in stderr or "Conflict" in stderr:
+                logger.warning(
+                    "Worker container %s name conflict; force-removing and retrying once",
+                    self._container_name,
+                )
+                docker_rm(self._container_name)
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+                except subprocess.CalledProcessError as retry_exc:
+                    logger.error(
+                        "Failed to start worker container %s after conflict retry: %s",
+                        self._container_name,
+                        retry_exc.stderr,
+                    )
+                    self._send_startup_failure_alert(f"docker run failed: {retry_exc.stderr}")
+                    return False
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        "Docker run timed out for worker container %s (conflict retry)",
+                        self._container_name,
+                    )
+                    self._send_startup_failure_alert("docker run timed out after 60s")
+                    return False
+            else:
+                logger.error(
+                    "Failed to start worker container %s: %s", self._container_name, exc.stderr
+                )
+                self._send_startup_failure_alert(f"docker run failed: {exc.stderr}")
+                return False
         except subprocess.TimeoutExpired:
             logger.error("Docker run timed out for worker container %s", self._container_name)
             self._send_startup_failure_alert("docker run timed out after 60s")

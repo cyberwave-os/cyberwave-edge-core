@@ -1105,6 +1105,11 @@ class ModelManager:
         filename = _derive_filename(model_id, catalog_entry, sources[0][1])
 
         model_dir = self._cache_dir / model_id
+        if model_dir.is_file():
+            logger.warning(
+                "Removing stale flat file at %s to create model cache directory", model_dir
+            )
+            model_dir.unlink()
         model_dir.mkdir(parents=True, exist_ok=True)
         self._chown(model_dir)
         dest_path = model_dir / filename
@@ -1266,6 +1271,11 @@ class ModelManager:
         through and re-triggers the runtime fetch.
         """
         model_dir = self._cache_dir / model_id
+        if model_dir.is_file():
+            logger.warning(
+                "Removing stale flat file at %s to create model cache directory", model_dir
+            )
+            model_dir.unlink()
         model_dir.mkdir(parents=True, exist_ok=True)
         self._chown(model_dir)
         logger.info(

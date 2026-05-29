@@ -1068,6 +1068,98 @@ class TestWorkerManagerRunContainerFailures:
         with patch.object(wm_module, "docker_inspect", return_value=inspect_data):
             assert worker_manager._run_container() is True
 
+    def test_proceeds_when_docker_rm_fails(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: False)
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            assert worker_manager._run_container() is True
+
+    def test_retries_on_name_conflict(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import subprocess as _sp
+
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        call_count: dict[str, int] = {"run": 0}
+        rm_calls: list[str] = []
+
+        def fake_run(*a: object, **kw: object) -> MagicMock:
+            call_count["run"] += 1
+            if call_count["run"] == 1:
+                raise _sp.CalledProcessError(
+                    125, "docker", stderr="Conflict. The container name is already in use."
+                )
+            return MagicMock()
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            wm_module, "docker_rm", lambda name, **kw: rm_calls.append(name) or True
+        )
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            assert worker_manager._run_container() is True
+
+        assert call_count["run"] == 2
+        assert len(rm_calls) == 2
+
+    def test_conflict_retry_failure_sends_alert(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import subprocess as _sp
+
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        alerts: list[str] = []
+        monkeypatch.setattr(
+            WorkerManager,
+            "_send_startup_failure_alert",
+            lambda self, detail="": alerts.append(detail),
+        )
+        monkeypatch.setattr(
+            wm_module.subprocess,
+            "run",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                _sp.CalledProcessError(125, "docker", stderr="already in use")
+            ),
+        )
+
+        assert worker_manager._run_container() is False
+        assert any("docker run failed" in a for a in alerts)
+
+    def test_non_conflict_error_not_retried(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import subprocess as _sp
+
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        call_count: dict[str, int] = {"run": 0}
+
+        def fail_once(*a: object, **kw: object) -> None:
+            call_count["run"] += 1
+            raise _sp.CalledProcessError(1, "docker", stderr="OCI runtime exec failed")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fail_once)
+        assert worker_manager._run_container() is False
+        assert call_count["run"] == 1
+
 
 class TestWorkerStartupProbeWindow:
     """Startup probe window defaults to 30s and is configurable via env var."""
