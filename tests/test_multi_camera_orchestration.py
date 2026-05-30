@@ -320,6 +320,10 @@ class TestStartWorkerAfterDrivers:
             lambda name, default=None: default,
         )
         monkeypatch.setattr(startup, "load_worker_resource_limits", lambda: None)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_container_status",
+            lambda name: "none",
+        )
 
         captured = {}
 
@@ -359,6 +363,11 @@ class TestStartWorkerAfterDrivers:
             lambda name, default=None: default or "http://localhost",
         )
         monkeypatch.setattr(startup, "load_worker_resource_limits", lambda: None)
+        # Worker not yet running — pre-download should proceed.
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_container_status",
+            lambda name: "none",
+        )
 
         workers_dir = tmp_config / "workers"
         workers_dir.mkdir()
@@ -401,6 +410,74 @@ class TestStartWorkerAfterDrivers:
 
         assert len(ensure_calls) == 1
         assert ensure_calls[0] == ["yolov8n"]
+
+    def test_skips_model_pre_download_when_worker_already_running(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Worker already running → skip pre-download to avoid race condition (CYB-2182).
+
+        When a workflow is reactivated, reconcile_worker_lifecycle starts the worker
+        container immediately via the MQTT path.  The periodic sync loop then calls
+        _start_worker_after_drivers with the container already up.  Pre-downloading
+        model weights at that point races with the worker's own download, can produce
+        a transient failure, and fires a false model_download_failure alert.
+        """
+        from cyberwave_edge_core.model_manager import ModelManager
+
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_config)
+        monkeypatch.setattr(startup, "_wait_for_driver_readiness", lambda *a, **kw: {})
+        monkeypatch.setattr(
+            startup,
+            "get_runtime_env_var",
+            lambda name, default=None: default or "http://localhost",
+        )
+        monkeypatch.setattr(startup, "load_worker_resource_limits", lambda: None)
+        # Worker already running — pre-download should be skipped.
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_container_status",
+            lambda name: "running",
+        )
+
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir()
+        (workers_dir / "worker.py").write_text('model = cw.models.load("yolov8n")\n')
+
+        ensure_calls: list[list[str]] = []
+        real_scan = ModelManager.scan_worker_model_ids
+
+        class FakeModelManager:
+            def __init__(self, **kwargs):
+                pass
+
+            @staticmethod
+            def scan_worker_model_ids(workers_dir):
+                return real_scan(workers_dir)
+
+            def ensure_models(self, model_ids):
+                ensure_calls.append(list(model_ids))
+
+        monkeypatch.setattr("cyberwave_edge_core.model_manager.ModelManager", FakeModelManager)
+
+        class FakeWM:
+            def __init__(self, **kwargs):
+                pass
+
+            def start(self):
+                return True
+
+        monkeypatch.setattr("cyberwave_edge_core.worker_manager.WorkerManager", FakeWM)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.worker_manager.resolve_worker_image",
+            lambda: "test-image",
+        )
+
+        startup._start_worker_after_drivers(
+            token="token",
+            environment_uuid="env-uuid",
+            twin_uuids=[TWIN_A],
+        )
+
+        assert ensure_calls == [], "ensure_models must not be called when worker is already running"
 
 
 # ---------------------------------------------------------------------------

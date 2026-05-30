@@ -3020,14 +3020,23 @@ def _start_worker_after_drivers(
                 ", ".join(f"{n}={s}" for n, s in unhealthy.items()),
             )
 
-        from .model_manager import ModelManager
-        from .worker_manager import WorkerManager, resolve_worker_image
+        from .docker_helpers import docker_container_status  # noqa: PLC0415
+        from .model_manager import ModelManager  # noqa: PLC0415
+        from .worker_manager import (  # noqa: PLC0415
+            WORKER_CONTAINER_PREFIX,
+            WorkerManager,
+            resolve_worker_image,
+        )
 
         workers_dir = CONFIG_DIR / "workers"
         models_dir = CONFIG_DIR / "models"
+
+        container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
+        worker_already_running = docker_container_status(container_name) == "running"
+
         if workers_dir.is_dir():
             model_ids = ModelManager.scan_worker_model_ids(workers_dir)
-            if model_ids:
+            if model_ids and not worker_already_running:
                 logger.info("Pre-downloading %d model(s) before worker startup: %s", len(model_ids), model_ids)
                 base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
                 mm = ModelManager(
@@ -3044,6 +3053,12 @@ def _start_worker_after_drivers(
                 _send_model_failure_alerts(
                     twin_uuids=twin_uuids,
                     failures=mm.last_ensure_failures,
+                )
+            elif model_ids and worker_already_running:
+                logger.debug(
+                    "Worker container %s already running; skipping model pre-download "
+                    "(worker resolves models on first inference — CYB-2182).",
+                    container_name,
                 )
 
         worker_manager = WorkerManager(
