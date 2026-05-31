@@ -176,7 +176,8 @@ class EdgeSyncClient:
             if filename and source and filename.startswith(_WF_PREFIX):
                 expected[filename] = source
 
-        self._workers_dir.mkdir(parents=True, exist_ok=True)
+        if expected:
+            self._workers_dir.mkdir(parents=True, exist_ok=True)
 
         for filename, source in expected.items():
             dest = self._workers_dir / filename
@@ -232,7 +233,8 @@ class EdgeSyncClient:
         ``wf_*.py`` gets one fresh strike of grace, matching the
         "be conservative on cold start" intuition.
         """
-        self._workers_dir.mkdir(parents=True, exist_ok=True)
+        if not self._workers_dir.exists():
+            return
         expected_filenames = set(expected.keys())
 
         # Files reclaimed by this sync get their strike count reset.

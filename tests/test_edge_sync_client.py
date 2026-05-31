@@ -153,6 +153,48 @@ class TestEdgeSyncClientSync:
         assert workers_dir.exists()
         assert result.written == ["wf_new.py"]
 
+    def test_does_not_create_workers_dir_for_empty_payload(self, tmp_path):
+        """Empty payload (no active workflows) must not create the workers dir.
+
+        A sync cycle that receives an empty payload while the workers/ dir
+        has been removed (e.g. right after ``cyberwave edge uninstall``) must
+        not recreate the directory.  Callers gate on ``workers_dir.exists()``
+        to decide whether to start a worker container, so a spuriously-created
+        empty dir would cause the container to start unnecessarily.
+        """
+        client = _make_client(tmp_path)
+        workers_dir = tmp_path / "workers"
+        assert not workers_dir.exists()
+
+        payload = _make_payload(workflows=[])
+
+        with patch.object(client, "_fetch_sync_payload", return_value=payload):
+            result = client.sync("twin-1")
+
+        assert not workers_dir.exists(), "workers dir must not be created for empty payload"
+        assert result.written == []
+        assert result.errors == []
+
+    def test_does_not_create_workers_dir_during_stale_cleanup_when_missing(self, tmp_path):
+        """_cleanup_stale must not create the workers dir if it doesn't exist.
+
+        When the config dir has been removed (e.g. during uninstall) a sync
+        cycle that reaches _cleanup_stale must return early rather than
+        recreating the directory.
+        """
+        client = _make_client(tmp_path)
+        workers_dir = tmp_path / "workers"
+        assert not workers_dir.exists()
+
+        # Two consecutive syncs trigger the two-strikes cleanup path.
+        # With no dir on disk there is nothing to clean up.
+        payload = _make_payload(workflows=[])
+        with patch.object(client, "_fetch_sync_payload", return_value=payload):
+            client.sync_all(["twin-1"])
+            client.sync_all(["twin-1"])
+
+        assert not workers_dir.exists(), "workers dir must not be created by _cleanup_stale"
+
     def test_ignores_entries_without_source(self, tmp_path):
         """Entries missing worker_source are silently skipped."""
         client = _make_client(tmp_path)
