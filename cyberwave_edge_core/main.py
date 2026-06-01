@@ -313,7 +313,7 @@ def worker_status() -> None:
     if cached:
         console.print("\n[bold]  Models:[/bold]")
         for model in cached:
-            console.print(f"    {model.model_id:<30} {model.size_mb():.1f} MB")
+            console.print(f"    {model.model_id:<30} {model.size_bytes / 1_000_000:.1f} MB")
     else:
         console.print("\n  [dim]No cached models[/dim]")
 
