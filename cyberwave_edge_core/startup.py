@@ -2688,7 +2688,11 @@ def fetch_and_run_twin_drivers(
 
     alert_by_spec_index: dict[int, DriverStartingAlertContext] = {}
     for idx, spec in enumerate(driver_specs):
-        ctx = DriverStartingAlertContext(twin_uuid=spec.twin_uuid, image=spec.driver_image)
+        ctx = DriverStartingAlertContext(
+            twin_uuid=spec.twin_uuid,
+            image=spec.driver_image,
+            service_name=spec.service_name,
+        )
         ctx.create()
         alert_by_spec_index[idx] = ctx
 

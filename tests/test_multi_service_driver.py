@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 from typing import Any
 
 import cyberwave_edge_core.driver_selection as driver_selection
@@ -462,3 +463,159 @@ class TestPullCollectsAllImages:
         assert "cyberwaveos/ros2-nav2:jetson-humble" in unique_images
         assert "cyberwaveos/ros2-slam:jetson-humble" in unique_images
         assert "cyberwaveos/ros2-elevation-mapping:jetson-humble" in unique_images
+
+
+# ===========================================================================
+# 6. Shared-image alert differentiation
+# ===========================================================================
+
+
+class TestDriverStartingAlertDifferentiation:
+    def test_shared_image_services_create_distinct_alert_contexts(
+        self, monkeypatch: Any
+    ) -> None:
+        """Services that share an image still emit distinct
+        ``driver_starting`` alerts, differentiated by ``service_name``."""
+
+        class _FakeTwin:
+            def __init__(self) -> None:
+                self.uuid = "11111111-2222-3333-4444-555555555555"
+                self.name = "GO2"
+                self.asset_uuid = "asset-go2"
+                self.asset_id = "asset-go2"
+                self.metadata = {
+                    "edge_fingerprint": "edge-fp",
+                    "drivers": {
+                        "default": {
+                            "services": [
+                                {
+                                    "name": "driver",
+                                    "image": "cyberwaveos/go2-ros2-driver:jetson-humble-dev",
+                                },
+                                {
+                                    "name": "bridges",
+                                    "image": "cyberwaveos/go2-ros2-driver:jetson-humble-dev",
+                                },
+                                {
+                                    "name": "nav2",
+                                    "image": "cyberwaveos/ros2-nav2:jetson-humble-dev",
+                                },
+                            ]
+                        }
+                    },
+                }
+
+        class _FakeTwinsAPI:
+            def __init__(self, twin: _FakeTwin) -> None:
+                self._twin = twin
+
+            def list(self, environment_id: str) -> list[_FakeTwin]:
+                return [self._twin]
+
+            def get_raw(self, twin_uuid: str) -> dict[str, Any]:
+                return {}
+
+        class _FakeAssetsAPI:
+            def get(self, asset_uuid: str) -> SimpleNamespace:
+                return SimpleNamespace(metadata={})
+
+        fake_twin = _FakeTwin()
+        fake_client = SimpleNamespace(
+            twins=_FakeTwinsAPI(fake_twin),
+            assets=_FakeAssetsAPI(),
+        )
+
+        created_alert_keys: list[tuple[str, str, str | None]] = []
+
+        class _FakeAlertContext:
+            def __init__(
+                self,
+                *,
+                twin_uuid: str,
+                image: str,
+                service_name: str | None = None,
+            ) -> None:
+                created_alert_keys.append((twin_uuid, image, service_name))
+
+            def create(self) -> None:
+                pass
+
+            def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
+                pass
+
+            def resolve(self) -> None:
+                pass
+
+            def mark_failed_and_resolve(
+                self,
+                description: str,
+                *,
+                phase: str = "pull_failed",
+            ) -> None:
+                pass
+
+        run_calls: list[dict[str, Any]] = []
+
+        def _fake_run_docker_image(
+            image: str,
+            params: list[str],
+            *,
+            twin_uuid: str,
+            token: str,
+            child_camera_twin_uuids: list[str] | None = None,
+            macos_bridge_device_candidates: list[str] | None = None,
+            skip_pull: bool = False,
+            prefer_gpu: bool = False,
+            gpu_spec: str = "all",
+            service_name: str | None = None,
+            command: list[str] | None = None,
+            service_env: dict[str, str] | None = None,
+            driver_alert_ctx: Any = None,
+        ) -> bool:
+            run_calls.append(
+                {
+                    "service_name": service_name,
+                    "driver_image": image,
+                    "alert_ctx_id": id(driver_alert_ctx),
+                }
+            )
+            return True
+
+        monkeypatch.setattr(startup, "Cyberwave", lambda base_url, api_key: fake_client)
+        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
+        monkeypatch.setattr(startup, "_maybe_rewrite_jetson_tag", lambda image, _: image)
+        monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *a, **kw: None)
+        monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *a, **kw: True)
+        monkeypatch.setattr(startup, "_clear_stale_driver_starting_alerts", lambda *a, **kw: 0)
+        monkeypatch.setattr(
+            startup,
+            "_pull_driver_images_parallel",
+            lambda images, **kw: {img: True for img in set(images)},
+        )
+        monkeypatch.setattr(startup, "_run_docker_image", _fake_run_docker_image)
+
+        results = startup.fetch_and_run_twin_drivers("test-token", "env-uuid", "edge-fp")
+
+        # One alert context per service launch (even when image is shared).
+        assert len(run_calls) == 3
+        assert len(created_alert_keys) == 3
+        assert len(set(created_alert_keys)) == 3
+
+        by_service = {call["service_name"]: call for call in run_calls}
+        assert by_service["driver"]["alert_ctx_id"] != by_service["bridges"]["alert_ctx_id"]
+        assert by_service["driver"]["driver_image"] == by_service["bridges"]["driver_image"]
+        assert by_service["nav2"]["alert_ctx_id"] != by_service["driver"]["alert_ctx_id"]
+
+        assert (
+            fake_twin.uuid,
+            "cyberwaveos/go2-ros2-driver:jetson-humble-dev",
+            "driver",
+        ) in created_alert_keys
+        assert (
+            fake_twin.uuid,
+            "cyberwaveos/go2-ros2-driver:jetson-humble-dev",
+            "bridges",
+        ) in created_alert_keys
+
+        assert len(results) == 3
+        assert all(result["success"] for result in results)

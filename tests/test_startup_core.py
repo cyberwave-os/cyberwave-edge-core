@@ -1238,7 +1238,14 @@ class TestDriverStartingAlertLifecycle:
                 call_order.append(f"resolve:{twin_uuid}")
                 return 1
 
-            def __init__(self, *, twin_uuid: str, image: str) -> None:
+            def __init__(
+                self,
+                *,
+                twin_uuid: str,
+                image: str,
+                service_name: str | None = None,
+            ) -> None:
+                _ = service_name
                 call_order.append(f"create:{twin_uuid}")
 
             def create(self) -> None:

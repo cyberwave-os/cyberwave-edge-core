@@ -31,11 +31,16 @@ class DriverStartingAlertContext:
         *,
         twin_uuid: str,
         image: str,
+        service_name: Optional[str] = None,
         throttle_seconds: Optional[float] = None,
     ) -> None:
         self.twin_uuid = twin_uuid
         self.image = image
-        self.container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+        self.service_name = service_name.strip() if isinstance(service_name, str) else None
+        if self.service_name:
+            self.container_name = f"cyberwave-driver-{twin_uuid[:8]}-{self.service_name}"
+        else:
+            self.container_name = f"cyberwave-driver-{twin_uuid[:8]}"
         self.throttle_seconds = (
             throttle_seconds
             if throttle_seconds is not None
@@ -59,11 +64,23 @@ class DriverStartingAlertContext:
                 "phase": "pull_started",
                 "image": self.image,
                 "container_name": self.container_name,
+                "service_name": self.service_name,
                 "started_at": time.time(),
             }
+            service_suffix = f" ({self.service_name})" if self.service_name else ""
+            if self.service_name:
+                description = (
+                    f"Downloading driver image {self.image} for service '{self.service_name}' "
+                    f"on the {self.twin_uuid} twin on the attached edge."
+                )
+            else:
+                description = (
+                    f"Downloading driver image {self.image} for the {self.twin_uuid} twin "
+                    "on the attached edge."
+                )
             self._alert = twin.alerts.create(
-                name="Driver starting",
-                description=f"Downloading driver image {self.image} for the {self.twin_uuid} twin on the attached edge.",  # noqa: E501
+                name=f"Driver starting{service_suffix}",
+                description=description,
                 severity="info",
                 alert_type=DRIVER_STARTING_ALERT_TYPE,
                 source_type="edge",

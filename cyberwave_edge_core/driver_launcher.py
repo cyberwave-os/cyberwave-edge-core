@@ -192,7 +192,11 @@ def _run_docker_image(
     )
 
     if driver_alert_ctx is None:
-        driver_alert_ctx = s.DriverStartingAlertContext(twin_uuid=twin_uuid, image=image)
+        driver_alert_ctx = s.DriverStartingAlertContext(
+            twin_uuid=twin_uuid,
+            image=image,
+            service_name=service_name,
+        )
         driver_alert_ctx.create()
 
     if skip_pull:
