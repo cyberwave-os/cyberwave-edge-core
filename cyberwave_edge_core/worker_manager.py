@@ -17,6 +17,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -145,6 +146,20 @@ def _ensure_dir_writable_by_container_user(path: Path) -> None:
 WORKER_CONTAINER_PREFIX = "cyberwave-worker-"
 _WORKER_IMAGE_BASE = "cyberwaveos/edge-ml-worker"
 DEFAULT_WORKER_IMAGE = f"{_WORKER_IMAGE_BASE}:latest"
+
+# One lock per container name. Prevents concurrent start() / _run_container()
+# calls — from MQTT handlers, the runtime reconcile loop, the watcher, and
+# edge-restart flows — from racing on docker rm + docker run for the same name.
+_CONTAINER_START_LOCKS: dict[str, threading.Lock] = {}
+_CONTAINER_START_LOCKS_MUTEX = threading.Lock()
+
+
+def _get_container_start_lock(container_name: str) -> threading.Lock:
+    """Return (creating if needed) the per-container start lock."""
+    with _CONTAINER_START_LOCKS_MUTEX:
+        if container_name not in _CONTAINER_START_LOCKS:
+            _CONTAINER_START_LOCKS[container_name] = threading.Lock()
+        return _CONTAINER_START_LOCKS[container_name]
 
 #: Host device node exposed by the Hailo PCIe driver (HailoRT). Presence of
 #: this path is the cheapest way to detect a Hailo accelerator on the host
@@ -399,12 +414,29 @@ class WorkerManager:
             return True
 
         current_status = docker_container_status(self._container_name)
-        if current_status == "running":
-            logger.info("Worker container %s is already running", self._container_name)
+        if current_status in {"running", "restarting"}:
+            logger.info(
+                "Worker container %s is already running/restarting (status=%s)",
+                self._container_name,
+                current_status,
+            )
             return True
 
         logger.info("Starting worker container %s (image=%s)", self._container_name, self._image)
-        ok = self._run_container()
+        lock = _get_container_start_lock(self._container_name)
+        with lock:
+            # Re-check inside the lock: a concurrent caller may have started it
+            # while we were waiting.
+            current_status = docker_container_status(self._container_name)
+            if current_status in {"running", "restarting"}:
+                logger.info(
+                    "Worker container %s reached running/restarting state while waiting "
+                    "for start lock (status=%s); skipping redundant start",
+                    self._container_name,
+                    current_status,
+                )
+                return True
+            ok = self._run_container()
         if ok and self._health_monitor is not None:
             self._health_monitor.record_start()
         return ok
@@ -750,6 +782,106 @@ class WorkerManager:
             logger.error("Timed out pulling worker image %s after %ds", image, timeout)
             return False
 
+    def _pull_worker_image_with_progress(self, image: str, timeout: int = 600) -> bool:
+        """Pull *image* with progress reporting to all linked twins.
+
+        Creates a ``worker_starting`` alert on each linked twin for the
+        duration of the pull so the workbench can display a progress bar
+        (byte counts, percent) in analogy with the driver image pull.
+
+        Falls back to the plain subprocess pull
+        (:meth:`_ensure_image_pulled`) when no twin UUIDs are attached to
+        this manager.  Fallback semantics for a failed pull with a local
+        copy present are identical to those of :meth:`_ensure_image_pulled`.
+        """
+        if not self._twin_uuids:
+            return self._ensure_image_pulled(image, timeout=timeout)
+
+        from .driver_logs import (  # noqa: PLC0415
+            _pull_docker_image_with_progress_multi,
+            _PullDeliveryContext,
+        )
+        from .utils import WorkerStartingAlertContext  # noqa: PLC0415
+
+        has_local = _docker_image_present(image)
+        mutable = _image_tag_is_mutable(image)
+
+        if has_local and not mutable:
+            logger.debug(
+                "Image %s already present locally (immutable tag); skipping pull",
+                image,
+            )
+            return True
+
+        logger.info(
+            "Pulling worker image %s with progress "
+            "(timeout=%ds, mutable_tag=%s, local_present=%s)...",
+            image,
+            timeout,
+            mutable,
+            has_local,
+        )
+
+        alert_ctxs: list[WorkerStartingAlertContext] = []
+        for twin_uuid in self._twin_uuids:
+            ctx = WorkerStartingAlertContext(
+                twin_uuid=twin_uuid,
+                image=image,
+                container_name=self._container_name,
+            )
+            ctx.create()
+            alert_ctxs.append(ctx)
+
+        contexts = [
+            _PullDeliveryContext(
+                twin_uuid=twin_uuid,
+                container_name=self._container_name,
+                driver_alert_ctx=alert_ctxs[i],
+            )
+            for i, twin_uuid in enumerate(self._twin_uuids)
+        ]
+
+        try:
+            _pull_docker_image_with_progress_multi(
+                image,
+                contexts=contexts,
+                token=self._token,
+                timeout=timeout,
+            )
+            logger.info("Successfully pulled %s", image)
+            for ctx in alert_ctxs:
+                ctx.resolve()
+            return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            if has_local:
+                logger.warning(
+                    "Pull failed/timed out for %s; using local copy. error=%s",
+                    image,
+                    exc,
+                )
+                for ctx in alert_ctxs:
+                    ctx.resolve()
+                return True
+            error_str = (getattr(exc, "stderr", None) or str(exc))[:500]
+            logger.error("Failed to pull worker image %s: %s", image, error_str)
+            for ctx in alert_ctxs:
+                ctx.mark_failed_and_resolve(error_str)
+            return False
+        except OSError as exc:
+            if has_local:
+                logger.warning(
+                    "Pull failed for %s (OS error); using local copy. error=%s",
+                    image,
+                    exc,
+                )
+                for ctx in alert_ctxs:
+                    ctx.resolve()
+                return True
+            logger.error("Failed to pull worker image %s: %s", image, exc)
+            for ctx in alert_ctxs:
+                ctx.mark_failed_and_resolve(str(exc)[:500])
+            return False
+
     def _send_startup_failure_alert(self, detail: str = "") -> None:
         """Best-effort alert to all linked twins when worker startup fails."""
         if not self._twin_uuids:
@@ -859,12 +991,12 @@ class WorkerManager:
 
         logger.info("Starting worker container %s from image %s", self._container_name, image)
 
-        if not self._ensure_image_pulled(image):
+        if not self._pull_worker_image_with_progress(image):
             if non_gpu_image:
                 logger.warning("GPU image %s unavailable; falling back to %s", image, non_gpu_image)
                 image = non_gpu_image
                 cmd[-1] = image
-                if not self._ensure_image_pulled(image):
+                if not self._pull_worker_image_with_progress(image):
                     self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
                     return False
             elif non_hailo_image:
@@ -880,7 +1012,7 @@ class WorkerManager:
                 )
                 image = non_hailo_image
                 cmd[-1] = image
-                if not self._ensure_image_pulled(image):
+                if not self._pull_worker_image_with_progress(image):
                     self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
                     return False
             else:
@@ -902,7 +1034,31 @@ class WorkerManager:
                     "Worker container %s name conflict; force-removing and retrying once",
                     self._container_name,
                 )
-                docker_rm(self._container_name)
+                if not docker_rm(self._container_name):
+                    logger.error(
+                        "docker rm timed out for %s during conflict recovery; cannot retry",
+                        self._container_name,
+                    )
+                    self._send_startup_failure_alert(
+                        "docker rm timed out during conflict recovery"
+                    )
+                    return False
+                # Brief pause so Docker's daemon finishes cleaning up the container
+                # record before we retry docker run.  The race window is sub-second;
+                # one fixed wait is sufficient and avoids holding the lock for a
+                # long polling loop.
+                time.sleep(1.0)
+                remaining_status = docker_container_status(self._container_name)
+                if remaining_status != "none":
+                    logger.error(
+                        "Worker container %s still exists (status=%s) after rm; aborting retry",
+                        self._container_name,
+                        remaining_status,
+                    )
+                    self._send_startup_failure_alert(
+                        f"container still exists (status={remaining_status}) after force-remove"
+                    )
+                    return False
                 try:
                     subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
                 except subprocess.CalledProcessError as retry_exc:

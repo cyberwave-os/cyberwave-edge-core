@@ -204,6 +204,135 @@ class DriverStartingAlertContext:
         return resolved
 
 
+WORKER_STARTING_ALERT_TYPE = "worker_starting"
+
+
+class WorkerStartingAlertContext:
+    """Create/update/resolve a ``worker_starting`` twin alert around worker image pull.
+
+    Analogous to :class:`DriverStartingAlertContext` but for the shared ML
+    worker container.  The key difference is that the caller supplies an
+    explicit *container_name* (the worker name is derived from the environment
+    UUID, not the twin UUID).
+
+    All API calls are best-effort; failures are logged and never block startup.
+    """
+
+    def __init__(
+        self,
+        *,
+        twin_uuid: str,
+        image: str,
+        container_name: str,
+        throttle_seconds: Optional[float] = None,
+    ) -> None:
+        self.twin_uuid = twin_uuid
+        self.image = image
+        self.container_name = container_name
+        self.throttle_seconds = (
+            throttle_seconds
+            if throttle_seconds is not None
+            else DRIVER_STARTING_ALERT_METADATA_UPDATE_INTERVAL_SECONDS
+        )
+        self._alert: Any = None
+        self._last_update_ts: float = 0.0
+
+    def create(self) -> None:
+        """POST a new active ``worker_starting`` alert."""
+        try:
+            from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
+
+            base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+            token = load_token()
+            client = Cyberwave(base_url=base_url, api_key=token)
+            twin = client.twin(twin_id=self.twin_uuid)
+            self._alert = twin.alerts.create(
+                name="Worker starting",
+                description=(
+                    f"Downloading ML worker image {self.image} for the edge attached to "
+                    f"twin {self.twin_uuid}."
+                ),
+                severity="info",
+                alert_type=WORKER_STARTING_ALERT_TYPE,
+                source_type="edge",
+                metadata={
+                    "phase": "pull_started",
+                    "image": self.image,
+                    "container_name": self.container_name,
+                    "started_at": time.time(),
+                },
+                force=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not create worker_starting alert for twin %s: %s",
+                self.twin_uuid,
+                exc,
+            )
+            self._alert = None
+
+    def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
+        """Best-effort metadata patch (e.g. pull progress bytes), throttled.
+
+        Mirrors :meth:`DriverStartingAlertContext.update_metadata` so this
+        class is a drop-in duck-type replacement when used by ``driver_logs``.
+        """
+        if self._alert is None:
+            return
+        now = time.time()
+        if not force and (now - self._last_update_ts) < self.throttle_seconds:
+            return
+        self._last_update_ts = now
+        try:
+            prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
+            merged = {**prev, **patch}
+            self._alert = self._alert.update(metadata=merged)
+        except Exception as exc:
+            logger.debug(
+                "Could not update worker_starting alert for twin %s: %s",
+                self.twin_uuid,
+                exc,
+            )
+
+    def resolve(self) -> None:
+        """Resolve the alert (pull finished / container up)."""
+        if self._alert is None:
+            return
+        try:
+            self._alert.resolve()
+        except Exception as exc:
+            logger.debug(
+                "Could not resolve worker_starting alert for twin %s: %s",
+                self.twin_uuid,
+                exc,
+            )
+        self._alert = None
+
+    def mark_failed_and_resolve(self, description: str) -> None:
+        """Mark the alert as failed and resolve it."""
+        if self._alert is None:
+            return
+        try:
+            prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
+            self._alert = self._alert.update(
+                description=description,
+                metadata={
+                    **prev,
+                    "phase": "pull_failed",
+                    "failed": True,
+                    "failed_at": time.time(),
+                },
+                severity="warning",
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not annotate worker_starting alert failure for twin %s: %s",
+                self.twin_uuid,
+                exc,
+            )
+        self.resolve()
+
+
 def _is_not_found_error(exc: BaseException) -> bool:
     """Return True if *exc* represents an HTTP 404 from the Cyberwave API.
 

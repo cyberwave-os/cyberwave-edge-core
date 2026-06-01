@@ -519,12 +519,24 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
     docker_cleanup: str,
     make_worker_manager: Callable[..., WorkerManager],
     monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Immutable tag (``:v1``) skips ``docker pull``; mutable tag (``:local``) always attempts it.
 
     The mutable pull fails (the stub image is local-only) and falls back
     to the local copy via ``_ensure_image_pulled``'s exception path; we
     only need to assert the attempt was made, not that it succeeded.
+
+    When ``twin_uuids`` are set (as in the integration-test fixture) the pull
+    goes through ``_pull_docker_image_with_progress_multi`` → Docker Engine
+    API, not through ``subprocess.run``.  We therefore detect the attempt via
+    two independent signals so the assertion is robust to either path:
+
+    1. ``subprocess.run(['docker', 'pull', …])`` — the no-twin-uuid /
+       subprocess-fallback path.
+    2. ``sys.stderr`` — ``_broadcast_pull_event`` always prints
+       ``"docker pull started for image <tag>"`` to stderr at the very
+       beginning of every engine-API pull, before any network I/O.
     """
     workers_dir = configured_edge / "workers"
     _write_worker_file(workers_dir, "wf_demo.py")
@@ -545,6 +557,7 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
     monkeypatch.setattr(worker_manager_module.subprocess, "run", spy_run)
 
     # --- Immutable tag: pre-pulled by the session fixture's docker tag step.
+    capfd.readouterr()  # Reset capture buffer.
     mgr_imm = make_worker_manager(image=STUB_IMAGE_IMMUTABLE)
     assert mgr_imm.start() is True
     wait_until(
@@ -553,9 +566,14 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
         description="immutable-tag container to reach running",
     )
     immutable_pulls = [c for c in pull_invocations if STUB_IMAGE_IMMUTABLE in c]
+    immutable_stderr = capfd.readouterr().err
     assert immutable_pulls == [], (
-        f"immutable tag {STUB_IMAGE_IMMUTABLE} triggered docker pull; "
+        f"immutable tag {STUB_IMAGE_IMMUTABLE} triggered docker pull (subprocess); "
         f"got {immutable_pulls}"
+    )
+    assert f"docker pull started for image {STUB_IMAGE_IMMUTABLE}" not in immutable_stderr, (
+        f"immutable tag {STUB_IMAGE_IMMUTABLE} triggered docker pull (engine API); "
+        f"stderr: {immutable_stderr[:500]}"
     )
 
     assert mgr_imm.stop() is True
@@ -566,6 +584,7 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
     )
 
     # --- Mutable tag: must attempt a docker pull every start, even when local copy exists.
+    capfd.readouterr()  # Reset capture buffer.
     pull_invocations.clear()
     mgr_mut = make_worker_manager(image=STUB_IMAGE_MUTABLE)
     assert mgr_mut.start() is True
@@ -575,9 +594,11 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
         description="mutable-tag container to reach running",
     )
     mutable_pulls = [c for c in pull_invocations if STUB_IMAGE_MUTABLE in c]
-    assert len(mutable_pulls) >= 1, (
+    mutable_stderr = capfd.readouterr().err
+    pull_attempted = len(mutable_pulls) >= 1 or f"docker pull started for image {STUB_IMAGE_MUTABLE}" in mutable_stderr
+    assert pull_attempted, (
         f"mutable tag {STUB_IMAGE_MUTABLE} should trigger docker pull; "
-        f"recorded pulls: {pull_invocations}"
+        f"recorded subprocess pulls: {pull_invocations}, stderr: {mutable_stderr[:500]}"
     )
 
 

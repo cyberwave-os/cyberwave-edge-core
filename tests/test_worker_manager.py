@@ -266,6 +266,104 @@ class TestWorkerManagerStartSkipWhenNoWorkers:
         result = worker_manager.start()
         assert result is True
 
+    def test_start_returns_true_when_restarting(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Container in Docker's 'restarting' state must not trigger _run_container.
+
+        --restart=unless-stopped causes Docker to automatically restart the
+        container when it exits. During that brief 'restarting' window
+        start() must yield to Docker rather than racing with its restart
+        daemon, which would cause a name-conflict on the subsequent docker run.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "detect.py").write_text("pass\n")
+
+        run_container_called: list[bool] = []
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "restarting")
+        monkeypatch.setattr(
+            WorkerManager,
+            "_run_container",
+            lambda self: run_container_called.append(True) or False,
+        )
+
+        result = worker_manager.start()
+        assert result is True
+        assert run_container_called == [], "_run_container must not be called during restarting"
+
+    def test_concurrent_start_only_runs_container_once(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two threads calling start() simultaneously must only call _run_container once.
+
+        This is the regression test for the per-container-name lock.
+        Without the lock, both callers that pass the pre-lock status check
+        would each call _run_container(), racing on docker rm + docker run.
+
+        Determinism: a Barrier ensures both threads reach the lock-acquire
+        point simultaneously (both see status="none" from the pre-lock check),
+        then one wins the lock and calls _run_container (marking state as
+        "running"), and the other re-checks inside the lock, sees "running",
+        and skips.
+        """
+        import threading as _th
+
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "detect.py").write_text("pass\n")
+
+        run_container_calls: list[int] = []
+        container_state: dict[str, str] = {"status": "none"}
+        # Both threads must pass through the pre-lock status check before
+        # either acquires the lock, ensuring they both see "none".
+        barrier = _th.Barrier(2)
+
+        original_status_calls: list[str] = []
+
+        def status_with_barrier(name: str) -> str:
+            s = container_state["status"]
+            original_status_calls.append(s)
+            if len(original_status_calls) <= 2:
+                # Synchronise: wait until both threads have called status
+                # (pre-lock check), then release them to race for the lock.
+                barrier.wait(timeout=2)
+            return s
+
+        def fake_run_container(self: WorkerManager) -> bool:
+            run_container_calls.append(1)
+            container_state["status"] = "running"
+            return True
+
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", status_with_barrier)
+        monkeypatch.setattr(WorkerManager, "_run_container", fake_run_container)
+
+        errors: list[BaseException] = []
+
+        def call_start() -> None:
+            try:
+                worker_manager.start()
+            except BaseException as exc:
+                errors.append(exc)
+
+        t1 = _th.Thread(target=call_start)
+        t2 = _th.Thread(target=call_start)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert not errors, f"Thread errors: {errors}"
+        assert not t1.is_alive() and not t2.is_alive(), "Threads did not finish — possible deadlock"
+        # With the lock: only the thread that wins the lock calls _run_container.
+        # The other re-checks inside the lock, sees "running", and skips.
+        assert len(run_container_calls) == 1, (
+            f"Expected exactly 1 _run_container call, got {len(run_container_calls)}. "
+            "Lock is missing or not working correctly."
+        )
+
     def test_start_returns_false_when_docker_unavailable(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -995,6 +1093,12 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(
             WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True)
         )
+        # Stub the full pull path (which makes live API calls via WorkerStartingAlertContext).
+        monkeypatch.setattr(
+            WorkerManager,
+            "_pull_worker_image_with_progress",
+            lambda self, image, timeout=600: True,
+        )
         monkeypatch.setattr(
             WorkerManager, "_send_startup_failure_alert", lambda self, detail="": None
         )
@@ -1106,6 +1210,8 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(
             wm_module, "docker_rm", lambda name, **kw: rm_calls.append(name) or True
         )
+        # Verification loop after conflict rm must see "none" so the retry proceeds.
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
 
         with patch.object(
             wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
@@ -1141,6 +1247,73 @@ class TestWorkerManagerRunContainerFailures:
         assert worker_manager._run_container() is False
         assert any("docker run failed" in a for a in alerts)
 
+    def test_conflict_retry_aborts_when_rm_fails(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If docker_rm times out during conflict recovery the run is not retried."""
+        import subprocess as _sp
+
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        alerts: list[str] = []
+        monkeypatch.setattr(
+            WorkerManager,
+            "_send_startup_failure_alert",
+            lambda self, detail="": alerts.append(detail),
+        )
+        call_count: dict[str, int] = {"run": 0}
+
+        def fake_run(*a: object, **kw: object) -> MagicMock:
+            call_count["run"] += 1
+            raise _sp.CalledProcessError(125, "docker", stderr="Conflict. already in use")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        # Simulate docker_rm timing out during conflict recovery (returns False).
+        rm_results = [True, False]  # initial rm ok, conflict-handler rm times out
+        monkeypatch.setattr(
+            wm_module, "docker_rm", lambda name, **kw: rm_results.pop(0) if rm_results else False
+        )
+
+        result = worker_manager._run_container()
+
+        assert result is False
+        # docker run must only have been called once (no retry when rm fails).
+        assert call_count["run"] == 1
+        assert any("docker rm timed out" in a for a in alerts)
+
+    def test_conflict_retry_aborts_when_container_persists_after_rm(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the container is still present after rm (Docker restart race) we abort cleanly."""
+        import subprocess as _sp
+
+        self._setup_run(worker_manager, tmp_config, monkeypatch)
+        alerts: list[str] = []
+        monkeypatch.setattr(
+            WorkerManager,
+            "_send_startup_failure_alert",
+            lambda self, detail="": alerts.append(detail),
+        )
+
+        def fake_run(*a: object, **kw: object) -> MagicMock:
+            raise _sp.CalledProcessError(125, "docker", stderr="Conflict. already in use")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+        monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+        # docker_container_status always returns "running" (Docker restart daemon keeps recreating).
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "running")
+
+        result = worker_manager._run_container()
+
+        assert result is False
+        assert any("still exists" in a for a in alerts)
+
     def test_non_conflict_error_not_retried(
         self,
         worker_manager: WorkerManager,
@@ -1175,6 +1348,11 @@ class TestWorkerStartupProbeWindow:
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(
             WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True)
+        )
+        monkeypatch.setattr(
+            WorkerManager,
+            "_pull_worker_image_with_progress",
+            lambda self, image, timeout=600: True,
         )
         monkeypatch.setattr(
             WorkerManager, "_send_startup_failure_alert", lambda self, detail="": None
@@ -1417,6 +1595,11 @@ class TestWorkerManagerStartHealthIntegration:
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(wm_module.subprocess, "run", lambda *a, **kw: MagicMock())
         monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
+        monkeypatch.setattr(
+            WorkerManager,
+            "_pull_worker_image_with_progress",
+            lambda self, image, timeout=600: True,
+        )
 
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
@@ -1426,7 +1609,8 @@ class TestWorkerManagerStartHealthIntegration:
         monkeypatch.setattr("os.environ", {})
 
         with (
-            patch.object(wm_module, "docker_container_status", side_effect=["none"]),
+            # start() now checks status twice: once before the lock and once inside it.
+            patch.object(wm_module, "docker_container_status", side_effect=["none", "none"]),
             patch.object(
                 wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
             ),
