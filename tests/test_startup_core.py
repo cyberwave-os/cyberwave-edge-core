@@ -2466,19 +2466,49 @@ class TestReconcileCameraConfigDrift:
 class TestLoadSelectedCameraDevice:
     """Tests for _load_selected_camera_device()."""
 
+    def _patch_config_paths(self, monkeypatch, config_dir: Path) -> None:
+        monkeypatch.setattr(startup, "CONFIG_DIR", config_dir)
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", config_dir / "edge.json")
+
     def test_returns_none_when_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        self._patch_config_paths(monkeypatch, tmp_path)
         assert startup._load_selected_camera_device() is None
         assert startup._load_selected_camera_device("any-twin") is None
 
+    def test_prefers_edge_json_metadata_over_cameras_json(self, tmp_path, monkeypatch):
+        """CYB-1763: edge.json metadata.cameras is the source of truth."""
+        self._patch_config_paths(monkeypatch, tmp_path)
+        (tmp_path / "cameras.json").write_text(json.dumps({"selected_device": 0}))
+        (tmp_path / "edge.json").write_text(
+            json.dumps({"metadata": {"cameras": {"selected_device": 5}}})
+        )
+
+        assert startup._read_cameras_config() == {"selected_device": 5}
+        assert startup._load_selected_camera_device() == "/dev/video5"
+
+    def test_falls_back_to_cameras_json_when_edge_json_missing(self, tmp_path, monkeypatch):
+        self._patch_config_paths(monkeypatch, tmp_path)
+        (tmp_path / "cameras.json").write_text(json.dumps({"selected_device": 2}))
+
+        assert startup._read_cameras_config() == {"selected_device": 2}
+        assert startup._load_selected_camera_device() == "/dev/video2"
+
+    def test_falls_back_when_edge_metadata_cameras_empty(self, tmp_path, monkeypatch):
+        self._patch_config_paths(monkeypatch, tmp_path)
+        (tmp_path / "cameras.json").write_text(json.dumps({"selected_device": 3}))
+        (tmp_path / "edge.json").write_text(json.dumps({"metadata": {"cameras": {}}}))
+
+        assert startup._read_cameras_config() == {"selected_device": 3}
+        assert startup._load_selected_camera_device() == "/dev/video3"
+
     def test_falls_back_to_selected_device(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        self._patch_config_paths(monkeypatch, tmp_path)
         (tmp_path / "cameras.json").write_text(json.dumps({"selected_device": 3}))
         assert startup._load_selected_camera_device() == "/dev/video3"
         assert startup._load_selected_camera_device("twin-without-mapping") == "/dev/video3"
 
     def test_per_twin_mapping_takes_precedence(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        self._patch_config_paths(monkeypatch, tmp_path)
         (tmp_path / "cameras.json").write_text(
             json.dumps(
                 {
@@ -2495,7 +2525,7 @@ class TestLoadSelectedCameraDevice:
         assert startup._load_selected_camera_device() == "/dev/video0"
 
     def test_invalid_mapping_values_are_ignored(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        self._patch_config_paths(monkeypatch, tmp_path)
         (tmp_path / "cameras.json").write_text(
             json.dumps(
                 {
@@ -2505,6 +2535,29 @@ class TestLoadSelectedCameraDevice:
             )
         )
         assert startup._load_selected_camera_device("twin-a") == "/dev/video1"
+
+
+class TestEdgeJsonFileHelpers:
+    """Tests for edge.json read/write helpers (CYB-1763)."""
+
+    def test_write_or_update_edge_json_file_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
+        edge_data = {
+            "uuid": "edge-1",
+            "metadata": {"cameras": {"selected_device": 1}},
+        }
+
+        assert startup.write_or_update_edge_json_file(edge_data) is True
+        assert startup._read_edge_json() == edge_data
+
+    def test_read_edge_json_returns_none_for_invalid_json(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        edge_json = tmp_path / "edge.json"
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", edge_json)
+        edge_json.write_text("{not-json")
+
+        assert startup._read_edge_json() is None
 
 
 class TestLoadAudioStreamUrlForTwin:
