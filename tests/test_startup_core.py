@@ -2870,3 +2870,71 @@ class TestPerformEdgeCoreRestart:
         )
         assert summary["worker_started"] is True
         assert summary["drivers_started"] == 1
+
+
+# ===========================================================================
+# Camera config source selection (edge.json vs cameras.json)
+# ===========================================================================
+
+
+class TestReadCamerasConfig:
+    """Tests for _read_cameras_config() preference order (CYB-1763)."""
+
+    def test_prefers_edge_json_metadata_cameras(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
+
+        (tmp_path / "edge.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "cameras": {
+                            "selected_device": 1,
+                            "devices": ["/dev/video1"],
+                        }
+                    }
+                }
+            )
+        )
+        (tmp_path / "cameras.json").write_text(
+            json.dumps({"selected_device": 99, "devices": ["/dev/video99"]})
+        )
+
+        config = startup._read_cameras_config()
+
+        assert config == {
+            "selected_device": 1,
+            "devices": ["/dev/video1"],
+        }
+
+    def test_falls_back_to_cameras_json_when_edge_json_missing_cameras(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
+
+        (tmp_path / "edge.json").write_text(json.dumps({"metadata": {}}))
+        (tmp_path / "cameras.json").write_text(
+            json.dumps({"selected_device": 2, "devices": ["/dev/video2"]})
+        )
+
+        config = startup._read_cameras_config()
+
+        assert config == {"selected_device": 2, "devices": ["/dev/video2"]}
+
+    def test_returns_none_when_no_camera_config_exists(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
+
+        assert startup._read_cameras_config() is None
+
+
+class TestWriteOrUpdateEdgeJsonFile:
+    def test_writes_edge_json_atomically(self, tmp_path, monkeypatch):
+        edge_json = tmp_path / "edge.json"
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", edge_json)
+
+        payload = {"uuid": "edge-123", "metadata": {"cameras": {"selected_device": 0}}}
+
+        assert startup.write_or_update_edge_json_file(payload) is True
+        assert json.loads(edge_json.read_text()) == payload
