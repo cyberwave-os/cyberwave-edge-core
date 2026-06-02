@@ -10,6 +10,7 @@ from typing import Any, Optional
 from cyberwave import Cyberwave
 
 DRIVER_STARTING_ALERT_TYPE = "driver_starting"
+WORKER_STARTING_ALERT_TYPE = "worker_starting"
 DRIVER_STARTING_ALERT_METADATA_UPDATE_INTERVAL_SECONDS = max(
     0.5,
     float(os.getenv("CYBERWAVE_DRIVER_STARTING_ALERT_UPDATE_INTERVAL_SECONDS", "2")),
@@ -221,18 +222,15 @@ class DriverStartingAlertContext:
         return resolved
 
 
-WORKER_STARTING_ALERT_TYPE = "worker_starting"
-
-
 class WorkerStartingAlertContext:
-    """Create/update/resolve a ``worker_starting`` twin alert around worker image pull.
+    """Create/update/resolve a ``worker_starting`` twin alert around a worker image pull.
 
-    Analogous to :class:`DriverStartingAlertContext` but for the shared ML
-    worker container.  The key difference is that the caller supplies an
-    explicit *container_name* (the worker name is derived from the environment
-    UUID, not the twin UUID).
+    Mirrors :class:`DriverStartingAlertContext` — same interface, same
+    best-effort semantics — but uses the ``worker_starting`` alert type and
+    worker-specific description copy.
 
-    All API calls are best-effort; failures are logged and never block startup.
+    All API calls are best-effort; failures are logged and never block worker
+    startup.
     """
 
     def __init__(
@@ -255,7 +253,7 @@ class WorkerStartingAlertContext:
         self._last_update_ts: float = 0.0
 
     def create(self) -> None:
-        """POST a new active ``worker_starting`` alert."""
+        """POST a new active alert (``force=True`` avoids dedupe collapsing repeats)."""
         try:
             from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
 
@@ -289,11 +287,7 @@ class WorkerStartingAlertContext:
             self._alert = None
 
     def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
-        """Best-effort metadata patch (e.g. pull progress bytes), throttled.
-
-        Mirrors :meth:`DriverStartingAlertContext.update_metadata` so this
-        class is a drop-in duck-type replacement when used by ``driver_logs``.
-        """
+        """Merge *patch* into alert metadata, optionally throttled."""
         if self._alert is None:
             return
         now = time.time()
@@ -309,6 +303,7 @@ class WorkerStartingAlertContext:
                 "Could not update worker_starting alert for twin %s: %s",
                 self.twin_uuid,
                 exc,
+                exc_info=True,
             )
 
     def resolve(self) -> None:
@@ -318,27 +313,28 @@ class WorkerStartingAlertContext:
         try:
             self._alert.resolve()
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Could not resolve worker_starting alert for twin %s: %s",
                 self.twin_uuid,
                 exc,
             )
         self._alert = None
 
-    def mark_failed_and_resolve(self, description: str) -> None:
-        """Mark the alert as failed and resolve it."""
+    def mark_failed_and_resolve(self, description: str, *, phase: str = "pull_failed") -> None:
+        """Annotate the alert with failure context, then resolve it."""
         if self._alert is None:
             return
         try:
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
+            merged = {
+                **prev,
+                "phase": phase,
+                "failed": True,
+                "failed_at": time.time(),
+            }
             self._alert = self._alert.update(
                 description=description,
-                metadata={
-                    **prev,
-                    "phase": "pull_failed",
-                    "failed": True,
-                    "failed_at": time.time(),
-                },
+                metadata=merged,
                 severity="warning",
             )
         except Exception as exc:
@@ -346,8 +342,65 @@ class WorkerStartingAlertContext:
                 "Could not annotate worker_starting alert failure for twin %s: %s",
                 self.twin_uuid,
                 exc,
+                exc_info=True,
             )
         self.resolve()
+
+    @staticmethod
+    def resolve_active_for_twin(twin_uuid: str) -> int:
+        """Resolve any active ``worker_starting`` alerts for *twin_uuid*.
+
+        Used to clear orphans left behind by interrupted worker image pulls
+        (for example, before an ``edge-core`` restart wipes the in-process
+        alert context).  Best-effort: failures are logged and never raised.
+        Returns the number of alerts resolved.
+
+        A ``404 Not Found`` from the backend means the twin is already gone —
+        nothing to clear; logs a single INFO line instead of a traceback.
+        """
+        from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
+
+        token = load_token()
+        if not token:
+            return 0
+
+        base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+
+        resolved = 0
+        try:
+            client = Cyberwave(base_url=base_url, api_key=token)
+            twin = client.twin(twin_id=twin_uuid)
+            for alert in twin.alerts.list(status="active", limit=100):
+                if getattr(alert, "alert_type", None) != WORKER_STARTING_ALERT_TYPE:
+                    continue
+                try:
+                    alert.resolve()
+                    resolved += 1
+                except Exception as exc:
+                    if _is_not_found_error(exc):
+                        continue
+                    logger.warning(
+                        "Could not resolve stale worker_starting alert %s for twin %s: %s",
+                        getattr(alert, "uuid", "<unknown>"),
+                        twin_uuid,
+                        exc,
+                    )
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                logger.info(
+                    "Skipping worker_starting alert cleanup for twin %s: "
+                    "twin no longer exists on backend (404)",
+                    twin_uuid,
+                )
+                return 0
+            logger.debug(
+                "Could not list worker_starting alerts for twin %s: %s",
+                twin_uuid,
+                exc,
+                exc_info=True,
+            )
+        return resolved
+
 
 
 def _is_not_found_error(exc: BaseException) -> bool:

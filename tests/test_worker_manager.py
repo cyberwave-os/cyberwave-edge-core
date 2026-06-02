@@ -1091,7 +1091,9 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(
-            WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True)
+            WorkerManager,
+            "_pull_worker_image_with_progress",
+            lambda self, image, timeout=600: True,
         )
         # Stub the full pull path (which makes live API calls via WorkerStartingAlertContext).
         monkeypatch.setattr(
@@ -1347,7 +1349,9 @@ class TestWorkerStartupProbeWindow:
         monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
         monkeypatch.setattr(
-            WorkerManager, "_ensure_image_pulled", staticmethod(lambda image, timeout=600: True)
+            WorkerManager,
+            "_pull_worker_image_with_progress",
+            lambda self, image, timeout=600: True,
         )
         monkeypatch.setattr(
             WorkerManager,

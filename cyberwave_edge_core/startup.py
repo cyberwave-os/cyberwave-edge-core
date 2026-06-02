@@ -48,6 +48,7 @@ from .utils import (
     EDGE_CORE_RESTART_PHASE_IN_PROGRESS,
     DriverStartingAlertContext,
     EdgeCoreRestartAlertContext,
+    WorkerStartingAlertContext,
 )
 from .zenoh_config import (
     ZenohConfig,
@@ -2332,7 +2333,7 @@ def _clear_stale_driver_starting_alerts(
     *,
     log_context: str,
 ) -> int:
-    """Resolve orphan ``driver_starting`` alerts for the given twins.
+    """Resolve orphan ``driver_starting`` and ``worker_starting`` alerts for the given twins.
 
     Best-effort: failures are logged and never raised.  Returns the number
     of alerts resolved.  *twin_uuids* may contain duplicates; each twin is
@@ -2352,9 +2353,17 @@ def _clear_stale_driver_starting_alerts(
                 twin_uuid,
                 exc_info=True,
             )
+        try:
+            cleared += WorkerStartingAlertContext.resolve_active_for_twin(twin_uuid)
+        except Exception:
+            logger.debug(
+                "Failed to clear stale worker_starting alerts for twin %s",
+                twin_uuid,
+                exc_info=True,
+            )
     if cleared:
         logger.info(
-            "Cleared %d stale driver_starting alert(s) before %s",
+            "Cleared %d stale driver/worker starting alert(s) before %s",
             cleared,
             log_context,
         )

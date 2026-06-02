@@ -16,9 +16,9 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Union
 
-from .utils import DriverStartingAlertContext
+from .utils import DriverStartingAlertContext, WorkerStartingAlertContext
 
 logger = logging.getLogger(__name__)
 
@@ -612,7 +612,7 @@ class _PullDeliveryContext:
 
     twin_uuid: str
     container_name: str
-    driver_alert_ctx: Optional[DriverStartingAlertContext] = None
+    driver_alert_ctx: Optional[Union[DriverStartingAlertContext, WorkerStartingAlertContext]] = None
     mqtt_client: Optional[Any] = None
     mqtt_topic: Optional[str] = None
 
@@ -978,7 +978,9 @@ def _pull_docker_image_with_progress(
     twin_uuid: str,
     token: str,
     timeout: int = 600,
-    driver_alert_ctx: Optional[DriverStartingAlertContext] = None,
+    driver_alert_ctx: Optional[
+        Union[DriverStartingAlertContext, WorkerStartingAlertContext]
+    ] = None,
 ) -> None:
     """Backward-compat single-twin shim around :func:`_pull_docker_image_with_progress_multi`."""
     _pull_docker_image_with_progress_multi(

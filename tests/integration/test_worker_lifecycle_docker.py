@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import cyberwave_edge_core.driver_logs as driver_logs_module
 import cyberwave_edge_core.startup as startup
 import cyberwave_edge_core.worker_manager as worker_manager_module
 from cyberwave_edge_core.docker_helpers import (
@@ -186,7 +187,7 @@ def test_phase_01_idle_start_no_files_no_pull_no_container(
 
     * No ``WorkerManager.start()`` invocation (the only path that could
       pull or create a container).
-    * No ``_ensure_image_pulled`` invocation (defence in depth in case
+    * No ``_pull_worker_image_with_progress`` invocation (defence in depth in case
       anyone reorders the call inside ``WorkerManager.start``).
     * No container present in Docker after the reconcile.
     """
@@ -200,16 +201,16 @@ def test_phase_01_idle_start_no_files_no_pull_no_container(
     monkeypatch.setattr(WorkerManager, "start", spy_start)
 
     pull_calls: List[str] = []
-    original_ensure = WorkerManager._ensure_image_pulled
+    original_pull = WorkerManager._pull_worker_image_with_progress
 
-    def spy_ensure(image: str, timeout: int = 600) -> bool:
+    def spy_pull(self: WorkerManager, image: str, timeout: int = 600) -> bool:
         pull_calls.append(image)
-        return original_ensure(image, timeout)
+        return original_pull(self, image, timeout)
 
     monkeypatch.setattr(
         WorkerManager,
-        "_ensure_image_pulled",
-        staticmethod(spy_ensure),
+        "_pull_worker_image_with_progress",
+        spy_pull,
     )
 
     startup.reconcile_worker_lifecycle(_reconcile_summary(removed=1))
@@ -524,7 +525,7 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
     """Immutable tag (``:v1``) skips ``docker pull``; mutable tag (``:local``) always attempts it.
 
     The mutable pull fails (the stub image is local-only) and falls back
-    to the local copy via ``_ensure_image_pulled``'s exception path; we
+    to the local copy via ``_pull_worker_image_with_progress``'s exception path; we
     only need to assert the attempt was made, not that it succeeded.
 
     When ``twin_uuids`` are set (as in the integration-test fixture) the pull
@@ -541,20 +542,18 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
     workers_dir = configured_edge / "workers"
     _write_worker_file(workers_dir, "wf_demo.py")
 
-    pull_invocations: list[list[str]] = []
-    original_run = worker_manager_module.subprocess.run
+    pull_invocations: list[str] = []
+    original_pull_multi = driver_logs_module._pull_docker_image_with_progress_multi
 
-    def spy_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
-        if (
-            isinstance(cmd, (list, tuple))
-            and len(cmd) >= 2
-            and cmd[0] == "docker"
-            and cmd[1] == "pull"
-        ):
-            pull_invocations.append(list(cmd))
-        return original_run(cmd, *args, **kwargs)
+    def spy_pull_multi(image: str, **kwargs: Any) -> Any:
+        pull_invocations.append(image)
+        return original_pull_multi(image, **kwargs)
 
-    monkeypatch.setattr(worker_manager_module.subprocess, "run", spy_run)
+    monkeypatch.setattr(
+        driver_logs_module,
+        "_pull_docker_image_with_progress_multi",
+        spy_pull_multi,
+    )
 
     # --- Immutable tag: pre-pulled by the session fixture's docker tag step.
     capfd.readouterr()  # Reset capture buffer.
