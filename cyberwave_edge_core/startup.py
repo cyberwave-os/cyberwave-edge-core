@@ -598,10 +598,17 @@ def write_or_update_edge_json_file(edge_data: dict) -> bool:
     Callers are expected to pass a plain-dict representation (e.g. from
     ``json.loads(edge.to_json())``) so all values are already JSON-serializable.
 
+    Written with mode ``0o644`` (world-readable) because edge.json contains no
+    secrets — only the edge UUID, hostname, platform, and metadata like camera
+    selection.  This matters when edge-core runs as root (systemd) but the
+    invoking user later reads the file via the CLI or worker container: a
+    restrictive ``0o600`` owned by root would make reads silently fail and
+    cause camera config to fall back to stale values.
+
     Returns True on success.
     """
     try:
-        _atomic_write_json(EDGE_JSON_FILE, edge_data)
+        _atomic_write_json(EDGE_JSON_FILE, edge_data, mode=0o644)
         return True
     except Exception as exc:
         logger.warning("Could not write edge.json: %s", exc)
