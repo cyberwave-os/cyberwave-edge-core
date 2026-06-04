@@ -1013,7 +1013,6 @@ def _follow_container_logs(
         return
 
     logger.info("Forwarding logs for container %s to service logs", container_name)
-    debug_log_stream = logger.isEnabledFor(logging.DEBUG)
     received_lines = 0
 
     mqtt_client: Optional[Any] = None
@@ -1060,14 +1059,6 @@ def _follow_container_logs(
                     mqtt_topic=mqtt_topic,
                     driver_image=driver_image,
                 )
-
-                if debug_log_stream:
-                    logger.debug(
-                        "Container log line received (container=%s, line=%d, chars=%d)",
-                        container_name,
-                        received_lines,
-                        len(message),
-                    )
 
                 if twin_uuid and container_name not in _CONTAINER_RUNTIME_ERROR_ALERTED:
                     m = _RUNTIME_ERROR_PATTERN.search(message)
