@@ -393,6 +393,23 @@ def _run_docker_image(
         container_env["CYBERWAVE_MQTT_HOST"] = s._rewrite_macos_container_hostname(
             mqtt_host
         )
+    mqtt_port = s.get_runtime_env_var("CYBERWAVE_MQTT_PORT")
+    if mqtt_port:
+        container_env["CYBERWAVE_MQTT_PORT"] = mqtt_port.strip()
+    else:
+        mqtt_kwargs = s._resolve_mqtt_kwargs()
+        inferred_port = mqtt_kwargs.get("mqtt_port")
+        if inferred_port is not None:
+            container_env.setdefault("CYBERWAVE_MQTT_PORT", str(inferred_port))
+        if not container_env.get("CYBERWAVE_MQTT_HOST"):
+            inferred_host = mqtt_kwargs.get("mqtt_host")
+            if inferred_host:
+                container_env["CYBERWAVE_MQTT_HOST"] = s._rewrite_macos_container_hostname(
+                    str(inferred_host)
+                )
+    edge_log_level = s.get_runtime_env_var("CYBERWAVE_EDGE_LOG_LEVEL")
+    if edge_log_level:
+        container_env.setdefault("CYBERWAVE_EDGE_LOG_LEVEL", edge_log_level.strip())
     if runtime_environment != "production":
         container_env["CYBERWAVE_ENVIRONMENT"] = runtime_environment
 
