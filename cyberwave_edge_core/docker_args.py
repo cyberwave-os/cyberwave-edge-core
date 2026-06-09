@@ -117,6 +117,89 @@ def _is_video_device_path(value: str) -> bool:
     return value.strip().startswith("/dev/video")
 
 
+def _is_snd_device_path(value: str) -> bool:
+    """Return True when *value* refers to the ALSA ``/dev/snd`` tree."""
+    normalized = value.strip()
+    return normalized == "/dev/snd" or normalized.startswith("/dev/snd/")
+
+
+# Linux ALSA character devices use major 116. A static ``--device /dev/snd``
+# snapshot does not pick up USB mics plugged in after container start; bind
+# mounting ``/dev/snd`` plus this cgroup rule allows hot-plugged nodes.
+_LINUX_ALSA_DEVICE_CGROUP_RULE = "c 116:* rmw"
+
+
+def _extract_docker_volume_mappings(params: list[str]) -> list[tuple[str, str]]:
+    """Extract ``-v/--volume`` host:container mappings from docker run params."""
+    mappings: list[tuple[str, str]] = []
+    i = 0
+    while i < len(params):
+        param = params[i]
+        raw_mapping: Optional[str] = None
+        if param in {"-v", "--volume"} and i + 1 < len(params):
+            raw_mapping = params[i + 1]
+            i += 1
+        elif param.startswith("--volume="):
+            raw_mapping = param.split("=", 1)[1]
+
+        if raw_mapping:
+            host_path, _, remainder = raw_mapping.partition(":")
+            container_path = remainder.split(":", 1)[0].strip()
+            host_path = host_path.strip()
+            if host_path and container_path:
+                mappings.append((host_path, container_path))
+        i += 1
+    return mappings
+
+
+def _strip_snd_device_mappings(params: list[str]) -> list[str]:
+    """Remove static ``--device`` mappings for ``/dev/snd`` (hot-plug unsafe)."""
+    rewritten: list[str] = []
+    i = 0
+    while i < len(params):
+        param = params[i]
+
+        if param == "--device" and i + 1 < len(params):
+            mapping_value = params[i + 1]
+            host_device, _, container_device = mapping_value.partition(":")
+            if _is_snd_device_path(host_device) or _is_snd_device_path(container_device):
+                i += 2
+                continue
+            rewritten.extend([param, mapping_value])
+            i += 2
+            continue
+
+        if param.startswith("--device="):
+            mapping_value = param.split("=", 1)[1]
+            host_device, _, container_device = mapping_value.partition(":")
+            if _is_snd_device_path(host_device) or _is_snd_device_path(container_device):
+                i += 1
+                continue
+
+        rewritten.append(param)
+        i += 1
+    return rewritten
+
+
+def _docker_params_include_snd_volume(params: list[str]) -> bool:
+    for host_path, container_path in _extract_docker_volume_mappings(params):
+        if _is_snd_device_path(host_path) or _is_snd_device_path(container_path):
+            return True
+    return False
+
+
+def _docker_params_include_alsa_cgroup_rule(params: list[str]) -> bool:
+    for i, param in enumerate(params):
+        raw_rule: Optional[str] = None
+        if param == "--device-cgroup-rule" and i + 1 < len(params):
+            raw_rule = params[i + 1]
+        elif param.startswith("--device-cgroup-rule="):
+            raw_rule = param.split("=", 1)[1]
+        if raw_rule and "116" in raw_rule:
+            return True
+    return False
+
+
 def _strip_video_device_mappings(params: list[str]) -> list[str]:
     """Remove ``--device`` mappings targeting ``/dev/video*`` from docker params."""
     rewritten: list[str] = []

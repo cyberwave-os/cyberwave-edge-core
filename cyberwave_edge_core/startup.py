@@ -707,18 +707,28 @@ def _is_generic_microphone_driver_image(image: str) -> bool:
 
 
 def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> list[str]:
-    """Append ALSA device passthrough for generic-microphone drivers on Linux."""
+    """Append ALSA passthrough for generic-microphone drivers on Linux.
+
+    Uses a live ``/dev/snd`` bind mount plus an ALSA cgroup rule so USB mics
+    plugged in after the container starts remain visible to PortAudio. A
+    static ``--device /dev/snd`` snapshot only reflects devices present at
+    container creation time.
+    """
     if platform.system() != "Linux" or not _is_generic_microphone_driver_image(image):
         return params
 
-    updated = list(params)
-    mappings = _extract_docker_device_mappings(updated)
-    has_snd = any(
-        host.startswith("/dev/snd") or container.startswith("/dev/snd")
-        for host, container in mappings
+    from .docker_args import (
+        _LINUX_ALSA_DEVICE_CGROUP_RULE,
+        _docker_params_include_alsa_cgroup_rule,
+        _docker_params_include_snd_volume,
+        _strip_snd_device_mappings,
     )
-    if not has_snd:
-        updated.extend(["--device", "/dev/snd:/dev/snd"])
+
+    updated = _strip_snd_device_mappings(list(params))
+    if not _docker_params_include_snd_volume(updated):
+        updated.extend(["-v", "/dev/snd:/dev/snd"])
+    if not _docker_params_include_alsa_cgroup_rule(updated):
+        updated.extend(["--device-cgroup-rule", _LINUX_ALSA_DEVICE_CGROUP_RULE])
 
     has_audio_group = False
     idx = 0

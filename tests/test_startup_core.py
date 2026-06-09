@@ -2591,14 +2591,16 @@ class TestEnsureLinuxMicrophoneDockerParams:
             "cyberwave/generic-microphone-driver:latest",
             [],
         )
-        assert "--device" in params
+        assert "-v" in params
         assert "/dev/snd:/dev/snd" in params
+        assert "--device-cgroup-rule" in params
+        assert "116" in params
         assert "--group-add" in params
         assert "audio" in params
 
     def test_noop_on_darwin(self, monkeypatch):
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
-        params = ["--device", "/dev/snd:/dev/snd"]
+        params = ["-v", "/dev/snd:/dev/snd"]
         assert (
             startup._ensure_linux_microphone_docker_params(
                 "cyberwave/generic-microphone-driver:latest",
@@ -2607,9 +2609,27 @@ class TestEnsureLinuxMicrophoneDockerParams:
             == params
         )
 
-    def test_idempotent_when_snd_already_mapped(self, monkeypatch):
+    def test_replaces_static_snd_device_with_bind_mount(self, monkeypatch):
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
-        params = ["--device", "/dev/snd:/dev/snd", "--group-add", "audio"]
+        params = startup._ensure_linux_microphone_docker_params(
+            "cyberwave/generic-microphone-driver:latest",
+            ["--device", "/dev/snd:/dev/snd", "--group-add", "audio"],
+        )
+        assert "--device" not in params
+        assert "/dev/snd:/dev/snd" in params
+        assert "--device-cgroup-rule" in params
+        assert params.count("audio") == 1
+
+    def test_idempotent_when_snd_bind_mount_already_present(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        params = [
+            "-v",
+            "/dev/snd:/dev/snd",
+            "--device-cgroup-rule",
+            "c 116:* rmw",
+            "--group-add",
+            "audio",
+        ]
         assert (
             startup._ensure_linux_microphone_docker_params(
                 "cyberwave/generic-microphone-driver:latest",
