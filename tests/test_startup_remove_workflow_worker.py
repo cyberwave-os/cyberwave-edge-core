@@ -313,6 +313,37 @@ class TestHandleTwinCommandDispatch:
         assert len(thread_calls) == 1
         assert thread_calls[0]["target"] is startup._run_immediate_worker_sync
 
+    def test_request_id_fifo_evicts_oldest_after_maxlen(self, monkeypatch):
+        """Bounded twin-command dedupe must allow replays after FIFO eviction."""
+        thread_calls: list[dict] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args=(), name="", daemon=False):
+                thread_calls.append({"target": target})
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(startup.threading, "Thread", FakeThread)
+
+        maxlen = startup._HANDLED_TWIN_COMMAND_REQUEST_IDS.maxlen
+        assert maxlen == 1024
+
+        first_id = "twin-cmd-evict-me"
+        startup._handle_twin_command_message(_payload(request_id=first_id))
+        assert len(thread_calls) == 1
+
+        for index in range(maxlen):
+            startup._handle_twin_command_message(
+                _payload(request_id=f"twin-cmd-fill-{index:04d}")
+            )
+
+        assert first_id not in startup._HANDLED_TWIN_COMMAND_REQUEST_IDS
+        count_after_fill = len(thread_calls)
+
+        startup._handle_twin_command_message(_payload(request_id=first_id))
+        assert len(thread_calls) == count_after_fill + 1
+
 
 class TestImmediateWorkerSyncChainsLifecycle:
     """``_run_immediate_worker_sync`` chains
