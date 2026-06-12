@@ -322,6 +322,7 @@ def _run_docker_image(
     #      single-camera fallback.
     _macos_camera_stream_url: Optional[str] = None
     _macos_audio_stream_url: Optional[str] = None
+    _macos_audio_playback_url: Optional[str] = None
     if platform.system() == "Darwin":
         _per_twin = s._load_camera_stream_url_for_twin(twin_uuid)
         if _per_twin:
@@ -338,6 +339,18 @@ def _run_docker_image(
             _raw_audio = s.get_runtime_env_var("CYBERWAVE_MACOS_AUDIO_STREAM_URL")
             if _raw_audio and _raw_audio.strip():
                 _macos_audio_stream_url = _raw_audio.strip()
+            else:
+                _macos_audio_stream_url = s._probe_macos_capture_bridge_url()
+
+        _per_twin_playback = s._load_audio_playback_url_for_twin(twin_uuid)
+        if _per_twin_playback:
+            _macos_audio_playback_url = _per_twin_playback
+        else:
+            _raw_playback = s.get_runtime_env_var("CYBERWAVE_MACOS_AUDIO_PLAYBACK_URL")
+            if _raw_playback and _raw_playback.strip():
+                _macos_audio_playback_url = _raw_playback.strip()
+            else:
+                _macos_audio_playback_url = s._probe_macos_playback_bridge_url()
 
     macos_bridge_ok, macos_resolved_devices = _run_macos_device_bridge_commands(
         params=params,
@@ -502,7 +515,53 @@ def _run_docker_image(
                 "Could not send macos_camera_not_configured alert: %s", exc
             )
 
-    if _macos_audio_stream_url:
+    if s._is_generic_speaker_driver_image(image):
+        if _macos_audio_playback_url:
+            container_env["CYBERWAVE_METADATA_AUDIO_DEVICE"] = _macos_audio_playback_url
+            logger.info(
+                "macOS audio playback URL override: %s",
+                _macos_audio_playback_url,
+            )
+            playback_rate, playback_channels = s._load_audio_playback_settings()
+            if (
+                playback_rate is not None
+                and "CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE" not in explicit_params_env
+            ):
+                container_env.setdefault(
+                    "CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE", str(playback_rate)
+                )
+            if (
+                playback_channels is not None
+                and "CYBERWAVE_METADATA_AUDIO_CHANNELS" not in explicit_params_env
+            ):
+                container_env.setdefault(
+                    "CYBERWAVE_METADATA_AUDIO_CHANNELS", str(playback_channels)
+                )
+        elif (
+            platform.system() == "Darwin"
+            and "CYBERWAVE_METADATA_AUDIO_DEVICE" not in explicit_params_env
+        ):
+            logger.warning(
+                "macOS speaker twin %s has no host playback sink URL configured. "
+                "Docker Desktop cannot pass CoreAudio into Linux containers. "
+                "Run: cyberwave edge install --reconfigure-speaker",
+                twin_uuid[:8],
+            )
+            try:
+                s._send_alert_for_twin(
+                    twin_uuid,
+                    "Speaker not configured for macOS",
+                    "This speaker twin has no host PCM playback URL. On macOS, "
+                    "run 'cyberwave edge install --reconfigure-speaker' to start "
+                    "the HTTP playback sink, then restart edge-core.",
+                    "macos_speaker_not_configured",
+                    severity="warning",
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Could not send macos_speaker_not_configured alert: %s", exc
+                )
+    elif _macos_audio_stream_url:
         container_env["CYBERWAVE_METADATA_AUDIO_DEVICE"] = _macos_audio_stream_url
         logger.info(
             "macOS audio stream URL override: %s",

@@ -2584,6 +2584,50 @@ class TestLoadAudioStreamUrlForTwin:
         )
 
 
+class TestLoadAudioPlaybackUrlForTwin:
+    """Tests for _load_audio_playback_url_for_twin() (macOS speaker playback sink)."""
+
+    def test_returns_none_when_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        assert startup._load_audio_playback_url_for_twin("twin-a") is None
+
+    def test_resolves_mapped_twin(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "audio_streams.json").write_text(
+            json.dumps(
+                {
+                    "twin_to_playback_url": {
+                        "twin-a": "http://host.docker.internal:8201",
+                    }
+                }
+            )
+        )
+        assert (
+            startup._load_audio_playback_url_for_twin("twin-a")
+            == "http://host.docker.internal:8201"
+        )
+
+
+class TestProbeMacosBridgeUrl:
+    def test_returns_first_open_port_as_docker_internal_url(self, monkeypatch):
+        open_ports = {8201}
+
+        def _fake_probe(_host: str, port: int, *, timeout: float = 0.35) -> bool:
+            return port in open_ports
+
+        monkeypatch.setattr(startup, "_probe_macos_host_tcp_port", _fake_probe)
+        assert (
+            startup._probe_macos_playback_bridge_url()
+            == "http://host.docker.internal:8201"
+        )
+
+    def test_returns_none_when_no_ports_open(self, monkeypatch):
+        monkeypatch.setattr(
+            startup, "_probe_macos_host_tcp_port", lambda *_args, **_kwargs: False
+        )
+        assert startup._probe_macos_capture_bridge_url() is None
+
+
 class TestEnsureLinuxMicrophoneDockerParams:
     def test_appends_snd_and_audio_group_for_microphone_image(self, monkeypatch):
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
@@ -2595,6 +2639,16 @@ class TestEnsureLinuxMicrophoneDockerParams:
         assert "/dev/snd:/dev/snd" in params
         assert "--device-cgroup-rule" in params
         assert "116" in params
+        assert "--group-add" in params
+        assert "audio" in params
+
+    def test_appends_snd_and_audio_group_for_speaker_image(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        params = startup._ensure_linux_microphone_docker_params(
+            "cyberwave/generic-speaker-driver:latest",
+            [],
+        )
+        assert "/dev/snd:/dev/snd" in params
         assert "--group-add" in params
         assert "audio" in params
 
@@ -2720,6 +2774,52 @@ class TestMacosAudioStreamInjection:
         env_map = base._extract_env_map(docker_run_cmd)
         assert env_map["CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE"] == "32000"
         assert env_map["CYBERWAVE_METADATA_AUDIO_CHANNELS"] == "2"
+
+
+class TestMacosAudioPlaybackInjection:
+    _TWIN_UUID = "f5faa70e-d613-46a1-a09e-f08c45595e48"
+
+    def test_injects_playback_url_from_json(self, tmp_path, monkeypatch):
+        base = TestRunDockerImagePullFallback()
+        base._patch_common(tmp_path, monkeypatch)
+        commands: list[list[str]] = []
+        (tmp_path / "audio_streams.json").write_text(
+            json.dumps(
+                {
+                    "twin_to_playback_url": {
+                        self._TWIN_UUID: "http://host.docker.internal:8201",
+                    },
+                    "playback_sample_rate": 48000,
+                    "channels": 1,
+                }
+            )
+        )
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+
+        def _fake_run(cmd, **kwargs):
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            startup, "_pull_docker_image_with_progress", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave/generic-speaker-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+        assert success is True
+        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+        env_map = base._extract_env_map(docker_run_cmd)
+        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == (
+            "http://host.docker.internal:8201"
+        )
+        assert env_map["CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE"] == "48000"
+        assert env_map["CYBERWAVE_METADATA_AUDIO_CHANNELS"] == "1"
 
 
 class TestLoadCameraStreamUrlForTwin:

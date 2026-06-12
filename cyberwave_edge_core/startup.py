@@ -681,6 +681,17 @@ def _load_audio_stream_url_for_twin(twin_uuid: Optional[str]) -> Optional[str]:
     return None
 
 
+def _load_audio_playback_url_for_twin(twin_uuid: Optional[str]) -> Optional[str]:
+    """Return the host PCM playback sink URL assigned to *twin_uuid* on macOS, if any."""
+    if not twin_uuid:
+        return None
+    mapping = _load_audio_streams_json().get("twin_to_playback_url") or {}
+    url = mapping.get(str(twin_uuid))
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
+
+
 def _load_audio_stream_capture_settings() -> tuple[Optional[int], Optional[int]]:
     """Return ``(capture_sample_rate, channels)`` from ``audio_streams.json``, if set."""
     data = _load_audio_streams_json()
@@ -701,20 +712,97 @@ def _load_audio_stream_capture_settings() -> tuple[Optional[int], Optional[int]]
     return sample_rate, channels
 
 
+_MACOS_DOCKER_BRIDGE_HOST = "host.docker.internal"
+_MACOS_CAPTURE_BRIDGE_PORT_START = 8101
+_MACOS_CAPTURE_BRIDGE_PORT_END = 8110
+_MACOS_PLAYBACK_BRIDGE_PORT_START = 8201
+_MACOS_PLAYBACK_BRIDGE_PORT_END = 8210
+
+
+def _probe_macos_host_tcp_port(host: str, port: int, *, timeout: float = 0.35) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _probe_macos_bridge_url(
+    *,
+    port_start: int,
+    port_end: int,
+    docker_host: str = _MACOS_DOCKER_BRIDGE_HOST,
+    probe_host: str = "127.0.0.1",
+) -> Optional[str]:
+    """Return an HTTP bridge URL when a host listener is reachable on localhost."""
+    for port in range(port_start, port_end + 1):
+        if _probe_macos_host_tcp_port(probe_host, port):
+            return f"http://{docker_host}:{port}"
+    return None
+
+
+def _probe_macos_capture_bridge_url() -> Optional[str]:
+    return _probe_macos_bridge_url(
+        port_start=_MACOS_CAPTURE_BRIDGE_PORT_START,
+        port_end=_MACOS_CAPTURE_BRIDGE_PORT_END,
+    )
+
+
+def _probe_macos_playback_bridge_url() -> Optional[str]:
+    return _probe_macos_bridge_url(
+        port_start=_MACOS_PLAYBACK_BRIDGE_PORT_START,
+        port_end=_MACOS_PLAYBACK_BRIDGE_PORT_END,
+    )
+
+
+def _load_audio_playback_settings() -> tuple[Optional[int], Optional[int]]:
+    """Return ``(playback_sample_rate, channels)`` from ``audio_streams.json``, if set."""
+    data = _load_audio_streams_json()
+    sample_rate: Optional[int] = None
+    channels: Optional[int] = None
+    for key in ("playback_sample_rate", "capture_sample_rate"):
+        if sample_rate is None and data.get(key) is not None:
+            try:
+                sample_rate = int(data[key])
+            except (TypeError, ValueError):
+                sample_rate = None
+    try:
+        if data.get("channels") is not None:
+            parsed = int(data["channels"])
+            if parsed in {1, 2}:
+                channels = parsed
+    except (TypeError, ValueError):
+        channels = None
+    return sample_rate, channels
+
+
 def _is_generic_microphone_driver_image(image: str) -> bool:
     lowered = image.lower()
     return "generic-microphone" in lowered or "microphone-driver" in lowered
 
 
-def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> list[str]:
-    """Append ALSA passthrough for generic-microphone drivers on Linux.
+def _is_generic_speaker_driver_image(image: str) -> bool:
+    lowered = image.lower()
+    return "generic-speaker" in lowered or "speaker-driver" in lowered
 
-    Uses a live ``/dev/snd`` bind mount plus an ALSA cgroup rule so USB mics
-    plugged in after the container starts remain visible to PortAudio. A
-    static ``--device /dev/snd`` snapshot only reflects devices present at
+
+def _is_linux_alsa_audio_driver_image(image: str) -> bool:
+    return _is_generic_microphone_driver_image(image) or _is_generic_speaker_driver_image(
+        image
+    )
+
+
+def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> list[str]:
+    """Append ALSA passthrough for generic audio drivers on Linux.
+
+    Uses a live ``/dev/snd`` bind mount plus an ALSA cgroup rule so USB audio
+    devices plugged in after the container starts remain visible to PortAudio.
+    A static ``--device /dev/snd`` snapshot only reflects devices present at
     container creation time.
     """
-    if platform.system() != "Linux" or not _is_generic_microphone_driver_image(image):
+    if platform.system() != "Linux" or not _is_linux_alsa_audio_driver_image(image):
         return params
 
     from .docker_args import (
