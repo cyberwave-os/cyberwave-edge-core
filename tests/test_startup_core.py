@@ -2992,6 +2992,135 @@ class TestPerformEdgeCoreRestart:
         assert summary["drivers_started"] == 1
 
 
+class TestWorkerStartupModelGate:
+    """ensure_models failure → worker not started, error-severity alerts."""
+
+    @staticmethod
+    def _capture_alerts(monkeypatch) -> list[dict[str, object]]:
+        captured: list[dict[str, object]] = []
+
+        def _capture(twin_uuid, title, description, alert_type, severity="warning"):
+            captured.append(
+                {
+                    "twin_uuid": twin_uuid,
+                    "title": title,
+                    "description": description,
+                    "alert_type": alert_type,
+                    "severity": severity,
+                }
+            )
+
+        monkeypatch.setattr(startup, "_send_alert_for_twin", _capture)
+        return captured
+
+    @staticmethod
+    def _patch_runtime(monkeypatch, tmp_path: Path, *, failures: dict[str, str]) -> dict[str, int]:
+        from cyberwave_edge_core import docker_helpers as dh_mod
+        from cyberwave_edge_core import model_manager as mm_mod
+        from cyberwave_edge_core import worker_manager as wm_mod
+
+        (tmp_path / "workers").mkdir()
+        (tmp_path / "workers" / "wf_demo.py").write_text("# stub\n")
+
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "_wait_for_driver_readiness", lambda twin_uuids: {})
+        monkeypatch.setattr(startup, "resolve_config_owner_uid_gid", lambda: (1000, 1000))
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda key, default=None: default)
+        monkeypatch.setattr(startup, "load_worker_resource_limits", lambda: {})
+        monkeypatch.setattr(dh_mod, "docker_container_status", lambda _n: "none")
+
+        class _StubManager:
+            @staticmethod
+            def scan_worker_model_ids(_dir):
+                return ["yoloe-26n-pf"]
+
+            def __init__(self, *args, **kwargs):
+                self.last_ensure_failures: dict[str, str] = {}
+
+            def ensure_models(self, _ids):
+                self.last_ensure_failures = dict(failures)
+                return {}
+
+        monkeypatch.setattr(mm_mod, "ModelManager", _StubManager)
+
+        spy = {"init": 0, "start": 0}
+
+        class _SpyWorkerManager:
+            def __init__(self, *args, **kwargs):
+                spy["init"] += 1
+
+            def start(self):
+                spy["start"] += 1
+
+        monkeypatch.setattr(wm_mod, "WorkerManager", _SpyWorkerManager)
+        monkeypatch.setattr(wm_mod, "resolve_worker_image", lambda: "cw/worker:test")
+        return spy
+
+    def test_failure_gates_worker_and_fires_error_alert(self, tmp_path, monkeypatch):
+        spy = self._patch_runtime(
+            monkeypatch, tmp_path, failures={"yoloe-26n-pf": "download failed"}
+        )
+        alerts = self._capture_alerts(monkeypatch)
+
+        startup._start_worker_after_drivers(
+            token="tok",
+            environment_uuid="env-abc-def-12345678",
+            twin_uuids=["twin-aaa", "twin-bbb"],
+        )
+
+        assert spy == {"init": 0, "start": 0}
+        assert len(alerts) == 2
+        for alert in alerts:
+            assert alert["alert_type"] == "model_download_failure"
+            assert alert["severity"] == "error"
+            # The pre-fix alert copy ("the worker will start without this
+            # model; inference steps … will be skipped") was what operators
+            # relied on to dismiss the alert — pin its absence.
+            assert "will start without" not in str(alert["description"])
+            assert "will not be started" in str(alert["description"])
+
+    def test_no_failure_starts_worker(self, tmp_path, monkeypatch):
+        spy = self._patch_runtime(monkeypatch, tmp_path, failures={})
+        alerts = self._capture_alerts(monkeypatch)
+
+        startup._start_worker_after_drivers(
+            token="tok",
+            environment_uuid="env-abc-def-12345678",
+            twin_uuids=["twin-aaa"],
+        )
+
+        assert spy == {"init": 1, "start": 1}
+        assert alerts == []
+
+    def test_worker_start_failure_alert_is_error_severity(self, monkeypatch):
+        alerts = self._capture_alerts(monkeypatch)
+        startup._send_worker_start_failure_alerts(
+            twin_uuids=["twin-aaa"], error="image pull failed: 503"
+        )
+
+        assert len(alerts) == 1
+        assert alerts[0]["severity"] == "error"
+        assert alerts[0]["alert_type"] == "worker_start_failure"
+        assert "image pull failed: 503" in str(alerts[0]["description"])
+
+    def test_alert_fan_out_isolates_per_twin_send_failures(self, monkeypatch):
+        attempted: list[str] = []
+
+        def _flaky(twin_uuid, *_a, **_kw):
+            attempted.append(twin_uuid)
+            if twin_uuid == "twin-aaa":
+                raise RuntimeError("transient blip")
+
+        monkeypatch.setattr(startup, "_send_alert_for_twin", _flaky)
+
+        startup._send_model_failure_alerts(
+            twin_uuids=["twin-aaa", "twin-bbb", "twin-ccc"],
+            failures={"yoloe-26n-pf": "download failed"},
+        )
+
+        assert attempted == ["twin-aaa", "twin-bbb", "twin-ccc"]
+
+
 # ===========================================================================
 # Camera config source selection (edge.json vs cameras.json)
 # ===========================================================================

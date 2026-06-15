@@ -677,8 +677,8 @@ Edge Core alerts and behavior:
 
 - `driver_start_failure`: raised if a driver container cannot reach a stable running state.
 - `driver_restart_loop`: raised when a driver restarts more than the configured threshold (default 4 restarts within 60 seconds). The container is stopped and marked as flapping.
-- `model_download_failure`: raised when a required ML model cannot be downloaded. The worker starts without the model; inference steps that depend on it will be skipped.
-- `worker_start_failure`: raised when the edge ML worker container cannot be started. Workflows will not run until the issue is resolved.
+- `model_download_failure` (`error`): raised when a required ML model cannot be downloaded. The worker container is **not** started — any workflow that depends on this model is held off rather than allowed to run with empty inference results. Models that the worker container can resolve on its own (e.g. an ultralytics auto-download on a frozen PyInstaller binary) are deferred via `_RuntimeManagedDeferred` and never trip this alert.
+- `worker_start_failure` (`error`): raised when the edge ML worker container cannot be started. No workflow on this edge will run until the issue is resolved.
 
 Optional environment variables to tune restart behavior:
 

@@ -3152,6 +3152,7 @@ def _start_worker_after_drivers(
         container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
         worker_already_running = docker_container_status(container_name) == "running"
 
+        model_ensure_failures: dict[str, str] = {}
         if workers_dir.is_dir():
             model_ids = ModelManager.scan_worker_model_ids(workers_dir)
             if model_ids and not worker_already_running:
@@ -3168,9 +3169,10 @@ def _start_worker_after_drivers(
                     owner_uid_gid=resolve_config_owner_uid_gid(),
                 )
                 mm.ensure_models(model_ids)
+                model_ensure_failures = dict(mm.last_ensure_failures)
                 _send_model_failure_alerts(
                     twin_uuids=twin_uuids,
-                    failures=mm.last_ensure_failures,
+                    failures=model_ensure_failures,
                 )
             elif model_ids and worker_already_running:
                 logger.debug(
@@ -3178,6 +3180,17 @@ def _start_worker_after_drivers(
                     "(worker resolves models on first inference — CYB-2182).",
                     container_name,
                 )
+
+        # Refuse to start the worker when ensure_models reports genuine
+        # failures (runtime-deferred downloads are pruned upstream).
+        if model_ensure_failures:
+            logger.error(
+                "Refusing to start worker for env %s: %d model(s) failed: %s",
+                environment_uuid,
+                len(model_ensure_failures),
+                ", ".join(sorted(model_ensure_failures)),
+            )
+            return
 
         worker_manager = WorkerManager(
             config_dir=CONFIG_DIR,
@@ -3221,10 +3234,10 @@ def _send_model_failure_alerts(
     twin_uuids: list[str],
     failures: dict[str, str],
 ) -> None:
-    """Send a technical alert for each model that failed to download.
+    """Send an ``error``-severity alert per (model, twin) on download failure.
 
-    Alerts are sent to every twin associated with the current edge so
-    that operators can see the failure in each twin's alert feed.
+    Severity is ``error`` because the worker container is not started when
+    ensure_models reports any failure.
     """
     if not failures:
         return
@@ -3233,15 +3246,18 @@ def _send_model_failure_alerts(
             try:
                 _send_alert_for_twin(
                     twin_uuid,
-                    f"Model not available: {model_id}",
+                    f"Model could not be loaded: {model_id}",
                     (
                         f"Failed to download model '{model_id}' required by an "
-                        f"active workflow. The worker will start without this "
-                        f"model; inference steps that depend on it will be "
-                        f"skipped. Error: {error_msg}"
+                        f"active workflow. The worker container will not be "
+                        f"started until this is resolved — any workflow that "
+                        f"depends on this model is currently NOT running, "
+                        f"regardless of whether downstream alerts continue to "
+                        f"surface for other twins on this edge. "
+                        f"Error: {error_msg}"
                     ),
                     "model_download_failure",
-                    severity="warning",
+                    severity="error",
                 )
             except Exception as alert_exc:
                 logger.debug(
@@ -3257,7 +3273,7 @@ def _send_worker_start_failure_alerts(
     twin_uuids: list[str],
     error: str = "",
 ) -> None:
-    """Send a technical alert when the worker container fails to start."""
+    """Send an ``error``-severity alert when the worker container fails to start."""
     detail = f" Error: {error}" if error else ""
     for twin_uuid in twin_uuids:
         try:
@@ -3266,10 +3282,11 @@ def _send_worker_start_failure_alerts(
                 "Worker container failed to start",
                 (
                     f"The edge ML worker container could not be started. "
-                    f"Workflows will not run until this is resolved.{detail}"
+                    f"No workflow on this edge will run until this is "
+                    f"resolved.{detail}"
                 ),
                 "worker_start_failure",
-                severity="warning",
+                severity="error",
             )
         except Exception as alert_exc:
             logger.debug(
