@@ -36,12 +36,19 @@ def _resolve_log_level() -> int:
 # Configure logging so info/warning/error messages appear in journald / log files.
 # Include timestamps so macOS LaunchAgent log files are readable; on Linux
 # journalctl adds its own but the ISO prefix is still harmless.
+#
+# Timestamps are emitted in UTC (``time.gmtime``) so that edge-core's own log
+# lines and the driver-container lines forwarded into the same stream share a
+# single clock. Driver containers default to UTC (no host timezone is mounted),
+# so without this the host-local edge-core lines drifted an hour ahead of the
+# forwarded container lines in ``cyberwave edge logs``.
 logging.basicConfig(
     level=_resolve_log_level(),
     format="%(asctime)s.%(msecs)03d [%(levelname)s] [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S UTC",
     stream=sys.stderr,
 )
+logging.Formatter.converter = time.gmtime
 
 logger = logging.getLogger(__name__)
 
