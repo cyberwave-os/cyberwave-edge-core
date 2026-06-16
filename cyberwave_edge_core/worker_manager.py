@@ -57,6 +57,59 @@ _MUTABLE_TAG_BASENAMES = frozenset(
 
 _DEFAULT_STARTUP_PROBE_SECONDS = 30
 
+# Coordinates concurrent worker-image pulls so a second ``WorkerManager.start()``
+# waits for an in-flight pull instead of failing immediately with
+# ``unavailable and no local copy`` and spamming ``worker_start_failure``.
+_WORKER_IMAGE_PULL_LOCK = threading.Lock()
+_WORKER_IMAGE_PULL_DONE: dict[str, threading.Event] = {}
+_WORKER_IMAGE_PULL_RESULTS: dict[str, bool] = {}
+
+
+def is_worker_image_pull_in_progress(image: str | None = None) -> bool:
+    """Return True when a worker image pull is currently in flight."""
+    with _WORKER_IMAGE_PULL_LOCK:
+        if image is None:
+            return bool(_WORKER_IMAGE_PULL_DONE)
+        return image in _WORKER_IMAGE_PULL_DONE
+
+
+def _begin_worker_image_pull(image: str) -> bool:
+    """Register *image* as being pulled. Returns True if this caller owns the pull."""
+    with _WORKER_IMAGE_PULL_LOCK:
+        if image in _WORKER_IMAGE_PULL_DONE:
+            return False
+        _WORKER_IMAGE_PULL_DONE[image] = threading.Event()
+        return True
+
+
+def _finish_worker_image_pull(image: str, result: bool) -> None:
+    """Publish *result* to any waiters and clear the in-flight slot."""
+    with _WORKER_IMAGE_PULL_LOCK:
+        event = _WORKER_IMAGE_PULL_DONE.pop(image, None)
+        _WORKER_IMAGE_PULL_RESULTS[image] = result
+    if event is not None:
+        event.set()
+
+
+def _wait_for_worker_image_pull(image: str, *, timeout: float) -> bool | None:
+    """Wait for another caller's pull of *image* to finish.
+
+    Returns the recorded pull result, or ``None`` when no pull was in flight.
+    """
+    with _WORKER_IMAGE_PULL_LOCK:
+        event = _WORKER_IMAGE_PULL_DONE.get(image)
+    if event is None:
+        return _WORKER_IMAGE_PULL_RESULTS.get(image)
+    finished = event.wait(timeout=max(1.0, timeout))
+    if not finished:
+        logger.warning(
+            "Timed out waiting %.0fs for in-progress worker image pull of %s",
+            timeout,
+            image,
+        )
+        return None
+    return _WORKER_IMAGE_PULL_RESULTS.get(image)
+
 
 def _image_tag_is_mutable(image: str) -> bool:
     """Return True for image references whose tag rolls forward over time.
@@ -782,18 +835,10 @@ class WorkerManager:
             logger.error("Timed out pulling worker image %s after %ds", image, timeout)
             return False
 
-    def _pull_worker_image_with_progress(self, image: str, timeout: int = 600) -> bool:
-        """Pull *image* with progress reporting to all linked twins.
-
-        Creates a ``worker_starting`` alert on each linked twin for the
-        duration of the pull so the workbench can display a progress bar
-        (byte counts, percent) in analogy with the driver image pull.
-
-        Falls back to the plain subprocess pull
-        (:meth:`_ensure_image_pulled`) when no twin UUIDs are attached to
-        this manager.  Fallback semantics for a failed pull with a local
-        copy present are identical to those of :meth:`_ensure_image_pulled`.
-        """
+    def _pull_worker_image_with_progress_once(
+        self, image: str, timeout: int = 600
+    ) -> bool:
+        """Single attempt to pull *image* with progress reporting."""
         if not self._twin_uuids:
             return self._ensure_image_pulled(image, timeout=timeout)
 
@@ -882,9 +927,70 @@ class WorkerManager:
                 ctx.mark_failed_and_resolve(str(exc)[:500])
             return False
 
+    def _pull_worker_image_with_progress(self, image: str, timeout: int = 600) -> bool:
+        """Pull *image* with progress reporting to all linked twins.
+
+        Creates a ``worker_starting`` alert on each linked twin for the
+        duration of the pull so the workbench can display a progress bar
+        (byte counts, percent) in analogy with the driver image pull.
+
+        Concurrent callers for the same image wait for the in-flight pull
+        instead of racing a second ``docker pull`` and tripping a premature
+        ``worker_start_failure`` alert.
+
+        Falls back to the plain subprocess pull
+        (:meth:`_ensure_image_pulled`) when no twin UUIDs are attached to
+        this manager.  Fallback semantics for a failed pull with a local
+        copy present are identical to those of :meth:`_ensure_image_pulled`.
+        """
+        if not _begin_worker_image_pull(image):
+            waited = _wait_for_worker_image_pull(
+                image, timeout=float(timeout) + 30.0
+            )
+            if waited is True or _docker_image_present(image):
+                return True
+            if waited is False:
+                return False
+            if not _begin_worker_image_pull(image):
+                return _docker_image_present(image)
+
+        max_attempts = max(
+            1,
+            int(os.getenv("CYBERWAVE_WORKER_IMAGE_PULL_RETRIES", "3")),
+        )
+        pull_succeeded = False
+        try:
+            for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    backoff = min(30.0, 2.0 ** (attempt - 1))
+                    logger.info(
+                        "Retrying worker image pull for %s (attempt %d/%d, backoff=%.1fs)",
+                        image,
+                        attempt,
+                        max_attempts,
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                if self._pull_worker_image_with_progress_once(image, timeout=timeout):
+                    pull_succeeded = True
+                    return True
+            return False
+        finally:
+            _finish_worker_image_pull(
+                image,
+                pull_succeeded or _docker_image_present(image),
+            )
+
     def _send_startup_failure_alert(self, detail: str = "") -> None:
         """Best-effort alert to all linked twins when worker startup fails."""
         if not self._twin_uuids:
+            return
+        if is_worker_image_pull_in_progress():
+            logger.info(
+                "Suppressing worker_start_failure alert while worker image pull "
+                "is in progress: %s",
+                detail or "(no detail)",
+            )
             return
         try:
             from .startup import _send_worker_start_failure_alerts  # noqa: PLC0415

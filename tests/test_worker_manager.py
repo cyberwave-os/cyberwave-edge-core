@@ -11,6 +11,8 @@ Covers:
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1871,3 +1873,71 @@ class TestEnsureImagePulledForceRePullsMutableTags:
 
         monkeypatch.setattr(wm_module.subprocess, "run", raise_timeout)
         assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is False
+
+
+class TestWorkerStartupFailureAlertWiring:
+    def test_send_startup_failure_alert_skips_while_image_pull_in_progress(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_manager._twin_uuids = ["twin-uuid-1"]
+        alerts: list[str] = []
+
+        def _capture(**kwargs: object) -> None:
+            alerts.append(str(kwargs.get("error", "")))
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.startup._send_worker_start_failure_alerts",
+            lambda **kwargs: _capture(**kwargs),
+        )
+        monkeypatch.setattr(
+            wm_module,
+            "is_worker_image_pull_in_progress",
+            lambda image=None: True,
+        )
+
+        worker_manager._send_startup_failure_alert("image unavailable and no local copy")
+        assert alerts == []
+
+    def test_pull_worker_image_with_progress_waits_for_in_flight_pull(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker_manager._twin_uuids = ["twin-uuid-1"]
+        calls: list[str] = []
+
+        def _fake_once(self: WorkerManager, image: str, timeout: int = 600) -> bool:
+            calls.append(image)
+            time.sleep(0.05)
+            return True
+
+        monkeypatch.setattr(
+            WorkerManager,
+            "_pull_worker_image_with_progress_once",
+            _fake_once,
+        )
+
+        results: list[bool] = []
+
+        def _owner() -> None:
+            results.append(
+                worker_manager._pull_worker_image_with_progress(
+                    "cyberwaveos/edge-ml-worker:dev"
+                )
+            )
+
+        def _waiter() -> None:
+            results.append(
+                worker_manager._pull_worker_image_with_progress(
+                    "cyberwaveos/edge-ml-worker:dev"
+                )
+            )
+
+        owner = threading.Thread(target=_owner)
+        waiter = threading.Thread(target=_waiter)
+        owner.start()
+        time.sleep(0.01)
+        waiter.start()
+        owner.join(timeout=5)
+        waiter.join(timeout=5)
+
+        assert results == [True, True]
+        assert calls == ["cyberwaveos/edge-ml-worker:dev"]
