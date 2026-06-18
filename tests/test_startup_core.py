@@ -15,12 +15,10 @@ import itertools
 import json
 import logging
 import os
-import stat
 import subprocess
 import threading
 import uuid as _uuid_module
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -1211,9 +1209,9 @@ class TestDriverStartingAlertLifecycle:
         """Orphan ``driver_starting`` alerts from a crashed boot must not
         survive the next ``fetch_and_run_twin_drivers`` call."""
         from tests.test_multi_camera_orchestration import (
+            TWIN_A,
             FakeAsset,
             FakeTwin,
-            TWIN_A,
             _stub_client,
         )
 
@@ -2579,8 +2577,7 @@ class TestLoadAudioStreamUrlForTwin:
             )
         )
         assert (
-            startup._load_audio_stream_url_for_twin("twin-a")
-            == "http://host.docker.internal:8101"
+            startup._load_audio_stream_url_for_twin("twin-a") == "http://host.docker.internal:8101"
         )
 
 
@@ -2616,15 +2613,10 @@ class TestProbeMacosBridgeUrl:
             return port in open_ports
 
         monkeypatch.setattr(startup, "_probe_macos_host_tcp_port", _fake_probe)
-        assert (
-            startup._probe_macos_playback_bridge_url()
-            == "http://host.docker.internal:8201"
-        )
+        assert startup._probe_macos_playback_bridge_url() == "http://host.docker.internal:8201"
 
     def test_returns_none_when_no_ports_open(self, monkeypatch):
-        monkeypatch.setattr(
-            startup, "_probe_macos_host_tcp_port", lambda *_args, **_kwargs: False
-        )
+        monkeypatch.setattr(startup, "_probe_macos_host_tcp_port", lambda *_args, **_kwargs: False)
         assert startup._probe_macos_capture_bridge_url() is None
 
 
@@ -2716,9 +2708,7 @@ class TestMacosAudioStreamInjection:
             commands.append(list(cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(
-            startup, "_pull_docker_image_with_progress", lambda *a, **kw: None
-        )
+        monkeypatch.setattr(startup, "_pull_docker_image_with_progress", lambda *a, **kw: None)
         monkeypatch.setattr(startup.subprocess, "run", _fake_run)
 
         success = startup._run_docker_image(
@@ -2730,13 +2720,9 @@ class TestMacosAudioStreamInjection:
         assert success is True
         docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
         env_map = base._extract_env_map(docker_run_cmd)
-        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == (
-            "http://host.docker.internal:8101"
-        )
+        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == ("http://host.docker.internal:8101")
 
-    def test_injects_capture_settings_from_audio_streams_json(
-        self, tmp_path, monkeypatch
-    ):
+    def test_injects_capture_settings_from_audio_streams_json(self, tmp_path, monkeypatch):
         base = TestRunDockerImagePullFallback()
         base._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
@@ -2758,9 +2744,7 @@ class TestMacosAudioStreamInjection:
             commands.append(list(cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(
-            startup, "_pull_docker_image_with_progress", lambda *a, **kw: None
-        )
+        monkeypatch.setattr(startup, "_pull_docker_image_with_progress", lambda *a, **kw: None)
         monkeypatch.setattr(startup.subprocess, "run", _fake_run)
 
         success = startup._run_docker_image(
@@ -2801,9 +2785,7 @@ class TestMacosAudioPlaybackInjection:
             commands.append(list(cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(
-            startup, "_pull_docker_image_with_progress", lambda *a, **kw: None
-        )
+        monkeypatch.setattr(startup, "_pull_docker_image_with_progress", lambda *a, **kw: None)
         monkeypatch.setattr(startup.subprocess, "run", _fake_run)
 
         success = startup._run_docker_image(
@@ -2815,9 +2797,7 @@ class TestMacosAudioPlaybackInjection:
         assert success is True
         docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
         env_map = base._extract_env_map(docker_run_cmd)
-        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == (
-            "http://host.docker.internal:8201"
-        )
+        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == ("http://host.docker.internal:8201")
         assert env_map["CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE"] == "48000"
         assert env_map["CYBERWAVE_METADATA_AUDIO_CHANNELS"] == "1"
 
@@ -3156,9 +3136,7 @@ class TestReadCamerasConfig:
             "devices": ["/dev/video1"],
         }
 
-    def test_falls_back_to_cameras_json_when_edge_json_missing_cameras(
-        self, tmp_path, monkeypatch
-    ):
+    def test_falls_back_to_cameras_json_when_edge_json_missing_cameras(self, tmp_path, monkeypatch):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
 

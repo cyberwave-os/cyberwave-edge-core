@@ -101,6 +101,7 @@ warn_unused_configs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
 markers = [
     "docker: requires a reachable Docker daemon; auto-skipped when Docker is unavailable.",
 ]
