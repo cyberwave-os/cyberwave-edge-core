@@ -598,33 +598,74 @@ class TestReconcileDriverRestartFailures:
 class TestRunDockerImagePullFallback:
     _TWIN_UUID = "99999999-9999-9999-9999-999999999999"
 
-    def _patch_common(self, tmp_path, monkeypatch):
+    def _patch_common(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        commands: list[list[str]] | None = None,
+        mock_image_exists: bool = True,
+    ):
+        from tests.driver_subprocess_fakes import fake_docker_start_popen
+
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup.shutil, "which", lambda name: "/usr/bin/docker")
         monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda *args, **kwargs: None)
+
+        def _fast_probe_env(name: str, default: object = None) -> object:
+            if name in {
+                "CYBERWAVE_DRIVER_STARTUP_PROBE_SECONDS",
+                "CYBERWAVE_DRIVER_CREATE_TIMEOUT_SECONDS",
+            }:
+                return "1"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _fast_probe_env)
         monkeypatch.setattr(startup.time, "sleep", lambda _: None)
+        monkeypatch.setattr("cyberwave_edge_core.docker_launch.time.sleep", lambda _: None)
         monkeypatch.setattr(
             startup,
             "_inspect_driver_container",
             lambda _name: {"State": {"Status": "running", "Error": ""}},
         )
         monkeypatch.setattr(startup, "_stream_container_logs", lambda *args, **kwargs: None)
+        monkeypatch.setattr(startup, "_pull_docker_image_with_progress", lambda *a, **kw: None)
+        # Pull-fallback tests need the real _docker_image_exists_locally so it
+        # issues a ``docker image inspect`` they can assert on; others mock it.
+        if mock_image_exists:
+            monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _img: True)
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_inspect",
+            lambda _name: {"State": {"Status": "running", "Error": ""}},
+        )
+        # Pre-cleanup removal is covered by test_docker_launch; here it would
+        # otherwise see the always-"running" docker_inspect mock and conclude
+        # the container can't be removed. No-op it so these tests stay focused.
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_launch.remove_existing_container",
+            lambda *a, **kw: True,
+        )
+        if commands is not None:
+            monkeypatch.setattr(
+                startup.subprocess,
+                "Popen",
+                fake_docker_start_popen(commands),
+            )
 
     @staticmethod
-    def _extract_env_map(docker_run_cmd: list[str]) -> dict[str, str]:
+    def _extract_env_map(docker_create_cmd: list[str]) -> dict[str, str]:
         env_map: dict[str, str] = {}
-        for idx, arg in enumerate(docker_run_cmd):
-            if arg != "-e" or idx + 1 >= len(docker_run_cmd):
+        for idx, arg in enumerate(docker_create_cmd):
+            if arg != "-e" or idx + 1 >= len(docker_create_cmd):
                 continue
-            key, sep, value = docker_run_cmd[idx + 1].partition("=")
+            key, sep, value = docker_create_cmd[idx + 1].partition("=")
             if sep:
                 env_map[key] = value
         return env_map
 
     def test_uses_local_image_when_pull_fails(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands, mock_image_exists=False)
         pull_calls: list[str] = []
 
         def _fake_pull(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -654,11 +695,11 @@ class TestRunDockerImagePullFallback:
         assert success is True
         assert pull_calls == ["pull"]
         assert any(cmd[:3] == ["docker", "image", "inspect"] for cmd in commands)
-        assert any(cmd[:2] == ["docker", "run"] for cmd in commands)
+        assert any(cmd[:2] == ["docker", "create"] for cmd in commands)
 
     def test_fails_when_pull_fails_and_image_missing_locally(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands, mock_image_exists=False)
         pull_calls: list[str] = []
 
         def _fake_pull(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -691,11 +732,11 @@ class TestRunDockerImagePullFallback:
 
         assert success is False
         assert pull_calls == ["pull"]
-        assert not any(cmd[:2] == ["docker", "run"] for cmd in commands)
+        assert not any(cmd[:2] == ["docker", "create"] for cmd in commands)
 
     def test_forwards_process_cyberwave_env_vars_to_driver_container(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setenv("CYBERWAVE_GO2_IP_ADDR", " 192.168.0.10 ")
         monkeypatch.setenv("CYBERWAVE_EMPTY", "   ")
         monkeypatch.setenv("GO2_IP_ADDR", "192.168.0.10")
@@ -717,15 +758,15 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_GO2_IP_ADDR"] == "192.168.0.10"
         assert "CYBERWAVE_EMPTY" not in env_map
         assert "GO2_IP_ADDR" not in env_map
 
     def test_process_env_does_not_override_credentials_env_values(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(
             startup,
             "load_credentials_envs",
@@ -755,15 +796,15 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_GO2_IP_ADDR"] == "10.0.0.2"
         assert env_map["CYBERWAVE_REGION"] == "eu-west-1"
         assert env_map["CYBERWAVE_EXTRA"] == "enabled"
 
     def test_runs_macos_bridge_command_before_docker_run(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
@@ -793,17 +834,17 @@ class TestRunDockerImagePullFallback:
         bridge_cmd = next(cmd for cmd in commands if cmd and cmd[0] == "/bin/echo")
         assert "bridge" in bridge_cmd
         assert "/dev/video0" in bridge_cmd
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        assert "--network" not in docker_run_cmd
-        assert "host" not in docker_run_cmd
-        assert "--add-host" in docker_run_cmd
-        assert "host.docker.internal:host-gateway" in docker_run_cmd
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        assert "--network" not in docker_create_cmd
+        assert "host" not in docker_create_cmd
+        assert "--add-host" in docker_create_cmd
+        assert "host.docker.internal:host-gateway" in docker_create_cmd
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_EDGE_HOST_PLATFORM"] == "darwin"
 
     def test_macos_driver_container_rewrites_localhost_base_url(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
@@ -828,13 +869,13 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_BASE_URL"] == "http://host.docker.internal:8000"
 
     def test_macos_driver_container_rewrites_localhost_mqtt_host(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
@@ -859,13 +900,13 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_MQTT_HOST"] == "host.docker.internal"
 
     def test_macos_bridge_command_failure_aborts_driver_start(self, tmp_path, monkeypatch):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
@@ -893,13 +934,13 @@ class TestRunDockerImagePullFallback:
 
         assert success is False
         assert any(cmd and cmd[0] == "/bin/false" for cmd in commands)
-        assert not any(cmd[:2] == ["docker", "run"] for cmd in commands)
+        assert not any(cmd[:2] == ["docker", "create"] for cmd in commands)
 
     def test_macos_bridge_resolved_source_sets_video_env_and_strips_video_device(
         self, tmp_path, monkeypatch
     ):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
@@ -933,10 +974,10 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        assert "--device" not in docker_run_cmd
-        assert "--device=/dev/video0:/dev/video0" not in docker_run_cmd
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        assert "--device" not in docker_create_cmd
+        assert "--device=/dev/video0:/dev/video0" not in docker_create_cmd
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_METADATA_VIDEO_DEVICE"] == "rtsp://host.docker.internal:8554/cam0"
         assert json.loads(env_map["CYBERWAVE_EDGE_VIDEO_DEVICE_MAP"]) == {
             "/dev/video0": "rtsp://host.docker.internal:8554/cam0"
@@ -945,8 +986,8 @@ class TestRunDockerImagePullFallback:
     def test_macos_does_not_override_explicit_video_device_env_in_params(
         self, tmp_path, monkeypatch
     ):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
@@ -983,15 +1024,15 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_METADATA_VIDEO_DEVICE"] == "/dev/video7"
 
     def test_macos_candidate_mapping_sets_video_env_without_device_params(
         self, tmp_path, monkeypatch
     ):
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
 
@@ -1024,8 +1065,8 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
         assert (
             env_map["CYBERWAVE_METADATA_VIDEO_DEVICE"]
             == "rtsp://host.docker.internal:8554/cam-main"
@@ -1046,8 +1087,8 @@ class TestRunDockerImagePullFallback:
 
     def test_usbip_active_skips_bridge_for_video_devices(self, tmp_path, monkeypatch):
         """When USB/IP is active, video device mappings bypass the bridge command."""
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: True)
 
@@ -1085,20 +1126,21 @@ class TestRunDockerImagePullFallback:
         assert bridge_calls == [], (
             "bridge command must NOT run for video devices when USB/IP is active"
         )
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        assert "--pid=host" in docker_run_cmd
-        env_map = self._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        assert "--pid=host" in docker_create_cmd
+        env_map = self._extract_env_map(docker_create_cmd)
         assert env_map.get("CYBERWAVE_USBIP_ENABLED") == "1"
         assert env_map.get("CYBERWAVE_METADATA_VIDEO_DEVICE") == "/dev/video0"
 
     def test_usbip_active_preserves_device_params_for_video(self, tmp_path, monkeypatch):
         """When USB/IP handles video, --device /dev/video* is NOT stripped."""
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: True)
 
         monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **kw: None)
+        monkeypatch.setattr("cyberwave_edge_core.docker_launch.time.sleep", lambda _: None)
 
         def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
             commands.append(list(cmd))
@@ -1114,15 +1156,15 @@ class TestRunDockerImagePullFallback:
         )
 
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        assert "--device" in docker_run_cmd
-        device_idx = docker_run_cmd.index("--device")
-        assert docker_run_cmd[device_idx + 1] == "/dev/video0:/dev/video0"
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        assert "--device" in docker_create_cmd
+        device_idx = docker_create_cmd.index("--device")
+        assert docker_create_cmd[device_idx + 1] == "/dev/video0:/dev/video0"
 
     def test_usbip_active_still_bridges_non_video_devices(self, tmp_path, monkeypatch):
         """USB/IP only skips video devices; serial devices still use the bridge command."""
-        self._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
         monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: True)
 
@@ -1177,7 +1219,15 @@ class TestDriverStartingAlertLifecycle:
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup.shutil, "which", lambda name: "/usr/bin/docker")
         monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **k: None)
+
+        def _fast_probe_env(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_DRIVER_STARTUP_PROBE_SECONDS":
+                return "1"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _fast_probe_env)
+        monkeypatch.setattr(startup.time, "sleep", lambda _: None)
+        monkeypatch.setattr("cyberwave_edge_core.docker_launch.time.sleep", lambda _: None)
         monkeypatch.setattr(startup.time, "sleep", lambda _: None)
         monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -1186,9 +1236,22 @@ class TestDriverStartingAlertLifecycle:
             lambda _n: {"State": {"Status": "running", "Error": ""}},
         )
         monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_inspect",
+            lambda _n: {"State": {"Status": "running", "Error": ""}},
+        )
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_launch.remove_existing_container",
+            lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
             startup.subprocess,
             "run",
             lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr=""),
+        )
+        monkeypatch.setattr(
+            startup.subprocess,
+            "Popen",
+            lambda *a, **kw: MagicMock(poll=lambda: 0),
         )
 
         success = startup._run_docker_image(
@@ -1431,6 +1494,13 @@ class TestPullDockerImageWithProgress:
 
         fake_client = self._FakeClient()
         monkeypatch.setattr(startup, "_get_shared_mqtt_client", lambda token: fake_client)
+
+        # Engine API is the primary pull path; force the documented subprocess
+        # fallback so this test exercises the CLI line-parsing it mocks below.
+        def _force_subprocess_fallback(*_args, **_kwargs):
+            raise driver_logs._EngineAPIUnavailableError("forced subprocess path in test")
+
+        monkeypatch.setattr(driver_logs, "_drive_pull_via_engine_api", _force_subprocess_fallback)
         monkeypatch.setattr(
             driver_logs.subprocess,
             "Popen",
@@ -2630,7 +2700,10 @@ class TestEnsureLinuxMicrophoneDockerParams:
         assert "-v" in params
         assert "/dev/snd:/dev/snd" in params
         assert "--device-cgroup-rule" in params
-        assert "116" in params
+        # The ALSA cgroup rule is a single token ("c 116:* rmw"); verify it
+        # references char-major 116 (/dev/snd) rather than being a bare element.
+        cgroup_rule = params[params.index("--device-cgroup-rule") + 1]
+        assert "116" in cgroup_rule
         assert "--group-add" in params
         assert "audio" in params
 
@@ -2690,8 +2763,8 @@ class TestMacosAudioStreamInjection:
 
     def test_injects_audio_url_from_json(self, tmp_path, monkeypatch):
         base = TestRunDockerImagePullFallback()
-        base._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        base._patch_common(tmp_path, monkeypatch, commands=commands)
         (tmp_path / "audio_streams.json").write_text(
             json.dumps(
                 {
@@ -2718,14 +2791,16 @@ class TestMacosAudioStreamInjection:
             token="test-token",
         )
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = base._extract_env_map(docker_run_cmd)
-        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == ("http://host.docker.internal:8101")
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = base._extract_env_map(docker_create_cmd)
+        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == (
+            "http://host.docker.internal:8101"
+        )
 
     def test_injects_capture_settings_from_audio_streams_json(self, tmp_path, monkeypatch):
         base = TestRunDockerImagePullFallback()
-        base._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        base._patch_common(tmp_path, monkeypatch, commands=commands)
         (tmp_path / "audio_streams.json").write_text(
             json.dumps(
                 {
@@ -2754,8 +2829,8 @@ class TestMacosAudioStreamInjection:
             token="test-token",
         )
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = base._extract_env_map(docker_run_cmd)
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = base._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE"] == "32000"
         assert env_map["CYBERWAVE_METADATA_AUDIO_CHANNELS"] == "2"
 
@@ -2765,8 +2840,8 @@ class TestMacosAudioPlaybackInjection:
 
     def test_injects_playback_url_from_json(self, tmp_path, monkeypatch):
         base = TestRunDockerImagePullFallback()
-        base._patch_common(tmp_path, monkeypatch)
         commands: list[list[str]] = []
+        base._patch_common(tmp_path, monkeypatch, commands=commands)
         (tmp_path / "audio_streams.json").write_text(
             json.dumps(
                 {
@@ -2795,9 +2870,11 @@ class TestMacosAudioPlaybackInjection:
             token="test-token",
         )
         assert success is True
-        docker_run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
-        env_map = base._extract_env_map(docker_run_cmd)
-        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == ("http://host.docker.internal:8201")
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = base._extract_env_map(docker_create_cmd)
+        assert env_map["CYBERWAVE_METADATA_AUDIO_DEVICE"] == (
+            "http://host.docker.internal:8201"
+        )
         assert env_map["CYBERWAVE_METADATA_AUDIO_SAMPLE_RATE"] == "48000"
         assert env_map["CYBERWAVE_METADATA_AUDIO_CHANNELS"] == "1"
 

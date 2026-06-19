@@ -9,7 +9,6 @@ import platform
 import shlex
 import shutil
 import subprocess
-import time
 from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -184,13 +183,6 @@ def _run_docker_image(
         s.get_runtime_env_var("CYBERWAVE_ENVIRONMENT", s.DEFAULT_ENVIRONMENT) or s.DEFAULT_ENVIRONMENT
     ).lower()
 
-    # Remove any existing container with the same name (idempotent re-runs)
-    subprocess.run(
-        ["docker", "rm", "-f", container_name],
-        capture_output=True,
-        timeout=30,
-    )
-
     if driver_alert_ctx is None:
         driver_alert_ctx = s.DriverStartingAlertContext(
             twin_uuid=twin_uuid,
@@ -198,6 +190,16 @@ def _run_docker_image(
             service_name=service_name,
         )
         driver_alert_ctx.create()
+
+    # Remove any existing container with the same name (idempotent re-runs).
+    from .docker_launch import remove_existing_container
+
+    if not remove_existing_container(container_name, get_runtime_env_var=s.get_runtime_env_var):
+        driver_alert_ctx.mark_failed_and_resolve(
+            f"Could not remove existing container {container_name} before starting the driver.",
+            phase="container_remove_failed",
+        )
+        return False
 
     if skip_pull:
         if not s._docker_image_exists_locally(image):
@@ -707,73 +709,35 @@ def _run_docker_image(
         )
         logger.debug("Docker run command args for %s: %s", container_name, debug_cmd)
     logger.info("Starting docker container %s from image %s", container_name, image)
-    try:
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+
+    from .docker_launch import launch_detached_container
+
+    def _on_container_created() -> None:
         s._CONTAINER_TWIN_MAP[container_name] = twin_uuid
+        driver_alert_ctx.update_metadata({"phase": "container_created"}, force=True)
+
+    def _on_running() -> None:
+        driver_alert_ctx.update_metadata({"phase": "container_running"}, force=True)
+        driver_alert_ctx.resolve()
+
+    def _on_failure(description: str, phase: str) -> None:
+        driver_alert_ctx.mark_failed_and_resolve(description, phase=phase)
+
+    def _on_removed() -> None:
+        # The container was force-removed; drop the map entry registered in
+        # _on_container_created so no stale name lingers for reconcile/shutdown.
+        s._CONTAINER_TWIN_MAP.pop(container_name, None)
+
+    def _stream_logs() -> None:
         s._stream_container_logs(container_name, twin_uuid=twin_uuid, token=token)
 
-        # A detached `docker run` can still fail immediately (e.g. missing USB
-        # hardware causes rapid crashes). Verify that the container reaches and
-        # stays in a running state for a brief window.
-        for _ in range(5):
-            inspect_data = s._inspect_driver_container(container_name)
-            if not inspect_data:
-                time.sleep(1.0)
-                continue
-            state = inspect_data.get("State") if isinstance(inspect_data.get("State"), dict) else {}
-            status = str(state.get("Status", "")).lower()
-            if status == "running":
-                driver_alert_ctx.update_metadata(
-                    {"phase": "container_running"}, force=True
-                )
-                driver_alert_ctx.resolve()
-                return True
-            if status in {"restarting", "exited", "dead"}:
-                logger.error(
-                    "Driver container %s failed to start cleanly (status=%s error=%s)",
-                    container_name,
-                    status,
-                    str(state.get("Error", "")).strip() or "none",
-                )
-                driver_alert_ctx.mark_failed_and_resolve(
-                    (
-                        f"Driver container {container_name} failed to start cleanly "
-                        f"(status={status})."
-                    ),
-                    phase="container_unhealthy",
-                )
-                return False
-            time.sleep(1.0)
-
-        logger.warning(
-            "Driver container %s did not reach a stable running state within startup probe window",
-            container_name,
-        )
-        # Probe window elapsed without confirmation; the container may still
-        # come up successfully, so close the alert as resolved (the caller
-        # surfaces a separate ``driver_start_failure`` alert if needed).
-        driver_alert_ctx.update_metadata(
-            {"phase": "container_probe_unconfirmed"}, force=True
-        )
-        driver_alert_ctx.resolve()
-        return True
-    except subprocess.CalledProcessError as exc:
-        logger.error("Failed to start container %s: %s", container_name, exc.stderr)
-        driver_alert_ctx.mark_failed_and_resolve(
-            f"Failed to start container {container_name}.",
-            phase="docker_run_failed",
-        )
-        return False
-    except subprocess.TimeoutExpired:
-        logger.error("Docker run timed out for image: %s", image)
-        driver_alert_ctx.mark_failed_and_resolve(
-            f"Docker run timed out for image {image}.",
-            phase="docker_run_timeout",
-        )
-        return False
+    return launch_detached_container(
+        container_name=container_name,
+        run_argv=cmd,
+        get_runtime_env_var=s.get_runtime_env_var,
+        on_container_created=_on_container_created,
+        on_running=_on_running,
+        on_failure=_on_failure,
+        stream_logs=_stream_logs,
+        on_removed=_on_removed,
+    )

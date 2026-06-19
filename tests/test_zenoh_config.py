@@ -481,7 +481,7 @@ class TestStopZenohRouter:
 
 
 class TestZenohEnvInjectionInStartup:
-    """Verify that _run_docker_image passes Zenoh env vars to docker run."""
+    """Verify that _run_docker_image passes Zenoh env vars to docker create."""
 
     def _make_mock_subprocess(self, captured_cmds: list[list[str]]) -> MagicMock:
         """Return a mock subprocess.run that records commands and simulates success."""
@@ -499,6 +499,26 @@ class TestZenohEnvInjectionInStartup:
         m.TimeoutExpired = subprocess.TimeoutExpired
         return m
 
+    def _patch_launch_probe(self, monkeypatch, captured: list[list[str]]) -> None:
+        import cyberwave_edge_core.startup as startup
+        from tests.driver_subprocess_fakes import fake_docker_start_popen
+
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_inspect",
+            lambda _name: {"State": {"Status": "running"}},
+        )
+        # Pre-cleanup removal is covered by test_docker_launch; no-op it so it
+        # doesn't trip over the always-"running" docker_inspect mock above.
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_launch.remove_existing_container",
+            lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
+            startup.subprocess,
+            "Popen",
+            fake_docker_start_popen(captured),
+        )
+
     def test_zenoh_data_backend_injected_into_driver_container(self, monkeypatch, tmp_path):
         import cyberwave_edge_core.startup as startup
 
@@ -506,6 +526,7 @@ class TestZenohEnvInjectionInStartup:
 
         # Patch subprocess so docker commands don't actually run.
         monkeypatch.setattr(startup.subprocess, "run", self._make_mock_subprocess(captured))
+        self._patch_launch_probe(monkeypatch, captured)
         monkeypatch.setattr(startup.shutil, "which", lambda name: "/usr/bin/docker")
 
         # Patch the zenoh config so we control what's returned.
@@ -519,7 +540,14 @@ class TestZenohEnvInjectionInStartup:
         monkeypatch.setattr(startup, "_inspect_driver_container", lambda name: _running)
         monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
         monkeypatch.setattr(startup, "DriverStartingAlertContext", MagicMock())
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda name, default=None: None)
+
+        def _fast_probe_env(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_DRIVER_STARTUP_PROBE_SECONDS":
+                return "1"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _fast_probe_env)
+        monkeypatch.setattr("cyberwave_edge_core.docker_launch.time.sleep", lambda _: None)
         monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
@@ -531,16 +559,16 @@ class TestZenohEnvInjectionInStartup:
             token="test-token",
         )
 
-        # Find the docker run command
-        run_cmds = [c for c in captured if len(c) > 2 and c[0] == "docker" and c[1] == "run"]
-        assert run_cmds, "No docker run command captured"
-        run_args = run_cmds[0]
+        # Find the docker create command
+        create_cmds = [c for c in captured if len(c) > 2 and c[0] == "docker" and c[1] == "create"]
+        assert create_cmds, "No docker create command captured"
+        create_args = create_cmds[0]
 
         # Collect all -e KEY=VALUE pairs
         env_pairs: dict[str, str] = {}
-        for i, arg in enumerate(run_args):
-            if arg == "-e" and i + 1 < len(run_args):
-                key, _, value = run_args[i + 1].partition("=")
+        for i, arg in enumerate(create_args):
+            if arg == "-e" and i + 1 < len(create_args):
+                key, _, value = create_args[i + 1].partition("=")
                 env_pairs[key] = value
 
         assert "CYBERWAVE_DATA_BACKEND" in env_pairs, (
@@ -555,6 +583,7 @@ class TestZenohEnvInjectionInStartup:
 
         captured: list[list[str]] = []
         monkeypatch.setattr(startup.subprocess, "run", self._make_mock_subprocess(captured))
+        self._patch_launch_probe(monkeypatch, captured)
         monkeypatch.setattr(startup.shutil, "which", lambda name: "/usr/bin/docker")
 
         test_cfg = _config(
@@ -569,7 +598,14 @@ class TestZenohEnvInjectionInStartup:
         monkeypatch.setattr(startup, "_inspect_driver_container", lambda name: _running)
         monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
         monkeypatch.setattr(startup, "DriverStartingAlertContext", MagicMock())
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda name, default=None: None)
+
+        def _fast_probe_env(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_DRIVER_STARTUP_PROBE_SECONDS":
+                return "1"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _fast_probe_env)
+        monkeypatch.setattr("cyberwave_edge_core.docker_launch.time.sleep", lambda _: None)
         monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
@@ -581,13 +617,13 @@ class TestZenohEnvInjectionInStartup:
             token="test-token",
         )
 
-        run_cmds = [c for c in captured if len(c) > 2 and c[0] == "docker" and c[1] == "run"]
-        run_args = run_cmds[0]
+        create_cmds = [c for c in captured if len(c) > 2 and c[0] == "docker" and c[1] == "create"]
+        create_args = create_cmds[0]
 
         env_pairs: dict[str, str] = {}
-        for i, arg in enumerate(run_args):
-            if arg == "-e" and i + 1 < len(run_args):
-                key, _, value = run_args[i + 1].partition("=")
+        for i, arg in enumerate(create_args):
+            if arg == "-e" and i + 1 < len(create_args):
+                key, _, value = create_args[i + 1].partition("=")
                 env_pairs[key] = value
 
         assert env_pairs.get("ZENOH_CONNECT") == "tcp/10.0.0.1:7447"
@@ -599,6 +635,7 @@ class TestZenohEnvInjectionInStartup:
 
         captured: list[list[str]] = []
         monkeypatch.setattr(startup.subprocess, "run", self._make_mock_subprocess(captured))
+        self._patch_launch_probe(monkeypatch, captured)
         monkeypatch.setattr(startup.shutil, "which", lambda name: "/usr/bin/docker")
 
         test_cfg = _config(data_backend="zenoh", shared_memory=False)
@@ -609,7 +646,14 @@ class TestZenohEnvInjectionInStartup:
         monkeypatch.setattr(startup, "_inspect_driver_container", lambda name: _running)
         monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
         monkeypatch.setattr(startup, "DriverStartingAlertContext", MagicMock())
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda name, default=None: None)
+
+        def _fast_probe_env(name: str, default: object = None) -> object:
+            if name == "CYBERWAVE_DRIVER_STARTUP_PROBE_SECONDS":
+                return "1"
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _fast_probe_env)
+        monkeypatch.setattr("cyberwave_edge_core.docker_launch.time.sleep", lambda _: None)
         monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
@@ -624,13 +668,13 @@ class TestZenohEnvInjectionInStartup:
             token="test-token",
         )
 
-        run_cmds = [c for c in captured if len(c) > 2 and c[0] == "docker" and c[1] == "run"]
-        run_args = run_cmds[0]
+        create_cmds = [c for c in captured if len(c) > 2 and c[0] == "docker" and c[1] == "create"]
+        create_args = create_cmds[0]
 
         env_pairs: dict[str, str] = {}
-        for i, arg in enumerate(run_args):
-            if arg == "-e" and i + 1 < len(run_args):
-                key, _, value = run_args[i + 1].partition("=")
+        for i, arg in enumerate(create_args):
+            if arg == "-e" and i + 1 < len(create_args):
+                key, _, value = create_args[i + 1].partition("=")
                 env_pairs[key] = value
 
         # The driver-specified value must override the Zenoh default.

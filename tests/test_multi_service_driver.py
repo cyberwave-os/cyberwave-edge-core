@@ -5,7 +5,7 @@ Covers:
   2. _get_driver_services — returns None for single-image metadata
   3. Container naming with service suffix
   4. shared_env + per-service env layering
-  5. Custom command passed to docker run
+  5. Custom command passed to docker create
   6. Parallel pull phase collects all service images
 """
 from __future__ import annotations
@@ -16,6 +16,74 @@ from typing import Any
 
 import cyberwave_edge_core.driver_selection as driver_selection
 import cyberwave_edge_core.startup as startup
+from tests.driver_subprocess_fakes import fake_docker_start_popen
+
+
+class _FakeAlertContext:
+    def __init__(self, **kwargs: Any) -> None:
+        pass
+
+    def create(self) -> None:
+        pass
+
+    def update_metadata(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def resolve(self) -> None:
+        pass
+
+    def fail_without_resolve(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def mark_failed_and_resolve(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+def _patch_driver_container_launch(monkeypatch: Any, captured_cmds: list[list[str]]) -> None:
+    """Patch subprocess and probe helpers for create+start driver launch."""
+
+    def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+
+    monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
+    monkeypatch.setattr(startup.subprocess, "Popen", fake_docker_start_popen(captured_cmds))
+    monkeypatch.setattr(
+        "cyberwave_edge_core.docker_helpers.docker_inspect",
+        lambda _: {"State": {"Status": "running"}},
+    )
+    # Pre-cleanup removal is covered by test_docker_launch; no-op it here so it
+    # doesn't trip over the always-"running" docker_inspect mock above.
+    monkeypatch.setattr(
+        "cyberwave_edge_core.docker_launch.remove_existing_container",
+        lambda *a, **kw: True,
+    )
+    monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
+    monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
+    monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
+
+    def _fast_probe_env(name: str, default: object = None) -> object:
+        if name in {
+            "CYBERWAVE_DRIVER_STARTUP_PROBE_SECONDS",
+            "CYBERWAVE_DRIVER_CREATE_TIMEOUT_SECONDS",
+        }:
+            return "1"
+        return default
+
+    monkeypatch.setattr(startup, "get_runtime_env_var", _fast_probe_env)
+    monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
+    monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
+    monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
+    monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
+    monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
+    monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
+    monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
+    monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
+    monkeypatch.setattr("cyberwave_edge_core.docker_launch.time.sleep", lambda _: None)
+    monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
+    monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
 
 
 # ===========================================================================
@@ -186,29 +254,7 @@ class TestMultiContainerNaming:
         """When service_name is set, the container name includes
         ``-{service_name}`` as a suffix."""
         captured_cmds: list[list[str]] = []
-
-        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            captured_cmds.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
-
-        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
-        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
-        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
-        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
-        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
-        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
-        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
-        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
-        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
-        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
-        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
-        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
-        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
-        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
-        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
-        monkeypatch.setattr(startup, "CONFIG_DIR", monkeypatch.tmp_path if hasattr(monkeypatch, "tmp_path") else startup.Path("/tmp/.cyberwave-test"))
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
 
         twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
         result = startup._run_docker_image(
@@ -220,9 +266,9 @@ class TestMultiContainerNaming:
             service_name="nav2",
         )
 
-        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
-        assert len(docker_run_cmd) >= 1
-        cmd = docker_run_cmd[0]
+        docker_create_cmd = [c for c in captured_cmds if c[:2] == ["docker", "create"]]
+        assert len(docker_create_cmd) >= 1
+        cmd = docker_create_cmd[0]
         name_idx = cmd.index("--name")
         container_name = cmd[name_idx + 1]
         assert container_name == f"cyberwave-driver-{twin_uuid[:8]}-nav2"
@@ -231,29 +277,7 @@ class TestMultiContainerNaming:
         """When service_name is None, the container name uses the
         original format without any suffix."""
         captured_cmds: list[list[str]] = []
-
-        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            captured_cmds.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
-
-        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
-        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
-        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
-        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
-        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
-        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
-        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
-        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
-        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
-        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
-        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
-        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
-        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
-        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
-        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
-        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
 
         twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
         startup._run_docker_image(
@@ -264,29 +288,12 @@ class TestMultiContainerNaming:
             skip_pull=True,
         )
 
-        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
-        assert len(docker_run_cmd) >= 1
-        cmd = docker_run_cmd[0]
+        docker_create_cmd = [c for c in captured_cmds if c[:2] == ["docker", "create"]]
+        assert len(docker_create_cmd) >= 1
+        cmd = docker_create_cmd[0]
         name_idx = cmd.index("--name")
         container_name = cmd[name_idx + 1]
         assert container_name == f"cyberwave-driver-{twin_uuid[:8]}"
-
-
-class _FakeAlertContext:
-    def __init__(self, **kwargs: Any) -> None:
-        pass
-
-    def create(self) -> None:
-        pass
-
-    def update_metadata(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def resolve(self) -> None:
-        pass
-
-    def fail_without_resolve(self, *args: Any, **kwargs: Any) -> None:
-        pass
 
 
 # ===========================================================================
@@ -298,29 +305,7 @@ class TestEnvMerge:
     def test_shared_env_merged_with_service_env(self, monkeypatch: Any) -> None:
         """service_env merges into the container env dict."""
         captured_cmds: list[list[str]] = []
-
-        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            captured_cmds.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
-
-        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
-        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
-        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
-        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
-        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
-        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
-        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
-        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
-        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
-        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
-        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
-        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
-        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
-        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
-        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
-        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
 
         twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
         startup._run_docker_image(
@@ -333,9 +318,9 @@ class TestEnvMerge:
             service_env={"ROS_DOMAIN_ID": "0", "CONFIG_PROFILE": "jetson"},
         )
 
-        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
-        assert len(docker_run_cmd) >= 1
-        cmd_str = " ".join(docker_run_cmd[0])
+        docker_create_cmd = [c for c in captured_cmds if c[:2] == ["docker", "create"]]
+        assert len(docker_create_cmd) >= 1
+        cmd_str = " ".join(docker_create_cmd[0])
         assert "ROS_DOMAIN_ID=0" in cmd_str
         assert "CONFIG_PROFILE=jetson" in cmd_str
 
@@ -348,29 +333,7 @@ class TestEnvMerge:
 class TestCommandAppended:
     def test_command_appended_after_image(self, monkeypatch: Any) -> None:
         captured_cmds: list[list[str]] = []
-
-        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            captured_cmds.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
-
-        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
-        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
-        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
-        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
-        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
-        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
-        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
-        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
-        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
-        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
-        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
-        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
-        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
-        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
-        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
-        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
 
         image = "cyberwaveos/go2-ros2-driver:jetson-humble"
         custom_cmd = ["ros2", "launch", "go2_driver", "robot.launch.py"]
@@ -386,38 +349,16 @@ class TestCommandAppended:
             command=custom_cmd,
         )
 
-        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
-        assert len(docker_run_cmd) >= 1
-        cmd = docker_run_cmd[0]
+        docker_create_cmd = [c for c in captured_cmds if c[:2] == ["docker", "create"]]
+        assert len(docker_create_cmd) >= 1
+        cmd = docker_create_cmd[0]
         image_idx = cmd.index(image)
         trailing = cmd[image_idx + 1:]
         assert trailing == custom_cmd
 
     def test_no_command_when_none(self, monkeypatch: Any) -> None:
         captured_cmds: list[list[str]] = []
-
-        def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            captured_cmds.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
-
-        monkeypatch.setattr(startup.shutil, "which", lambda _: "/usr/bin/docker")
-        monkeypatch.setattr(startup.subprocess, "run", _fake_subprocess_run)
-        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
-        monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda img: img)
-        monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _: True)
-        monkeypatch.setattr(startup, "_build_driver_network_args", lambda _: ["--network", "host"])
-        monkeypatch.setattr(startup, "get_runtime_env_var", lambda k, d=None: d)
-        monkeypatch.setattr(startup, "load_credentials_envs", lambda: {})
-        monkeypatch.setattr(startup, "build_zenoh_env_vars", lambda _: {})
-        monkeypatch.setattr(startup, "_get_zenoh_config", lambda: None)
-        monkeypatch.setattr(startup, "_is_usbip_server_running", lambda: False)
-        monkeypatch.setattr(startup, "_run_macos_device_bridge_commands", lambda **kw: (True, {}))
-        monkeypatch.setattr(startup, "_normalize_macos_bridge_candidates", lambda _: {})
-        monkeypatch.setattr(startup, "_extract_docker_env_map", lambda _: {})
-        monkeypatch.setattr(startup, "_stream_container_logs", lambda *a, **kw: None)
-        monkeypatch.setattr(startup, "_inspect_driver_container", lambda _: {"State": {"Status": "running"}})
-        monkeypatch.setattr(startup, "DriverStartingAlertContext", _FakeAlertContext)
-        monkeypatch.setattr(startup, "CONFIG_DIR", startup.Path("/tmp/.cyberwave-test"))
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
 
         image = "cyberwaveos/so101-driver:humble"
         twin_uuid = "aabbccdd-1234-5678-9012-abcdef012345"
@@ -430,9 +371,9 @@ class TestCommandAppended:
             skip_pull=True,
         )
 
-        docker_run_cmd = [c for c in captured_cmds if c[:2] == ["docker", "run"]]
-        assert len(docker_run_cmd) >= 1
-        cmd = docker_run_cmd[0]
+        docker_create_cmd = [c for c in captured_cmds if c[:2] == ["docker", "create"]]
+        assert len(docker_create_cmd) >= 1
+        cmd = docker_create_cmd[0]
         assert cmd[-1] == image
 
 
