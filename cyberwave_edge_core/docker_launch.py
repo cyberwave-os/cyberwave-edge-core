@@ -149,6 +149,16 @@ def probe_container_startup(
         if last_status == "running":
             return ContainerProbeResult(success=True, last_status=last_status)
 
+        # A zero exit code means the container ran to completion cleanly
+        # (e.g. hello-world).  Treat as success so stream_logs() can forward
+        # any output before Docker's restart policy relaunches the container.
+        # We check both "exited" and "restarting" because the 1-second poll
+        # may catch the container in either state between restart cycles.
+        if last_status in {"exited", "restarting"}:
+            exit_code = int(state.get("ExitCode", -1))
+            if exit_code == 0:
+                return ContainerProbeResult(success=True, last_status=last_status)
+
         if last_status in {"exited", "dead"}:
             restart_count = int(inspect_data.get("RestartCount", 0))
             if restart_count > 0 and last_status == "exited":

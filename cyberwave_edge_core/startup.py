@@ -4290,6 +4290,13 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
     of the existing content so that any locally-written keys are preserved.
     Existing files are rewritten in place so bind-mounted driver containers keep
     seeing the same inode.
+
+    Written with mode ``0o644`` (world-readable) — same rationale as
+    ``edge.json``/``fingerprint.json``: the file carries device metadata (no
+    secrets) and is bind-mounted into driver containers that run as an
+    unprivileged user (UID 1001). A restrictive ``0o600`` owned by ``root``/the
+    edge user makes the in-container read fail with ``PermissionError`` and
+    silently disables metadata-driven device selection.
     """
     twin_data["asset"] = asset_data
     twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
@@ -4334,7 +4341,7 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
             os.fsync(file_handle.fileno())
         if os.name != "nt":
             try:
-                os.chmod(twin_json_file, 0o600)
+                os.chmod(twin_json_file, 0o644)
             except OSError:
                 pass
     else:
@@ -4353,7 +4360,7 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
                 os.fsync(temp_file.fileno())
                 temp_path = temp_file.name
             if os.name != "nt":
-                os.chmod(temp_path, 0o600)
+                os.chmod(temp_path, 0o644)
             os.replace(temp_path, twin_json_file)
         finally:
             if temp_path and os.path.exists(temp_path):
@@ -4503,7 +4510,7 @@ def _atomic_write_twin_json(twin_json_file: Path, rendered: str) -> bool:
             temp_path = temp_file.name
         if os.name != "nt":
             try:
-                os.chmod(temp_path, 0o600)
+                os.chmod(temp_path, 0o644)
             except OSError:
                 pass
         os.replace(temp_path, twin_json_file)

@@ -18,6 +18,96 @@ DRIVER_STARTING_ALERT_METADATA_UPDATE_INTERVAL_SECONDS = max(
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Startup progress helpers
+# ---------------------------------------------------------------------------
+
+#: Phases where edge-core is actively transferring image layers from the
+#: registry.  ``installing`` is handled separately (fixed 57% bucket).
+_STARTUP_PULLING_PHASES: frozenset[str] = frozenset({"pull_started", "pulling", "downloading"})
+
+
+def _compute_overall_progress_percent(phase: str, download_percent: float) -> int | None:
+    """Map *phase* + *download_percent* (0–100) to an overall startup percentage.
+
+    The lifecycle is split into three buckets so the user sees a single
+    monotonically-increasing number from 0 to 100:
+
+    * **Download** (0–55 %) — driven by layer-byte progress from docker pull.
+    * **Install**  (57 %)   — brief post-download extraction window.
+    * **Container** (60–100 %) — create → start → probe → running.
+
+    Returns ``None`` for phases where no meaningful percentage can be
+    computed (e.g. unrecognised or backward-compat phases like
+    ``container_probe_unconfirmed``), so callers can omit the field
+    gracefully rather than publishing a stale value.
+    """
+    if phase == "installing":
+        return 57
+    if phase in _STARTUP_PULLING_PHASES or phase == "":
+        clamped = max(0.0, min(100.0, download_percent))
+        return round(clamped * 0.55)
+    if phase in ("pull_complete", "pull_skipped"):
+        return 60
+    if phase == "starting_container":
+        return 65
+    if phase == "container_created":
+        return 80
+    if phase == "container_running":
+        return 100
+    return None
+
+
+# ---------------------------------------------------------------------------
+# User-friendly failure descriptions
+# ---------------------------------------------------------------------------
+
+_DRIVER_FAILED_DESCRIPTIONS: dict[str, str] = {
+    # Container removal / creation / start failures (b/CYB-2331 and legacy)
+    "container_remove_failed": "Could not restart your robot. Please try again.",
+    "docker_create_failed": "Could not start your robot. Please try again.",
+    "docker_run_failed": "Could not start your robot. Please try again.",
+    "docker_start_failed": "Could not start your robot. Please try again.",
+    "docker_create_timeout": "Your robot took too long to start. Please try again.",
+    "docker_run_timeout": "Your robot took too long to start. Please try again.",
+    "container_startup_timeout": "Your robot took too long to start. Please try again.",
+    "container_unhealthy": "Your robot stopped unexpectedly. Please try again.",
+    # Image pull failures
+    "image_missing": "Robot software not found. Please contact support.",
+    "pull_failed": "Could not download the robot software. Check your connection and try again.",
+    "pull_failed_using_local": "Could not download the robot software. Check your connection and try again.",
+    "pull_exit_error": "Could not download the robot software. Check your connection and try again.",
+    "pull_timeout": "Download timed out. Check your connection and try again.",
+    "pull_timeout_using_local": "Download timed out. Check your connection and try again.",
+    "pull_timed_out": "Download timed out. Check your connection and try again.",
+    "pull_spawn_failed": "Could not start the download. Please try again.",
+    "pull_oserror": "Could not start the download. Please try again.",
+    "pull_oserror_using_local": "Could not start the download. Please try again.",
+    # macOS-specific
+    "macos_bridge_failed": "Network setup failed. Please try again.",
+}
+
+_WORKER_FAILED_DESCRIPTIONS: dict[str, str] = {
+    "container_remove_failed": "Could not restart your worker. Please try again.",
+    "docker_create_failed": "Could not start your worker. Please try again.",
+    "docker_run_failed": "Could not start your worker. Please try again.",
+    "docker_start_failed": "Could not start your worker. Please try again.",
+    "docker_create_timeout": "Your worker took too long to start. Please try again.",
+    "docker_run_timeout": "Your worker took too long to start. Please try again.",
+    "container_startup_timeout": "Your worker took too long to start. Please try again.",
+    "container_unhealthy": "Your worker stopped unexpectedly. Please try again.",
+    "image_missing": "Worker software not found. Please contact support.",
+    "pull_failed": "Could not download the worker software. Check your connection and try again.",
+    "pull_failed_using_local": "Could not download the worker software. Check your connection and try again.",
+    "pull_exit_error": "Could not download the worker software. Check your connection and try again.",
+    "pull_timeout": "Download timed out. Check your connection and try again.",
+    "pull_timeout_using_local": "Download timed out. Check your connection and try again.",
+    "pull_timed_out": "Download timed out. Check your connection and try again.",
+    "pull_spawn_failed": "Could not start the download. Please try again.",
+    "pull_oserror": "Could not start the download. Please try again.",
+    "pull_oserror_using_local": "Could not start the download. Please try again.",
+}
+
 
 class DriverStartingAlertContext:
     """Create/update/resolve a ``driver_starting`` twin alert around docker pull and pre-run.
@@ -67,18 +157,10 @@ class DriverStartingAlertContext:
                 "container_name": self.container_name,
                 "service_name": self.service_name,
                 "started_at": time.time(),
+                "overall_progress_percent": 0,
             }
             service_suffix = f" ({self.service_name})" if self.service_name else ""
-            if self.service_name:
-                description = (
-                    f"Downloading driver image {self.image} for service '{self.service_name}' "
-                    f"on the {self.twin_uuid} twin on the attached edge."
-                )
-            else:
-                description = (
-                    f"Downloading driver image {self.image} for the {self.twin_uuid} twin "
-                    "on the attached edge."
-                )
+            description = "Your robot is starting up. This may take a few minutes."
             self._alert = twin.alerts.create(
                 name=f"Driver starting{service_suffix}",
                 description=description,
@@ -97,7 +179,13 @@ class DriverStartingAlertContext:
             self._alert = None
 
     def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
-        """Merge *patch* into alert metadata, optionally throttled."""
+        """Merge *patch* into alert metadata, optionally throttled.
+
+        Automatically injects ``overall_progress_percent`` (0–100) derived
+        from the merged ``phase`` and ``progress_percent`` values so the UI
+        can show a single startup-wide percentage rather than a
+        download-only one.
+        """
         if not self._alert:
             return
         now = time.time()
@@ -107,6 +195,14 @@ class DriverStartingAlertContext:
         try:
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {**prev, **patch}
+            phase = str(merged.get("phase") or "")
+            download_pct = merged.get("progress_percent")
+            overall = _compute_overall_progress_percent(
+                phase,
+                float(download_pct) if isinstance(download_pct, (int, float)) else 0.0,
+            )
+            if overall is not None:
+                merged["overall_progress_percent"] = overall
             self._alert = self._alert.update(metadata=merged)
         except Exception as exc:
             logger.debug(
@@ -137,9 +233,15 @@ class DriverStartingAlertContext:
         separate ``driver_start_failure`` alerts created by the caller, so
         leaving this alert active would be redundant and confusing
         (especially after an explicit ``restart edge-core`` request).
+
+        The user-facing *description* is replaced with plain-language copy
+        from ``_DRIVER_FAILED_DESCRIPTIONS`` keyed on *phase*; the original
+        technical *description* is preserved in ``metadata.internal_description``
+        for diagnostics.
         """
         if not self._alert:
             return
+        user_description = _DRIVER_FAILED_DESCRIPTIONS.get(phase, description)
         try:
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {
@@ -147,9 +249,10 @@ class DriverStartingAlertContext:
                 "phase": phase,
                 "failed": True,
                 "failed_at": time.time(),
+                "internal_description": description,
             }
             self._alert = self._alert.update(
-                description=description,
+                description=user_description,
                 metadata=merged,
                 severity="warning",
             )
@@ -263,10 +366,7 @@ class WorkerStartingAlertContext:
             twin = client.twin(twin_id=self.twin_uuid)
             self._alert = twin.alerts.create(
                 name="Worker starting",
-                description=(
-                    f"Downloading ML worker image {self.image} for the edge attached to "
-                    f"twin {self.twin_uuid}."
-                ),
+                description="Your worker is starting up. This may take a few minutes.",
                 severity="info",
                 alert_type=WORKER_STARTING_ALERT_TYPE,
                 source_type="edge",
@@ -275,6 +375,7 @@ class WorkerStartingAlertContext:
                     "image": self.image,
                     "container_name": self.container_name,
                     "started_at": time.time(),
+                    "overall_progress_percent": 0,
                 },
                 force=True,
             )
@@ -287,7 +388,11 @@ class WorkerStartingAlertContext:
             self._alert = None
 
     def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
-        """Merge *patch* into alert metadata, optionally throttled."""
+        """Merge *patch* into alert metadata, optionally throttled.
+
+        Automatically injects ``overall_progress_percent`` derived from the
+        merged ``phase`` and ``progress_percent`` values.
+        """
         if self._alert is None:
             return
         now = time.time()
@@ -297,6 +402,14 @@ class WorkerStartingAlertContext:
         try:
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {**prev, **patch}
+            phase = str(merged.get("phase") or "")
+            download_pct = merged.get("progress_percent")
+            overall = _compute_overall_progress_percent(
+                phase,
+                float(download_pct) if isinstance(download_pct, (int, float)) else 0.0,
+            )
+            if overall is not None:
+                merged["overall_progress_percent"] = overall
             self._alert = self._alert.update(metadata=merged)
         except Exception as exc:
             logger.debug(
@@ -321,9 +434,15 @@ class WorkerStartingAlertContext:
         self._alert = None
 
     def mark_failed_and_resolve(self, description: str, *, phase: str = "pull_failed") -> None:
-        """Annotate the alert with failure context, then resolve it."""
+        """Annotate the alert with failure context, then resolve it.
+
+        Replaces the technical *description* with plain-language copy from
+        ``_WORKER_FAILED_DESCRIPTIONS``; the original is kept in
+        ``metadata.internal_description`` for diagnostics.
+        """
         if self._alert is None:
             return
+        user_description = _WORKER_FAILED_DESCRIPTIONS.get(phase, description)
         try:
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {
@@ -331,9 +450,10 @@ class WorkerStartingAlertContext:
                 "phase": phase,
                 "failed": True,
                 "failed_at": time.time(),
+                "internal_description": description,
             }
             self._alert = self._alert.update(
-                description=description,
+                description=user_description,
                 metadata=merged,
                 severity="warning",
             )

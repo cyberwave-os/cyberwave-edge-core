@@ -201,6 +201,60 @@ class TestProbeContainerStartup:
             result = dl.probe_container_startup("cyberwave-driver-test", probe_seconds=10)
         assert result.success is True
 
+    def test_exited_with_exit_code_zero_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Short-lived containers (e.g. hello-world) that exit 0 are treated as success."""
+        monkeypatch.setattr(dl.time, "sleep", lambda _: None)
+        with patch.object(
+            docker_helpers,
+            "docker_inspect",
+            return_value={"State": {"Status": "exited", "ExitCode": 0}, "RestartCount": 0},
+        ):
+            result = dl.probe_container_startup("cyberwave-driver-test", probe_seconds=5)
+        assert result.success is True
+        assert result.last_status == "exited"
+
+    def test_exited_with_exit_code_zero_and_restarts_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """hello-world with restart policy: seen as exited/exit-0 + restart_count > 0 → success."""
+        monkeypatch.setattr(dl.time, "sleep", lambda _: None)
+        with patch.object(
+            docker_helpers,
+            "docker_inspect",
+            return_value={"State": {"Status": "exited", "ExitCode": 0}, "RestartCount": 3},
+        ):
+            result = dl.probe_container_startup("cyberwave-driver-test", probe_seconds=5)
+        assert result.success is True
+        assert result.last_status == "exited"
+
+    def test_restarting_with_exit_code_zero_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """hello-world caught mid-restart cycle (status=restarting, last exit 0) → success."""
+        monkeypatch.setattr(dl.time, "sleep", lambda _: None)
+        with patch.object(
+            docker_helpers,
+            "docker_inspect",
+            return_value={"State": {"Status": "restarting", "ExitCode": 0}, "RestartCount": 1},
+        ):
+            result = dl.probe_container_startup("cyberwave-driver-test", probe_seconds=5)
+        assert result.success is True
+        assert result.last_status == "restarting"
+
+    def test_restarting_with_nonzero_exit_code_keeps_waiting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failing container in restart loop (exit non-0) keeps waiting for running."""
+        monkeypatch.setattr(dl.time, "sleep", lambda _: None)
+        inspect_results = [
+            {"State": {"Status": "restarting", "ExitCode": 1}, "RestartCount": 2},
+            {"State": {"Status": "running"}, "RestartCount": 2},
+        ]
+        with patch.object(docker_helpers, "docker_inspect", side_effect=inspect_results):
+            result = dl.probe_container_startup("cyberwave-driver-test", probe_seconds=5)
+        assert result.success is True
+        assert result.last_status == "running"
+
 
 class TestLaunchDetachedContainer:
     _RUN_ARGV = [
