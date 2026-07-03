@@ -37,6 +37,7 @@ from .docker_helpers import (
     docker_stop,
     group_gid,
 )
+from .driver_selection import is_jetson
 from .zenoh_config import ZenohConfig, build_zenoh_env_vars
 
 if TYPE_CHECKING:
@@ -137,7 +138,8 @@ def _image_tag_is_mutable(image: str) -> bool:
         # (e.g. ``myregistry.io:5000/img``); docker resolves both to
         # ``:latest`` which is mutable.
         return True
-    # Strip arch/runtime suffixes such as ``-gpu``, ``-cpu``, ``-arm64``.
+    # Strip arch/runtime suffixes such as ``-gpu``, ``-cpu``, ``-arm64``,
+    # ``-hailo``, ``-jetson``.
     base = tag.split("-", 1)[0].lower()
     return base in _MUTABLE_TAG_BASENAMES
 
@@ -243,16 +245,39 @@ def _apply_hailo_image_tag(image: str) -> str:
     Mirrors the ``-gpu`` rewrite in :meth:`WorkerManager._run_container`:
     only ``cyberwaveos/edge-ml-worker:<tag>`` references are rewritten,
     and only when the tag is not already a Hailo variant. Custom
-    operator overrides (``CYBERWAVE_WORKER_IMAGE``) and the ``-gpu``
-    fork are left untouched — Hailo + NVIDIA on the same host is not
-    a supported combination and ``-gpu`` wins because it's the
-    higher-priority accelerator for the rest of the catalog.
+    operator overrides (``CYBERWAVE_WORKER_IMAGE``) and the ``-gpu`` /
+    ``-jetson`` forks are left untouched — Hailo + NVIDIA on the same
+    host is not a supported combination and ``-gpu``/``-jetson`` win
+    because they are the higher-priority accelerators for the rest of
+    the catalog.
     """
     if not image.startswith(f"{_WORKER_IMAGE_BASE}:"):
         return image
-    if image.endswith("-hailo") or image.endswith("-gpu"):
+    if image.endswith("-hailo") or image.endswith("-gpu") or image.endswith("-jetson"):
         return image
     return f"{image}-hailo"
+
+
+def _apply_jetson_image_tag(image: str) -> str:
+    """Append ``-jetson`` to the worker image tag on Jetson hosts.
+
+    Mirrors :func:`_apply_hailo_image_tag`: only rewrites
+    ``cyberwaveos/edge-ml-worker:<tag>`` references, leaves custom
+    ``CYBERWAVE_WORKER_IMAGE`` overrides alone, and refuses to double-suffix
+    an already-Jetson tag. The ``-hailo`` fork is also left untouched — a
+    single host can't be both a Jetson and a Pi-with-AI-HAT — but this is a
+    defensive check rather than a real code path.
+
+    Never combines with ``-gpu``: Jetson is arm64 and the amd64 ``-gpu``
+    blob has the wrong ``libcuda.so`` ABI (desktop/server CUDA vs Tegra
+    CUDA). :meth:`WorkerManager._run_container` picks Jetson before GPU for
+    the same reason.
+    """
+    if not image.startswith(f"{_WORKER_IMAGE_BASE}:"):
+        return image
+    if image.endswith("-jetson") or image.endswith("-hailo") or image.endswith("-gpu"):
+        return image
+    return f"{image}-jetson"
 
 
 def _build_hailo_passthrough_args() -> list[str]:
@@ -1031,9 +1056,30 @@ class WorkerManager:
         volume_args = self._build_volume_args()
         network_args = self._build_network_args()
 
+        # Accelerator precedence: Jetson > discrete NVIDIA > Hailo > CPU.
+        #
+        # Jetson is checked first because on a Jetson host both ``is_jetson()``
+        # and ``docker_has_nvidia_runtime()`` return true — the L4T install
+        # ships the nvidia-container-runtime — but the amd64 ``-gpu`` blob
+        # does not run on Tegra (different libcuda ABI, wrong PTX arch), so
+        # we must pick the ``-jetson`` sibling here. Both share the
+        # ``--gpus all`` flag: nvidia-container-runtime handles the Tegra
+        # iGPU passthrough the same way it handles a discrete GPU.
         gpu_args: list[str] = []
         non_gpu_image: str | None = None
-        if docker_has_nvidia_runtime():
+        if is_jetson():
+            gpu_args = ["--gpus", "all"]
+            rewritten = _apply_jetson_image_tag(image)
+            if rewritten != image:
+                non_gpu_image = image
+                image = rewritten
+                logger.info("Jetson host detected; using Jetson image %s", image)
+            else:
+                logger.info(
+                    "Jetson host detected; adding --gpus all to worker container %s",
+                    image,
+                )
+        elif docker_has_nvidia_runtime():
             gpu_args = ["--gpus", "all"]
             if image.startswith("cyberwaveos/edge-ml-worker:") and not image.endswith("-gpu"):
                 non_gpu_image = image
@@ -1099,7 +1145,15 @@ class WorkerManager:
 
         if not self._pull_worker_image_with_progress(image):
             if non_gpu_image:
-                logger.warning("GPU image %s unavailable; falling back to %s", image, non_gpu_image)
+                # Covers both the ``-gpu`` (discrete NVIDIA) and ``-jetson``
+                # (Tegra) rewrites: same fallback shape — drop the accelerator
+                # suffix and re-pull the base tag so the worker still comes
+                # up, albeit on CPU.
+                logger.warning(
+                    "Accelerator image %s unavailable; falling back to %s",
+                    image,
+                    non_gpu_image,
+                )
                 image = non_gpu_image
                 cmd[-1] = image
                 if not self._pull_worker_image_with_progress(image):

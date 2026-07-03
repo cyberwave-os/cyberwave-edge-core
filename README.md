@@ -335,7 +335,7 @@ Two ways to set it (both honoured by `get_runtime_env_var`):
 
 Either way, restart edge-core (`sudo systemctl restart cyberwave-edge-core`) to reload the resolver.
 
-Use the `:local` tag (no `-gpu`/`-cpu` suffix) — same convention as the camera-driver `:local` tag. `_run_container` auto-appends `-gpu` for `cyberwaveos/edge-ml-worker:*` overrides on GPU hosts, so the operator only commits and pins one tag.
+Use the `:local` tag (no `-gpu`/`-cpu`/`-jetson`/`-hailo` suffix) — same convention as the camera-driver `:local` tag. `_run_container` auto-appends the accelerator suffix (`-jetson` on Jetson hosts, `-gpu` on discrete-NVIDIA hosts, `-hailo` on Pi 5 + AI HAT+) for `cyberwaveos/edge-ml-worker:*` overrides, so the operator only commits and pins one tag.
 
 Typical hot-fix loop (mirroring the camera-driver `:local` tag pattern):
 
@@ -346,10 +346,12 @@ docker cp /path/to/patched/file.py "$WORKER:/usr/local/lib/python3.12/dist-packa
 docker exec -u root "$WORKER" rm /usr/local/.../file.cpython-312-x86_64-linux-gnu.so
 
 # 2. Snapshot the patched container as a local-only tag (and an alias on the
-#    GPU-suffixed tag, so the same image is used regardless of which path
-#    `_run_container` resolves to on this host).
+#    accelerator-suffixed tag matching the host, so the same image is used
+#    regardless of which path `_run_container` resolves to on this host).
 docker commit "$WORKER" cyberwaveos/edge-ml-worker:local
 docker tag    cyberwaveos/edge-ml-worker:local cyberwaveos/edge-ml-worker:local-gpu
+# On Jetson hosts, alias -jetson instead of -gpu:
+# docker tag  cyberwaveos/edge-ml-worker:local cyberwaveos/edge-ml-worker:local-jetson
 
 # 3. Tell edge-core to use it (see the two options above), then restart it.
 #    Pull will fail (registry has no :local) and `_ensure_image_pulled`
@@ -357,9 +359,9 @@ docker tag    cyberwaveos/edge-ml-worker:local cyberwaveos/edge-ml-worker:local-
 sudo systemctl restart cyberwave-edge-core
 ```
 
-The patched image survives every `docker rm`/`docker run` cycle from edge-core's reconcile loop. To revert, remove the env var (or `systemctl revert cyberwave-edge-core` if you used the dropin) and `docker rmi cyberwaveos/edge-ml-worker:local cyberwaveos/edge-ml-worker:local-gpu`.
+The patched image survives every `docker rm`/`docker run` cycle from edge-core's reconcile loop. To revert, remove the env var (or `systemctl revert cyberwave-edge-core` if you used the dropin) and `docker rmi cyberwaveos/edge-ml-worker:local cyberwaveos/edge-ml-worker:local-gpu` (or `…local-jetson` on Jetson hosts).
 
-When overriding to a registry outside `cyberwaveos/edge-ml-worker:*` (e.g. an internal mirror), include the `-gpu` suffix yourself if you need GPU access — the auto-suffix path in `_run_container` only triggers for the canonical `cyberwaveos/edge-ml-worker:` prefix.
+When overriding to a registry outside `cyberwaveos/edge-ml-worker:*` (e.g. an internal mirror), include the accelerator suffix (`-gpu` / `-jetson` / `-hailo`) yourself if you need accelerator access — the auto-suffix path in `_run_container` only triggers for the canonical `cyberwaveos/edge-ml-worker:` prefix.
 
 ### Worker startup probe
 
@@ -443,6 +445,15 @@ Edge Core monitors host memory usage and CPU temperature every ~30 seconds. When
 ### GPU support
 
 When an NVIDIA container runtime is detected (`docker info` reports `nvidia` runtime), Edge Core adds `--gpus all` to the **worker** container's `docker run` command.
+
+For the worker image, Edge Core also rewrites the tag to point at the accelerator-specific sibling. The precedence is:
+
+1. **Jetson host** (`/etc/nv_tegra_release` present, or `CYBERWAVE_PLATFORM_VARIANT=jetson`) → `cyberwaveos/edge-ml-worker:<tag>-jetson` + `--gpus all`. Wins over the plain `-gpu` branch: on Jetson the nvidia-container-runtime is present too, but the amd64 `-gpu` blob has the wrong `libcuda.so` ABI (desktop/server CUDA vs Tegra CUDA). Requires JetPack 7 (Ubuntu 24.04 / L4T r38); JetPack 6 hosts are not supported.
+2. **NVIDIA container runtime detected (not Jetson)** → `cyberwaveos/edge-ml-worker:<tag>-gpu` + `--gpus all`.
+3. **`/dev/hailo0` present and no GPU runtime** → `cyberwaveos/edge-ml-worker:<tag>-hailo` + device passthrough.
+4. **None** → CPU base image.
+
+If the accelerator-specific tag cannot be pulled (e.g. the sibling isn't published for your channel yet), Edge Core falls back to the base tag and logs the demotion — the worker still comes up, just on CPU.
 
 **Driver GPU passthrough** is opt-in via asset metadata. When a driver's config includes `"prefer_gpu": true` and the host has:
 

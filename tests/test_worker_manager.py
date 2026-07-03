@@ -719,6 +719,15 @@ class TestHailoHelpers:
             == "cyberwaveos/edge-ml-worker:latest-gpu"
         )
 
+    def test_apply_hailo_image_tag_leaves_jetson_alone(self) -> None:
+        # A single host is never both a Jetson and a Pi-with-AI-HAT, but
+        # the guard exists so a manual ``CYBERWAVE_WORKER_IMAGE=<...>-jetson``
+        # override on a Hailo host doesn't get double-suffixed.
+        assert (
+            wm_module._apply_hailo_image_tag("cyberwaveos/edge-ml-worker:dev-jetson")
+            == "cyberwaveos/edge-ml-worker:dev-jetson"
+        )
+
     def test_apply_hailo_image_tag_leaves_custom_image_alone(self) -> None:
         assert (
             wm_module._apply_hailo_image_tag("myregistry.local/cyberwave/custom:dev")
@@ -741,6 +750,188 @@ class TestHailoHelpers:
         assert "--group-add" not in args
         assert "--device" in args
         assert "CYBERWAVE_REQUIRED_DEVICES=/dev/hailo0" in args
+
+
+class TestJetsonHelpers:
+    """Pure-function tests for the Jetson helpers (no docker subprocess)."""
+
+    def test_apply_jetson_image_tag_rewrites_known_tag(self) -> None:
+        assert (
+            wm_module._apply_jetson_image_tag("cyberwaveos/edge-ml-worker:latest")
+            == "cyberwaveos/edge-ml-worker:latest-jetson"
+        )
+        assert (
+            wm_module._apply_jetson_image_tag("cyberwaveos/edge-ml-worker:dev")
+            == "cyberwaveos/edge-ml-worker:dev-jetson"
+        )
+
+    def test_apply_jetson_image_tag_leaves_existing_jetson_alone(self) -> None:
+        assert (
+            wm_module._apply_jetson_image_tag("cyberwaveos/edge-ml-worker:dev-jetson")
+            == "cyberwaveos/edge-ml-worker:dev-jetson"
+        )
+
+    def test_apply_jetson_image_tag_leaves_gpu_alone(self) -> None:
+        # Belt-and-braces: an operator override pointing at ``-gpu`` on a
+        # Jetson host doesn't get a second suffix. The image will fail to
+        # pull (wrong arch) but the resolver won't compound the confusion.
+        assert (
+            wm_module._apply_jetson_image_tag("cyberwaveos/edge-ml-worker:latest-gpu")
+            == "cyberwaveos/edge-ml-worker:latest-gpu"
+        )
+
+    def test_apply_jetson_image_tag_leaves_hailo_alone(self) -> None:
+        assert (
+            wm_module._apply_jetson_image_tag("cyberwaveos/edge-ml-worker:dev-hailo")
+            == "cyberwaveos/edge-ml-worker:dev-hailo"
+        )
+
+    def test_apply_jetson_image_tag_leaves_custom_image_alone(self) -> None:
+        assert (
+            wm_module._apply_jetson_image_tag("myregistry.local/cyberwave/custom:dev")
+            == "myregistry.local/cyberwave/custom:dev"
+        )
+
+
+class TestWorkerManagerJetson:
+    """Verify Jetson image tag rewrite + ``--gpus all`` passthrough.
+
+    On a Jetson host the L4T install ships nvidia-container-runtime, so
+    ``docker_has_nvidia_runtime()`` also returns True. The resolver has to
+    pick the ``-jetson`` sibling anyway because the amd64 ``-gpu`` blob has
+    the wrong ``libcuda.so`` ABI for Tegra. These tests pin that precedence
+    with both signals asserted on and confirm ``--gpus all`` still lands in
+    the ``docker run`` command (nvidia-container-runtime handles the Tegra
+    iGPU passthrough the same way).
+    """
+
+    def _stub_docker_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_calls: list[list[str]],
+    ) -> None:
+        def fake_run(cmd: list, **kwargs: object) -> MagicMock:
+            run_calls.append(cmd)
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+
+    def test_jetson_host_uses_jetson_image_not_gpu(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        # Both signals on: real Jetson hosts satisfy both. The resolver
+        # must still land on ``-jetson``, not ``-gpu``.
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--gpus" in docker_run_cmd
+        assert "all" in docker_run_cmd
+        # No Hailo device passthrough — Jetson-and-Hailo isn't a real host,
+        # but the guard is here to catch a resolver refactor that leaks the
+        # Hailo branch into the Jetson code path.
+        assert "--device" not in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-jetson"
+
+    def test_jetson_image_not_double_suffixed_when_already_selected(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        worker_manager._image = "cyberwaveos/edge-ml-worker:latest-jetson"
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            assert worker_manager._run_container() is True
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--gpus" in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-jetson"
+
+    def test_custom_image_override_left_untouched_on_jetson(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``CYBERWAVE_WORKER_IMAGE`` overrides bypass the ``-jetson`` rewrite.
+
+        Same shape as :func:`TestWorkerManagerHailo.test_custom_image_override_left_untouched`
+        and the GPU counterpart: ``--gpus all`` still lands (nvidia-container-runtime
+        needs it regardless of what image the operator chose), but the image
+        reference is left alone.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        worker_manager._image = "myregistry.local/cyberwave/custom-worker:dev"
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--gpus" in docker_run_cmd
+        assert docker_run_cmd[-1] == "myregistry.local/cyberwave/custom-worker:dev"
+
+    def test_no_jetson_args_when_not_jetson_host(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-Jetson host: base tag is preserved (or ``-gpu`` if NVIDIA is present)."""
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: False)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--gpus" not in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest"
 
 
 class TestGetZenohEnvVars:
@@ -1731,8 +1922,11 @@ class TestImageTagMutability:
             "cyberwaveos/edge-ml-worker:dev",
             "cyberwaveos/edge-ml-worker:dev-gpu",
             "cyberwaveos/edge-ml-worker:dev-cpu",
+            "cyberwaveos/edge-ml-worker:dev-jetson",
+            "cyberwaveos/edge-ml-worker:dev-hailo",
             "cyberwaveos/edge-ml-worker:local",
             "cyberwaveos/edge-ml-worker:local-arm64",
+            "cyberwaveos/edge-ml-worker:local-jetson",
             "cyberwaveos/edge-ml-worker:staging",
             "cyberwaveos/edge-ml-worker:nightly",
             "cyberwaveos/edge-ml-worker:edge",
