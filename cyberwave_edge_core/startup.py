@@ -2623,12 +2623,34 @@ def fetch_and_run_twin_drivers(
                 asset = client.assets.get(asset_uuid)
                 assets_by_twin_uuid[twin_uuid] = asset
             except Exception as exc:
-                logger.warning(
+                # Blocking: without the asset we cannot resolve a driver image,
+                # so this twin would otherwise be skipped silently.
+                logger.error(
                     "Failed to get asset %s for twin %s: %s",
                     asset_uuid,
                     twin_uuid,
                     exc,
                 )
+                try:
+                    _send_alert_for_twin(
+                        twin_uuid,
+                        "Driver could not start: asset unavailable",
+                        (
+                            f"The edge could not load the asset for twin "
+                            f"'{getattr(twin, 'name', twin_uuid)}', so its driver was "
+                            "not started. The asset may have been deleted or is no "
+                            "longer accessible. Check the edge logs for details. "
+                            f"Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}"
+                        ),
+                        "driver_start_failure",
+                        severity="error",
+                    )
+                except Exception as alert_exc:
+                    logger.warning(
+                        "Could not send asset-unavailable alert for twin %s: %s",
+                        twin_uuid,
+                        alert_exc,
+                    )
                 continue
 
         attach_to = attach_to_by_twin_uuid.get(twin_uuid)
