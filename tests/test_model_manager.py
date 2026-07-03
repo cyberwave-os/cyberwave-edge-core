@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -364,6 +365,133 @@ def test_ultralytics_self_download_defers_on_frozen_binary(
         _model_manager_mod._ultralytics_self_download("yoloe-26x-seg-pf.pt", tmp_path)
 
 
+def test_ultralytics_self_download_defers_when_sys_executable_is_cli_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If ``sys.executable`` is a CLI wrapper (not Python), pre-download must defer.
+
+    Reproduces CYB-2586 where subprocess probing runs ``cyberwave-edge-core -c``
+    and Click rejects ``-c`` with "No such option".
+    """
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sys, "executable", "/usr/bin/cyberwave-edge-core")
+    monkeypatch.setattr(sys, "_base_executable", "/usr/bin/cyberwave-edge-core", raising=False)
+    monkeypatch.setattr(_model_manager_mod.shutil, "which", lambda _name: None)
+
+    def _fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=2,
+            stdout="",
+            stderr=(
+                "Usage: cyberwave-edge-core [OPTIONS] COMMAND [ARGS]...\n"
+                "Error: No such option '-c'."
+            ),
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    with pytest.raises(_model_manager_mod._RuntimeManagedDeferred):
+        _model_manager_mod._ultralytics_self_download("yoloe-26m-seg.pt", tmp_path)
+
+
+def test_ultralytics_self_download_defers_when_no_interpreter_has_ultralytics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fresh-Pi CYB-2586 repro: wrapper as ``sys.executable`` + ``python3`` on
+    ``PATH`` that lacks ``ultralytics`` must **defer**, not fail.
+
+    On a Pi installed via ``install.sh`` without the ``[ml]`` extra, the
+    wrapper rejects ``-c`` and ``/usr/bin/python3`` accepts ``-c`` but has no
+    ``ultralytics`` installed. A probe that only checks for a live interpreter
+    (e.g. ``import sys``) would hand back that ``python3`` and the real
+    snippet would then fail with ``ModuleNotFoundError`` — surfacing as a
+    misleading ``model_download_failure`` alert. The correct behavior is
+    :class:`_RuntimeManagedDeferred` so the worker container resolves the
+    weight on first inference.
+    """
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sys, "executable", "/usr/bin/cyberwave-edge-core")
+    monkeypatch.setattr(sys, "_base_executable", "/usr/bin/cyberwave-edge-core", raising=False)
+
+    def _fake_which(name: str) -> Optional[str]:
+        return "/usr/bin/python3" if name == "python3" else None
+
+    monkeypatch.setattr(_model_manager_mod.shutil, "which", _fake_which)
+
+    def _fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[0] == "/usr/bin/cyberwave-edge-core":
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=2,
+                stdout="",
+                stderr=(
+                    "Usage: cyberwave-edge-core [OPTIONS] COMMAND [ARGS]...\n"
+                    "Error: No such option '-c'."
+                ),
+            )
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr="ModuleNotFoundError: No module named 'ultralytics'",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    with pytest.raises(_model_manager_mod._RuntimeManagedDeferred):
+        _model_manager_mod._ultralytics_self_download("yoloe-26m-seg.pt", tmp_path)
+
+
+def test_runtime_download_probe_uses_python3_fallback_when_wrapper_rejects_c(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Helper should fall back to ``python3`` when wrapper executables reject ``-c``.
+
+    The probe must be tied to the actual runtime (``import ultralytics``), so
+    ``python3`` only counts as a viable candidate if it can import ultralytics —
+    a bare ``import sys`` success is not enough (CYB-2586).
+    """
+    monkeypatch.setattr(sys, "executable", "/usr/bin/cyberwave-edge-core")
+    monkeypatch.setattr(sys, "_base_executable", "/usr/bin/cyberwave-edge-core", raising=False)
+
+    def _fake_which(name: str) -> Optional[str]:
+        return "/usr/bin/python3" if name == "python3" else None
+
+    monkeypatch.setattr(_model_manager_mod.shutil, "which", _fake_which)
+
+    def _fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        # Wrapper rejects ``-c`` regardless of payload.
+        if cmd[0] == "/usr/bin/cyberwave-edge-core":
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=2,
+                stdout="",
+                stderr=(
+                    "Usage: cyberwave-edge-core [OPTIONS] COMMAND [ARGS]...\n"
+                    "Error: No such option '-c'."
+                ),
+            )
+        # python3 succeeds only when the probe payload matches the runtime we
+        # actually care about: bare ``import sys`` would false-positive on a
+        # host without ultralytics installed.
+        if cmd[0] == "/usr/bin/python3" and cmd[1:] == ["-c", "import ultralytics"]:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr="ModuleNotFoundError: No module named 'ultralytics'",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    resolved = _model_manager_mod._resolve_python_subprocess_executable_for_runtime_download(
+        "yoloe-26m-seg.pt", runtime_module="ultralytics"
+    )
+    assert resolved == "/usr/bin/python3"
+
+
 def test_ensure_models_omits_runtime_managed_deferrals_from_failures(
     tmp_path: Path,
 ) -> None:
@@ -374,9 +502,7 @@ def test_ensure_models_omits_runtime_managed_deferrals_from_failures(
     manager = _make_manager(tmp_path)
 
     def _ensure_raises_deferred(model_id: str) -> Path:
-        raise _model_manager_mod._RuntimeManagedDeferred(
-            f"frozen-binary deferral for {model_id}"
-        )
+        raise _model_manager_mod._RuntimeManagedDeferred(f"frozen-binary deferral for {model_id}")
 
     with patch.object(manager, "ensure_model", side_effect=_ensure_raises_deferred):
         result = manager.ensure_models(["yoloe-26x-seg-pf.pt"])
@@ -1288,8 +1414,7 @@ def test_extract_runtime_reads_edge_runtime() -> None:
     assert _extract_runtime({"metadata": {"edge_package": "ultralytics"}}) == "ultralytics"
     # Explicit ``runtime`` still wins when both are set.
     assert (
-        _extract_runtime({"runtime": "onnxruntime", "edge_runtime": "ultralytics"})
-        == "onnxruntime"
+        _extract_runtime({"runtime": "onnxruntime", "edge_runtime": "ultralytics"}) == "onnxruntime"
     )
 
 

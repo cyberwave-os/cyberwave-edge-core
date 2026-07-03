@@ -158,6 +158,92 @@ class _RuntimeManagedDeferred(Exception):
     (CYB-2103).
     """
 
+
+def _resolve_python_subprocess_executable_for_runtime_download(
+    filename: str, *, runtime_module: str
+) -> str:
+    """Return an interpreter that can ``import <runtime_module>`` in a subprocess.
+
+    Walks a small candidate list (``sys.executable``, ``sys._base_executable``,
+    ``python3``/``python`` on ``PATH``) and returns the first one whose
+    ``<executable> -c "import <runtime_module>"`` exits 0. This is what the
+    runtime-managed download subprocess actually needs: not just "a Python
+    interpreter", but "a Python interpreter that has the runtime installed".
+
+    Some edge-core deployment modes launch the daemon from a non-Python CLI
+    wrapper (e.g. ``/usr/bin/cyberwave-edge-core`` on a fresh Pi installed via
+    ``install.sh``). In those modes ``sys.executable`` rejects ``-c`` outright.
+    On the same hosts, ``python3`` on ``PATH`` may exist but not have the
+    optional runtime installed (``cyberwave-edge-core[ml]`` extras are opt-in),
+    so probing ``import sys`` would false-positive and hand back an interpreter
+    that then fails the real download snippet with ``ModuleNotFoundError`` —
+    surfacing as a misleading ``model_download_failure`` alert.
+
+    If no candidate can import the runtime, raise :class:`_RuntimeManagedDeferred`
+    so the caller can silently defer pre-download to the worker container, which
+    bundles the runtime and will resolve the weight on first inference (CYB-2586
+    / CYB-2103).
+    """
+    import subprocess
+
+    candidates: list[str] = []
+
+    def _add(candidate: str | None) -> None:
+        if not candidate:
+            return
+        candidate = candidate.strip()
+        if not candidate or candidate in candidates:
+            return
+        candidates.append(candidate)
+
+    _add(getattr(sys, "executable", None))
+    _add(getattr(sys, "_base_executable", None))
+    _add(shutil.which("python3"))
+    _add(shutil.which("python"))
+
+    if not candidates:
+        raise _RuntimeManagedDeferred(
+            f"Cannot resolve a Python interpreter that can `import {runtime_module}` "
+            f"for runtime-managed download of {filename!r}; worker container will "
+            f"resolve it on first inference."
+        )
+
+    probe = f"import {runtime_module}"
+    probe_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            proc = subprocess.run(
+                [candidate, "-c", probe],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            probe_errors.append(f"{candidate!r}: {exc}")
+            continue
+        except subprocess.TimeoutExpired:
+            probe_errors.append(f"{candidate!r}: probe timed out")
+            continue
+        except OSError as exc:
+            probe_errors.append(f"{candidate!r}: {exc}")
+            continue
+
+        if proc.returncode == 0:
+            return candidate
+
+        detail = (proc.stderr or proc.stdout or "").strip() or "no output"
+        probe_errors.append(f"{candidate!r}: exit={proc.returncode}: {detail}")
+
+    detail = "; ".join(probe_errors)
+    raise _RuntimeManagedDeferred(
+        f"No Python interpreter on this host can `import {runtime_module}` for "
+        f"runtime-managed download of {filename!r}; attempted "
+        f"{len(candidates)} candidate(s): {detail}. "
+        f"The worker container will resolve this weight on first inference."
+    )
+
+
 #: Regex that matches ``cw.models.load("model-id")`` or
 #: ``cw.models.load('model-id')`` calls in worker Python source files.
 _CW_MODELS_LOAD_RE = re.compile(
@@ -414,9 +500,7 @@ class ModelManager:
         try:
             os.lchown(path, target_uid, target_gid)
         except OSError as exc:
-            logger.debug(
-                "Cannot chown %s to %d:%d: %s", path, target_uid, target_gid, exc
-            )
+            logger.debug("Cannot chown %s to %d:%d: %s", path, target_uid, target_gid, exc)
 
     def _chown_tree(self, root: Path) -> None:
         """Recursively apply :meth:`_chown` to *root* and every entry under it.
@@ -545,9 +629,7 @@ class ModelManager:
             try:
                 results[model_id] = self.ensure_model(model_id)
             except _RuntimeManagedDeferred as exc:
-                logger.info(
-                    "Model '%s' deferred to worker runtime: %s", model_id, exc
-                )
+                logger.info("Model '%s' deferred to worker runtime: %s", model_id, exc)
             except Exception as exc:
                 logger.warning(
                     "Failed to ensure model '%s': %s — worker will handle gracefully",
@@ -599,9 +681,7 @@ class ModelManager:
                     )
                     return True
                 except OSError as exc:
-                    logger.warning(
-                        "Failed to remove orphan model dir %s: %s", orphan_dir, exc
-                    )
+                    logger.warning("Failed to remove orphan model dir %s: %s", orphan_dir, exc)
                     return False
             logger.debug("evict_model: '%s' not in manifest", model_id)
             return False
@@ -868,9 +948,7 @@ class ModelManager:
             local_path = entry.get("local_path") if isinstance(entry, dict) else None
             if isinstance(local_path, str) and local_path:
                 try:
-                    relative = Path(local_path).resolve().relative_to(
-                        self._cache_dir.resolve()
-                    )
+                    relative = Path(local_path).resolve().relative_to(self._cache_dir.resolve())
                 except (OSError, ValueError):
                     continue
                 if relative.parts:
@@ -1279,8 +1357,7 @@ class ModelManager:
         model_dir.mkdir(parents=True, exist_ok=True)
         self._chown(model_dir)
         logger.info(
-            "Resolving model '%s' via runtime-managed downloader "
-            "(runtime=%s, filename=%s) → %s",
+            "Resolving model '%s' via runtime-managed downloader (runtime=%s, filename=%s) → %s",
             model_id,
             runtime,
             filename,
@@ -1797,9 +1874,13 @@ def _ultralytics_self_download(filename: str, dest_dir: Path) -> Path:
         "from ultralytics import YOLO\n"
         f"YOLO({filename!r})\n"
     )
+    python_executable = _resolve_python_subprocess_executable_for_runtime_download(
+        filename, runtime_module="ultralytics"
+    )
+
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", snippet],
+            [python_executable, "-c", snippet],
             capture_output=True,
             text=True,
             timeout=600,
@@ -1807,7 +1888,8 @@ def _ultralytics_self_download(filename: str, dest_dir: Path) -> Path:
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"Cannot invoke Python interpreter for ultralytics self-download: {exc}"
+            f"Cannot invoke Python interpreter {python_executable!r} "
+            f"for ultralytics self-download: {exc}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -1817,8 +1899,7 @@ def _ultralytics_self_download(filename: str, dest_dir: Path) -> Path:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(
-            f"Ultralytics self-download for {filename!r} failed "
-            f"(exit={proc.returncode}): {detail}"
+            f"Ultralytics self-download for {filename!r} failed (exit={proc.returncode}): {detail}"
         )
 
     candidate = dest_dir / filename
@@ -1830,11 +1911,7 @@ def _ultralytics_self_download(filename: str, dest_dir: Path) -> Path:
     # newest weight file in the dir as a defensive fallback so we don't
     # error out on a successful download.
     weight_files = sorted(
-        (
-            p
-            for p in dest_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in (".pt", ".pth")
-        ),
+        (p for p in dest_dir.iterdir() if p.is_file() and p.suffix.lower() in (".pt", ".pth")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
