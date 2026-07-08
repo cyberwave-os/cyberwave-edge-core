@@ -462,13 +462,10 @@ class ModelManager:
         )
         self._manifest = _Manifest.load(self._manifest_path)
         self.last_ensure_failures: dict[str, str] = {}
-        # Self-heal hosts that came up with an orphan staging directory
-        # left by a previously failed download. Without this sweep the
-        # SDK in the worker container would see ``cache_dir/{id}/`` as a
-        # poison-pill directory on every restart and crash with
-        # ``IsADirectoryError`` inside ``torch.load``. We run this once
-        # at construction time so subsequent ``ensure_model`` /
-        # ``evict_model`` calls operate on a clean cache.
+        # Recover any ``*.__cw_normalize__`` files left by a mid-rename
+        # crash in :meth:`_normalize_flat_prestaged_layout`, then prune
+        # empty orphan staging directories from failed downloads.
+        self._recover_normalize_orphans()
         self._prune_orphan_staging_dirs()
 
     # ------------------------------------------------------------------
@@ -922,6 +919,79 @@ class ModelManager:
     # Disk reconciliation (pre-staged / air-gapped support)
     # ------------------------------------------------------------------
 
+    def _recover_normalize_orphans(self) -> None:
+        """Restore ``*.__cw_normalize__`` files left by a mid-rename crash.
+
+        :meth:`_normalize_flat_prestaged_layout` works in three steps:
+        rename flat → staging, mkdir at flat, rename staging → flat/model_id.
+        A crash between steps 1 and 3 leaves the operator's weight at
+        ``cache_dir/{model_id}.__cw_normalize__`` with no manifest entry and
+        nothing at the original flat path (or just an empty directory from
+        step 2). This sweep detects that state at startup and moves the file
+        back so the next :meth:`_reconcile_disk_for` call can retry.
+        """
+        if not self._cache_dir.is_dir():
+            return
+        try:
+            children = list(self._cache_dir.iterdir())
+        except OSError:
+            return
+        suffix = ".__cw_normalize__"
+        for child in children:
+            if not child.name.endswith(suffix):
+                continue
+            if not child.is_file():
+                continue
+            model_id = child.name[: -len(suffix)]
+            if not model_id:
+                continue
+            # Skip if the manifest already has a complete entry — the
+            # normalization succeeded and this is an unexpected leftover.
+            if self._manifest.get(model_id) is not None:
+                logger.warning(
+                    "Unexpected normalize staging file %s with existing manifest "
+                    "entry for '%s'; leaving it in place.",
+                    child,
+                    model_id,
+                )
+                continue
+            flat_path = self._cache_dir / model_id
+            # Step 2 may have created an empty directory at flat_path;
+            # remove it so the rename below can succeed.
+            if flat_path.is_dir():
+                try:
+                    flat_path.rmdir()
+                except OSError as exc:
+                    logger.warning(
+                        "Cannot recover normalize orphan %s: rmdir(%s) failed: %s",
+                        child,
+                        flat_path,
+                        exc,
+                    )
+                    continue
+            if flat_path.exists():
+                logger.warning(
+                    "Cannot recover normalize orphan %s: %s already exists.",
+                    child,
+                    flat_path,
+                )
+                continue
+            try:
+                child.rename(flat_path)
+                logger.info(
+                    "Recovered normalize orphan for '%s': %s → %s",
+                    model_id,
+                    child,
+                    flat_path,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Cannot recover normalize orphan %s → %s: %s",
+                    child,
+                    flat_path,
+                    exc,
+                )
+
     def _prune_orphan_staging_dirs(self) -> None:
         """Remove orphan per-model staging directories at startup.
 
@@ -972,23 +1042,145 @@ class ModelManager:
                 reason="startup sweep — no manifest entry, no recognizable weight file",
             )
 
+    def _normalize_flat_prestaged_layout(self, model_id: str, flat_path: Path) -> Optional[Path]:
+        """Promote ``cache_dir/{model_id}`` (flat file) into ``cache_dir/{model_id}/{model_id}``.
+
+        Three-step rename dance with restore-on-failure so every code path
+        below sees the canonical subdirectory layout. Returns the new file
+        path, or ``None`` when the rename can't complete (caller falls back
+        to registering the flat file as-is).
+        """
+        staging_path = flat_path.parent / f"{model_id}.__cw_normalize__"
+        canonical_file = flat_path / model_id
+
+        if staging_path.exists():
+            logger.warning(
+                "Leftover normalize staging path %s blocks flat-file normalize; remove manually.",
+                staging_path,
+            )
+            return None
+
+        try:
+            flat_path.rename(staging_path)
+        except OSError as exc:
+            logger.warning(
+                "Flat-file normalize aborted at initial rename (%s → %s): %s",
+                flat_path,
+                staging_path,
+                exc,
+            )
+            return None
+
+        try:
+            flat_path.mkdir()
+        except OSError as exc:
+            self._restore_flat_after_normalize(
+                model_id, flat_path, staging_path, needs_rmdir=False, exc=exc
+            )
+            return None
+
+        try:
+            staging_path.rename(canonical_file)
+        except OSError as exc:
+            self._restore_flat_after_normalize(
+                model_id, flat_path, staging_path, needs_rmdir=True, exc=exc
+            )
+            return None
+
+        # mkdir ran as this process (root under systemd); file keeps its
+        # original ownership via rename. Chown the new dir so the worker
+        # container can traverse it.
+        self._chown(flat_path)
+        logger.info(
+            "Normalized flat pre-staged model '%s': %s → %s", model_id, flat_path, canonical_file
+        )
+        return canonical_file
+
+    def _restore_flat_after_normalize(
+        self,
+        model_id: str,
+        flat_path: Path,
+        staging_path: Path,
+        *,
+        needs_rmdir: bool,
+        exc: OSError,
+    ) -> None:
+        """Undo a partial normalize; put the operator's file back at ``flat_path``."""
+        restore_exc: Optional[OSError] = None
+        if needs_rmdir:
+            try:
+                flat_path.rmdir()
+            except OSError as e:
+                restore_exc = e
+        if restore_exc is None:
+            try:
+                staging_path.rename(flat_path)
+            except OSError as e:
+                restore_exc = e
+        if restore_exc is None:
+            logger.warning("Flat-file normalize for '%s' rolled back (%s).", model_id, exc)
+            return
+        logger.error(
+            "Flat-file normalize for '%s' failed (%s) AND restore failed (%s); "
+            "weight file left at %s, move back to %s manually.",
+            model_id,
+            exc,
+            restore_exc,
+            staging_path,
+            flat_path,
+        )
+
+    def _reconcile_flat_prestaged_file(self, model_id: str, weight_path: Path) -> None:
+        """Fallback: register a flat pre-staged file as-is when normalize can't run.
+
+        Closes the ``EEXIST`` crash on ``_download_model``'s ``mkdir``; the
+        trade-off is that no sidecar is written, so ``_restamp_if_prestaged``
+        cannot detect an in-place restage until the operator moves the file
+        into a subdirectory manually.
+        """
+        checksum = _sha256_file(weight_path)
+        runtime = _runtime_from_extension(weight_path.suffix)
+        self._manifest.set(
+            CachedModel(
+                model_id=model_id,
+                local_path=str(weight_path),
+                size_bytes=weight_path.stat().st_size,
+                downloaded_at=_utc_iso_now(),
+                source_url=None,
+                checksum_sha256=checksum,
+                runtime=runtime,
+                downloaded_from=SOURCE_KIND_PRESTAGED,
+            )
+        )
+        self._save_manifest()
+        logger.info(
+            "Reconciled flat pre-staged model '%s' from %s (no-normalize fallback)",
+            model_id,
+            weight_path,
+        )
+
     def _reconcile_disk_for(self, model_id: str) -> None:
         """Rebuild the manifest entry for *model_id* from on-disk state.
 
-        Idempotent. Used for two scenarios:
+        Idempotent. Handles:
 
-        * Air-gapped operator copied weights into ``cache_dir/{model_id}/``
-          on a USB stick, with or without a sidecar ``metadata.json``.
-        * Manifest was deleted but per-model sidecars remain.
-
-        If a sidecar exists it is honored; otherwise a single weight file
-        in the directory is auto-detected and a sidecar is written so that
-        subsequent runs are deterministic.
+        * ``cache_dir/{model_id}/`` — directory layout, with or without a sidecar.
+        * ``cache_dir/{model_id}`` as a flat file — normalized into the
+          directory layout via :meth:`_normalize_flat_prestaged_layout` so
+          every downstream code path sees a single canonical shape. On
+          rename failure we fall back to :meth:`_reconcile_flat_prestaged_file`.
         """
         if self._manifest.get(model_id) is not None:
             return
 
         model_dir = self._cache_dir / model_id
+
+        if model_dir.is_file():
+            if self._normalize_flat_prestaged_layout(model_id, model_dir) is None:
+                self._reconcile_flat_prestaged_file(model_id, model_dir)
+                return
+            # Fall through: model_dir is now a directory.
+
         if not model_dir.is_dir():
             return
 
@@ -1183,11 +1375,15 @@ class ModelManager:
         filename = _derive_filename(model_id, catalog_entry, sources[0][1])
 
         model_dir = self._cache_dir / model_id
+        # Reconciliation is meant to promote any flat operator-staged file
+        # into the subdirectory layout before we reach the download path.
+        # Refuse rather than clobber if it's still here.
         if model_dir.is_file():
-            logger.warning(
-                "Removing stale flat file at %s to create model cache directory", model_dir
+            raise RuntimeError(
+                f"Refusing to download model '{model_id}': a pre-staged file "
+                f"exists at {model_dir}. Move it into {model_dir}/ or call "
+                f"evict_model({model_id!r})."
             )
-            model_dir.unlink()
         model_dir.mkdir(parents=True, exist_ok=True)
         self._chown(model_dir)
         dest_path = model_dir / filename
@@ -1349,11 +1545,13 @@ class ModelManager:
         through and re-triggers the runtime fetch.
         """
         model_dir = self._cache_dir / model_id
+        # Same clobber-refusal as :meth:`_download_model`.
         if model_dir.is_file():
-            logger.warning(
-                "Removing stale flat file at %s to create model cache directory", model_dir
+            raise RuntimeError(
+                f"Refusing runtime-managed download for '{model_id}': a "
+                f"pre-staged file exists at {model_dir}. Move it into "
+                f"{model_dir}/ or call evict_model({model_id!r})."
             )
-            model_dir.unlink()
         model_dir.mkdir(parents=True, exist_ok=True)
         self._chown(model_dir)
         logger.info(

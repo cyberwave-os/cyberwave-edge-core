@@ -1666,6 +1666,149 @@ def test_reconcile_ignores_dotfiles_and_temp_downloads(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Flat-file pre-staged layout (cache_dir/{model_id} is a file)
+# ---------------------------------------------------------------------------
+
+
+def test_flat_prestaged_file_normalized_into_subdirectory_layout(tmp_path: Path) -> None:
+    """Regression for ``[Errno 17] File exists``: a flat pre-staged weight is
+    promoted to ``cache_dir/{model_id}/{model_id}`` with a sidecar and manifest
+    entry so every downstream code path sees the canonical layout."""
+    model_id = "yoloe-26s-seg.pt"
+    (tmp_path / model_id).write_bytes(b"yoloe-flat-weights")
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    canonical_file = tmp_path / model_id / model_id
+    assert result == canonical_file
+    assert canonical_file.read_bytes() == b"yoloe-flat-weights"
+
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.downloaded_from == SOURCE_KIND_PRESTAGED
+    assert cached.local_path == str(canonical_file)
+    assert cached.runtime == "ultralytics"
+    assert (tmp_path / model_id / MODEL_METADATA_FILENAME).exists()
+
+
+def test_flat_prestaged_restage_in_place_after_normalization(tmp_path: Path) -> None:
+    """The Option A payoff: after normalization, an in-place overwrite is
+    recognized as a restage via the shared ``_restamp_if_prestaged`` path."""
+    model_id = "yoloe-26s-seg.pt"
+    (tmp_path / model_id).write_bytes(b"v1-original")
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        canonical = manager.ensure_model(model_id)
+
+    new_content = b"v2-restaged-in-place-XXXXXXXXXX"
+    canonical.write_bytes(new_content)
+
+    manager2 = _make_manager(tmp_path)
+    with patch.object(manager2, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager2.ensure_model(model_id)
+
+    assert result.read_bytes() == new_content
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.checksum_sha256 == hashlib.sha256(new_content).hexdigest()
+
+
+def test_normalize_orphan_recovered_after_crash_before_mkdir(tmp_path: Path) -> None:
+    """Crash between step 1 (flat→staging rename) and step 2 (mkdir).
+
+    On next boot the weight is at ``{model_id}.__cw_normalize__`` and
+    ``{model_id}`` doesn't exist. The startup sweep renames it back and
+    the subsequent ``ensure_model`` normalizes it cleanly."""
+    model_id = "yoloe-26s-seg.pt"
+    staging = tmp_path / f"{model_id}.__cw_normalize__"
+    staging.write_bytes(b"operator-weights")
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == tmp_path / model_id / model_id
+    assert result.read_bytes() == b"operator-weights"
+    assert not staging.exists()
+
+
+def test_normalize_orphan_recovered_after_crash_after_mkdir(tmp_path: Path) -> None:
+    """Crash between step 2 (mkdir) and step 3 (staging→canonical rename).
+
+    On next boot the weight is at ``{model_id}.__cw_normalize__`` and
+    ``{model_id}`` is an empty directory. The startup sweep removes the
+    directory and renames the file back."""
+    model_id = "yoloe-26s-seg.pt"
+    staging = tmp_path / f"{model_id}.__cw_normalize__"
+    staging.write_bytes(b"operator-weights")
+    (tmp_path / model_id).mkdir()  # empty dir from step 2
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == tmp_path / model_id / model_id
+    assert result.read_bytes() == b"operator-weights"
+    assert not staging.exists()
+
+
+def test_flat_prestaged_normalization_failure_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the normalizing rename fails (read-only fs, leftover staging, …),
+    reconcile falls back to flat-file registration so the crash still goes
+    away — in-place restage becomes unavailable until the operator fixes
+    layout manually."""
+    model_id = "yoloe-26s-seg.pt"
+    flat_path = tmp_path / model_id
+    flat_path.write_bytes(b"unmovable-weights")
+
+    original_rename = Path.rename
+
+    def _rename(self: Path, target: Any) -> Path:
+        if str(self) == str(flat_path):
+            raise OSError("simulated read-only")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _rename)
+
+    manager = _make_manager(tmp_path)
+    with patch.object(manager, "_download_model", side_effect=AssertionError("must not download")):
+        result = manager.ensure_model(model_id)
+
+    assert result == flat_path
+    assert flat_path.is_file()
+    cached = _Manifest.load(tmp_path / "manifest.json").get(model_id)
+    assert cached is not None
+    assert cached.local_path == str(flat_path)
+
+
+def test_download_refuses_to_clobber_flat_prestaged_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Belt-and-braces: if reconciliation is bypassed and ``_download_model``
+    still sees a flat file, it raises rather than silently unlinks it."""
+    model_id = "yoloe-26s-seg.pt"
+    flat_path = tmp_path / model_id
+    flat_path.write_bytes(b"operator-blessed")
+
+    manager = _make_manager(tmp_path)
+    monkeypatch.setattr(
+        manager,
+        "_fetch_catalog_entry",
+        lambda mid: {"download_url": "https://dl.example.com/x.pt", "runtime": "ultralytics"},
+    )
+    monkeypatch.setattr(manager, "_stream_download", lambda u, d: pytest.fail("must not stream"))
+
+    with pytest.raises(RuntimeError, match="Refusing to download"):
+        manager._download_model(model_id)
+    assert flat_path.read_bytes() == b"operator-blessed"
+
+
+# ---------------------------------------------------------------------------
 # _extract_download_url: new upstream_weights_url alias
 # ---------------------------------------------------------------------------
 
