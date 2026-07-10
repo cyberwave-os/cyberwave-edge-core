@@ -256,7 +256,12 @@ def docker_prune_stopped_cyberwave_containers(prefix: str = "cyberwave") -> int:
 
 
 def docker_prune_unused_images() -> bool:
-    """Run ``docker image prune --all --force`` to remove all unused images.
+    """Remove unused Docker images that are older than 2 hours.
+
+    The ``--filter until=2h`` guard protects freshly-built or freshly-pulled
+    local images (e.g. a dev test image tagged moments before a service
+    restart) from being collected before the worker container has a chance to
+    start and reference them.
 
     Returns True on success.
     """
@@ -264,7 +269,7 @@ def docker_prune_unused_images() -> bool:
         return False
     try:
         subprocess.run(
-            ["docker", "image", "prune", "--all", "--force"],
+            ["docker", "image", "prune", "--all", "--force", "--filter", "until=2h"],
             check=True,
             capture_output=True,
             text=True,

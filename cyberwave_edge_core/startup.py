@@ -5295,8 +5295,8 @@ _EDGE_JSON_SYNC_INTERVAL_LOOPS = int(
 )
 _edge_json_sync_loop_counter = 0
 
-_last_container_prune_time: float = 0.0
-_last_image_prune_time: float = 0.0
+_last_container_prune_time: float = time.monotonic()
+_last_image_prune_time: float = time.monotonic()
 _docker_cleanup_disabled: bool | None = None
 
 
