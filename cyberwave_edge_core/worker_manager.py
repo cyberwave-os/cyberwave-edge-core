@@ -1062,13 +1062,23 @@ class WorkerManager:
         # and ``docker_has_nvidia_runtime()`` return true — the L4T install
         # ships the nvidia-container-runtime — but the amd64 ``-gpu`` blob
         # does not run on Tegra (different libcuda ABI, wrong PTX arch), so
-        # we must pick the ``-jetson`` sibling here. Both share the
-        # ``--gpus all`` flag: nvidia-container-runtime handles the Tegra
-        # iGPU passthrough the same way it handles a discrete GPU.
+        # we must pick the ``-jetson`` sibling here.
+        #
+        # On Jetson JP7 (L4T r39, CUDA 13.x), the nvidia-container-runtime uses
+        # CSV mode to inject GPU device files and the libcuda.so.1 driver.  The
+        # injection is triggered by NVIDIA_VISIBLE_DEVICES=all; ``--gpus all`` in
+        # Docker CLI sets that env var, but passing it explicitly via ``-e`` is
+        # more reliable across different runtime and Docker version combinations.
+        # NVIDIA_DRIVER_CAPABILITIES=all is also required so the CUDA runtime
+        # libraries bundled in the image can communicate with the host driver.
         gpu_args: list[str] = []
         non_gpu_image: str | None = None
         if is_jetson():
-            gpu_args = ["--gpus", "all"]
+            gpu_args = [
+                "--runtime", "nvidia",
+                "-e", "NVIDIA_VISIBLE_DEVICES=all",
+                "-e", "NVIDIA_DRIVER_CAPABILITIES=all",
+            ]
             rewritten = _apply_jetson_image_tag(image)
             if rewritten != image:
                 non_gpu_image = image
@@ -1076,7 +1086,7 @@ class WorkerManager:
                 logger.info("Jetson host detected; using Jetson image %s", image)
             else:
                 logger.info(
-                    "Jetson host detected; adding --gpus all to worker container %s",
+                    "Jetson host detected; adding NVIDIA runtime env to worker container %s",
                     image,
                 )
         elif docker_has_nvidia_runtime():
