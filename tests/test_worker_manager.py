@@ -908,6 +908,40 @@ class TestWorkerManagerJetson:
         assert "--gpus" in docker_run_cmd
         assert docker_run_cmd[-1] == "myregistry.local/cyberwave/custom-worker:dev"
 
+    def test_jetson_image_not_gpu_suffixed_on_nvidia_host(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``-jetson`` override on a non-Jetson NVIDIA host must not become ``-jetson-gpu``.
+
+        Jetson implies GPU — there is no non-GPU Jetson variant.  If an operator
+        pins ``CYBERWAVE_WORKER_IMAGE=…:dev-jetson`` on a machine where
+        ``is_jetson()`` returns False but ``docker_has_nvidia_runtime()`` is True
+        (e.g. a misconfigured host or a future edge-core binary running a
+        pre-tagged image), the ``-gpu`` suffix must not be appended.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        worker_manager._image = "cyberwaveos/edge-ml-worker:dev-jetson"
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: False)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            assert worker_manager._run_container() is True
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--gpus" in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:dev-jetson"
+
     def test_no_jetson_args_when_not_jetson_host(
         self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

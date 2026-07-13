@@ -1091,7 +1091,7 @@ class WorkerManager:
                 )
         elif docker_has_nvidia_runtime():
             gpu_args = ["--gpus", "all"]
-            if image.startswith("cyberwaveos/edge-ml-worker:") and not image.endswith("-gpu"):
+            if image.startswith("cyberwaveos/edge-ml-worker:") and not image.endswith("-gpu") and not image.endswith("-jetson"):
                 non_gpu_image = image
                 image = f"{image}-gpu"
                 logger.info("NVIDIA runtime detected; using GPU image %s", image)
