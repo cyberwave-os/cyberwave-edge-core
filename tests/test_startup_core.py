@@ -1808,7 +1808,7 @@ class TestFixConfigDirOwnership:
     def test_chowns_under_systemd_via_config_parent_owner(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """systemd-style: root without SUDO_UID, but CONFIG_DIR.parent is user-owned."""
+        """systemd-style: root without SUDO_UID, but CONFIG_DIR.parent is user-written."""
         target_uid, target_gid = 1000, 1000
         (tmp_path / "fingerprint.json").write_text("{}")
 
@@ -1817,7 +1817,7 @@ class TestFixConfigDirOwnership:
         monkeypatch.delenv("SUDO_UID", raising=False)
         monkeypatch.delenv("SUDO_GID", raising=False)
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-        # Simulate a user-owned parent — helper returns that user's uid/gid.
+        # Simulate a user-written parent — helper returns that user's uid/gid.
         monkeypatch.setattr(
             startup,
             "resolve_config_owner_uid_gid",
@@ -2089,7 +2089,7 @@ class TestEnsureConfigSubdirs:
         assert chown_calls == []
 
     def test_chowns_created_subdirs_under_systemd(self, tmp_path: Path, monkeypatch) -> None:
-        """Root caller with a user-owned parent chowns created subdirs."""
+        """Root caller with a user-written parent chowns created subdirs."""
         cfg_dir = tmp_path / ".cyberwave"
         monkeypatch.setattr(startup, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(
