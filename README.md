@@ -436,11 +436,16 @@ On devices with ≤4 GB total RAM, Edge Core automatically applies a memory limi
 
 Edge Core monitors host memory usage and CPU temperature every ~30 seconds. When memory usage exceeds 85% (warning) or 92% (critical), or CPU temperature exceeds 75°C (warning) or 82°C (critical), structured log messages are emitted so operators can investigate via `journalctl`.
 
+Every heartbeat also samples instantaneous board power draw from sysfs (Jetson INA3221 `in_power0_input`, generic `hwmon/power1_input`, or `power_supply/BAT*/power_now` in that order) and publishes it as `power_mw` on the `edge_health` MQTT payload. This surfaces as the `pwr X.XW` pill in the Edge details panel of the dashboard. Power is read fresh on every 5 s heartbeat (not throttled by the 30 s monitor cache) because draw can change several-fold between idle and motion in under a second.
+
+Set `CYBERWAVE_BATTERY_WH` to your battery pack's watt-hour capacity to enable a rough runtime estimate on the dashboard (e.g. `36.0` for a 36 Wh pack). The estimate is a simple linear model (`battery_wh / current_watts` hours); it ignores discharge curves and temperature effects and is only meant to answer "will this run another 30 minutes?".
+
 | Variable | Default | Description |
 |---|---|---|
 | `CYBERWAVE_HARDWARE_WATCHDOG` | `true` | Enable/disable the hardware watchdog (`/dev/watchdog`) |
 | `CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT` | `true` | Enable/disable auto-detected memory limits on ≤4 GB hosts |
 | `CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS` | `30` | Seconds to wait for the worker container to reach `running` state after `docker run` |
+| `CYBERWAVE_BATTERY_WH` | _(unset)_ | Battery pack capacity in watt-hours. Enables the battery uptime estimate in the Edge details panel of the dashboard. |
 
 ### GPU support
 

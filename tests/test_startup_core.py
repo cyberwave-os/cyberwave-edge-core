@@ -1640,6 +1640,13 @@ class TestBuildHostMetricsProvider:
     covered separately under ``cyberwave-python/tests/test_edge_health.py``.
     """
 
+    @pytest.fixture(autouse=True)
+    def _isolate_power_and_battery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Neutralise real sysfs reads / env config so tests are deterministic on
+        any host (Jetson dev box, laptop with a battery, operator-set env)."""
+        monkeypatch.setattr(startup, "_read_host_power_draw", lambda: None)
+        monkeypatch.delenv("CYBERWAVE_BATTERY_WH", raising=False)
+
     def test_returns_none_when_both_monitors_absent(self) -> None:
         assert startup._build_host_metrics_provider(None, None) is None
 
@@ -1702,6 +1709,102 @@ class TestBuildHostMetricsProvider:
         # Provider must not raise; watchdog field is still present.
         out = provider()
         assert out == {"watchdog_layers": ["systemd"]}
+
+    def test_includes_power_mw_when_reader_returns_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``power_mw`` is emitted directly on the payload, not nested."""
+        from cyberwave.edge.host_metrics import HostPowerDraw
+
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return []
+
+        monkeypatch.setattr(
+            startup,
+            "_read_host_power_draw",
+            lambda: HostPowerDraw(milliwatts=8500.0, source="ina3221x:in_power0"),
+        )
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+        out = provider()
+        assert out["power_mw"] == pytest.approx(8500.0)
+
+    def test_omits_power_mw_when_reader_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Missing sysfs sources must not emit ``power_mw: null``."""
+
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return []
+
+        monkeypatch.setattr(startup, "_read_host_power_draw", lambda: None)
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+        out = provider()
+        assert "power_mw" not in out
+
+    def test_reads_battery_wh_from_env_at_closure_creation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``CYBERWAVE_BATTERY_WH`` is captured once, not re-read per call."""
+
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return []
+
+        monkeypatch.setenv("CYBERWAVE_BATTERY_WH", "36.0")
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+
+        # Change the env AFTER building the provider; the closure must
+        # keep returning the value captured at creation time.
+        monkeypatch.setenv("CYBERWAVE_BATTERY_WH", "999.9")
+        out = provider()
+        assert out["battery_wh"] == pytest.approx(36.0)
+
+    def test_battery_wh_absent_when_env_unset(self) -> None:
+        """Uptime estimate is opt-in; no key emitted without the env var."""
+
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return []
+
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+        out = provider()
+        assert "battery_wh" not in out
+
+    def test_battery_wh_ignored_when_env_is_malformed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-numeric env value degrades to "no estimate" rather than crashing."""
+
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return []
+
+        monkeypatch.setenv("CYBERWAVE_BATTERY_WH", "not-a-float")
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+        out = provider()
+        assert "battery_wh" not in out
+
+    def test_isolates_power_reader_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A crashing power reader must not suppress the rest of the payload."""
+
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return ["systemd"]
+
+        def _boom() -> None:
+            raise RuntimeError("sysfs read blew up")
+
+        monkeypatch.setattr(startup, "_read_host_power_draw", _boom)
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+        out = provider()
+        assert "power_mw" not in out
+        assert out["watchdog_layers"] == ["systemd"]
 
 
 class TestStartupHeartbeatOrdering:

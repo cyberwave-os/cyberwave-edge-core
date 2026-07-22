@@ -41,6 +41,19 @@ from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_
 from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 
+# Graceful fallback for edge-cores paired with an older SDK wheel that
+# predates ``read_host_power_draw`` — matches the pattern in
+# ``resource_monitor.py`` for the other host-metric readers.
+try:
+    from cyberwave.edge.host_metrics import (
+        read_host_power_draw as _read_host_power_draw,
+    )
+except ImportError:  # pragma: no cover - defensive
+
+    def _read_host_power_draw():  # type: ignore[misc]
+        return None
+
+
 from . import __version__ as PACKAGE_EDGE_CORE_VERSION
 from .utils import (
     EDGE_CORE_RESTART_PHASE_COMPLETED,
@@ -2316,12 +2329,25 @@ def _build_host_metrics_provider(
     payload shape (any subclass / older edge node without the host
     instrumentation continues to publish unchanged).
 
-    The closure is intentionally tolerant: each subreader is wrapped so
-    that a single misbehaving source (e.g. a resource monitor that has
-    never been ``check()``-ed yet) cannot suppress the whole payload.
+    Power draw bypasses ``resource_monitor``'s 30 s throttle and is
+    sampled fresh every heartbeat (draw can jump 3x sub-second between
+    idle and motion).  ``CYBERWAVE_BATTERY_WH`` is captured once here
+    because the battery pack is static hardware config.
     """
     if resource_monitor is None and watchdog is None:
         return None
+
+    battery_wh: Optional[float] = None
+    battery_wh_str = os.environ.get("CYBERWAVE_BATTERY_WH", "").strip()
+    if battery_wh_str:
+        try:
+            battery_wh = float(battery_wh_str)
+        except ValueError:
+            logger.warning(
+                "CYBERWAVE_BATTERY_WH is not a valid float: %r; battery "
+                "uptime estimate on the dashboard will be hidden.",
+                battery_wh_str,
+            )
 
     def _provider() -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -2338,6 +2364,14 @@ def _build_host_metrics_provider(
                 out["watchdog_layers"] = watchdog.active_layers()
             except Exception:  # pragma: no cover - defensive
                 logger.debug("watchdog active_layers() raised", exc_info=True)
+        try:
+            power = _read_host_power_draw()
+            if power is not None:
+                out["power_mw"] = power.milliwatts
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("read_host_power_draw() raised", exc_info=True)
+        if battery_wh is not None:
+            out["battery_wh"] = battery_wh
         return out
 
     return _provider
