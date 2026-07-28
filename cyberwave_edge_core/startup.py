@@ -5191,6 +5191,10 @@ def _sync_workers_for_twins(
                 "unchanged": len(result.unchanged),
                 "errors": len(result.errors),
             }
+            # Alert per twin whose worker couldn't be downloaded/written;
+            # skip the synthetic ``__cleanup__`` sweep result.
+            if result.errors and not result.twin_uuid.startswith("__"):
+                _send_worker_sync_failure_alert(result.twin_uuid, result.errors)
     except Exception:
         logger.exception("Worker sync_all failed for twins %s", twin_uuids)
         for twin_uuid in twin_uuids:
@@ -5200,7 +5204,41 @@ def _sync_workers_for_twins(
                 "unchanged": 0,
                 "errors": 1,
             }
+            _send_worker_sync_failure_alert(
+                twin_uuid, ["worker sync failed before any workflow was fetched"]
+            )
     return summary
+
+
+def _send_worker_sync_failure_alert(twin_uuid: str, errors: list[str]) -> None:
+    """Best-effort twin alert when workflow workers fail to sync. Stable
+    title/description (specifics go to the log) so the backend dedupes a
+    persistent outage into a single row.
+    """
+    logger.warning(
+        "Worker sync for twin %s had %d error(s): %s",
+        twin_uuid,
+        len(errors),
+        "; ".join(errors),
+    )
+    try:
+        _send_alert_for_twin(
+            twin_uuid,
+            "Workflow download failed",
+            (
+                "The edge could not download one or more workflow workers "
+                "from the cloud. Affected workflows will not run on this "
+                "twin until the next successful sync."
+            ),
+            "workflow_sync_failure",
+            severity="error",
+        )
+    except Exception:
+        logger.debug(
+            "Failed to send workflow-sync-failure alert for twin %s",
+            twin_uuid,
+            exc_info=True,
+        )
 
 
 def reconcile_worker_sync() -> dict[str, int]:

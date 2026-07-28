@@ -146,8 +146,14 @@ class TestSyncWorkersForTwins:
         fake_client.sync_all.assert_called_once_with(["twin-a", "twin-b"])
 
     def test_isolates_per_twin_exception(self, monkeypatch, tmp_path):
-        """If sync_all() raises, all twins get error entries."""
+        """If sync_all() raises, all twins get error entries + an alert."""
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        alerted: list[str] = []
+        monkeypatch.setattr(
+            startup,
+            "_send_alert_for_twin",
+            lambda twin_uuid, *a, **kw: alerted.append(twin_uuid),
+        )
 
         fake_client = MagicMock()
         fake_client.sync_all.side_effect = RuntimeError("network timeout")
@@ -164,6 +170,41 @@ class TestSyncWorkersForTwins:
 
         assert summary["twin-a"]["errors"] == 1
         assert summary["twin-b"]["errors"] == 1
+        assert set(alerted) == {"twin-a", "twin-b"}
+
+    def test_sends_alert_when_a_twin_worker_fails_to_download(
+        self, monkeypatch, tmp_path
+    ):
+        """A per-twin download/write error surfaces a twin-scoped alert so the
+        operator sees why an active workflow isn't running."""
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        alerted: list[str] = []
+        monkeypatch.setattr(
+            startup,
+            "_send_alert_for_twin",
+            lambda twin_uuid, *a, **kw: alerted.append(twin_uuid),
+        )
+
+        fake_client = MagicMock()
+        fake_client.sync_all.return_value = [
+            _result("twin-a", written=["wf_aaa.py"]),
+            _result("twin-b", errors=["Failed to write wf_bbb.py: disk full"]),
+            # The synthetic cleanup result must never raise an alert.
+            _result("__cleanup__", errors=["stale sweep noise"]),
+        ]
+
+        with patch(
+            "cyberwave_edge_core.edge_sync_client.EdgeSyncClient",
+            return_value=fake_client,
+        ):
+            summary = startup._sync_workers_for_twins(
+                token="tok",
+                twin_uuids=["twin-a", "twin-b"],
+                base_url="http://localhost:8000",
+            )
+
+        assert summary["twin-b"]["errors"] == 1
+        assert alerted == ["twin-b"]
 
     def test_uses_config_dir_workers_subdirectory(self, monkeypatch, tmp_path):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
