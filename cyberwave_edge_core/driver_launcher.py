@@ -428,21 +428,27 @@ def _run_docker_image(
     if runtime_environment != "production":
         container_env["CYBERWAVE_ENVIRONMENT"] = runtime_environment
 
-    # Also forward additional CYBERWAVE_* env vars persisted by the CLI.
+    # Forward additional CYBERWAVE_* env vars persisted by the CLI (the values
+    # an operator passes to ``cyberwave edge install``). These operator-supplied
+    # values MUST be able to OVERRIDE an asset's baked ``driver_docker_params``
+    # — e.g. a driver whose params hardcode the prod broker
+    # (CYBERWAVE_BASE_URL / CYBERWAVE_MQTT_HOST / CYBERWAVE_MQTT_PORT) must still
+    # honor a local CYBERWAVE_MQTT_PORT=1883 the operator configured. Because
+    # container_env is merged OVER the asset params below (edge-injected wins),
+    # we deliberately do NOT skip keys that also appear in the asset params;
+    # skipping them let a stale baked value shadow the operator's config.
     for key, value in s.load_credentials_envs().items():
         if key.startswith("CYBERWAVE_"):
-            if key in explicit_params_env:
-                continue
             container_env.setdefault(key, value)
 
     # Forward CYBERWAVE_* from the edge core process environment so that
-    # host-set vars (e.g. systemd Environment=, /etc/environment) reach
-    # the driver container. E.g. CYBERWAVE_GO2_IP_ADDR for the Go2 driver.
-    # setdefault avoids overwriting vars we or credentials already set.
+    # host-set vars (e.g. systemd Environment=, /etc/environment, and vars an
+    # operator exports before running the installer) reach the driver container
+    # and likewise override asset-baked params. E.g. CYBERWAVE_GO2_IP_ADDR for
+    # the Go2 driver. setdefault preserves the environment-correct values the
+    # explicit block above already resolved (host/port/base_url/environment).
     for key, value in os.environ.items():
         if key.startswith("CYBERWAVE_") and isinstance(value, str) and value.strip():
-            if key in explicit_params_env:
-                continue
             container_env.setdefault(key, value.strip())
 
     # Auto-infer MQTT TLS when port 8883 is configured but USE_TLS is absent.
@@ -660,6 +666,34 @@ def _run_docker_image(
                 container_name,
             )
 
+    # De-duplicate environment variables across driver-metadata ``params`` and
+    # edge-injected ``env_vars``. Driver metadata sometimes hardcodes connection
+    # vars (e.g. CYBERWAVE_BASE_URL / CYBERWAVE_MQTT_HOST / CYBERWAVE_MQTT_PORT)
+    # that edge-core already sets with the environment-correct values. Emitting
+    # both leaves two ``-e`` for the same key: docker uses the last (edge-injected)
+    # value, but the duplicate is confusing and a driver's startup banner can read
+    # the stale one. Collapse to exactly one ``-e`` per key, edge-injected wins
+    # (identical to docker's existing last-wins behavior — no runtime change).
+    def _split_env(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
+        passthrough: list[str] = []
+        env: dict[str, str] = {}
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == "-e" and i + 1 < len(tokens):
+                env[tokens[i + 1].split("=", 1)[0]] = tokens[i + 1]
+                i += 2
+            else:
+                passthrough.append(tokens[i])
+                i += 1
+        return passthrough, env
+
+    params_pass, params_env = _split_env(params)
+    envvars_pass, injected_env = _split_env(env_vars)
+    merged_env = {**params_env, **injected_env}  # edge-injected value wins
+    env_flags: list[str] = []
+    for kv in merged_env.values():
+        env_flags += ["-e", kv]
+
     cmd = [
         "docker",
         "run",
@@ -675,8 +709,9 @@ def _run_docker_image(
         *network_args,
         "--name",
         container_name,
-        *params,
-        *env_vars,
+        *params_pass,
+        *envvars_pass,
+        *env_flags,
         image,
         *(command or []),
     ]

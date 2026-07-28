@@ -38,6 +38,7 @@ pyinstaller \
     --hidden-import httpx \
     --collect-submodules cyberwave \
     --collect-submodules rich._unicode_data \
+    --exclude-module matplotlib \
     __pyinstaller_entry.py
 
 # Clean up the temporary entry point
