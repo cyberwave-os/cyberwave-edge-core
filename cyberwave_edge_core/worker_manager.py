@@ -21,7 +21,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .docker_args import (
     _rewrite_macos_container_base_url,
@@ -861,9 +861,15 @@ class WorkerManager:
             return False
 
     def _pull_worker_image_with_progress_once(
-        self, image: str, timeout: int = 600
+        self,
+        image: str,
+        timeout: int = 600,
+        *,
+        alert_ctxs: list[Any] | None = None,
+        is_final_attempt: bool = True,
     ) -> bool:
-        """Single attempt to pull *image* with progress reporting."""
+        """Single attempt to pull *image*. Reuses *alert_ctxs* across retries
+        if given; *is_final_attempt* gates critical-escalation vs. just annotating."""
         if not self._twin_uuids:
             return self._ensure_image_pulled(image, timeout=timeout)
 
@@ -892,15 +898,28 @@ class WorkerManager:
             has_local,
         )
 
-        alert_ctxs: list[WorkerStartingAlertContext] = []
-        for twin_uuid in self._twin_uuids:
-            ctx = WorkerStartingAlertContext(
-                twin_uuid=twin_uuid,
-                image=image,
-                container_name=self._container_name,
-            )
-            ctx.create()
-            alert_ctxs.append(ctx)
+        owns_alert_ctxs = alert_ctxs is None
+        if alert_ctxs is None:
+            alert_ctxs = []
+            for twin_uuid in self._twin_uuids:
+                ctx = WorkerStartingAlertContext(
+                    twin_uuid=twin_uuid,
+                    image=image,
+                    container_name=self._container_name,
+                )
+                ctx.create()
+                alert_ctxs.append(ctx)
+
+        def _fail(error_str: str, *, phase: str) -> bool:
+            if is_final_attempt:
+                for ctx in alert_ctxs:
+                    ctx.mark_failed_and_resolve(error_str, phase=phase)
+            else:
+                for ctx in alert_ctxs:
+                    ctx.update_metadata(
+                        {"phase": phase, "last_error": error_str[:500]}, force=True
+                    )
+            return False
 
         contexts = [
             _PullDeliveryContext(
@@ -919,8 +938,9 @@ class WorkerManager:
                 timeout=timeout,
             )
             logger.info("Successfully pulled %s", image)
-            for ctx in alert_ctxs:
-                ctx.resolve()
+            if owns_alert_ctxs:
+                for ctx in alert_ctxs:
+                    ctx.resolve()
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             if has_local:
@@ -929,14 +949,18 @@ class WorkerManager:
                     image,
                     exc,
                 )
-                for ctx in alert_ctxs:
-                    ctx.resolve()
+                if owns_alert_ctxs:
+                    for ctx in alert_ctxs:
+                        ctx.resolve()
                 return True
             error_str = (getattr(exc, "stderr", None) or str(exc))[:500]
             logger.error("Failed to pull worker image %s: %s", image, error_str)
-            for ctx in alert_ctxs:
-                ctx.mark_failed_and_resolve(error_str)
-            return False
+            phase = (
+                "pull_timeout"
+                if isinstance(exc, subprocess.TimeoutExpired)
+                else "pull_failed"
+            )
+            return _fail(error_str, phase=phase)
         except OSError as exc:
             if has_local:
                 logger.warning(
@@ -944,13 +968,16 @@ class WorkerManager:
                     image,
                     exc,
                 )
-                for ctx in alert_ctxs:
-                    ctx.resolve()
+                if owns_alert_ctxs:
+                    for ctx in alert_ctxs:
+                        ctx.resolve()
                 return True
             logger.error("Failed to pull worker image %s: %s", image, exc)
-            for ctx in alert_ctxs:
-                ctx.mark_failed_and_resolve(str(exc)[:500])
-            return False
+            return _fail(str(exc)[:500], phase="pull_oserror")
+        except Exception as exc:
+            # Catch-all so an unexpected error doesn't leave the alert active forever.
+            logger.exception("Unexpected error pulling worker image %s", image)
+            return _fail(str(exc)[:500], phase="pull_unexpected")
 
     def _pull_worker_image_with_progress(self, image: str, timeout: int = 600) -> bool:
         """Pull *image* with progress reporting to all linked twins.
@@ -984,6 +1011,19 @@ class WorkerManager:
             int(os.getenv("CYBERWAVE_WORKER_IMAGE_PULL_RETRIES", "3")),
         )
         pull_succeeded = False
+        # Reused across retries so a later-attempt success doesn't leave a stray critical alert.
+        alert_ctxs: list[Any] = []
+        if self._twin_uuids:
+            from .utils import WorkerStartingAlertContext  # noqa: PLC0415
+
+            for twin_uuid in self._twin_uuids:
+                ctx = WorkerStartingAlertContext(
+                    twin_uuid=twin_uuid,
+                    image=image,
+                    container_name=self._container_name,
+                )
+                ctx.create()
+                alert_ctxs.append(ctx)
         try:
             for attempt in range(1, max_attempts + 1):
                 if attempt > 1:
@@ -996,8 +1036,15 @@ class WorkerManager:
                         backoff,
                     )
                     time.sleep(backoff)
-                if self._pull_worker_image_with_progress_once(image, timeout=timeout):
+                if self._pull_worker_image_with_progress_once(
+                    image,
+                    timeout=timeout,
+                    alert_ctxs=alert_ctxs or None,
+                    is_final_attempt=attempt == max_attempts,
+                ):
                     pull_succeeded = True
+                    for ctx in alert_ctxs:
+                        ctx.resolve()
                     return True
             return False
         finally:

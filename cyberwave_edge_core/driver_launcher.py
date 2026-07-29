@@ -275,6 +275,14 @@ def _run_docker_image(
                     phase="pull_oserror",
                 )
                 return False
+        except Exception as exc:
+            # Catch-all so an unexpected error doesn't leave the alert active forever.
+            logger.exception("Unexpected error pulling driver image %s", image)
+            driver_alert_ctx.mark_failed_and_resolve(
+                f"Unexpected error pulling driver image {image}: {exc}",
+                phase="pull_unexpected",
+            )
+            return False
         else:
             # NOTE: deliberately not "pull_complete" — the frontend treats that
             # as a terminal phase and would briefly drop the spinner between

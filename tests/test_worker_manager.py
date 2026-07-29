@@ -2132,7 +2132,14 @@ class TestWorkerStartupFailureAlertWiring:
         worker_manager._twin_uuids = ["twin-uuid-1"]
         calls: list[str] = []
 
-        def _fake_once(self: WorkerManager, image: str, timeout: int = 600) -> bool:
+        def _fake_once(
+            self: WorkerManager,
+            image: str,
+            timeout: int = 600,
+            *,
+            alert_ctxs: object = None,
+            is_final_attempt: bool = True,
+        ) -> bool:
             calls.append(image)
             time.sleep(0.05)
             return True

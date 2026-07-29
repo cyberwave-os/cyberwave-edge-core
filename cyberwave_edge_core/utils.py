@@ -85,6 +85,7 @@ _DRIVER_FAILED_DESCRIPTIONS: dict[str, str] = {
     "pull_oserror_using_local": "Could not start the download. Please try again.",
     # macOS-specific
     "macos_bridge_failed": "Network setup failed. Please try again.",
+    "pull_unexpected": "An unexpected error occurred. Please contact support.",
 }
 
 _WORKER_FAILED_DESCRIPTIONS: dict[str, str] = {
@@ -106,6 +107,7 @@ _WORKER_FAILED_DESCRIPTIONS: dict[str, str] = {
     "pull_spawn_failed": "Could not start the download. Please try again.",
     "pull_oserror": "Could not start the download. Please try again.",
     "pull_oserror_using_local": "Could not start the download. Please try again.",
+    "pull_unexpected": "An unexpected error occurred. Please contact support.",
 }
 
 
@@ -205,7 +207,7 @@ class DriverStartingAlertContext:
                 merged["overall_progress_percent"] = overall
             self._alert = self._alert.update(metadata=merged)
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Could not update driver_starting alert for twin %s: %s",
                 self.twin_uuid,
                 exc,
@@ -236,28 +238,29 @@ class DriverStartingAlertContext:
 
         The user-facing *description* is replaced with plain-language copy
         from ``_DRIVER_FAILED_DESCRIPTIONS`` keyed on *phase*; the original
-        technical *description* is preserved in ``metadata.internal_description``
-        for diagnostics.
+        technical *description* is preserved in ``metadata.technical_detail``.
         """
         if not self._alert:
             return
         user_description = _DRIVER_FAILED_DESCRIPTIONS.get(phase, description)
         try:
+            from cyberwave._error_metadata import redact
+
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {
                 **prev,
                 "phase": phase,
                 "failed": True,
                 "failed_at": time.time(),
-                "internal_description": description,
+                "technical_detail": redact(description),
             }
             self._alert = self._alert.update(
                 description=user_description,
                 metadata=merged,
-                severity="warning",
+                severity="critical",
             )
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Could not annotate driver_starting alert failure for twin %s: %s",
                 self.twin_uuid,
                 exc,
@@ -280,49 +283,7 @@ class DriverStartingAlertContext:
         referencing it.  In that case there is nothing to clear, so we log
         a single ``INFO`` line instead of a debug traceback.
         """
-        from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
-
-        token = load_token()
-        if not token:
-            return 0
-
-        base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-
-        resolved = 0
-        try:
-            client = Cyberwave(base_url=base_url, api_key=token)
-            twin = client.twin(twin_id=twin_uuid)
-            for alert in twin.alerts.list(status="active", limit=100):
-                if getattr(alert, "alert_type", None) != DRIVER_STARTING_ALERT_TYPE:
-                    continue
-                try:
-                    alert.resolve()
-                    resolved += 1
-                except Exception as exc:
-                    if _is_not_found_error(exc):
-                        # Alert was concurrently deleted/resolved; nothing to do.
-                        continue
-                    logger.warning(
-                        "Could not resolve stale driver_starting alert %s for twin %s: %s",
-                        getattr(alert, "uuid", "<unknown>"),
-                        twin_uuid,
-                        exc,
-                    )
-        except Exception as exc:
-            if _is_not_found_error(exc):
-                logger.info(
-                    "Skipping driver_starting alert cleanup for twin %s: "
-                    "twin no longer exists on backend (404)",
-                    twin_uuid,
-                )
-                return 0
-            logger.debug(
-                "Could not list driver_starting alerts for twin %s: %s",
-                twin_uuid,
-                exc,
-                exc_info=True,
-            )
-        return resolved
+        return resolve_active_alerts_for_twin(twin_uuid, DRIVER_STARTING_ALERT_TYPE)
 
 
 class WorkerStartingAlertContext:
@@ -412,7 +373,7 @@ class WorkerStartingAlertContext:
                 merged["overall_progress_percent"] = overall
             self._alert = self._alert.update(metadata=merged)
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Could not update worker_starting alert for twin %s: %s",
                 self.twin_uuid,
                 exc,
@@ -438,27 +399,29 @@ class WorkerStartingAlertContext:
 
         Replaces the technical *description* with plain-language copy from
         ``_WORKER_FAILED_DESCRIPTIONS``; the original is kept in
-        ``metadata.internal_description`` for diagnostics.
+        ``metadata.technical_detail``.
         """
         if self._alert is None:
             return
         user_description = _WORKER_FAILED_DESCRIPTIONS.get(phase, description)
         try:
+            from cyberwave._error_metadata import redact
+
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {
                 **prev,
                 "phase": phase,
                 "failed": True,
                 "failed_at": time.time(),
-                "internal_description": description,
+                "technical_detail": redact(description),
             }
             self._alert = self._alert.update(
                 description=user_description,
                 metadata=merged,
-                severity="warning",
+                severity="critical",
             )
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Could not annotate worker_starting alert failure for twin %s: %s",
                 self.twin_uuid,
                 exc,
@@ -478,48 +441,7 @@ class WorkerStartingAlertContext:
         A ``404 Not Found`` from the backend means the twin is already gone —
         nothing to clear; logs a single INFO line instead of a traceback.
         """
-        from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
-
-        token = load_token()
-        if not token:
-            return 0
-
-        base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-
-        resolved = 0
-        try:
-            client = Cyberwave(base_url=base_url, api_key=token)
-            twin = client.twin(twin_id=twin_uuid)
-            for alert in twin.alerts.list(status="active", limit=100):
-                if getattr(alert, "alert_type", None) != WORKER_STARTING_ALERT_TYPE:
-                    continue
-                try:
-                    alert.resolve()
-                    resolved += 1
-                except Exception as exc:
-                    if _is_not_found_error(exc):
-                        continue
-                    logger.warning(
-                        "Could not resolve stale worker_starting alert %s for twin %s: %s",
-                        getattr(alert, "uuid", "<unknown>"),
-                        twin_uuid,
-                        exc,
-                    )
-        except Exception as exc:
-            if _is_not_found_error(exc):
-                logger.info(
-                    "Skipping worker_starting alert cleanup for twin %s: "
-                    "twin no longer exists on backend (404)",
-                    twin_uuid,
-                )
-                return 0
-            logger.debug(
-                "Could not list worker_starting alerts for twin %s: %s",
-                twin_uuid,
-                exc,
-                exc_info=True,
-            )
-        return resolved
+        return resolve_active_alerts_for_twin(twin_uuid, WORKER_STARTING_ALERT_TYPE)
 
 
 
@@ -540,6 +462,61 @@ def _is_not_found_error(exc: BaseException) -> bool:
         except (TypeError, ValueError):
             continue
     return False
+
+
+def resolve_active_alerts_for_twin(twin_uuid: str, alert_type: str) -> int:
+    """Resolve active *alert_type* alerts for *twin_uuid*; best-effort, returns count resolved.
+
+    Shared by the alert-context classes and by callers clearing a persistent
+    failure alert (e.g. ``driver_start_failure``) once a later pull/start
+    attempt succeeds, since the retry/revival loops never do so themselves.
+    """
+    from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
+
+    token = load_token()
+    if not token:
+        return 0
+
+    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+
+    resolved = 0
+    try:
+        client = Cyberwave(base_url=base_url, api_key=token)
+        twin = client.twin(twin_id=twin_uuid)
+        for alert in twin.alerts.list(status="active", limit=100):
+            if getattr(alert, "alert_type", None) != alert_type:
+                continue
+            try:
+                alert.resolve()
+                resolved += 1
+            except Exception as exc:
+                if _is_not_found_error(exc):
+                    # Alert was concurrently deleted/resolved; nothing to do.
+                    continue
+                logger.warning(
+                    "Could not resolve stale %s alert %s for twin %s: %s",
+                    alert_type,
+                    getattr(alert, "uuid", "<unknown>"),
+                    twin_uuid,
+                    exc,
+                )
+    except Exception as exc:
+        if _is_not_found_error(exc):
+            logger.info(
+                "Skipping %s alert cleanup for twin %s: "
+                "twin no longer exists on backend (404)",
+                alert_type,
+                twin_uuid,
+            )
+            return 0
+        logger.debug(
+            "Could not list %s alerts for twin %s: %s",
+            alert_type,
+            twin_uuid,
+            exc,
+            exc_info=True,
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------

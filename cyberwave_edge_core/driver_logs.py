@@ -230,14 +230,20 @@ def _send_runtime_error_alert(
     _CONTAINER_RUNTIME_ERROR_ALERTED.add(container_name)
 
     try:
+        from cyberwave._error_metadata import redact
+
         from .startup import _send_alert_for_twin
 
         _send_alert_for_twin(
             twin_uuid,
             "Driver runtime error",
-            (f"Container '{container_name}' reported a RuntimeError: {error_message[:500]}"),
+            "Your robot's driver ran into a problem and may not work correctly.",
             "driver_runtime_error",
             severity="error",
+            metadata={
+                "error_code": "RuntimeError",
+                "technical_detail": f"RuntimeError: {redact(error_message)[:500]}",
+            },
         )
         logger.info(
             "Sent driver_runtime_error alert for container %s (twin %s)",

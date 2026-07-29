@@ -62,6 +62,7 @@ from .utils import (
     DriverStartingAlertContext,
     EdgeCoreRestartAlertContext,
     WorkerStartingAlertContext,
+    resolve_active_alerts_for_twin,
 )
 from .zenoh_config import (
     ZenohConfig,
@@ -1494,6 +1495,9 @@ def _pull_driver_images_parallel(
             return image, True
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
             return image, False
+        except Exception:
+            logger.exception("Unexpected error pulling driver image %s", image)
+            return image, False
 
     logger.info(
         "Pulling %d unique driver image(s) in parallel: %s",
@@ -2638,17 +2642,24 @@ def fetch_and_run_twin_drivers(
                 twin.name,
                 twin_uuid,
             )
-            _send_alert_for_twin(
-                twin_uuid,
-                "Twin has no asset",
-                (
-                    f"Twin '{twin.name}' has no asset attached on the backend. "
-                    "The edge cannot spawn a driver for this twin until an "
-                    "asset is attached via the dashboard."
-                ),
-                "driver_start_failure",
-                severity="error",
-            )
+            try:
+                _send_alert_for_twin(
+                    twin_uuid,
+                    "Twin has no asset",
+                    (
+                        f"Twin '{twin.name}' has no asset attached on the backend. "
+                        "The edge cannot spawn a driver for this twin until an "
+                        "asset is attached via the dashboard."
+                    ),
+                    "driver_start_failure",
+                    severity="error",
+                )
+            except Exception as alert_exc:
+                logger.warning(
+                    "Could not send no-asset alert for twin %s: %s",
+                    twin_uuid,
+                    alert_exc,
+                )
             continue
 
         asset = assets_by_twin_uuid.get(twin_uuid)
@@ -2722,13 +2733,20 @@ def fetch_and_run_twin_drivers(
                     continue
 
                 logger.warning("No drivers specified in asset metadata for twin '%s'", twin.name)
-                _send_alert_for_twin(
-                    twin_uuid,
-                    "No drivers specified",
-                    f"No drivers specified in asset metadata for twin '{twin.name}'",
-                    "driver_start_failure",
-                    severity="error",
-                )
+                try:
+                    _send_alert_for_twin(
+                        twin_uuid,
+                        "No drivers specified",
+                        f"No drivers specified in asset metadata for twin '{twin.name}'",
+                        "driver_start_failure",
+                        severity="error",
+                    )
+                except Exception as alert_exc:
+                    logger.warning(
+                        "Could not send no-drivers alert for twin %s: %s",
+                        twin_uuid,
+                        alert_exc,
+                    )
                 continue
             else:
                 logger.warning(
@@ -2814,13 +2832,20 @@ def fetch_and_run_twin_drivers(
 
         if not driver_image:
             logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
-            _send_alert_for_twin(
-                twin_uuid,
-                "No driver_docker_image in asset metadata",
-                f"No driver_docker_image in asset metadata for twin '{twin.name}'",
-                "driver_start_failure",
-                severity="error",
-            )
+            try:
+                _send_alert_for_twin(
+                    twin_uuid,
+                    "No driver_docker_image in asset metadata",
+                    f"No driver_docker_image in asset metadata for twin '{twin.name}'",
+                    "driver_start_failure",
+                    severity="error",
+                )
+            except Exception as alert_exc:
+                logger.warning(
+                    "Could not send no-driver-image alert for twin %s: %s",
+                    twin_uuid,
+                    alert_exc,
+                )
             continue
 
         driver_image = _resolve_driver_image_tag(driver_image)
@@ -2968,14 +2993,22 @@ def fetch_and_run_twin_drivers(
                     f"'{spec.twin.name}'.",
                     phase="pull_failed",
                 )
-            _send_alert_for_twin(
-                spec.twin_uuid,
-                "Driver image not available",
-                f"Driver image '{spec.driver_image}' could not be pulled for twin "
-                f"'{spec.twin.name}'. Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}",
-                "driver_start_failure",
-                severity="error",
-            )
+            try:
+                _send_alert_for_twin(
+                    spec.twin_uuid,
+                    "Driver image not available",
+                    f"Driver image '{spec.driver_image}' could not be pulled for twin "
+                    f"'{spec.twin.name}'. Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}",
+                    "driver_start_failure",
+                    severity="error",
+                )
+            except Exception as alert_exc:
+                # Don't let an alert-send failure abort the rest of this loop.
+                logger.warning(
+                    "Could not send driver-image-not-available alert for twin %s: %s",
+                    spec.twin_uuid,
+                    alert_exc,
+                )
             fail_entry: Dict[str, Any] = {
                 "twin_uuid": spec.twin_uuid,
                 "twin_name": spec.twin.name,
@@ -3018,6 +3051,25 @@ def fetch_and_run_twin_drivers(
             if spec.service_name:
                 result_entry["service_name"] = spec.service_name
             results.append(result_entry)
+            if success:
+                # Clears a stale driver_start_failure alert now that the start succeeded.
+                try:
+                    resolved = resolve_active_alerts_for_twin(
+                        spec.twin_uuid, "driver_start_failure"
+                    )
+                    if resolved:
+                        logger.info(
+                            "Resolved %d driver_start_failure alert(s) for twin %s "
+                            "after successful driver start",
+                            resolved,
+                            spec.twin_uuid,
+                        )
+                except Exception as alert_exc:
+                    logger.warning(
+                        "Could not resolve driver_start_failure alerts for twin %s: %s",
+                        spec.twin_uuid,
+                        alert_exc,
+                    )
             if not success:
                 try:
                     startup_failure_message = (
@@ -3039,13 +3091,21 @@ def fetch_and_run_twin_drivers(
                         alert_exc,
                     )
         except Exception as exc:
-            _send_alert_for_twin(
-                spec.twin_uuid,
-                "Failed to run driver docker image",
-                f"Failed to run driver docker image for twin '{spec.twin.name}': {exc}",
-                "driver_start_failure",
-                severity="error",
-            )
+            try:
+                _send_alert_for_twin(
+                    spec.twin_uuid,
+                    "Failed to run driver docker image",
+                    f"Failed to run driver docker image for twin '{spec.twin.name}': {exc}",
+                    "driver_start_failure",
+                    severity="error",
+                )
+            except Exception as alert_exc:
+                # Don't let this mask the original driver-run exception below.
+                logger.warning(
+                    "Could not send driver-run-failure alert for twin %s: %s",
+                    spec.twin_uuid,
+                    alert_exc,
+                )
             logger.error(
                 "Failed to run driver docker image %s for twin '%s': %s",
                 spec.driver_image,
@@ -3257,6 +3317,23 @@ def _start_worker_after_drivers(
             resource_limits=load_worker_resource_limits(),
         )
         worker_manager.start()
+        # Clears stale worker_start_failure alerts now that the start succeeded.
+        for twin_uuid in twin_uuids:
+            try:
+                resolved = resolve_active_alerts_for_twin(twin_uuid, "worker_start_failure")
+                if resolved:
+                    logger.info(
+                        "Resolved %d worker_start_failure alert(s) for twin %s "
+                        "after successful worker start",
+                        resolved,
+                        twin_uuid,
+                    )
+            except Exception as alert_exc:
+                logger.warning(
+                    "Could not resolve worker_start_failure alerts for twin %s: %s",
+                    twin_uuid,
+                    alert_exc,
+                )
     except Exception as exc:
         logger.warning("Failed to start worker container after driver startup: %s", exc)
         _send_worker_start_failure_alerts(twin_uuids=twin_uuids, error=str(exc))
@@ -3268,6 +3345,7 @@ def _send_alert_for_twin(
     alert_description: str,
     alert_type: str,
     severity: str = "warning",
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """
     Send an alert to the twin.
@@ -3282,6 +3360,7 @@ def _send_alert_for_twin(
         severity=severity,  # info | warning | error | critical
         alert_type=alert_type,
         source_type="edge",  # edge | cloud | workflow
+        metadata=metadata,
     )
 
 
@@ -5234,7 +5313,7 @@ def _send_worker_sync_failure_alert(twin_uuid: str, errors: list[str]) -> None:
             severity="error",
         )
     except Exception:
-        logger.debug(
+        logger.warning(
             "Failed to send workflow-sync-failure alert for twin %s",
             twin_uuid,
             exc_info=True,
