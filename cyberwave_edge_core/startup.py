@@ -3513,7 +3513,7 @@ def _post_host_facts_once(token: str) -> bool:
 
     try:
         client = Cyberwave(base_url=base_url, api_key=token)
-        client.edges.discover(
+        result = client.edges.discover(
             fingerprint=fingerprint,
             hostname=hostname,
             platform=plat,
@@ -3524,6 +3524,21 @@ def _post_host_facts_once(token: str) -> bool:
             len(facts),
             fingerprint,
         )
+        network_interfaces = facts.get("network_interfaces")
+        if network_interfaces:
+            try:
+                from .driver_logs import publish_network_facts_log_async
+
+                twin_uuids = [
+                    binding["twin_uuid"] for binding in (result or {}).get("twins", [])
+                ]
+                # Deliberately off-thread: this function runs on the REST
+                # keepalive thread, and an MQTT connect against an unreachable
+                # broker would stall the next /discover POST past the window
+                # that keeps Edge.last_seen_at (and the liveness pill) fresh.
+                publish_network_facts_log_async(twin_uuids, network_interfaces, token=token)
+            except Exception as exc:
+                logger.debug("Network facts log publish failed: %s", exc, exc_info=True)
         return True
     except Exception as exc:
         logger.warning(

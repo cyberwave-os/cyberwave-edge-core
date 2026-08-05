@@ -213,6 +213,190 @@ def _log_and_publish_driver_message(
     )
 
 
+# ---------------------------------------------------------------------------
+# Network interface facts -> driver_log fan-out
+# ---------------------------------------------------------------------------
+
+# Last-published (name, ipv4_address) signature *per twin*, so the periodic
+# host-facts keepalive doesn't republish the same interface set every 30 s --
+# only when it actually changes (e.g. the device joins a different WiFi
+# network).  Keyed by twin UUID rather than held as one process-wide value
+# because the set of bound twins grows over an edge's lifetime: a twin that
+# gets bound after the first publish has never seen the line, so "already
+# published" has to be a per-twin fact.  An absent key means "never published
+# to this twin", which also covers the edge that had no bound twins at all on
+# its first tick.
+#
+# Process-lifetime only: an edge-core restart re-publishes one baseline line
+# per twin even when nothing changed, which is an acceptable amount of noise.
+_LAST_NETWORK_INTERFACES_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {}
+
+# Guards the dict above -- the host-facts keepalive hands the fan-out to a
+# worker thread (see :func:`publish_network_facts_log_async`), so reads and
+# writes are no longer confined to a single thread.
+_NETWORK_FACTS_STATE_LOCK = threading.Lock()
+
+# Held for the duration of one fan-out attempt so a slow MQTT connect can't
+# pile up workers: the keepalive ticks every 30 s, while a connect against an
+# unreachable broker can burn ~50 s (3 attempts x CONNACK timeout + backoff).
+# Acquired non-blocking -- if an attempt is already in flight this tick is
+# simply skipped, and the next one retries because nothing was recorded.
+_NETWORK_FACTS_PUBLISH_LOCK = threading.Lock()
+
+
+def _addressed_network_interfaces(
+    network_interfaces: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only interfaces that actually have an IPv4 address bound.
+
+    An interface with no address is nothing anyone can SSH to, so it has no
+    place in the log line -- and, more importantly, no place in the dedup
+    signature: address-less interfaces come and go (``docker0``/``veth*`` as
+    driver containers cycle, ``usb0``/``rndis0`` as cables are plugged) and
+    would otherwise re-fire the whole fan-out on churn that tells an operator
+    nothing.  This also keeps the log line consistent with the frontend,
+    which filters on ``ipv4_address`` for both the Edge details row and the
+    Edge Devices meta line.
+    """
+    return [nic for nic in network_interfaces if nic.get("ipv4_address")]
+
+
+def _network_interfaces_signature(
+    network_interfaces: list[dict[str, Any]],
+) -> tuple[tuple[str, str], ...]:
+    """Order-independent identity of an interface set, for change detection."""
+    return tuple(
+        sorted(
+            (str(nic.get("name") or ""), str(nic.get("ipv4_address"))) for nic in network_interfaces
+        )
+    )
+
+
+def _format_network_interfaces_message(network_interfaces: list[dict[str, Any]]) -> str:
+    if not network_interfaces:
+        return "Network interfaces: none detected"
+    parts = [
+        f"{nic.get('name')}={nic.get('ipv4_address') or 'no IPv4'} "
+        f"({'up' if nic.get('is_up') else 'down'})"
+        for nic in network_interfaces
+    ]
+    return "Network interfaces: " + ", ".join(parts)
+
+
+def publish_network_facts_log(
+    twin_uuids: Iterable[str],
+    network_interfaces: list[dict[str, Any]],
+    *,
+    token: Optional[str],
+) -> None:
+    """Publish a ``driver_log`` line to every bound twin when interfaces change.
+
+    Surfaces the device's current LAN-facing IP(s) in the twin's Logs tab so
+    a support engineer can find/SSH to a device whose IP changed (e.g. after
+    reconnecting to a different WiFi network) without scanning the network.
+    Deduplicated per twin via :data:`_LAST_NETWORK_INTERFACES_SIGNATURES` so
+    this fires on an actual change, not on every host-facts keepalive tick.
+
+    A twin's signature is recorded only after its message has actually been
+    handed to a connected broker.  Recording up-front would mean a broker
+    that happens to be unreachable on the tick where the IP changed loses
+    that line *permanently* -- the publish path swallows failures, so the
+    next tick would see an unchanged signature and skip.  Because nothing is
+    recorded on failure, every subsequent tick retries until it lands.
+
+    Prefer :func:`publish_network_facts_log_async` from anything on a
+    latency-sensitive thread: this function can block for as long as an MQTT
+    connect takes.
+    """
+    twin_uuid_list = list(twin_uuids)
+    if not twin_uuid_list:
+        return
+
+    addressed = _addressed_network_interfaces(network_interfaces)
+    signature = _network_interfaces_signature(addressed)
+
+    with _NETWORK_FACTS_STATE_LOCK:
+        pending = [
+            twin_uuid
+            for twin_uuid in twin_uuid_list
+            if _LAST_NETWORK_INTERFACES_SIGNATURES.get(twin_uuid) != signature
+        ]
+    if not pending:
+        return
+
+    message = _format_network_interfaces_message(addressed)
+    # One stderr line regardless of fan-out width: the service log doesn't
+    # need the same sentence once per bound twin.
+    print(message, file=sys.stderr)
+
+    for twin_uuid in pending:
+        mqtt_client, mqtt_topic = _resolve_driver_log_publish_context(
+            twin_uuid=twin_uuid,
+            token=token,
+        )
+        if not mqtt_client or not mqtt_topic:
+            # No usable broker right now -- leave this twin unrecorded so the
+            # next keepalive tick tries again.
+            continue
+        # ``MQTTClient.publish`` drops the message with only a warning when the
+        # socket has gone away, so a disconnected client must not count as a
+        # publish either.  Default True keeps this tolerant of client objects
+        # that don't expose the flag.
+        if not getattr(mqtt_client.mqtt, "connected", True):
+            continue
+
+        _publish_driver_log_message(
+            message,
+            "network",
+            mqtt_client=mqtt_client,
+            mqtt_topic=mqtt_topic,
+        )
+        with _NETWORK_FACTS_STATE_LOCK:
+            _LAST_NETWORK_INTERFACES_SIGNATURES[twin_uuid] = signature
+
+
+def publish_network_facts_log_async(
+    twin_uuids: Iterable[str],
+    network_interfaces: list[dict[str, Any]],
+    *,
+    token: Optional[str],
+) -> Optional[threading.Thread]:
+    """Run :func:`publish_network_facts_log` on a short-lived daemon thread.
+
+    The caller is the host-facts REST keepalive, whose cadence is what powers
+    the Online/Idle/Offline pill (the backend's standby window is only 3x the
+    30 s period).  Establishing an MQTT connection inline would let an
+    unreachable broker stall that thread for ~50 s and eat the entire margin
+    on a liveness signal that is supposed to be independent of MQTT -- so the
+    fan-out gets its own thread and the keepalive never waits on it.
+
+    Returns the worker thread, or ``None`` when the tick was skipped because
+    an attempt is already in flight.
+    """
+    if not _NETWORK_FACTS_PUBLISH_LOCK.acquire(blocking=False):
+        logger.debug("Network facts log publish already in flight; skipping tick")
+        return None
+
+    twin_uuid_list = list(twin_uuids)
+    interfaces = list(network_interfaces)
+
+    def _run() -> None:
+        try:
+            publish_network_facts_log(twin_uuid_list, interfaces, token=token)
+        except Exception:
+            logger.debug("Network facts log publish failed", exc_info=True)
+        finally:
+            _NETWORK_FACTS_PUBLISH_LOCK.release()
+
+    thread = threading.Thread(
+        target=_run,
+        name="cyberwave-edge-core.network-facts-log",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _send_runtime_error_alert(
     twin_uuid: str,
     container_name: str,
