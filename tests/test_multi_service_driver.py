@@ -8,6 +8,7 @@ Covers:
   5. Custom command passed to docker create
   6. Parallel pull phase collects all service images
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -16,6 +17,10 @@ from typing import Any
 
 import cyberwave_edge_core.driver_selection as driver_selection
 import cyberwave_edge_core.startup as startup
+from cyberwave_edge_core.docker_args import (
+    DEFAULT_DOCKER_LOG_MAX_FILE,
+    DEFAULT_DOCKER_LOG_MAX_SIZE,
+)
 from tests.driver_subprocess_fakes import fake_docker_start_popen
 
 
@@ -249,6 +254,84 @@ class TestGetDriverServices:
 # ===========================================================================
 
 
+class TestDriverContainerLogCap:
+    """Driver containers must carry a log-size cap.
+
+    Applied per container rather than via the host's daemon.json, which only
+    the Pi image configures.
+    """
+
+    def test_log_cap_applied_by_default(self, monkeypatch: Any) -> None:
+        captured_cmds: list[list[str]] = []
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
+        monkeypatch.delenv("CYBERWAVE_DOCKER_LOG_MAX_SIZE", raising=False)
+        monkeypatch.delenv("CYBERWAVE_DOCKER_LOG_MAX_FILE", raising=False)
+
+        startup._run_docker_image(
+            "cyberwaveos/so101-driver:humble",
+            [],
+            twin_uuid="aabbccdd-1234-5678-9012-abcdef012345",
+            token="test-token",
+            skip_pull=True,
+        )
+
+        cmd = next(c for c in captured_cmds if c[:2] == ["docker", "create"])
+        assert "--log-driver" in cmd
+        assert f"max-size={DEFAULT_DOCKER_LOG_MAX_SIZE}" in cmd
+        assert f"max-file={DEFAULT_DOCKER_LOG_MAX_FILE}" in cmd
+
+    def test_default_does_not_loosen_the_pi_image_cap(self) -> None:
+        """Per-container flags override daemon.json, so ours must not be larger.
+
+        The Pi image ships 10m x 3 daemon-wide
+        (devops/raspberry_pi_imager/files/chroot-setup.sh); a bigger default
+        here would raise the ceiling on the device with the least headroom.
+        """
+        assert DEFAULT_DOCKER_LOG_MAX_SIZE == "10m"
+        assert DEFAULT_DOCKER_LOG_MAX_FILE == "3"
+
+    def test_driver_params_override_wins(self, monkeypatch: Any) -> None:
+        """An explicit --log-driver in docker_run_params wins.
+
+        Suppressed entirely rather than appended: ``--log-opt max-size`` is
+        meaningless against a non-json-file driver.
+        """
+        captured_cmds: list[list[str]] = []
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
+
+        startup._run_docker_image(
+            "cyberwaveos/so101-driver:humble",
+            ["--log-driver", "journald"],
+            twin_uuid="aabbccdd-1234-5678-9012-abcdef012345",
+            token="test-token",
+            skip_pull=True,
+        )
+
+        cmd = next(c for c in captured_cmds if c[:2] == ["docker", "create"])
+        assert cmd.count("--log-driver") == 1
+        assert "journald" in cmd
+        assert not any(a.startswith("max-size=") for a in cmd)
+
+    def test_partial_driver_override_keeps_the_other_bound(self, monkeypatch: Any) -> None:
+        """A pinned max-size must not take the max-file cap down with it."""
+        captured_cmds: list[list[str]] = []
+        _patch_driver_container_launch(monkeypatch, captured_cmds)
+
+        startup._run_docker_image(
+            "cyberwaveos/so101-driver:humble",
+            ["--log-opt", "max-size=1g"],
+            twin_uuid="aabbccdd-1234-5678-9012-abcdef012345",
+            token="test-token",
+            skip_pull=True,
+        )
+
+        cmd = next(c for c in captured_cmds if c[:2] == ["docker", "create"])
+        assert "max-size=1g" in cmd
+        assert "max-file=3" in cmd
+        # One value per key — Docker would otherwise silently take the last.
+        assert len([a for a in cmd if a.startswith("max-size=")]) == 1
+
+
 class TestMultiContainerNaming:
     def test_container_name_includes_service_suffix(self, monkeypatch: Any) -> None:
         """When service_name is set, the container name includes
@@ -412,9 +495,7 @@ class TestPullCollectsAllImages:
 
 
 class TestDriverStartingAlertDifferentiation:
-    def test_shared_image_services_create_distinct_alert_contexts(
-        self, monkeypatch: Any
-    ) -> None:
+    def test_shared_image_services_create_distinct_alert_contexts(self, monkeypatch: Any) -> None:
         """Services that share an image still emit distinct
         ``driver_starting`` alerts, differentiated by ``service_name``."""
 

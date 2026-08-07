@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from .docker_args import (
     _rewrite_macos_container_base_url,
     _rewrite_macos_container_hostname,
+    build_log_args,
 )
 from .docker_helpers import (
     build_user_args,
@@ -1185,6 +1186,7 @@ class WorkerManager:
             "--detach",
             "--restart",
             "unless-stopped",
+            *build_log_args(),
             *network_args,
             *user_args,
             "--name",

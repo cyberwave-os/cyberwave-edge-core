@@ -11,6 +11,10 @@ import shutil
 import subprocess
 from typing import Any, List, Optional
 
+# Module-level is safe: docker_args is stdlib-only, so this cannot reintroduce
+# the cycle the lazy ``_startup()`` accessor below exists to break.
+from .docker_args import build_log_args
+
 logger = logging.getLogger(__name__)
 
 
@@ -702,6 +706,9 @@ def _run_docker_image(
     for kv in merged_env.values():
         env_flags += ["-e", kv]
 
+    # build_log_args defers to anything the driver's own params already pin.
+    log_args = build_log_args(params_pass)
+
     cmd = [
         "docker",
         "run",
@@ -712,6 +719,7 @@ def _run_docker_image(
         "--restart",
         "unless-stopped",
         "--privileged",
+        *log_args,
         *gpu_args,
         *pid_args,
         *network_args,

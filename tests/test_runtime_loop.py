@@ -350,23 +350,40 @@ class TestRuntimeLoopSyncCadence:
 # 3. _run_periodic_docker_cleanup()
 # ===========================================================================
 
+# "No prune has ever run", so every interval reads as elapsed. Not 0.0:
+# time.monotonic() counts from boot, so a 0.0 anchor only clears the 3 h
+# image/volume intervals once the host has been up 3 h. That passed on a
+# long-lived CI runner and failed on a freshly booted Pi.
+_NEVER_PRUNED = float("-inf")
+
 
 class TestRunPeriodicDockerCleanup:
     """Tests for the _run_periodic_docker_cleanup scheduling logic."""
 
     @pytest.fixture(autouse=True)
     def _reset_prune_times(self, monkeypatch):
-        """Reset module-level prune timestamps and cleanup flag before/after each test."""
-        startup._last_container_prune_time = 0.0
-        startup._last_image_prune_time = 0.0
+        """Reset prune timestamps and cleanup flags before/after each test.
+
+        The SD-card caches are process-level; leaving them set would make
+        these tests order-dependent.
+        """
+        startup._last_container_prune_time = _NEVER_PRUNED
+        startup._last_image_prune_time = _NEVER_PRUNED
+        startup._last_volume_prune_time = _NEVER_PRUNED
         startup._docker_cleanup_disabled = None
+        startup._root_is_sd_card = None
+        startup._sd_card_pressure_logged = False
         monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
         import cyberwave_edge_core.docker_helpers as _dh
-        monkeypatch.setattr(_dh, "is_sd_card_root", lambda: False)
+        monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: False)
+        monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
         yield
-        startup._last_container_prune_time = 0.0
-        startup._last_image_prune_time = 0.0
+        startup._last_container_prune_time = _NEVER_PRUNED
+        startup._last_image_prune_time = _NEVER_PRUNED
+        startup._last_volume_prune_time = _NEVER_PRUNED
         startup._docker_cleanup_disabled = None
+        startup._root_is_sd_card = None
+        startup._sd_card_pressure_logged = False
 
     def test_runs_both_prune_on_first_call(self, monkeypatch):
         container_prune_calls = [0]
@@ -490,33 +507,133 @@ class TestRunPeriodicDockerCleanup:
         assert image_prune_calls[0] == 0
         startup._docker_cleanup_disabled = None
 
-    def test_skips_cleanup_on_sd_card(self, monkeypatch):
-        """Cleanup is skipped when root filesystem is on an SD card."""
+    def _patch_prune_counters(self, monkeypatch):
+        """Patch the three prune helpers and return their call counters."""
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        calls = {"container": 0, "image": 0, "volume": 0}
+
+        def _bump(key, retval):
+            def _inner(*_args, **_kwargs):
+                calls[key] += 1
+                return retval
+
+            return _inner
+
+        monkeypatch.setattr(
+            _dh, "docker_prune_stopped_cyberwave_containers", _bump("container", 0)
+        )
+        monkeypatch.setattr(_dh, "docker_prune_unused_images", _bump("image", True))
+        monkeypatch.setattr(_dh, "docker_prune_dangling_volumes", _bump("volume", True))
+        return calls
+
+    def test_defers_cleanup_on_healthy_sd_card(self, monkeypatch):
+        """On an SD card below the usage threshold, cleanup is deferred for flash wear."""
         startup._docker_cleanup_disabled = None
         monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
 
         import cyberwave_edge_core.docker_helpers as _dh
 
-        monkeypatch.setattr(_dh, "is_sd_card_root", lambda: True)
-
-        container_prune_calls = [0]
-        image_prune_calls = [0]
-
-        monkeypatch.setattr(
-            _dh,
-            "docker_prune_stopped_cyberwave_containers",
-            lambda **kw: container_prune_calls.__setitem__(0, container_prune_calls[0] + 1) or 0,
-        )
-        monkeypatch.setattr(
-            _dh,
-            "docker_prune_unused_images",
-            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
-        )
+        monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: True)
+        monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
+        monkeypatch.setattr(startup, "_docker_disk_usage_percent", lambda: 41.0)
+        calls = self._patch_prune_counters(monkeypatch)
 
         startup._run_periodic_docker_cleanup()
 
-        assert container_prune_calls[0] == 0
-        assert image_prune_calls[0] == 0
+        assert calls == {"container": 0, "image": 0, "volume": 0}
+        startup._docker_cleanup_disabled = None
+
+    def test_runs_cleanup_on_full_sd_card(self, monkeypatch):
+        """Crossing the threshold overrides the wear deferral.
+
+        The unconditional SD-card check is what let a Pi fill to 95%.
+        """
+        startup._docker_cleanup_disabled = None
+        monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: True)
+        monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
+        monkeypatch.setattr(startup, "_docker_disk_usage_percent", lambda: 95.0)
+        monkeypatch.setattr(startup, "_last_container_prune_time", _NEVER_PRUNED)
+        monkeypatch.setattr(startup, "_last_image_prune_time", _NEVER_PRUNED)
+        monkeypatch.setattr(startup, "_last_volume_prune_time", _NEVER_PRUNED)
+        calls = self._patch_prune_counters(monkeypatch)
+
+        startup._run_periodic_docker_cleanup()
+
+        assert calls == {"container": 1, "image": 1, "volume": 1}
+        startup._docker_cleanup_disabled = None
+
+    def test_pressure_warning_logged_once_per_crossing(self, monkeypatch, caplog):
+        """The over-threshold warning must not fire on every reconcile tick.
+
+        This runs every ~15 s, so an unconditional warning would add
+        thousands of journald lines a day to an already-full device.
+        """
+        import logging
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: True)
+        monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
+        usage = [95.0]
+        monkeypatch.setattr(startup, "_docker_disk_usage_percent", lambda: usage[0])
+        self._patch_prune_counters(monkeypatch)
+
+        def _warnings() -> list[str]:
+            return [r.message for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.WARNING, logger=startup.logger.name):
+            for _ in range(5):
+                startup._run_periodic_docker_cleanup()
+            assert len(_warnings()) == 1
+
+            # Recovering below the threshold re-arms it, so a second episode
+            # is still reported rather than silently swallowed forever.
+            caplog.clear()
+            usage[0] = 40.0
+            startup._run_periodic_docker_cleanup()
+            assert _warnings() == []
+
+            usage[0] = 96.0
+            startup._run_periodic_docker_cleanup()
+            assert len(_warnings()) == 1
+
+    def test_defers_cleanup_when_sd_card_usage_unreadable(self, monkeypatch):
+        """An unreadable statvfs keeps the historical wear-sparing behaviour."""
+        startup._docker_cleanup_disabled = None
+        monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: True)
+        monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
+        monkeypatch.setattr(startup, "_docker_disk_usage_percent", lambda: None)
+        calls = self._patch_prune_counters(monkeypatch)
+
+        startup._run_periodic_docker_cleanup()
+
+        assert calls == {"container": 0, "image": 0, "volume": 0}
+        startup._docker_cleanup_disabled = None
+
+    def test_env_opt_out_beats_disk_pressure(self, monkeypatch):
+        """The explicit operator opt-out wins even on a full SD card."""
+        startup._docker_cleanup_disabled = None
+        monkeypatch.setenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", "1")
+
+        import cyberwave_edge_core.docker_helpers as _dh
+
+        monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: True)
+        monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
+        monkeypatch.setattr(startup, "_docker_disk_usage_percent", lambda: 99.0)
+        calls = self._patch_prune_counters(monkeypatch)
+
+        startup._run_periodic_docker_cleanup()
+
+        assert calls == {"container": 0, "image": 0, "volume": 0}
         startup._docker_cleanup_disabled = None
 
     def test_runs_cleanup_when_not_sd_card_and_no_env_var(self, monkeypatch):
@@ -537,7 +654,8 @@ class TestRunPeriodicDockerCleanup:
 
         import cyberwave_edge_core.docker_helpers as _dh
 
-        monkeypatch.setattr(_dh, "is_sd_card_root", lambda: False)
+        monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: False)
+        monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
 
         container_prune_calls = [0]
         image_prune_calls = [0]

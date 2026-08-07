@@ -966,6 +966,56 @@ Or pass env vars to the CLI installer:
 sudo CYBERWAVE_ENVIRONMENT="yourenv" CYBERWAVE_BASE_URL="https://yourbaseurl" CYBERWAVE_MQTT_HOST="yourmqtt" cyberwave edge install
 ```
 
+### Disk usage: container logs and cleanup
+
+Docker's default `json-file` log driver has no size limit, and every container
+Edge Core launches runs under `--restart unless-stopped`. On a device with a
+small disk — a Raspberry Pi on a 16 GB uSD, say — a chatty driver can fill the
+card in days. Edge Core therefore caps each container's log at launch rather
+than relying on the host's `/etc/docker/daemon.json`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CYBERWAVE_DOCKER_LOG_MAX_SIZE` | `10m` | Max size per container log file before rotation. Set to `off` to emit no log flags at all and inherit the host daemon's configuration — use this if you ship logs through a daemon-wide driver such as `journald` or `fluentd`. |
+| `CYBERWAVE_DOCKER_LOG_MAX_FILE` | `3` | Rotated files kept per container (so 30 MB per container by default). |
+| `CYBERWAVE_DRIVER_LOG_COLD_START_TAIL` | `500` | Backlog lines replayed when Edge Core starts following an already-running container's logs. `0` restores the previous unbounded replay. |
+
+Per-container flags override `daemon.json`, so the defaults match what the Pi
+image already sets daemon-wide — installing Edge Core never raises a cap the
+host had already chosen. Raise them explicitly if you want more history.
+
+A driver's catalog `docker_run_params` win, at the granularity they were set:
+an explicit `--log-driver` means Edge Core adds nothing at all, while an
+explicit `--log-opt max-size` (with no driver) keeps that value and still gets
+the default `max-file` bound.
+
+Periodic cleanup prunes stopped Cyberwave containers (every 30 min) plus unused
+images and anonymous volumes (every 3 h):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP` | unset | Set to `1` to disable all periodic pruning. |
+| `CYBERWAVE_SD_CARD_CLEANUP_USAGE_PERCENT` | `80` | When Docker's data root is on an SD card, routine pruning is deferred to limit flash wear — but runs anyway once that filesystem reaches this percentage full. |
+| `CYBERWAVE_CONTAINER_PRUNE_INTERVAL_SECONDS` | `1800` | Stopped-container prune interval. |
+| `CYBERWAVE_IMAGE_PRUNE_INTERVAL_SECONDS` | `10800` | Unused-image prune interval. |
+| `CYBERWAVE_VOLUME_PRUNE_INTERVAL_SECONDS` | `10800` | Anonymous-volume prune interval. Named volumes are never pruned. |
+
+Volume pruning requires Docker 23.0 or newer, where `docker volume prune`
+removes only anonymous volumes. On older daemons the same command would also
+delete unused *named* volumes belonging to other workloads on the host, so Edge
+Core skips it and prunes containers and images only. The `docker-ce` packages
+our installer and Pi image use are well past 23.0; the distro `docker.io`
+package is not.
+
+If a device is running out of space, start here:
+
+```bash
+docker system df -v
+sudo ls -lSh /var/lib/docker/containers/*/*-json.log | head
+du -sh ~/.cyberwave/models/
+journalctl --disk-usage
+```
+
 ## Local development (from this folder)
 
 You can develop both the **Cyberwave CLI** and **Edge Core** from the `cyberwave-edge-core` directory using a single virtual environment that has the monorepo SDK, CLI, and edge-core installed in editable mode.

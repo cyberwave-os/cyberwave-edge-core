@@ -354,6 +354,10 @@ class TestStartZenohRouter:
         assert "--network" in run_cmd
         assert "host" in run_cmd
         assert "cyberwave-zenoh-router-abcd1234" in run_cmd
+        # The router is long-lived under --restart unless-stopped, so its log
+        # must be capped like every other container we launch.
+        assert "--log-driver" in run_cmd
+        assert any(a.startswith("max-size=") for a in run_cmd)
 
     def test_returns_false_on_docker_error(self, monkeypatch):
         import cyberwave_edge_core.zenoh_config as zmod
@@ -443,7 +447,13 @@ class TestStopZenohRouter:
 
         result = stop_zenoh_router("abcd1234-xxxx")
         assert result is True
-        assert captured[0] == ["docker", "rm", "-f", "cyberwave-zenoh-router-abcd1234"]
+        assert captured[0] == [
+            "docker",
+            "rm",
+            "-f",
+            "-v",
+            "cyberwave-zenoh-router-abcd1234",
+        ]
 
     def test_returns_true_even_when_container_not_found(self, monkeypatch):
         import cyberwave_edge_core.zenoh_config as zmod

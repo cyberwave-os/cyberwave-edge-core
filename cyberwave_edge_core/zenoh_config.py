@@ -77,6 +77,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
+from .docker_args import build_log_args
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -375,7 +377,7 @@ def start_zenoh_router(config: ZenohConfig, env_uuid: str) -> bool:
 
     # Remove any stale stopped container with the same name.
     subprocess.run(
-        ["docker", "rm", "-f", container_name],
+        ["docker", "rm", "-f", "-v", container_name],
         capture_output=True,
         timeout=30,
     )
@@ -404,6 +406,7 @@ def start_zenoh_router(config: ZenohConfig, env_uuid: str) -> bool:
         "--detach",
         "--restart",
         "unless-stopped",
+        *build_log_args(),
         "--name",
         container_name,
         *port_args,
@@ -462,7 +465,7 @@ def stop_zenoh_router(env_uuid: str) -> bool:
 
     try:
         result = subprocess.run(
-            ["docker", "rm", "-f", container_name],
+            ["docker", "rm", "-f", "-v", container_name],
             capture_output=True,
             text=True,
             timeout=30,

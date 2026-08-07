@@ -7,9 +7,80 @@ Pure string/list helpers that construct or inspect fragments of
 from __future__ import annotations
 
 import json
+import os
 import platform
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
+
+# json-file is uncapped by default and our containers run with
+# ``--restart unless-stopped``, so a chatty driver fills the host disk. Only the
+# Pi image caps this daemon-wide; per-container flags hold on every host.
+#
+# These mirror that image's daemon.json
+# (devops/raspberry_pi_imager/files/chroot-setup.sh): per-container flags
+# override daemon config, so a larger default here would raise the ceiling on
+# the device with the least headroom. Keep the two in step.
+DOCKER_LOG_MAX_SIZE_ENV_VAR = "CYBERWAVE_DOCKER_LOG_MAX_SIZE"
+DOCKER_LOG_MAX_FILE_ENV_VAR = "CYBERWAVE_DOCKER_LOG_MAX_FILE"
+DEFAULT_DOCKER_LOG_MAX_SIZE = "10m"
+DEFAULT_DOCKER_LOG_MAX_FILE = "3"
+
+
+def _flag_values(params: list[str], flag: str) -> list[str]:
+    """Collect values given to *flag*, in both ``--f v`` and ``--f=v`` forms."""
+    values: list[str] = []
+    prefix = f"{flag}="
+    index = 0
+    while index < len(params):
+        item = params[index]
+        if item == flag and index + 1 < len(params):
+            values.append(params[index + 1])
+            index += 2
+            continue
+        if item.startswith(prefix):
+            values.append(item[len(prefix) :])
+        index += 1
+    return values
+
+
+def build_log_args(params: Optional[list[str]] = None) -> list[str]:
+    """Return ``--log-driver``/``--log-opt`` args, defaulting to 10m x 3 files.
+
+    *params* is the container's catalog ``docker_run_params``, which win at the
+    granularity they were set: an explicit ``--log-driver`` suppresses our args
+    entirely (``--log-opt`` is json-file-specific and the daemon rejects it for
+    drivers like ``none``), while a pinned ``--log-opt max-size`` keeps that
+    value and still gets our ``max-file``.
+
+    ``CYBERWAVE_DOCKER_LOG_MAX_SIZE=off`` emits nothing, deferring to a
+    daemon-wide driver such as journald or fluentd.
+    """
+    max_size = (os.getenv(DOCKER_LOG_MAX_SIZE_ENV_VAR) or "").strip()
+    if max_size.lower() == "off":
+        return []
+    if not max_size:
+        max_size = DEFAULT_DOCKER_LOG_MAX_SIZE
+    max_file = (os.getenv(DOCKER_LOG_MAX_FILE_ENV_VAR) or "").strip()
+    if not max_file:
+        max_file = DEFAULT_DOCKER_LOG_MAX_FILE
+
+    params = params or []
+    if _flag_values(params, "--log-driver"):
+        return []
+
+    # Keys the operator already pinned. Docker silently takes the last
+    # occurrence of a repeated key, so emitting both would make the result
+    # depend on flag ordering; one value per key keeps it explicit.
+    operator_keys = {
+        opt.split("=", 1)[0].strip() for opt in _flag_values(params, "--log-opt") if opt
+    }
+
+    args = ["--log-driver", "json-file"]
+    if "max-size" not in operator_keys:
+        args += ["--log-opt", f"max-size={max_size}"]
+    if "max-file" not in operator_keys:
+        args += ["--log-opt", f"max-file={max_file}"]
+    return args
 
 
 def _extract_docker_device_mappings(params: list[str]) -> list[tuple[str, str]]:

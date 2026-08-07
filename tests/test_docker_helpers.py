@@ -13,13 +13,17 @@ Covers:
 - docker_has_nvidia_runtime: nvidia present, absent, empty output, bad JSON, errors
 - docker_prune_stopped_cyberwave_containers: removes stopped containers, skips running
 - docker_prune_unused_images: success, failure, docker unavailable
+- docker_prune_dangling_volumes: command shape, success, failure paths
 - docker_logs_follow: returns Popen handle, docker unavailable, OSError on Popen
-- is_sd_card_root: detects mmcblk root device on Linux
+- backing_device_for: longest-mountpoint match, sibling-prefix safety
+- is_sd_card_path / is_sd_card_root: detects mmcblk backing device on Linux
+- docker_data_root: docker info -> daemon.json -> default, and caching
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -163,7 +167,9 @@ class TestDockerRm:
             dh.subprocess, "run", lambda cmd, **kw: captured.append(cmd) or _make_completed()
         )
         dh.docker_rm("target_container")
-        assert captured[0] == ["docker", "rm", "-f", "target_container"]
+        # -v reaps the container's anonymous volumes; named volumes and bind
+        # mounts are untouched by it.
+        assert captured[0] == ["docker", "rm", "-f", "-v", "target_container"]
 
 
 # ---------------------------------------------------------------------------
@@ -692,12 +698,336 @@ class TestDockerPruneUnusedImages:
             dh.subprocess, "run", lambda cmd, **kw: captured.append(cmd) or _make_completed()
         )
         dh.docker_prune_unused_images()
-        assert captured[0] == ["docker", "image", "prune", "--all", "--force"]
+        # The until=2h guard keeps freshly-pulled images that no container has
+        # had a chance to reference yet.
+        assert captured[0] == [
+            "docker",
+            "image",
+            "prune",
+            "--all",
+            "--force",
+            "--filter",
+            "until=2h",
+        ]
 
 
 # ---------------------------------------------------------------------------
-# is_sd_card_root
+# docker_prune_dangling_volumes
 # ---------------------------------------------------------------------------
+
+
+class TestDockerPruneDanglingVolumes:
+    @pytest.fixture(autouse=True)
+    def _modern_docker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """These cases are about the prune itself; open the version gate."""
+        monkeypatch.setattr(dh, "volume_prune_is_anonymous_only", lambda: True)
+
+    def test_returns_false_when_docker_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: False)
+        assert dh.docker_prune_dangling_volumes() is False
+
+    def test_returns_true_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed())
+        assert dh.docker_prune_dangling_volumes() is True
+
+    def test_returns_false_on_called_process_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+
+        def raise_cpe(*a: Any, **kw: Any) -> None:
+            raise subprocess.CalledProcessError(1, "docker")
+
+        monkeypatch.setattr(dh.subprocess, "run", raise_cpe)
+        assert dh.docker_prune_dangling_volumes() is False
+
+    def test_returns_false_on_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+
+        def raise_timeout(*a: Any, **kw: Any) -> None:
+            raise subprocess.TimeoutExpired("docker", 120)
+
+        monkeypatch.setattr(dh.subprocess, "run", raise_timeout)
+        assert dh.docker_prune_dangling_volumes() is False
+
+    def test_command_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both omissions are load-bearing.
+
+        No ``--all`` keeps operator-created named volumes; no ``--filter``
+        because the daemon rejects ``until`` for volume prune.
+        """
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            dh.subprocess, "run", lambda cmd, **kw: captured.append(cmd) or _make_completed()
+        )
+        dh.docker_prune_dangling_volumes()
+        assert captured[0] == ["docker", "volume", "prune", "--force"]
+        assert "--all" not in captured[0]
+        assert "--filter" not in captured[0]
+
+
+# ---------------------------------------------------------------------------
+# docker_server_version / volume_prune_is_anonymous_only
+# ---------------------------------------------------------------------------
+
+
+class TestVolumePruneVersionGate:
+    """Bare ``docker volume prune`` only spares named volumes on Docker >= 23.0.
+
+    Below that it deletes every unused volume on the host, other workloads'
+    named ones included.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        dh._docker_server_version = None
+        yield
+        dh._docker_server_version = None
+
+    def _with_version(self, monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh.subprocess, "run", lambda *a, **kw: _make_completed(stdout=stdout))
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("24.0.7", (24, 0)),
+            ("23.0.0", (23, 0)),
+            ("20.10.24", (20, 10)),
+            # Vendor builds tack a suffix on: 20.10.25-0ubuntu1~22.04.1
+            ("20.10.25-0ubuntu1~22.04.1", (20, 10)),
+            ("27", (27, 0)),
+        ],
+    )
+    def test_parses_version(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: tuple[int, int]
+    ) -> None:
+        self._with_version(monkeypatch, f"{raw}\n")
+        assert dh.docker_server_version() == expected
+
+    @pytest.mark.parametrize("raw", ["", "dev", "not.a.version"])
+    def test_unparseable_version_is_none(self, monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+        self._with_version(monkeypatch, raw)
+        assert dh.docker_server_version() is None
+
+    def test_daemon_down_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+
+        def raise_timeout(*_a: Any, **_kw: Any) -> None:
+            raise subprocess.TimeoutExpired("docker", 15)
+
+        monkeypatch.setattr(dh.subprocess, "run", raise_timeout)
+        assert dh.docker_server_version() is None
+
+    def test_version_is_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = [0]
+
+        def _run(*_a: Any, **_kw: Any) -> Any:
+            calls[0] += 1
+            return _make_completed(stdout="24.0.7\n")
+
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh.subprocess, "run", _run)
+        dh.docker_server_version()
+        dh.docker_server_version()
+        assert calls[0] == 1
+
+    def test_failure_is_not_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A miss stays retryable: Edge Core can start before dockerd."""
+        calls = [0]
+        stdout = [""]
+
+        def _run(*_a: Any, **_kw: Any) -> Any:
+            calls[0] += 1
+            return _make_completed(stdout=stdout[0])
+
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh.subprocess, "run", _run)
+
+        assert dh.docker_server_version() is None
+        assert dh.docker_server_version() is None
+        assert calls[0] == 2
+
+        # dockerd finished starting; the next probe settles and sticks.
+        stdout[0] = "24.0.7\n"
+        assert dh.docker_server_version() == (24, 0)
+        assert dh.docker_server_version() == (24, 0)
+        assert calls[0] == 3
+
+    @pytest.mark.parametrize(
+        "raw,allowed",
+        [("24.0.7", True), ("23.0.0", True), ("22.9.9", False), ("20.10.24", False)],
+    )
+    def test_gate_follows_version(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, allowed: bool
+    ) -> None:
+        self._with_version(monkeypatch, f"{raw}\n")
+        assert dh.volume_prune_is_anonymous_only() is allowed
+
+    def test_unknown_version_is_treated_as_old(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_server_version", lambda: None)
+        assert dh.volume_prune_is_anonymous_only() is False
+
+    def test_old_docker_never_runs_the_prune(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On an old daemon, no prune is issued.
+
+        Asserted against the prune command rather than "no subprocess at all":
+        the skip path logs the version, a cache hit in production but a real
+        call here because the gate is stubbed out.
+        """
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh, "volume_prune_is_anonymous_only", lambda: False)
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            dh.subprocess, "run", lambda cmd, **kw: captured.append(cmd) or _make_completed()
+        )
+        # True, not False — a deliberate skip is not a failure. False is
+        # reserved for "we tried and Docker refused".
+        assert dh.docker_prune_dangling_volumes() is True
+        assert not any("prune" in cmd for cmd in captured)
+
+
+# ---------------------------------------------------------------------------
+# backing_device_for / is_sd_card_path / docker_data_root
+# ---------------------------------------------------------------------------
+
+
+def _fake_proc_mounts(monkeypatch: pytest.MonkeyPatch, tmp_path: Any, content: str) -> None:
+    """Redirect reads of /proc/mounts to a fixture file."""
+    mounts = tmp_path / "mounts"
+    mounts.write_text(content)
+    monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
+
+    import builtins
+
+    real_open = builtins.open
+
+    def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+        if str(path) == "/proc/mounts":
+            return real_open(str(mounts), *a, **kw)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+
+# A Pi that boots from SD but keeps Docker on an external SSD — the case that
+# matching on "/" alone gets wrong in both directions.
+#
+# Mountpoints go through realpath since the host may symlink a component
+# (macOS maps /var -> /private/var); queries below use the raw spelling.
+_DOCKER_MOUNTPOINT = os.path.realpath("/var/lib/docker")
+_SPLIT_MOUNTS = (
+    "/dev/mmcblk0p2 / ext4 rw,relatime 0 0\n"
+    f"/dev/sda1 {_DOCKER_MOUNTPOINT} ext4 rw,relatime 0 0\n"
+    "tmpfs /tmp tmpfs rw 0 0\n"
+)
+
+
+class TestBackingDeviceFor:
+    def test_picks_longest_matching_mountpoint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        _fake_proc_mounts(monkeypatch, tmp_path, _SPLIT_MOUNTS)
+        assert dh.backing_device_for("/var/lib/docker/overlay2") == "/dev/sda1"
+        assert dh.backing_device_for("/etc/hostname") == "/dev/mmcblk0p2"
+
+    def test_does_not_match_sibling_prefix(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """/var/lib/docker must not claim /var/lib/docker-backup."""
+        _fake_proc_mounts(monkeypatch, tmp_path, _SPLIT_MOUNTS)
+        assert dh.backing_device_for("/var/lib/docker-backup") == "/dev/mmcblk0p2"
+
+    def test_returns_none_on_non_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.platform, "system", lambda: "Darwin")
+        assert dh.backing_device_for("/") is None
+
+
+class TestIsSdCardPath:
+    def test_distinguishes_docker_root_from_boot_card(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """The wear/pressure decision follows the data root, not the boot device."""
+        _fake_proc_mounts(monkeypatch, tmp_path, _SPLIT_MOUNTS)
+        assert dh.is_sd_card_path("/") is True
+        assert dh.is_sd_card_path("/var/lib/docker") is False
+
+
+class TestDockerDataRoot:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        dh._docker_data_root = None
+        yield
+        dh._docker_data_root = None
+
+    def test_prefers_docker_info(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        root = tmp_path / "dockerroot"
+        root.mkdir()
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(
+            dh.subprocess,
+            "run",
+            lambda *a, **kw: _make_completed(stdout=f"{root}\n"),
+        )
+        assert dh.docker_data_root() == str(root)
+
+    def test_result_is_cached(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        """docker info is a round-trip; the gate runs every ~15 s."""
+        root = tmp_path / "dockerroot"
+        root.mkdir()
+        calls = [0]
+
+        def _run(*_a: Any, **_kw: Any) -> Any:
+            calls[0] += 1
+            return _make_completed(stdout=f"{root}\n")
+
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh.subprocess, "run", _run)
+        dh.docker_data_root()
+        dh.docker_data_root()
+        assert calls[0] == 1
+
+    def test_falls_back_to_root_when_path_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-existent data root would make disk_usage raise."""
+        monkeypatch.setattr(dh, "docker_available", lambda: False)
+
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+            if str(path) == "/etc/docker/daemon.json":
+                raise OSError("no such file")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        monkeypatch.setattr(dh.os.path, "isdir", lambda p: False)
+        assert dh.docker_data_root() == "/"
+
+    def test_docker_info_failure_falls_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+
+        def raise_timeout(*_a: Any, **_kw: Any) -> None:
+            raise subprocess.TimeoutExpired("docker", 15)
+
+        monkeypatch.setattr(dh.subprocess, "run", raise_timeout)
+        daemon = tmp_path / "daemon.json"
+        daemon.write_text(json.dumps({"data-root": "/mnt/docker"}))
+
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(path: Any, *a: Any, **kw: Any) -> Any:
+            if str(path) == "/etc/docker/daemon.json":
+                return real_open(str(daemon), *a, **kw)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        monkeypatch.setattr(dh.os.path, "isdir", lambda p: p == "/mnt/docker")
+        assert dh.docker_data_root() == "/mnt/docker"
 
 
 class TestIsSdCardRoot:
@@ -709,10 +1039,7 @@ class TestIsSdCardRoot:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
     ) -> None:
         mounts = tmp_path / "mounts"
-        mounts.write_text(
-            "/dev/mmcblk0p2 / ext4 rw,relatime 0 0\n"
-            "tmpfs /tmp tmpfs rw 0 0\n"
-        )
+        mounts.write_text("/dev/mmcblk0p2 / ext4 rw,relatime 0 0\ntmpfs /tmp tmpfs rw 0 0\n")
         monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
 
         import builtins
@@ -731,10 +1058,7 @@ class TestIsSdCardRoot:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
     ) -> None:
         mounts = tmp_path / "mounts"
-        mounts.write_text(
-            "/dev/sda1 / ext4 rw,relatime 0 0\n"
-            "tmpfs /tmp tmpfs rw 0 0\n"
-        )
+        mounts.write_text("/dev/sda1 / ext4 rw,relatime 0 0\ntmpfs /tmp tmpfs rw 0 0\n")
         monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
 
         import builtins
@@ -749,9 +1073,7 @@ class TestIsSdCardRoot:
         monkeypatch.setattr(builtins, "open", fake_open)
         assert dh.is_sd_card_root() is False
 
-    def test_returns_false_when_proc_mounts_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_proc_mounts_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(dh.platform, "system", lambda: "Linux")
 
         import builtins

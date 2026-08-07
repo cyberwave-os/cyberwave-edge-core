@@ -274,6 +274,14 @@ CONTAINER_PRUNE_INTERVAL_SECONDS = float(
 IMAGE_PRUNE_INTERVAL_SECONDS = float(
     os.getenv("CYBERWAVE_IMAGE_PRUNE_INTERVAL_SECONDS", "10800")  # 3 hours
 )
+VOLUME_PRUNE_INTERVAL_SECONDS = float(
+    os.getenv("CYBERWAVE_VOLUME_PRUNE_INTERVAL_SECONDS", "10800")  # 3 hours
+)
+# Data-root usage at which an SD-card host stops deferring cleanup for
+# flash-wear reasons. See ``_is_periodic_docker_cleanup_disabled``.
+SD_CARD_CLEANUP_USAGE_PERCENT = float(
+    os.getenv("CYBERWAVE_SD_CARD_CLEANUP_USAGE_PERCENT", "80")
+)
 
 
 def _atomic_write_json(path: Path, data: Any, *, mode: int = 0o600) -> None:
@@ -2147,7 +2155,7 @@ def _stop_and_prune_driver_containers() -> list[str]:
     for container_name in containers:
         try:
             subprocess.run(
-                ["docker", "rm", "-f", container_name],
+                ["docker", "rm", "-f", "-v", container_name],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -5463,7 +5471,11 @@ _edge_json_sync_loop_counter = 0
 
 _last_container_prune_time: float = time.monotonic()
 _last_image_prune_time: float = time.monotonic()
+_last_volume_prune_time: float = time.monotonic()
 _docker_cleanup_disabled: bool | None = None
+_root_is_sd_card: bool | None = None
+# Edge-triggered so the over-threshold warning logs once per crossing.
+_sd_card_pressure_logged: bool = False
 
 
 def reconcile_edge_json_file_sync() -> bool:
@@ -5512,56 +5524,96 @@ def reconcile_edge_json_file_sync() -> bool:
     return False
 
 
+def _docker_disk_usage_percent() -> float | None:
+    """Percent used of the filesystem holding Docker's data root, or None."""
+    from .docker_helpers import docker_data_root
+
+    try:
+        usage = shutil.disk_usage(docker_data_root())
+    except OSError:
+        return None
+    if usage.total <= 0:
+        return None
+    return (usage.used / usage.total) * 100.0
+
+
 def _is_periodic_docker_cleanup_disabled() -> bool:
-    """Return True when periodic Docker cleanup should be skipped.
+    """Return True when periodic Docker cleanup should be skipped this tick.
 
-    Cleanup is disabled when:
-    - ``CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP=1`` is set, OR
-    - the root filesystem lives on an SD card (``/dev/mmcblk*``),
-      to avoid accelerating flash wear from repeated prune/pull cycles.
+    ``CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP=1`` disables cleanup outright. A
+    Docker data root on an SD card only *defers* it, to limit flash wear;
+    pruning resumes once that filesystem crosses
+    ``CYBERWAVE_SD_CARD_CLEANUP_USAGE_PERCENT`` (default 80%).
 
-    The result is cached after the first call.
+    That deferral used to be unconditional: a Pi both trips the SD-card check
+    and has the least headroom, so images and stopped containers accumulated
+    forever on the devices least able to absorb them. The wear argument also
+    inverts near a full disk — pruning is mostly unlinks, while a filesystem at
+    95% drives far worse write amplification.
+
+    Both checks target the data root, not ``/``: they coincide on a stock Pi but
+    diverge when ``/var/lib/docker`` lives on a separate disk.
     """
-    global _docker_cleanup_disabled
+    global _docker_cleanup_disabled, _root_is_sd_card, _sd_card_pressure_logged
 
-    if _docker_cleanup_disabled is not None:
-        return _docker_cleanup_disabled
+    if _docker_cleanup_disabled is None:
+        env_val = os.getenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", "").strip()
+        _docker_cleanup_disabled = env_val in {"1", "true", "yes"}
+        if _docker_cleanup_disabled:
+            logger.info(
+                "Periodic Docker cleanup disabled via CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP"
+            )
 
-    env_val = os.getenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", "").strip()
-    if env_val in {"1", "true", "yes"}:
-        logger.info(
-            "Periodic Docker cleanup disabled via CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP"
-        )
-        _docker_cleanup_disabled = True
+    if _docker_cleanup_disabled:
         return True
 
-    from .docker_helpers import is_sd_card_root
+    if _root_is_sd_card is None:
+        from .docker_helpers import docker_data_root, is_sd_card_path
 
-    if is_sd_card_root():
-        logger.info(
-            "Periodic Docker cleanup disabled: root filesystem is on an SD card"
-        )
-        _docker_cleanup_disabled = True
+        # Cached: reads /proc/mounts, and neither value moves at runtime.
+        _root_is_sd_card = is_sd_card_path(docker_data_root())
+
+    if not _root_is_sd_card:
+        return False
+
+    usage_percent = _docker_disk_usage_percent()
+    if usage_percent is None:
+        # Can't measure pressure; keep the historical wear-sparing behaviour.
+        return True
+    if usage_percent < SD_CARD_CLEANUP_USAGE_PERCENT:
+        # Recovered below the threshold — re-arm the log for the next crossing.
+        _sd_card_pressure_logged = False
         return True
 
-    _docker_cleanup_disabled = False
+    # Once per crossing, not per tick — this runs every ~15 s.
+    if not _sd_card_pressure_logged:
+        _sd_card_pressure_logged = True
+        logger.warning(
+            "Root filesystem on SD card is %.1f%% full (>= %.1f%%); running Docker "
+            "cleanup despite the flash-wear deferral",
+            usage_percent,
+            SD_CARD_CLEANUP_USAGE_PERCENT,
+        )
     return False
 
 
 def _run_periodic_docker_cleanup() -> None:
-    """Prune stopped cyberwave containers and unused images on a schedule.
+    """Prune stopped containers, unused images and dangling volumes on a schedule.
 
-    Container pruning runs every ``CONTAINER_PRUNE_INTERVAL_SECONDS`` (default
-    30 min). Image pruning runs every ``IMAGE_PRUNE_INTERVAL_SECONDS`` (default
-    3 h).  Both are no-ops when Docker is unavailable or when the root
-    filesystem is on an SD card (to avoid flash wear).
+    Containers every ``CONTAINER_PRUNE_INTERVAL_SECONDS`` (default 30 min);
+    images and anonymous volumes every ``IMAGE_PRUNE_INTERVAL_SECONDS`` /
+    ``VOLUME_PRUNE_INTERVAL_SECONDS`` (default 3 h each). All are no-ops when
+    Docker is unavailable, when cleanup is disabled outright, or on an SD-card
+    root below the usage threshold — see
+    :func:`_is_periodic_docker_cleanup_disabled`.
     """
     if _is_periodic_docker_cleanup_disabled():
         return
 
-    global _last_container_prune_time, _last_image_prune_time
+    global _last_container_prune_time, _last_image_prune_time, _last_volume_prune_time
 
     from .docker_helpers import (
+        docker_prune_dangling_volumes,
         docker_prune_stopped_cyberwave_containers,
         docker_prune_unused_images,
     )
@@ -5581,6 +5633,13 @@ def _run_periodic_docker_cleanup() -> None:
         except Exception:
             logger.exception("Unexpected error during unused-image prune")
         _last_image_prune_time = now
+
+    if now - _last_volume_prune_time >= VOLUME_PRUNE_INTERVAL_SECONDS:
+        try:
+            docker_prune_dangling_volumes()
+        except Exception:
+            logger.exception("Unexpected error during dangling-volume prune")
+        _last_volume_prune_time = now
 
 
 def run_runtime_loop(

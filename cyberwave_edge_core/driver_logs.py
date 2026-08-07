@@ -8,6 +8,7 @@ publishes them to the MQTT ``driverlog`` topic.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -31,7 +32,27 @@ logger = logging.getLogger(__name__)
 _CONTAINER_LOG_THREADS: dict[str, threading.Thread] = {}
 
 # Track when log streaming last ended per container so reattach uses --since.
+# Process-lifetime only, so a restart has no anchor to resume from.
 _CONTAINER_LOG_LAST_SEEN: dict[str, str] = {}
+
+# Backlog to replay when there is no --since anchor. Unbounded, `docker logs -f`
+# streams the container's entire history, and every line is both printed to
+# stderr and published to MQTT as a TwinDriverLog row. 0 restores that.
+DRIVER_LOG_COLD_START_TAIL_ENV_VAR = "CYBERWAVE_DRIVER_LOG_COLD_START_TAIL"
+DEFAULT_DRIVER_LOG_COLD_START_TAIL = 500
+
+
+def _cold_start_tail_lines() -> int:
+    """Backlog line count for a follow with no ``--since`` anchor."""
+    raw = (os.getenv(DRIVER_LOG_COLD_START_TAIL_ENV_VAR) or "").strip()
+    if not raw:
+        return DEFAULT_DRIVER_LOG_COLD_START_TAIL
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_DRIVER_LOG_COLD_START_TAIL
+    return max(0, value)
+
 
 # Containers for which a driver_runtime_error alert has already been sent
 # during the current log-follow session, to avoid alert spam.
@@ -1222,6 +1243,11 @@ def _follow_container_logs(
     since_ts = _CONTAINER_LOG_LAST_SEEN.get(container_name)
     if since_ts:
         cmd += ["--since", since_ts]
+    else:
+        # Cold start: bound the backlog rather than replay everything.
+        tail_lines = _cold_start_tail_lines()
+        if tail_lines:
+            cmd += ["--tail", str(tail_lines)]
     cmd.append(container_name)
 
     try:

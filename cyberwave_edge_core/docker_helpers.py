@@ -34,12 +34,24 @@ def docker_available() -> bool:
 
 
 def docker_rm(container_name: str, *, timeout: int = 30) -> bool:
-    """Force-remove a container. Returns True on success (including not-found)."""
+    """Force-remove a container and its anonymous volumes.
+
+    ``-v`` only reaps volumes Docker created implicitly from an image's
+    ``VOLUME`` directive — never named volumes or bind mounts. Without it,
+    recreating such a container orphans a directory no prune reclaims. Our own
+    images declare none, but third-party ones (eclipse/zenoh, worker) may.
+
+    No state is lost: a recreate is ``rm`` + ``create``, and ``create`` mints a
+    fresh anonymous volume rather than reattaching the old one, so the previous
+    behaviour leaked the directory rather than preserving it.
+
+    Returns True on success (including not-found).
+    """
     if not docker_available():
         return False
     try:
         subprocess.run(
-            ["docker", "rm", "-f", container_name],
+            ["docker", "rm", "-f", "-v", container_name],
             check=True,
             capture_output=True,
             text=True,
@@ -285,24 +297,187 @@ def docker_prune_unused_images() -> bool:
         return False
 
 
-def is_sd_card_root() -> bool:
-    """Return True when the root filesystem is on an SD card (mmcblk device).
+# Docker 23.0 narrowed bare ``docker volume prune`` to anonymous volumes and
+# moved the sweep-everything behaviour behind ``--all``.
+ANONYMOUS_ONLY_VOLUME_PRUNE_MIN_VERSION = (23, 0)
 
-    SD cards appear as ``/dev/mmcblkN`` block devices on Linux.  Detecting this
-    lets callers avoid heavy disk I/O (e.g. periodic Docker image pruning) that
-    accelerates wear on flash storage.
+# Cached on success only. Edge Core can come up before dockerd, and caching
+# that miss would disable volume pruning for the whole process lifetime.
+_docker_server_version: Optional[tuple[int, int]] = None
+
+
+def docker_server_version() -> Optional[tuple[int, int]]:
+    """Return the daemon's ``(major, minor)`` version, or None if unknown.
+
+    None covers daemon-down and unparseable output alike; callers must read it
+    as "assume the older, more destructive semantics".
+    """
+    global _docker_server_version
+    if _docker_server_version is not None:
+        return _docker_server_version
+
+    resolved: Optional[tuple[int, int]] = None
+    if docker_available():
+        try:
+            result = subprocess.run(
+                ["docker", "version", "--format", "{{.Server.Version}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            raw = result.stdout.strip()
+            if result.returncode == 0 and raw:
+                parts = raw.split("-", 1)[0].split(".")
+                resolved = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+        except (subprocess.TimeoutExpired, OSError, ValueError, IndexError) as exc:
+            logger.debug("Could not determine Docker server version: %s", exc)
+
+    if resolved is not None:
+        _docker_server_version = resolved
+    return resolved
+
+
+def volume_prune_is_anonymous_only() -> bool:
+    """Return True when bare ``docker volume prune`` spares named volumes.
+
+    Older daemons remove *every* unused volume on the host, including other
+    workloads' named ones — too high a price for reclaiming our own logs. The
+    distro ``docker.io`` package still ships 20.10. Unknown counts as old.
+    """
+    version = docker_server_version()
+    return version is not None and version >= ANONYMOUS_ONLY_VOLUME_PRUNE_MIN_VERSION
+
+
+def docker_prune_dangling_volumes() -> bool:
+    """Remove anonymous volumes no container references.
+
+    Omitting ``--all`` keeps named volumes, but only on new enough daemons, so
+    :func:`volume_prune_is_anonymous_only` gates the call. No ``until`` filter,
+    unlike :func:`docker_prune_unused_images`: the daemon rejects it here, and
+    ``docker create`` attaches volumes before start, so a mid-recreate
+    container is never a candidate anyway.
+
+    Returns True on success. A version-gated skip is not a failure.
+    """
+    if not docker_available():
+        return False
+    if not volume_prune_is_anonymous_only():
+        logger.debug(
+            "Skipping volume prune: Docker %s predates the anonymous-only default "
+            "(>= %d.%d), so a bare prune would also delete named volumes",
+            docker_server_version() or "version unknown",
+            *ANONYMOUS_ONLY_VOLUME_PRUNE_MIN_VERSION,
+        )
+        return True
+    try:
+        subprocess.run(
+            ["docker", "volume", "prune", "--force"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        logger.info("Docker dangling volume prune completed")
+        return True
+    except subprocess.CalledProcessError as exc:
+        logger.warning("Docker volume prune failed: %s", exc)
+        return False
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Docker volume prune error: %s", exc)
+        return False
+
+
+def backing_device_for(path: str) -> Optional[str]:
+    """Return the block device backing *path*, via the longest mountpoint match.
+
+    Matching on ``/`` alone misattributes any path on a separate mount — e.g. a
+    Docker data root relocated to an external SSD.
     """
     if platform.system() != "Linux":
-        return False
+        return None
+    target = os.path.realpath(path)
+    best_device: Optional[str] = None
+    best_len = -1
     try:
         with open("/proc/mounts", encoding="utf-8") as fh:
             for line in fh:
                 parts = line.split()
-                if len(parts) >= 2 and parts[1] == "/":
-                    return "mmcblk" in parts[0]
+                if len(parts) < 2:
+                    continue
+                device, mountpoint = parts[0], parts[1]
+                if target == mountpoint or target.startswith(mountpoint.rstrip("/") + "/"):
+                    if len(mountpoint) > best_len:
+                        best_device, best_len = device, len(mountpoint)
     except OSError:
-        pass
-    return False
+        return None
+    return best_device
+
+
+def is_sd_card_path(path: str) -> bool:
+    """Return True when *path* lives on an SD card (``mmcblk`` device).
+
+    Lets callers avoid disk I/O that accelerates flash wear.
+    """
+    device = backing_device_for(path)
+    return device is not None and "mmcblk" in device
+
+
+def is_sd_card_root() -> bool:
+    """Return True when the root filesystem is on an SD card.
+
+    Prefer :func:`is_sd_card_path` — wear and free space are per-filesystem.
+    """
+    return is_sd_card_path("/")
+
+
+# Cached: the data root cannot move under a running dockerd, and callers hit
+# this every reconcile cycle.
+_docker_data_root: Optional[str] = None
+
+
+def docker_data_root() -> str:
+    """Return the directory Docker stores images, containers and volumes in.
+
+    This — not ``/`` — is the filesystem that fills and that prune I/O wears.
+    Resolved from ``docker info``, then ``data-root`` in
+    ``/etc/docker/daemon.json``, then ``/var/lib/docker``, then ``/``.
+    """
+    global _docker_data_root
+    if _docker_data_root is not None:
+        return _docker_data_root
+
+    resolved: Optional[str] = None
+    if docker_available():
+        try:
+            result = subprocess.run(
+                ["docker", "info", "--format", "{{.DockerRootDir}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            candidate = result.stdout.strip()
+            if result.returncode == 0 and candidate:
+                resolved = candidate
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug("Could not read Docker data root from `docker info`: %s", exc)
+
+    if resolved is None:
+        try:
+            with open("/etc/docker/daemon.json", encoding="utf-8") as fh:
+                candidate = json.load(fh).get("data-root")
+            if isinstance(candidate, str) and candidate.strip():
+                resolved = candidate.strip()
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+
+    if resolved is None:
+        resolved = "/var/lib/docker"
+    if not os.path.isdir(resolved):
+        resolved = "/"
+
+    _docker_data_root = resolved
+    logger.debug("Resolved Docker data root to %s", resolved)
+    return resolved
 
 
 def docker_logs_follow(container_name: str) -> Optional[subprocess.Popen]:  # type: ignore[type-arg]
