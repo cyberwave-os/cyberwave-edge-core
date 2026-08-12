@@ -661,7 +661,7 @@ Each entry under `streams[id]` may carry an optional `stream_config` block — a
 
 **Static (REST `POST /api/v1/edges/discover`, every ~30 s):**
 
-Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, `/dev/watchdog` availability, and non-loopback network interfaces — into `Edge.metadata['host_facts']`. The first POST is performed by a background daemon thread as soon as it starts, then the same thread re-POSTs the same payload every ~30 s. Running the bootstrap POST off the main thread is deliberate: under systemd `Type=notify`, the service signals `READY=1` from the main thread, and we don't want a slow or unreachable backend to push past `TimeoutStartSec` (which would cause `systemctl restart cyberwave-edge-core` to fail). The call is idempotent (it upserts `Edge.metadata['host_facts']` and bumps `Edge.last_seen_at`), so the keepalive cost is one tiny round-trip per edge regardless of how many bound twins the edge has — or whether it has any at all.
+Edge Core uploads a `host_facts` object — total RAM, CPU model and core count, kernel, thermal source, `/dev/watchdog` availability, non-loopback network interfaces, and the current CPU-temperature / memory gauges — into `Edge.metadata['host_facts']`. The first POST is performed by a background daemon thread as soon as it starts, then the same thread re-reads and re-POSTs every ~30 s (a fresh read each tick, not a cached payload — the interface list and the gauges below depend on that). Running the bootstrap POST off the main thread is deliberate: under systemd `Type=notify`, the service signals `READY=1` from the main thread, and we don't want a slow or unreachable backend to push past `TimeoutStartSec` (which would cause `systemctl restart cyberwave-edge-core` to fail). The call is idempotent (it upserts `Edge.metadata['host_facts']` and bumps `Edge.last_seen_at`), so the keepalive cost is one tiny round-trip per edge regardless of how many bound twins the edge has — or whether it has any at all.
 
 `network_interfaces` — each interface's name, IPv4 address, MAC and up/down state — exists so an edge that reconnects to a different network (e.g. a different WiFi AP) can still be found and SSH'd into without scanning the LAN. Because it's the one field here that legitimately changes over the device's lifetime, Edge Core additionally publishes a one-line `driver_log` message (`"Network interfaces: eth0=192.168.1.42 (up), ..."`) to every twin bound to the edge whenever the observed interface set changes, so the change shows up in that twin's Logs tab with a timestamp — not just as a silently-overwritten snapshot.
 
@@ -691,10 +691,21 @@ Coverage per platform:
 | `memory_total_mb` | `/proc/meminfo` | `sysctl hw.memsize` | Rounded to one decimal on both platforms. |
 | `cpu_model` | `/proc/cpuinfo` | `sysctl machdep.cpu.brand_string` | E.g. `"Apple M2 Pro"`. |
 | `cpu_count` | `/proc/cpuinfo` (`processor:` records) | `sysctl hw.logicalcpu` → `hw.ncpu` | Logical CPU count on both platforms (after SMT expansion). |
-| `thermal_source` | first CPU thermal zone | omitted | Tracks the path the live publisher reads from. Darwin has no live thermal publisher today, so the field stays absent rather than claim a source that isn't sampled. |
+| `thermal_source` | first CPU thermal zone | omitted | Tracks the path the live publisher reads from. Darwin has no thermal reader today, so the field stays absent rather than claim a source that isn't sampled. |
 | `has_hardware_watchdog` | `/dev/watchdog` | always `false` | Linux-only kernel capability. |
 | `network_interfaces` | `/sys/class/net/*` (name, `address`, `operstate`; IPv4 via `SIOCGIFADDR`) | omitted (`[]`) | Non-loopback interfaces only. `ipv4_address` is `null` when the interface has no bound address (e.g. down). |
+| `cpu_temp_c` | hottest CPU thermal zone | omitted | Live gauge, not a fact — see below. Deliberately the *hottest* zone, while `thermal_source` names the *first*; the two disagree by design. |
+| `memory_used_percent`, `memory_available_mb` | `/proc/meminfo` | omitted | Live gauges — see below. `sysctl` gives Darwin the total but not the free/available split, so both stay absent there. |
 | `sdk_version`, `edge_core_version` | in-process `__version__` → `importlib.metadata` | in-process `__version__` → `importlib.metadata` | Version of the SDK and Edge Core **actually loaded** by the running daemon. The in-process lookup preserves the `BUILD_VERSION` stamp injected by CI for `.deb` builds and pre-release wheels, and survives PyInstaller binaries that ship without `.dist-info`, so the Edges tab agrees with `cyberwave-edge-core --version`. CLI version is intentionally not part of `host_facts` — the CLI ships as a separate PyInstaller binary, so Edge Core cannot observe it from its own Python process; `cyberwave --version` remains the source of truth for the CLI an operator is running locally. |
+
+#### Why two gauges ride a facts payload
+
+`cpu_temp_c` and the `memory_*` gauges are the same readings the MQTT `edge_health` heartbeat publishes every ~5 s, duplicated onto the ~30 s REST keepalive. The duplication is not redundancy for its own sake — without it those readings have no route off a working edge at all:
+
+- The bootstrap `edge_health` publisher is the only thing that samples them, and Edge Core **stops** it as soon as the first driver starts (drivers own the twin's health topic from then on).
+- A containerised driver sees its own `/proc` and has no access to the host's thermal sysfs, so it cannot take over the sampling.
+
+The net effect before this existed: memory and temperature appeared while an edge sat idle and vanished the moment it started doing work — exactly backwards from when an operator wants them. Consumers that may see both copies should prefer whichever is *fresher*, which is the heartbeat's only while heartbeats are still arriving — a consumer holding the last-received payload in memory keeps those numbers indefinitely, so once the heartbeat stops they become a frozen snapshot and this copy is the live one. The dashboard treats a stale heartbeat as having no gauges at all and falls through to these. Treat a fallback reading as up to 30 s stale at the source, plus whatever polling interval the consumer adds on top.
 
 ### Driver failure handling
 
