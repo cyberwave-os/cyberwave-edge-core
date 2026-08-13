@@ -275,9 +275,11 @@ def _addressed_network_interfaces(
     signature: address-less interfaces come and go (``docker0``/``veth*`` as
     driver containers cycle, ``usb0``/``rndis0`` as cables are plugged) and
     would otherwise re-fire the whole fan-out on churn that tells an operator
-    nothing.  This also keeps the log line consistent with the frontend,
-    which filters on ``ipv4_address`` for both the Edge details row and the
-    Edge Devices meta line.
+    nothing.  The Edge details row in the frontend filters on the same
+    condition; the Edge Devices meta line instead renders only the interface
+    named by ``host_facts.primary_interface_name`` and keeps the rest on
+    hover.  All three are about the same thing -- don't put unreachable
+    interfaces in front of an operator -- reached by different means.
     """
     return [nic for nic in network_interfaces if nic.get("ipv4_address")]
 
