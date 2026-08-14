@@ -849,6 +849,8 @@ device:
 When this value differs from `/dev/video*`, Edge Core can transparently:
 
 - inject `CYBERWAVE_METADATA_VIDEO_DEVICE` for the driver
+- inject `CYBERWAVE_CHILD_CAMERA_STREAM_URLS` with the per-child MJPEG mapping
+  for multi-camera parent drivers such as SO101
 - inject `CYBERWAVE_EDGE_VIDEO_DEVICE_MAP` (JSON map of Linux device to resolved source)
 - remove Linux-only `--device /dev/video*` flags before `docker run` on macOS
   (default enabled with `CYBERWAVE_MACOS_STRIP_VIDEO_DEVICE_PARAMS=true`)

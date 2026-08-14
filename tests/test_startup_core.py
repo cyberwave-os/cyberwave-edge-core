@@ -3035,6 +3035,27 @@ class TestLoadCameraStreamUrlForTwin:
         )
         assert startup._load_camera_stream_url_for_twin("twin-c") is None
 
+    def test_resolves_multiple_requested_twins(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        (tmp_path / "camera_streams.json").write_text(
+            json.dumps(
+                {
+                    "twin_to_stream_url": {
+                        "twin-a": "http://host.docker.internal:8091",
+                        "twin-b": "http://host.docker.internal:8092",
+                        "unrelated": "http://host.docker.internal:8099",
+                    }
+                }
+            )
+        )
+
+        assert startup._load_camera_stream_urls_for_twins(
+            ["twin-b", "missing", "twin-a", "twin-b"]
+        ) == {
+            "twin-b": "http://host.docker.internal:8092",
+            "twin-a": "http://host.docker.internal:8091",
+        }
+
     def test_ignores_invalid_json(self, tmp_path, monkeypatch):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         (tmp_path / "camera_streams.json").write_text("not-json")
