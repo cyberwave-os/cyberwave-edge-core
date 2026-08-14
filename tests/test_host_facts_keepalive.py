@@ -39,7 +39,7 @@ def test_start_keepalive_spawns_thread_that_ticks_repeatedly(monkeypatch):
     calls: list[float] = []
     call_event = threading.Event()
 
-    def fake_post(token: str) -> bool:
+    def fake_post(token: str, watchdog=None) -> bool:
         calls.append(time.monotonic())
         if len(calls) >= 2:
             call_event.set()
@@ -66,7 +66,9 @@ def test_start_keepalive_spawns_thread_that_ticks_repeatedly(monkeypatch):
 
 def test_start_keepalive_is_idempotent(monkeypatch):
     """Repeat calls don't spawn duplicate threads."""
-    monkeypatch.setattr(startup, "_post_host_facts_once", lambda token: True)
+    monkeypatch.setattr(
+        startup, "_post_host_facts_once", lambda token, watchdog=None: True
+    )
 
     assert startup._start_host_facts_keepalive("test-token", period_seconds=0.5)
     first = startup._HOST_FACTS_KEEPALIVE_THREAD
@@ -94,7 +96,7 @@ def test_upload_on_startup_is_non_blocking_and_posts_from_thread(monkeypatch):
     calling_threads: list[int] = []
     bootstrap_done = threading.Event()
 
-    def fake_post(token: str) -> bool:
+    def fake_post(token: str, watchdog=None) -> bool:
         calling_threads.append(threading.get_ident())
         bootstrap_done.set()
         return True
@@ -121,3 +123,91 @@ def test_upload_on_startup_is_non_blocking_and_posts_from_thread(monkeypatch):
     assert thread is not None and thread.is_alive(), (
         "boot path must also schedule the periodic keepalive"
     )
+
+
+class _FakeWatchdog:
+    """Stands in for ``ProcessWatchdog``; only ``active_layers()`` is used."""
+
+    def __init__(self, layers=None, raises=False):
+        self._layers = layers if layers is not None else []
+        self._raises = raises
+
+    def active_layers(self):
+        if self._raises:
+            raise RuntimeError("watchdog probe exploded")
+        return list(self._layers)
+
+
+def _post_with(monkeypatch, watchdog, facts=None):
+    """Run ``_post_host_facts_once`` against fakes; return the uploaded facts."""
+    import sys
+    import types
+
+    fake_module = types.ModuleType("cyberwave.edge.host_metrics")
+
+    class _Facts:
+        def to_dict(self):
+            return dict(facts if facts is not None else {"platform": "Linux"})
+
+    fake_module.read_host_facts = lambda: _Facts()
+    monkeypatch.setitem(sys.modules, "cyberwave.edge.host_metrics", fake_module)
+    monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: "fp-test")
+
+    sent: dict = {}
+
+    class _Edges:
+        def discover(self, **kwargs):
+            sent.update(kwargs)
+            return {"twins": []}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            self.edges = _Edges()
+
+    monkeypatch.setattr(startup, "Cyberwave", _Client)
+
+    startup._post_host_facts_once("test-token", watchdog=watchdog)
+    return sent.get("host_facts", {})
+
+
+def test_watchdog_layers_ride_the_rest_upload(monkeypatch):
+    """Layers reach the dashboard over REST, not the ``edge_health`` heartbeat.
+
+    The heartbeat publisher stops at the first driver start, so a static
+    capability published only there disappears on exactly the edges that are
+    doing work. ``read_host_facts()`` cannot supply this itself -- it probes
+    ``/dev/watchdog`` and so knows the device exists, not what is pinging it.
+    """
+    facts = _post_with(monkeypatch, _FakeWatchdog(["systemd", "hardware"]))
+
+    assert facts["watchdog_layers"] == ["systemd", "hardware"]
+
+
+def test_watchdog_layers_omitted_when_no_layer_is_enabled(monkeypatch):
+    """Absent, not ``[]``: "no layers enabled" and "edge predates this upload"
+    are different states, and only the missing key can express the second --
+    which is what lets the dashboard fall back to ``has_hardware_watchdog``."""
+    facts = _post_with(monkeypatch, _FakeWatchdog([]))
+
+    assert "watchdog_layers" not in facts
+
+
+def test_watchdog_probe_failure_does_not_lose_the_upload(monkeypatch):
+    """A broken watchdog must not cost us ``last_seen_at``.
+
+    The POST is also the keepalive that holds the edge out of "Offline", so
+    letting ``active_layers()`` propagate would trade one cosmetic field for
+    the row's whole liveness signal.
+    """
+    facts = _post_with(monkeypatch, _FakeWatchdog(raises=True))
+
+    assert "watchdog_layers" not in facts
+    assert facts["platform"] == "Linux"
+
+
+def test_no_watchdog_leaves_host_facts_untouched(monkeypatch):
+    """One-shot CLI flows pass no watchdog and must still upload."""
+    facts = _post_with(monkeypatch, None)
+
+    assert "watchdog_layers" not in facts
+    assert facts["platform"] == "Linux"
