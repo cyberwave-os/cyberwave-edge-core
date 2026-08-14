@@ -857,30 +857,105 @@ def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> lis
     return updated
 
 
-def _load_camera_stream_url_for_twin(twin_uuid: Optional[str]) -> Optional[str]:
-    """Return the MJPEG stream URL assigned to *twin_uuid* on macOS, if any.
+def _load_camera_stream_urls_for_twins(twin_uuids: list[str]) -> dict[str, str]:
+    """Return valid macOS MJPEG stream URLs for the requested twin UUIDs.
 
     Reads ``~/.cyberwave/camera_streams.json`` (written by the CLI installer
-    when multiple camera twins are mapped to different AVFoundation cameras)
-    and returns the entry for *twin_uuid*.  Returns ``None`` when no mapping
-    exists or the file is missing/invalid.
+    when multiple camera twins are mapped to different AVFoundation cameras).
+    Missing, malformed, and non-string entries are ignored.
     """
-    if not twin_uuid:
-        return None
+    normalized = (str(uuid).strip() for uuid in twin_uuids)
+    requested = list(dict.fromkeys(uuid for uuid in normalized if uuid))
+    if not requested:
+        return {}
     streams_file = CONFIG_DIR / "camera_streams.json"
     if not streams_file.exists():
-        return None
+        return {}
     try:
         with open(streams_file) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         logger.debug("Could not read camera_streams.json")
-        return None
+        return {}
+    if not isinstance(data, dict):
+        return {}
     mapping = data.get("twin_to_stream_url") or {}
-    url = mapping.get(str(twin_uuid))
-    if isinstance(url, str) and url.strip():
-        return url.strip()
-    return None
+    if not isinstance(mapping, dict):
+        return {}
+    urls: dict[str, str] = {}
+    for twin_uuid in requested:
+        url = mapping.get(twin_uuid)
+        if isinstance(url, str) and url.strip():
+            urls[twin_uuid] = url.strip()
+    return urls
+
+
+def _load_camera_stream_url_for_twin(twin_uuid: Optional[str]) -> Optional[str]:
+    """Return the MJPEG stream URL assigned to *twin_uuid* on macOS, if any."""
+    if not twin_uuid:
+        return None
+    return _load_camera_stream_urls_for_twins([str(twin_uuid)]).get(str(twin_uuid))
+
+
+def _load_serial_bridge_ports() -> list[int]:
+    """Return the host TCP ports serving USB serial devices on macOS, in order.
+
+    Reads ``~/.cyberwave/serial_bridges.json`` (written by the CLI installer,
+    same shape as ``camera_streams.json``). macOS keeps its own CDC driver
+    attached to these devices, so USB/IP enumerates them but cannot carry their
+    bulk data; the CLI publishes each one as a TCP listener instead and the
+    driver container turns the ports back into PTYs.
+
+    Order is significant: it decides which arm becomes ``/dev/ttyACM0``.
+    Returns ``[]`` when unconfigured or unreadable, so callers fall back to the
+    existing USB/IP path rather than failing to start.
+    """
+    bridges_file = CONFIG_DIR / "serial_bridges.json"
+    if not bridges_file.exists():
+        return []
+    try:
+        with open(bridges_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Could not read serial_bridges.json; ignoring serial bridge config")
+        return []
+    if not isinstance(data, dict):
+        logger.warning(
+            "serial_bridges.json must contain an object; ignoring serial bridge config"
+        )
+        return []
+
+    bridges = data.get("bridges") or []
+    if not isinstance(bridges, list):
+        logger.warning(
+            "serial_bridges.json bridges must contain a list; ignoring serial bridge config"
+        )
+        return []
+
+    ports: list[int] = []
+    for entry in bridges:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            port = int(entry.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if port <= 0:
+            continue
+        # The file is a snapshot from install time with a /dev/cu.* path baked
+        # into each wrapper, and macOS callout names encode USB location. Move a
+        # device to another port and its wrapper waits forever on a name that
+        # never returns, so nothing listens. Without this check a stale entry
+        # would still suppress the USB/IP fallback and leave no path at all.
+        if not _probe_macos_host_tcp_port("127.0.0.1", port):
+            logger.warning(
+                "serial_bridges.json lists port %s but nothing is listening; "
+                "ignoring it (re-run `cyberwave edge install` if a device moved)",
+                port,
+            )
+            continue
+        ports.append(port)
+    return ports
 
 
 def _load_selected_camera_device(twin_uuid: Optional[str] = None) -> Optional[str]:

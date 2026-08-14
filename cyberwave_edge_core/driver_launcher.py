@@ -24,6 +24,123 @@ def _startup():
     return _startup_mod
 
 
+# Entrypoint flag that makes a driver image attach USB/IP devices into the
+# Docker VM and exit, printing one ``USBIP_DEVICE=<path>`` line per ready node.
+_USBIP_ATTACH_ONLY_FLAG = "--usbip-attach-only"
+# Images opt in by declaring this label; see the so101 Dockerfile.
+_USBIP_ATTACH_ONLY_LABEL = "com.cyberwave.usbip.attach-only"
+_SERIAL_BRIDGE_LABEL = "com.cyberwave.serial-bridge"
+# Operator-facing USB/IP knobs. The helper performs the attach, so it has to see
+# the same configuration the driver container would.
+_USBIP_ENV_PREFIX = "CYBERWAVE_USBIP_"
+
+
+def _image_has_capability_label(image: str, label: str) -> bool:
+    """Return whether *image* opts into a Cyberwave launcher capability."""
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                f'{{{{index .Config.Labels "{label}"}}}}',
+                image,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    return (proc.stdout or "").strip() in {"1", "true", "yes"}
+
+
+def _image_supports_usbip_attach_only(image: str) -> bool:
+    """True when *image* declares it understands ``--usbip-attach-only``.
+
+    ``_run_docker_image`` launches every driver, so the flag must never be sent
+    to an image that would forward it to its own entrypoint — that would start a
+    second privileged ``--pid=host`` copy of that driver with no environment.
+    A label keeps this opt-in and driver-agnostic.
+    """
+    return _image_has_capability_label(image, _USBIP_ATTACH_ONLY_LABEL)
+
+
+def _image_supports_serial_bridge(image: str) -> bool:
+    """True when *image* can rebuild host TCP serial bridges as local PTYs."""
+    return _image_has_capability_label(image, _SERIAL_BRIDGE_LABEL)
+
+
+def _usbip_preattach_serial_devices(
+    *, image: str, env: Optional[dict[str, str]] = None, timeout: int = 90
+) -> list[str]:
+    """Attach USB/IP serial buses into Docker's Linux VM *before* the driver runs.
+
+    Docker populates a privileged container's private tmpfs ``/dev`` by
+    snapshotting the VM's device list at container-*creation* time. A container
+    that attaches USB/IP devices from its own entrypoint therefore can never see
+    the resulting ``/dev/ttyACM*`` nodes: they appear in the VM's devtmpfs after
+    the snapshot was already taken. Attaching from a short-lived helper first
+    means the nodes exist by the time the driver container is created, so they
+    are both snapshotted and mappable via explicit ``--device`` flags.
+
+    Best effort by design: on any failure this returns ``[]`` and the driver
+    still starts, because the entrypoint mirrors the nodes as a second layer.
+    """
+    if not _image_supports_usbip_attach_only(image):
+        logger.debug(
+            "Image %s does not support %s; skipping pre-attach",
+            image,
+            _USBIP_ATTACH_ONLY_FLAG,
+        )
+        return []
+
+    env_flags: list[str] = []
+    for key, value in sorted((env or {}).items()):
+        if key.startswith(_USBIP_ENV_PREFIX):
+            env_flags += ["-e", f"{key}={value}"]
+
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "--privileged",
+        # nsenter -t 1 targets the VM's init only when the host PID namespace
+        # is shared; without this the helper would enter its own namespace.
+        "--pid=host",
+        *env_flags,
+        image,
+        _USBIP_ATTACH_ONLY_FLAG,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("USB/IP pre-attach helper could not run: %s", exc)
+        return []
+
+    if proc.returncode != 0:
+        logger.warning(
+            "USB/IP pre-attach helper exited %s; falling back to in-container attach. stderr=%s",
+            proc.returncode,
+            (proc.stderr or "").strip()[:500],
+        )
+        return []
+
+    devices: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("USBIP_DEVICE="):
+            continue
+        path = stripped.split("=", 1)[1].strip()
+        if path and path not in devices:
+            devices.append(path)
+    return devices
+
+
 def _run_macos_device_bridge_commands(
     *,
     params: list[str],
@@ -302,6 +419,7 @@ def _run_docker_image(
         "CYBERWAVE_API_KEY": token,
         "CYBERWAVE_EDGE_HOST_PLATFORM": platform.system().lower(),
     }
+    normalized_child_uuids: list[str] = []
     if child_camera_twin_uuids:
         normalized_child_uuids = [str(child_uuid).strip() for child_uuid in child_camera_twin_uuids]
         normalized_child_uuids = [child_uuid for child_uuid in normalized_child_uuids if child_uuid]
@@ -322,7 +440,27 @@ def _run_docker_image(
 
     # Determine USB/IP state early so the bridge function can skip video
     # devices that USB/IP will handle transparently inside the container.
-    usbip_active = platform.system() == "Darwin" and s._is_usbip_server_running()
+    # macOS serial bridge: when the CLI has published devices as TCP listeners,
+    # the container rebuilds them as PTYs and skips the USB/IP block outright.
+    # USB/IP is then not in play at all, so anything premised on an attach
+    # happening — --pid=host, the /dev/video* readiness wait, suppressing the
+    # "camera not configured" warning — would be premised on nothing.
+    serial_bridge_ports: list[int] = []
+    if platform.system() == "Darwin":
+        configured_serial_bridge_ports = s._load_serial_bridge_ports()
+        if configured_serial_bridge_ports and _image_supports_serial_bridge(image):
+            serial_bridge_ports = configured_serial_bridge_ports
+        elif configured_serial_bridge_ports:
+            logger.info(
+                "Image %s does not declare %s; retaining USB/IP passthrough",
+                image,
+                _SERIAL_BRIDGE_LABEL,
+            )
+    usbip_active = (
+        platform.system() == "Darwin"
+        and not serial_bridge_ports
+        and s._is_usbip_server_running()
+    )
 
     # Check for an explicit MJPEG camera stream URL early.  When the user has
     # configured one, video device bridge resolution is pointless because the
@@ -338,6 +476,13 @@ def _run_docker_image(
     _macos_audio_stream_url: Optional[str] = None
     _macos_audio_playback_url: Optional[str] = None
     if platform.system() == "Darwin":
+        child_stream_urls = s._load_camera_stream_urls_for_twins(normalized_child_uuids)
+        if child_stream_urls:
+            container_env["CYBERWAVE_CHILD_CAMERA_STREAM_URLS"] = json.dumps(
+                child_stream_urls,
+                separators=(",", ":"),
+            )
+
         _per_twin = s._load_camera_stream_url_for_twin(twin_uuid)
         if _per_twin:
             _macos_camera_stream_url = _per_twin
@@ -490,10 +635,39 @@ def _run_docker_image(
     # --pid=host lets the container use nsenter to access Docker Desktop's
     # pre-installed usbip tools; CYBERWAVE_USBIP_ENABLED tells the entrypoint
     # to auto-attach devices (serial + video).
+    if serial_bridge_ports:
+        container_env["CYBERWAVE_SERIAL_BRIDGE_PORTS"] = ",".join(
+            str(p) for p in serial_bridge_ports
+        )
+        logger.info(
+            "macOS serial bridge for %s: %s",
+            twin_uuid[:8],
+            container_env["CYBERWAVE_SERIAL_BRIDGE_PORTS"],
+        )
+
     pid_args: list[str] = []
+    usbip_device_args: list[str] = []
     if usbip_active:
         pid_args = ["--pid=host"]
         container_env.setdefault("CYBERWAVE_USBIP_ENABLED", "1")
+        # Attach the arm buses into the VM *before* this container is created,
+        # then map the resulting nodes explicitly. Without this the nodes only
+        # come into existence after Docker has already snapshotted the VM's
+        # device list, so the container starts blind to its own arms. The
+        # entrypoint still attaches and mirrors nodes as a second layer.
+        # usbip_active is already False when a bridge is configured.
+        for vm_device in _usbip_preattach_serial_devices(image=image, env=container_env):
+            usbip_device_args += ["--device", f"{vm_device}:{vm_device}"]
+        if usbip_device_args:
+            # Tells the entrypoint to keep these imports rather than detaching
+            # them as "stale" and re-attaching duplicates.
+            container_env["CYBERWAVE_USBIP_PREATTACHED"] = "1"
+            logger.info(
+                "USB/IP pre-attached %d serial device(s) for %s: %s",
+                len(usbip_device_args) // 2,
+                twin_uuid[:8],
+                ", ".join(usbip_device_args[1::2]),
+            )
         has_video_devices = any(
             s._is_video_device_path(d) for d in macos_resolved_devices
         )
@@ -722,6 +896,7 @@ def _run_docker_image(
         *log_args,
         *gpu_args,
         *pid_args,
+        *usbip_device_args,
         *network_args,
         "--name",
         container_name,
