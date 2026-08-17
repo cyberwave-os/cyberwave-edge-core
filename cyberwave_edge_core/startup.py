@@ -19,6 +19,7 @@ import hashlib
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -2427,11 +2428,19 @@ def _build_host_metrics_provider(
     battery_wh: Optional[float] = None
     battery_wh_str = os.environ.get("CYBERWAVE_BATTERY_WH", "").strip()
     if battery_wh_str:
+        # ``nan``/``inf`` parse without raising but serialise as bare JSON
+        # tokens no strict parser accepts, so they are rejected here on the
+        # same terms as garbage.  ``read_host_facts()`` applies the same rule
+        # to its own copy of this value.
         try:
-            battery_wh = float(battery_wh_str)
+            parsed = float(battery_wh_str)
         except ValueError:
+            parsed = None
+        if parsed is not None and math.isfinite(parsed):
+            battery_wh = parsed
+        else:
             logger.warning(
-                "CYBERWAVE_BATTERY_WH is not a valid float: %r; battery "
+                "CYBERWAVE_BATTERY_WH is not a finite number: %r; battery "
                 "uptime estimate on the dashboard will be hidden.",
                 battery_wh_str,
             )
@@ -3562,13 +3571,20 @@ _HOST_FACTS_KEEPALIVE_STOP: Optional[threading.Event] = None
 _HOST_FACTS_KEEPALIVE_LOCK = threading.Lock()
 
 
-def _post_host_facts_once(token: str) -> bool:
+def _post_host_facts_once(token: str, watchdog: Optional[Any] = None) -> bool:
     """Single ``POST /api/v1/edges/discover`` with current host facts.
 
     Returns ``True`` when the call succeeded. Failure is non-fatal at
     every call site: we just lose one keepalive cycle (the dashboard
     will hold "Online/Standby" within its window) and the next 30 s
     tick retries.
+
+    *watchdog* is folded in because the SDK cannot see it: ``read_host_facts()``
+    only probes ``/dev/watchdog``, so it knows the device exists but not which
+    layers are supervising this process.  Riding REST rather than the
+    ``edge_health`` heartbeat is the point -- the heartbeat stops at the first
+    driver start, and which layers protect an edge is exactly what an operator
+    wants to know about an edge that is *running drivers*.
     """
     try:
         from cyberwave.edge.host_metrics import read_host_facts
@@ -3587,6 +3603,18 @@ def _post_host_facts_once(token: str) -> bool:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Host facts uploader: read_host_facts() raised: %s", exc)
         return False
+
+    if watchdog is not None:
+        try:
+            layers = watchdog.active_layers()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("watchdog active_layers() raised", exc_info=True)
+        else:
+            # Omit the key rather than sending ``[]``: an edge with no layers
+            # enabled and an edge running a build that predates this upload are
+            # different states, and only the absent key can express the second.
+            if layers:
+                facts["watchdog_layers"] = list(layers)
 
     hostname = socket.gethostname() or ""
     try:
@@ -3637,6 +3665,7 @@ def _start_host_facts_keepalive(
     *,
     period_seconds: float = HOST_FACTS_KEEPALIVE_PERIOD_SECONDS,
     fire_immediately: bool = True,
+    watchdog: Optional[Any] = None,
 ) -> bool:
     """Spawn (once) a daemon thread that POSTs host facts to ``/discover``.
 
@@ -3678,7 +3707,7 @@ def _start_host_facts_keepalive(
             # propagating would kill the daemon thread silently.
             if fire_immediately:
                 try:
-                    _post_host_facts_once(token)
+                    _post_host_facts_once(token, watchdog=watchdog)
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.warning(
                         "Host facts bootstrap tick raised: %s: %s",
@@ -3688,7 +3717,7 @@ def _start_host_facts_keepalive(
 
             while not stop_event.wait(timeout=period_seconds):
                 try:
-                    _post_host_facts_once(token)
+                    _post_host_facts_once(token, watchdog=watchdog)
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.warning(
                         "Host facts keepalive tick raised: %s: %s",
@@ -3727,7 +3756,7 @@ def _stop_host_facts_keepalive() -> None:
         thread.join(timeout=1.0)
 
 
-def _upload_host_facts_on_startup(token: str) -> bool:
+def _upload_host_facts_on_startup(token: str, watchdog: Optional[Any] = None) -> bool:
     """Schedule background host-facts upload and the 30 s REST keepalive.
 
     Called once near the end of :func:`run_startup_checks`. Returns as
@@ -3753,7 +3782,7 @@ def _upload_host_facts_on_startup(token: str) -> bool:
     not known synchronously. Visibility of the upload result is via the
     keepalive thread's logs.
     """
-    _start_host_facts_keepalive(token, fire_immediately=True)
+    _start_host_facts_keepalive(token, fire_immediately=True, watchdog=watchdog)
     return True
 
 
@@ -5024,9 +5053,10 @@ def run_startup_checks(
 
     ``resource_monitor`` and ``watchdog``, when provided, are folded into
     the bootstrap ``edge_health`` publisher so the very first heartbeat
-    payload already carries host pressure data.  Both default to ``None``
-    so callers that just want the legacy startup behaviour (e.g. tests,
-    one-shot CLI flows) are unaffected.
+    payload already carries host pressure data.  ``watchdog`` additionally
+    rides the REST host-facts keepalive, which outlives that publisher.
+    Both default to ``None`` so callers that just want the legacy startup
+    behaviour (e.g. tests, one-shot CLI flows) are unaffected.
     """
     _fix_config_dir_ownership()
     _ensure_config_subdirs()
@@ -5098,7 +5128,7 @@ def run_startup_checks(
     # dashboard's "what hardware is this" row simply lags by one boot
     # cycle if the call fails.
     _t0 = time.perf_counter()
-    host_facts_ok = _upload_host_facts_on_startup(token)
+    host_facts_ok = _upload_host_facts_on_startup(token, watchdog=watchdog)
     elapsed = time.perf_counter() - _t0
     if host_facts_ok:
         console.print(f"  [green]✓[/green] Host facts [dim]({elapsed:.3f}s)[/dim]")

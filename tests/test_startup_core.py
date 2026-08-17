@@ -1789,6 +1789,24 @@ class TestBuildHostMetricsProvider:
         out = provider()
         assert "battery_wh" not in out
 
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "1e400"])
+    def test_battery_wh_ignored_when_env_is_non_finite(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        """``float()`` accepts these, but they serialise as bare ``NaN`` /
+        ``Infinity`` tokens that no strict JSON parser will take back."""
+
+        class _FakeWatchdog:
+            def active_layers(self) -> list[str]:
+                return []
+
+        monkeypatch.setenv("CYBERWAVE_BATTERY_WH", raw)
+        provider = startup._build_host_metrics_provider(None, _FakeWatchdog())
+        assert provider is not None
+        out = provider()
+        assert "battery_wh" not in out
+        json.dumps(out, allow_nan=False)
+
     def test_isolates_power_reader_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A crashing power reader must not suppress the rest of the payload."""
 
@@ -1821,7 +1839,7 @@ class TestStartupHeartbeatOrdering:
         monkeypatch.setattr(
             startup,
             "_upload_host_facts_on_startup",
-            lambda token: call_order.append("upload_host_facts") or True,
+            lambda token, watchdog=None: call_order.append("upload_host_facts") or True,
         )
         monkeypatch.setattr(
             startup,
