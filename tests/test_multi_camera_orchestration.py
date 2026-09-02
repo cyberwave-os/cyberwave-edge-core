@@ -760,6 +760,7 @@ class TestTwoCameraOneWorkerScenario:
             service_name=None,
             command=None,
             service_env=None,
+            extra_networks=None,
             driver_alert_ctx=None,
         ):
             run_calls.append({"twin_uuid": twin_uuid, "image": image})

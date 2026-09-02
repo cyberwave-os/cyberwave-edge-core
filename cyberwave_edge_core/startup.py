@@ -42,6 +42,14 @@ from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_
 from cyberwave.fingerprint import generate_fingerprint
 from rich.console import Console
 
+# Module-level is safe: docker_helpers is stdlib-only, so this cannot
+# reintroduce the cycle the bottom-of-file relative imports exist to break.
+# Re-exported because DRIVER_CONTAINER_PREFIX was defined here historically and
+# other modules still read it off ``startup``.
+from . import health_gating
+from .docker_helpers import DRIVER_CONTAINER_PREFIX as DRIVER_CONTAINER_PREFIX
+from .docker_helpers import driver_container_name
+
 # Graceful fallback for edge-cores paired with an older SDK wheel that
 # predates ``read_host_power_draw`` — matches the pattern in
 # ``resource_monitor.py`` for the other host-metric readers.
@@ -261,7 +269,6 @@ ENVIRONMENT_FILE = CONFIG_DIR / "environment.json"
 EDGE_JSON_FILE = CONFIG_DIR / "edge.json"
 DEFAULT_API_URL = "https://api.cyberwave.com"
 DEFAULT_ENVIRONMENT = "production"
-DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS = 15.0
 EDGE_COMMAND_RESTART = "restart_edge_core"
 DRIVER_RESTART_LOOP_THRESHOLD = int(os.getenv("CYBERWAVE_DRIVER_RESTART_LOOP_THRESHOLD", "4"))
@@ -1519,6 +1526,60 @@ def _maybe_rewrite_jetson_tag(image: str, twin_name: str = "") -> str:
     return jetson_image
 
 
+def _image_declared_services_for_twin(
+    drivers: Dict[str, Any],
+    twin: Any,
+    twin_uuid: str,
+    *,
+    child_registry_ids: set[str],
+    token: Optional[str],
+    watchdog: Optional[Any] = None,
+) -> Optional[tuple[list[Any], dict[str, str], list[str]]]:
+    """Service graph the twin's driver image declares, or None.
+
+    Consulted only when twin metadata carries no ``services`` array, so metadata
+    stays authoritative and this path is dormant until a twin is trimmed.
+
+    The labels live in the image, which means the image has to be on disk before
+    the graph is known — hence the extra single-image pull ahead of the main
+    parallel pull phase. On a warm edge that pull is a no-op; on a cold one it
+    costs one serialized pull, which is the price of the image owning its own
+    topology.
+
+    *watchdog* is forwarded for the same reason the main pull phase takes one:
+    this runs inside ``fetch_and_run_twin_drivers``, which at boot happens
+    before ``start_pinging``, so a multi-gigabyte ROS image pulled here with no
+    ``EXTEND_TIMEOUT_USEC`` heartbeat can outrun ``TimeoutStartSec`` and have
+    systemd kill the boot -- the failure CYB-2049 added that heartbeat to stop.
+    """
+    candidate, _params, _prefer_gpu, _gpu = _get_best_driver_image_and_params(
+        drivers, child_registry_ids=child_registry_ids
+    )
+    if not candidate:
+        return None
+
+    image = _maybe_rewrite_jetson_tag(_resolve_driver_image_tag(candidate), twin.name)
+
+    if not _docker_image_exists_locally(image):
+        logger.info(
+            "Pulling %s ahead of the main pull phase to read its declared topology",
+            image,
+        )
+        if not _pull_driver_images_parallel(
+            [image], watchdog=watchdog, token=token
+        ).get(image, False):
+            # Not fatal here: the main pull phase reports the failure for this
+            # twin with the alerting the operator already expects.
+            logger.warning(
+                "Could not pull %s; cannot read image-declared topology for twin '%s'",
+                image,
+                twin.name,
+            )
+            return None
+
+    return get_image_declared_services(image, twin_uuid=twin_uuid)
+
+
 def _pull_driver_images_parallel(
     images: list[str],
     *,
@@ -1738,6 +1799,80 @@ def _track_container_restarts(container_name: str, restart_count: int) -> tuple[
         while history and history[0] < window_start:
             history.popleft()
     return new_restarts, len(history)
+
+
+def _container_health_status(container_name: str) -> tuple[bool, str]:
+    """``(the container exists, its health status)`` for one driver container.
+
+    A named indirection rather than a plain alias: the launch loop's tests swap
+    this out for a scripted probe, which only works while the lookup happens at
+    call time.
+    """
+    return health_gating.container_health_status(container_name)
+
+
+def _defer_health_gated_twins(driver_specs: list[Any]) -> list[Any]:
+    """Move every twin with a ``service_healthy`` dependency to the end.
+
+    The launch loop is serial across EVERY twin on the edge and waits inline for
+    each health-gated dependency. ``HealthGate``'s memo bounds what one dead
+    dependency costs (once per pass rather than once per dependent -- four times
+    over on the Go2 graph); it does not bound WHO pays it. A Go2 whose plant
+    never becomes healthy held every camera on the edge behind it for the full
+    timeout, and whether that happened at all depended on the order the backend
+    happened to return twins in. Afterwards, ungated twins always start first.
+
+    By TWIN, not by spec. ``depends_on`` only ever names services of the same
+    twin -- the loop resolves it as
+    ``driver_container_name(spec.twin_uuid, dependency)`` -- so moving a whole
+    twin preserves every dependency relationship, and both comprehensions are
+    stable so ``_order_by_dependencies``' sequence survives inside each twin.
+    Per-spec would hoist the ungated ``plant`` away from its five siblings:
+    still correct, but it interleaves one robot across the whole pass and makes
+    the logs unreadable.
+
+    Call this immediately after ``driver_specs`` is built and BEFORE pass 1b.
+    ``alert_by_spec_index`` and everything derived from it
+    (``pull_contexts_by_image``, the post-pull metadata update, the Jetson
+    fallback contexts, the launch loop itself) are keyed by position in this
+    list, so reordering after any of those exist attaches every alert to the
+    wrong twin.
+
+    What this does NOT do is bound the tail: N sick twins still cost up to N
+    timeouts between them, they are just no longer in front of the healthy ones.
+    """
+    gated = {
+        spec.twin_uuid
+        for spec in driver_specs
+        if any(
+            condition == "service_healthy"
+            for condition in (getattr(spec, "depends_on", None) or {}).values()
+        )
+    }
+    if not gated:
+        return driver_specs
+
+    ungated_specs = [s for s in driver_specs if s.twin_uuid not in gated]
+    logger.info(
+        "Deferring %d health-gated twin(s) behind %d ungated driver(s): %s",
+        len(gated),
+        len(ungated_specs),
+        ",".join(sorted(uuid[:8] for uuid in gated)),
+    )
+    return ungated_specs + [s for s in driver_specs if s.twin_uuid in gated]
+
+
+def _health_gate(watchdog: Optional[Any] = None) -> health_gating.HealthGate:
+    """One gate per launch pass, wired to this module's probe and logger.
+
+    Per PASS, not per service: the gate's whole job is to spend a dependency's
+    health budget once rather than once per dependent.
+    """
+    return health_gating.HealthGate(
+        probe=_container_health_status,
+        watchdog=watchdog,
+        log=logger,
+    )
 
 
 def _stop_driver_container(container_name: str) -> bool:
@@ -2702,6 +2837,11 @@ def fetch_and_run_twin_drivers(
         service_name: str | None = None
         command: list[str] | None = None
         service_env: dict[str, str] | None = None
+        # Attached after create; see launch_detached_container.
+        extra_networks: list[str] | None = None
+        # ``{dependency service: compose condition}``; only ``service_healthy``
+        # makes the launch loop wait. See _wait_for_dependency_health.
+        depends_on: dict[str, str] | None = None
 
     driver_specs: list[_DriverSpec] = []
 
@@ -2870,11 +3010,22 @@ def fetch_and_run_twin_drivers(
                     ",".join(macos_bridge_candidates),
                 )
 
-        # --- Multi-container mode: services array -----------------------
+        # --- Multi-container mode: metadata first, then the image ---------
+        # Twin metadata wins so a robot pinned to a one-off topology keeps it;
+        # the image-declared graph is what a trimmed twin resolves to. CYB-3469.
         multi = _get_driver_services(
             drivers,
             child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
         )
+        if multi is None:
+            multi = _image_declared_services_for_twin(
+                drivers,
+                twin,
+                twin_uuid,
+                child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+                token=token,
+                watchdog=watchdog,
+            )
         if multi is not None:
             svc_specs, shared_env, shared_params = multi
             logger.info(
@@ -2899,6 +3050,8 @@ def fetch_and_run_twin_drivers(
                     service_name=svc.name,
                     command=svc.command,
                     service_env=merged_env,
+                    extra_networks=list(svc.extra_networks),
+                    depends_on=dict(svc.depends_on),
                 ))
             continue
 
@@ -2955,6 +3108,36 @@ def fetch_and_run_twin_drivers(
         ))
 
     # ------------------------------------------------------------------
+    # Pass 0: Health-gated twins go last.
+    #
+    #         The launch loop below is serial across EVERY twin on the edge, and
+    #         it waits inline for each `service_healthy` dependency. HealthGate's
+    #         memo bounds what one dead dependency costs (once per pass, not once
+    #         per dependent — four times over on the Go2 graph); it does not bound
+    #         WHO pays it. A Go2 whose plant never becomes healthy held every
+    #         camera on the edge behind it for the full timeout, and whether that
+    #         happened at all depended on the order the backend happened to return
+    #         twins in.
+    #
+    #         Partitioning by TWIN, not by spec: `depends_on` only ever names
+    #         services of the same twin (the loop resolves it as
+    #         `driver_container_name(spec.twin_uuid, dependency)`), so moving a
+    #         whole twin preserves every dependency relationship, and both
+    #         comprehensions are stable so `_order_by_dependencies`' sequence
+    #         survives inside each twin. Per-spec would hoist the ungated `plant`
+    #         away from its five siblings — still correct, but it interleaves one
+    #         robot across the whole pass and makes the logs unreadable.
+    #
+    #         HERE, immediately after the list is built, and NOT next to the gate:
+    #         `alert_by_spec_index` and everything derived from it
+    #         (`pull_contexts_by_image`, the post-pull metadata update, the Jetson
+    #         fallback contexts, the launch loop itself) are keyed by position in
+    #         this list. Reordering after any of those are built would attach
+    #         every alert to the wrong twin.
+    # ------------------------------------------------------------------
+    driver_specs = _defer_health_gated_twins(driver_specs)
+
+    # ------------------------------------------------------------------
     # Pass 1a: Drop orphan ``driver_starting`` alerts left by interrupted
     #          prior attempts (watchdog kill, crash loop, OOM, etc.).
     #          Fresh alerts are created with ``force=True`` in pass 1b, so
@@ -2996,7 +3179,7 @@ def fetch_and_run_twin_drivers(
             pull_contexts_by_image.setdefault(spec.driver_image, []).append(
                 _PullDeliveryContext(
                     twin_uuid=spec.twin_uuid,
-                    container_name=f"cyberwave-driver-{spec.twin_uuid[:8]}",
+                    container_name=driver_container_name(spec.twin_uuid),
                     driver_alert_ctx=alert_by_spec_index.get(idx),
                 )
             )
@@ -3049,7 +3232,7 @@ def fetch_and_run_twin_drivers(
                 fallback_contexts_by_image.setdefault(original_image, []).append(
                     _PullDeliveryContext(
                         twin_uuid=spec.twin_uuid,
-                        container_name=f"cyberwave-driver-{spec.twin_uuid[:8]}",
+                        container_name=driver_container_name(spec.twin_uuid),
                         driver_alert_ctx=alert_by_spec_index.get(idx),
                     )
                 )
@@ -3069,6 +3252,10 @@ def fetch_and_run_twin_drivers(
     # ------------------------------------------------------------------
 
     results: List[Dict[str, Any]] = []
+    # One gate for the whole pass. It owns the per-dependency memo that keeps a
+    # dead plant from costing the health budget once per dependent -- see
+    # health_gating.HealthGate.
+    health_gate = _health_gate(watchdog)
 
     for idx, spec in enumerate(driver_specs):
         alert_ctx = alert_by_spec_index.get(idx)
@@ -3112,6 +3299,19 @@ def fetch_and_run_twin_drivers(
             results.append(fail_entry)
             continue
 
+        # `depends_on` ordering already put dependencies earlier in this list;
+        # this is the second half of the contract, waiting for the health state
+        # the dependency's own healthcheck reports.
+        #
+        # Called for its side effect -- the delay -- and never branched on: a
+        # service that is skipped is never created, and `reconcile_driver_revival`
+        # ignores a `removed` container by design, so nothing would revive it.
+        # The gate spends each dependency's budget at most once per pass.
+        for dependency, condition in (spec.depends_on or {}).items():
+            if condition != "service_healthy":
+                continue
+            health_gate.wait_once(driver_container_name(spec.twin_uuid, dependency))
+
         logger.info(
             "Starting driver container %s%s for twin '%s'",
             spec.driver_image,
@@ -3132,6 +3332,7 @@ def fetch_and_run_twin_drivers(
                 service_name=spec.service_name,
                 command=spec.command,
                 service_env=spec.service_env,
+                extra_networks=spec.extra_networks,
                 driver_alert_ctx=alert_ctx,
             )
             result_entry: Dict[str, Any] = {
@@ -3229,7 +3430,7 @@ def _wait_for_driver_readiness(
     """
     expected_containers: dict[str, str] = {}
     for tu in twin_uuids:
-        container_name = f"{DRIVER_CONTAINER_PREFIX}{tu[:8]}"
+        container_name = driver_container_name(tu)
         if container_name in expected_containers:
             logger.warning(
                 "UUID prefix collision: twins %s and %s both map to container %s",
@@ -3528,6 +3729,9 @@ from .driver_selection import (
     _get_best_driver_image_and_params as _get_best_driver_image_and_params,  # noqa: E402
 )
 from .driver_selection import _get_driver_services as _get_driver_services  # noqa: E402
+from .driver_selection import (  # noqa: E402
+    get_image_declared_services as get_image_declared_services,
+)
 
 
 def register_edge(token: str) -> bool:

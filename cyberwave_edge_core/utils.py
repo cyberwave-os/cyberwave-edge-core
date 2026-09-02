@@ -9,6 +9,8 @@ from typing import Any, Optional
 
 from cyberwave import Cyberwave
 
+from .docker_helpers import driver_container_name
+
 DRIVER_STARTING_ALERT_TYPE = "driver_starting"
 WORKER_STARTING_ALERT_TYPE = "worker_starting"
 DRIVER_STARTING_ALERT_METADATA_UPDATE_INTERVAL_SECONDS = max(
@@ -130,10 +132,7 @@ class DriverStartingAlertContext:
         self.twin_uuid = twin_uuid
         self.image = image
         self.service_name = service_name.strip() if isinstance(service_name, str) else None
-        if self.service_name:
-            self.container_name = f"cyberwave-driver-{twin_uuid[:8]}-{self.service_name}"
-        else:
-            self.container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+        self.container_name = driver_container_name(twin_uuid, self.service_name)
         self.throttle_seconds = (
             throttle_seconds
             if throttle_seconds is not None

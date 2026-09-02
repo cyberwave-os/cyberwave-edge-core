@@ -15,7 +15,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from . import docker_helpers
 
@@ -251,6 +251,7 @@ def launch_detached_container(
     run_argv: list[str],
     get_runtime_env_var: GetRuntimeEnvVar,
     on_container_created: Callable[[], None],
+    extra_networks: Sequence[str] = (),
     on_running: Callable[[], None],
     on_failure: Callable[[str, str], None],
     stream_logs: Callable[[], None] | None = None,
@@ -262,6 +263,14 @@ def launch_detached_container(
     leave orphans in ``created``.  ``on_removed`` (when provided) fires right
     after that force-removal so the caller can drop any state it registered in
     ``on_container_created`` (e.g. the container→twin map).
+
+    ``extra_networks`` are attached between create and start. ``docker create``
+    only honours one ``--network`` before Docker 25, so a container that has to
+    span two — the simulation plant proxy bridges the cyberwave-sim Zenoh network
+    and the ROS/DDS network — gets the rest connected here. A failure to attach
+    is fatal for the container rather than a warning: a proxy on one of its two
+    networks looks healthy while being unable to reach either the plant or the
+    ROS graph.
     """
     create_argv = docker_create_argv_from_run_argv(run_argv)
     create_timeout = driver_create_timeout_seconds(get_runtime_env_var)
@@ -291,6 +300,31 @@ def launch_detached_container(
             "docker_create_timeout",
         )
         return False
+
+    for network in extra_networks:
+        try:
+            subprocess.run(
+                ["docker", "network", "connect", network, container_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=create_timeout,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            detail = (getattr(exc, "stderr", "") or "").strip() or str(exc)
+            logger.error(
+                "Failed to attach container %s to network %s: %s",
+                container_name,
+                network,
+                detail,
+            )
+            docker_helpers.docker_rm(container_name)
+            on_failure(
+                f"Could not attach {container_name} to network {network}.",
+                "docker_network_attach_failed",
+            )
+            return False
+        logger.info("Attached %s to additional network %s", container_name, network)
 
     on_container_created()
 

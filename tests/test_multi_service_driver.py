@@ -592,6 +592,7 @@ class TestDriverStartingAlertDifferentiation:
             service_name: str | None = None,
             command: list[str] | None = None,
             service_env: dict[str, str] | None = None,
+            extra_networks: list[str] | None = None,
             driver_alert_ctx: Any = None,
         ) -> bool:
             run_calls.append(

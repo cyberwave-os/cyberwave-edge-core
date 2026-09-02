@@ -14,6 +14,7 @@ from typing import Any, List, Optional
 # Module-level is safe: docker_args is stdlib-only, so this cannot reintroduce
 # the cycle the lazy ``_startup()`` accessor below exists to break.
 from .docker_args import build_log_args
+from .docker_helpers import driver_container_name
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,7 @@ def _run_docker_image(
     service_name: str | None = None,
     command: list[str] | None = None,
     service_env: dict[str, str] | None = None,
+    extra_networks: Optional[list[str]] = None,
     driver_alert_ctx: Optional[Any] = None,
 ) -> bool:
     """Run a driver Docker container for a twin.
@@ -294,10 +296,7 @@ def _run_docker_image(
         logger.error("Docker is not installed or not in PATH")
         return False
 
-    if service_name:
-        container_name = f"cyberwave-driver-{twin_uuid[:8]}-{service_name}"
-    else:
-        container_name = f"cyberwave-driver-{twin_uuid[:8]}"
+    container_name = driver_container_name(twin_uuid, service_name)
     image = s._resolve_driver_image_tag(image)
     params = s._ensure_linux_microphone_docker_params(image, params)
     runtime_environment = (
@@ -962,6 +961,7 @@ def _run_docker_image(
         run_argv=cmd,
         get_runtime_env_var=s.get_runtime_env_var,
         on_container_created=_on_container_created,
+        extra_networks=extra_networks or (),
         on_running=_on_running,
         on_failure=_on_failure,
         stream_logs=_stream_logs,

@@ -17,6 +17,27 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# Every driver container Edge Core creates is named from this prefix plus the
+# twin's first 8 uuid characters, and a service suffix for a multi-service
+# driver. It lives here, at the bottom of the dependency graph, because it is
+# not one module's private convention: driver_launcher MINTS these names,
+# utils.DriverStartingAlertContext reports on them, startup's reconcilers
+# enumerate them, and `_wait_for_dependency_health` FINDS a container another
+# module created by rebuilding its name. That last one is why a shared builder
+# matters rather than being tidiness: when the health gate's name and the
+# launcher's name disagree, `docker inspect` simply misses, the gate reports
+# "not inspectable" and returns True, and `depends_on: service_healthy`
+# degrades to no gating at all -- silently, which is the CYB-3442 failure mode
+# it exists to prevent. Four hand-written copies of one f-string had to agree
+# for that not to happen.
+DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
+
+
+def driver_container_name(twin_uuid: str, service_name: str | None = None) -> str:
+    """Container name for a twin's driver, or for one service of a multi-service driver."""
+    base = f"{DRIVER_CONTAINER_PREFIX}{twin_uuid[:8]}"
+    return f"{base}-{service_name}" if service_name else base
+
 
 def build_user_args() -> list[str]:
     """Return ``--user uid:gid`` flags on Linux so container writes match the host user.

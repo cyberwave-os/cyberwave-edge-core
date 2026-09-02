@@ -1406,6 +1406,36 @@ class TestDriverSelection:
         assert prefer_gpu is True
         assert gpu_spec == "all"
 
+    def test_select_driver_image_matches_the_host_for_outside_callers(self, monkeypatch):
+        """cyberwave-sim resolves the same twin metadata through this wrapper.
+
+        It must pick by the HOST's platform: a cloud node reading labels off the
+        Jetson variant would get a plausible graph for the wrong machine.
+        """
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        drivers = {
+            "default": {"docker_image": "cyberwave/driver:humble"},
+            "linux-aarch64-jetson": {"docker_image": "cyberwave/driver:jetson-humble"},
+        }
+
+        assert driver_selection.select_driver_image(drivers) == "cyberwave/driver:humble"
+
+    def test_select_driver_image_refuses_a_multi_service_profile(self, monkeypatch):
+        """A `services` list names no single image, so there is nothing to inspect."""
+        monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(driver_selection, "_jetson_detected", None)
+        monkeypatch.setattr(driver_selection, "is_jetson", lambda: False)
+
+        with pytest.raises(ValueError, match="No docker_image specified"):
+            driver_selection.select_driver_image(
+                {"default": {"services": [{"image": "a:1", "name": "a"}]}}
+            )
+
     def test_prefer_gpu_returned_from_driver_config(self, monkeypatch):
         monkeypatch.setattr(driver_selection.platform, "system", lambda: "Linux")
         monkeypatch.setattr(driver_selection.platform, "machine", lambda: "x86_64")
