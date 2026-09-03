@@ -476,6 +476,46 @@ _PUBLISHED_PROXY_ENVIRONMENTS = frozenset({"dev", "staging", "production"})
 # `dev` rather than `latest`, which is never published for this image.
 _FALLBACK_PROXY_TAG = "dev"
 
+# A THIRD train, for the same structural reason as the second, and it needs its
+# own resolution because neither of the other two can name a tag it publishes.
+#
+# `ros2-moveit` is the arms' autonomy service the way ros2-nav2 and ros2-slam are
+# the Go2's -- but unlike those, it is NOT built by the driver's workflow. It has
+# its own (`edge-ros2-moveit-build-and-push.yml`), so:
+#
+#   * its tag grammar happens to MATCH the kinova driver's
+#     (`{distro}[-dev|-staging]`), which is why the two agree on `dev` and hide
+#     the problem, and diverge on a PR build where the driver is
+#     `jazzy-pr-4001-sha-abc` and no such ros2-moveit tag exists at all;
+#   * the piper driver's tags carry NO ros distro (`dev`, `staging`, `latest`,
+#     `<sha>`), so `${CW_CHANNEL_TAG}` there is `dev` -- a tag ros2-moveit has
+#     never published, and one no amount of string manipulation can repair,
+#     because the distro simply is not in it.
+#
+# Hence a label the DRIVER's build writes, recording which MoveIt train that
+# driver was built against. That is not the mistake `_resolve_sim_proxy_tag`
+# warns about (reading the driver's OWN `io.cyberwave.image.channel-tag` for a
+# different image): this label's whole subject is the other image, and only the
+# driver build knows both its ros distro and its train.
+MOVEIT_TAG_ENV = "CYBERWAVE_MOVEIT_TAG"
+_MOVEIT_TAG_LABEL = "io.cyberwave.moveit.channel-tag"
+
+# The substitution name, and the exact string searched for in the rendered
+# document to decide whether a declaration needs this train at all. Spelled once:
+# a graph that does not name ros2-moveit -- every existing one -- must not be
+# refused for failing to resolve a tag it never references.
+_MOVEIT_TAG_SUBSTITUTION = "CW_MOVEIT_TAG"
+_MOVEIT_TAG_PLACEHOLDER = "${" + _MOVEIT_TAG_SUBSTITUTION + "}"
+
+# The ros distros ros2-moveit publishes under. Used only to recognise a distro
+# already present in the driver's channel tag -- never to guess one that is not.
+_MOVEIT_ROS_DISTROS = ("jazzy", "humble")
+
+# The suffix each deployment environment's ros2-moveit tag carries. `production`
+# publishes the bare `{distro}` tag (plus a version), so it maps to no suffix --
+# which is why this is a mapping rather than the proxy's flat frozenset.
+_MOVEIT_ENVIRONMENT_SUFFIX = {"dev": "-dev", "staging": "-staging", "production": ""}
+
 
 def _image_labels(image: str) -> Optional[Dict[str, str]]:
     """Every label on a *locally present* image, or None when it is not there.
@@ -985,8 +1025,68 @@ def _resolve_sim_proxy_tag(sim_proxy_tag: Optional[str] = None) -> tuple[str, st
     return _FALLBACK_PROXY_TAG, "default"
 
 
+def _resolve_moveit_tag(
+    labels: Dict[str, str],
+    channel_tag: str,
+    moveit_tag: Optional[str] = None,
+) -> tuple[str, str]:
+    """Return ``(ros2-moveit tag, where it came from)``, or ``("", reason)``.
+
+    Precedence: explicit argument, then :data:`MOVEIT_TAG_ENV`, then the driver
+    image's :data:`_MOVEIT_TAG_LABEL`, then a tag derived from the driver's own
+    channel tag plus the deployment environment.
+
+    The derivation is deliberately narrow: it reads a ros distro that is ALREADY
+    in *channel_tag* and pairs it with this environment's suffix. It never
+    invents one. A piper driver's channel tag is `dev` -- no distro anywhere in
+    it -- so this returns ``""`` and the caller must refuse rather than render
+    `ros2-moveit:dev`, an image that has never been published.
+
+    Returning empty rather than a plausible-looking guess is the whole point. An
+    unresolved or wrong image tag is SILENT: `docker create` accepts it and the
+    failure surfaces at `docker start`, several phases and one health-gate budget
+    later, as a graph that will not come up. That is exactly how the Go2's sim
+    plant was unpullable on every run before `CW_SIM_PROXY_TAG` existed.
+    """
+    if moveit_tag:
+        return moveit_tag, "argument"
+    from_env = os.environ.get(MOVEIT_TAG_ENV, "").strip()
+    if from_env:
+        return from_env, MOVEIT_TAG_ENV
+    from_label = labels.get(_MOVEIT_TAG_LABEL, "").strip()
+    if from_label:
+        return from_label, _MOVEIT_TAG_LABEL
+
+    # `startswith`, not a substring test: `humble` must come from the front of
+    # `humble-pr-4001-sha-abc`, not from a sha that happens to spell a distro.
+    distro = next(
+        (d for d in _MOVEIT_ROS_DISTROS if channel_tag.startswith(d)),
+        "",
+    )
+    if not distro:
+        return "", (
+            f"unresolved: driver channel tag {channel_tag!r} carries no ros distro "
+            f"and the image declares no {_MOVEIT_TAG_LABEL}"
+        )
+    environment = (
+        (os.environ.get("CYBERWAVE_ENVIRONMENT") or os.environ.get("ENVIRONMENT") or "")
+        .strip()
+        .lower()
+    )
+    if environment not in _MOVEIT_ENVIRONMENT_SUFFIX:
+        return "", (
+            f"unresolved: no {_MOVEIT_TAG_LABEL} on the image and environment "
+            f"{environment!r} is not one ros2-moveit publishes for"
+        )
+    return f"{distro}{_MOVEIT_ENVIRONMENT_SUFFIX[environment]}", "CYBERWAVE_ENVIRONMENT"
+
+
 def compose_substitutions(
-    *, channel_tag: str, twin_uuid: str = "", sim_proxy_tag: Optional[str] = None
+    *,
+    channel_tag: str,
+    twin_uuid: str = "",
+    sim_proxy_tag: Optional[str] = None,
+    moveit_tag: Optional[str] = None,
 ) -> Dict[str, str]:
     """Every ``${NAME}`` a rendered declaration may carry, and what it becomes.
 
@@ -1008,6 +1108,13 @@ def compose_substitutions(
     prefix. A service whose image has that entrypoint needs nothing; one whose
     image does not (the sim plant runs ros2-sim-proxy) sets ROS_NAMESPACE from
     this.
+
+    ``CW_MOVEIT_TAG`` is the arms' autonomy service, and a THIRD train for the
+    same structural reason as the second -- see :func:`_resolve_moveit_tag`.
+    Unlike the other two it is set only when it RESOLVES: it is the one tag that
+    cannot always be derived (a piper driver's channel tag carries no ros
+    distro), and callers refuse a declaration that needs an unresolvable one
+    rather than render an image reference that has never been published.
     """
     substitutions = {"CW_CHANNEL_TAG": channel_tag}
     # A SECOND train, resolved separately -- see `_resolve_sim_proxy_tag`. Always
@@ -1015,6 +1122,15 @@ def compose_substitutions(
     # reach docker as a literal image tag, which is the same class of failure as
     # the `${CW_TWIN_NS}` namespace above, and just as quiet.
     substitutions["CW_SIM_PROXY_TAG"] = _resolve_sim_proxy_tag(sim_proxy_tag)[0]
+    # Absent when unresolved, deliberately. Every other key here is always
+    # present because it can always be computed; this one cannot, and a key
+    # mapped to "" would render `ros2-moveit:` -- which docker parses, accepts at
+    # `create`, and fails at `start`. Left ABSENT, `_substitute` leaves the
+    # literal `${CW_MOVEIT_TAG}` in place and logs it -- and
+    # `get_image_declared_services` refuses the declaration before it gets that
+    # far, so no caller has to notice the difference.
+    if moveit_tag:
+        substitutions[_MOVEIT_TAG_SUBSTITUTION] = moveit_tag
     if twin_uuid:
         substitutions["CW_TWIN8"] = twin_uuid[:8]
         substitutions["CW_TWIN_NS"] = "twin_" + twin_uuid.lower().replace("-", "_")
@@ -1027,6 +1143,7 @@ def get_image_declared_services(
     variant: Optional[str] = None,
     twin_uuid: str = "",
     channel_tag: Optional[str] = None,
+    moveit_tag: Optional[str] = None,
 ) -> tuple[list[_ServiceSpec], dict[str, str], list[str]] | None:
     """Service graph *image* declares for *variant*, or None when it declares none.
 
@@ -1044,6 +1161,14 @@ def get_image_declared_services(
     come from. Normally left to the image's own label; pass it (or set
     :data:`CHANNEL_TAG_ENV`) to pin a whole graph to one train, which a test that
     pins a single image must do or it silently tests one image out of four.
+
+    *moveit_tag* resolves ``${CW_MOVEIT_TAG}`` for the arm graphs, whose autonomy
+    service (``ros2-moveit``) is on a third train -- see
+    :func:`_resolve_moveit_tag`. A declaration that names it and cannot resolve
+    it is REFUSED here rather than rendered, which is the one case where this
+    function returns None for something that is a genuine misconfiguration rather
+    than an older image. A graph that never mentions the placeholder -- the Go2's,
+    and every metadata-driven twin -- is unaffected.
 
     None rather than an exception for every "this image says nothing" case: an
     image built before these labels existed is not an error, it simply falls
@@ -1123,8 +1248,34 @@ def get_image_declared_services(
 
     channel_tag, channel_source = _resolve_channel_tag(image, labels, channel_tag)
     proxy_tag, proxy_source = _resolve_sim_proxy_tag()
+    moveit_tag, moveit_source = _resolve_moveit_tag(labels, channel_tag, moveit_tag)
+    # Refuse BEFORE rendering, and only when this declaration actually needs the
+    # tag. An arm graph names ros2-moveit; the Go2's does not, and must not start
+    # paying for a train it never references. Checked against the raw document
+    # because that is the only place the placeholder still exists -- after
+    # `_specs_from_compose` it has already become a literal image tag.
+    if not moveit_tag and _MOVEIT_TAG_PLACEHOLDER in raw:
+        logger.error(
+            "Image %s declares a %r graph that needs ${%s}, which did not resolve "
+            "(%s). Refusing rather than starting `ros2-moveit:${%s}` literally: "
+            "docker accepts that at create and fails it at start, one health-gate "
+            "budget later. Pin it with %s, or rebuild the driver image so it "
+            "carries the %s label.",
+            image,
+            name,
+            _MOVEIT_TAG_SUBSTITUTION,
+            moveit_source,
+            _MOVEIT_TAG_SUBSTITUTION,
+            MOVEIT_TAG_ENV,
+            _MOVEIT_TAG_LABEL,
+        )
+        return None
+
     substitutions = compose_substitutions(
-        channel_tag=channel_tag, twin_uuid=twin_uuid, sim_proxy_tag=proxy_tag
+        channel_tag=channel_tag,
+        twin_uuid=twin_uuid,
+        sim_proxy_tag=proxy_tag,
+        moveit_tag=moveit_tag,
     )
 
     try:
@@ -1136,7 +1287,7 @@ def get_image_declared_services(
     if resolved is not None:
         logger.info(
             "Using image-declared topology from %s (variant=%s from %s, channel=%s "
-            "from %s, sim-proxy=%s from %s): %s",
+            "from %s, sim-proxy=%s from %s, moveit=%s from %s): %s",
             image,
             name,
             source,
@@ -1144,6 +1295,8 @@ def get_image_declared_services(
             channel_source,
             proxy_tag,
             proxy_source,
+            moveit_tag or "<unused>",
+            moveit_source,
             ", ".join(spec.name for spec in resolved[0]),
         )
     return resolved

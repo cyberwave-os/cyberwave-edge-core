@@ -39,6 +39,10 @@ def _no_inherited_variant(monkeypatch: Any) -> None:
     # pins it, so a developer's own CYBERWAVE_ENVIRONMENT would otherwise decide
     # what the default tests mean.
     monkeypatch.delenv(ds.SIM_PROXY_TAG_ENV, raising=False)
+    # Third train, same hazard, and one more reason it matters here: an inherited
+    # value would satisfy the refusal tests below for the wrong reason, turning
+    # "this cannot resolve" into a silent pass.
+    monkeypatch.delenv(ds.MOVEIT_TAG_ENV, raising=False)
     monkeypatch.delenv("CYBERWAVE_ENVIRONMENT", raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
 
@@ -909,3 +913,198 @@ def test_nothing_to_say_is_an_empty_dict_never_an_error(drivers: Any) -> None:
     state every twin was in before this existed -- not a reason to fail a
     workload mid-start."""
     assert ds.select_driver_shared_env(drivers) == {}
+
+
+# ── the MoveIt train ─────────────────────────────────────────────────────────
+#
+# `ros2-moveit` is the arms' autonomy service, and a THIRD train for the same
+# structural reason as the sim proxy above: it is built by its own workflow
+# (edge-ros2-moveit-build-and-push.yml), not by the driver's.
+#
+# It is worse-behaved than the proxy in one way that these tests exist to pin.
+# The proxy's tag can ALWAYS be derived, because its grammar has one dimension
+# (the deployment environment). MoveIt's has two — `{distro}[-dev|-staging]` —
+# and the piper driver's own tags carry no distro at all (`dev`, `staging`,
+# `latest`, `<sha>`). So there are inputs from which no correct tag can be
+# computed, and the only honest answer is to refuse. A `ros2-moveit:dev` would
+# pass `docker create` and fail at `docker start`, one health-gate budget later.
+
+
+def _moveit_doc(image: str = "cyberwaveos/ros2-moveit:${CW_MOVEIT_TAG}") -> dict[str, Any]:
+    """A minimal arm graph: a plant on the driver train, MoveIt on its own."""
+    return {
+        "x-cyberwave": {"schema": 1, "variant": "robot", "state_owner": "bridges"},
+        "services": {
+            "moveit": {
+                "image": image,
+                "network_mode": "host",
+                "command": ["ros2", "launch", "cyberwave_moveit", "moveit_planning.launch.py"],
+            },
+            "plant": {
+                "image": "cyberwaveos/kinova-ros2-driver:${CW_CHANNEL_TAG}",
+                "network_mode": "host",
+            },
+        },
+    }
+
+
+def test_the_moveit_tag_is_not_the_driver_channel(monkeypatch: Any) -> None:
+    """The regression, in the shape it takes for an arm. A PR-tagged driver
+    leaves the MoveIt sibling on whatever its own workflow last published, so one
+    variable naming both would assemble a graph half of which is not under
+    test — and report green for it."""
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "dev")
+    subs = ds.compose_substitutions(channel_tag="jazzy-pr-4001-sha-7f29d2c1c975")
+    assert subs["CW_CHANNEL_TAG"] == "jazzy-pr-4001-sha-7f29d2c1c975"
+    assert "CW_MOVEIT_TAG" not in subs, (
+        "compose_substitutions must not invent a MoveIt tag; the caller resolves "
+        "it from the image labels and passes it in"
+    )
+
+
+def test_an_explicit_argument_outranks_everything(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ds.MOVEIT_TAG_ENV, "from-env")
+    labels = {ds._MOVEIT_TAG_LABEL: "from-label"}
+    assert ds._resolve_moveit_tag(labels, "jazzy-dev", "explicit") == ("explicit", "argument")
+
+
+def test_the_env_var_pins_moveit_for_a_test_build(monkeypatch: Any) -> None:
+    """How CI pins the pair to one head. Two workflows, so two separate pins —
+    exactly as the sim proxy already needs."""
+    monkeypatch.setenv(ds.MOVEIT_TAG_ENV, "jazzy-pr-77-sha-abcdef123456")
+    assert ds._resolve_moveit_tag({}, "jazzy-dev") == (
+        "jazzy-pr-77-sha-abcdef123456",
+        ds.MOVEIT_TAG_ENV,
+    )
+
+
+def test_the_env_var_outranks_the_label(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ds.MOVEIT_TAG_ENV, "from-env")
+    labels = {ds._MOVEIT_TAG_LABEL: "jazzy-dev"}
+    assert ds._resolve_moveit_tag(labels, "jazzy-dev") == ("from-env", ds.MOVEIT_TAG_ENV)
+
+
+def test_the_driver_image_label_names_the_moveit_train(monkeypatch: Any) -> None:
+    """The layer that makes a PIPER possible at all.
+
+    This label's subject is a DIFFERENT image, which is what distinguishes it
+    from the mistake `_resolve_sim_proxy_tag` warns about (reading the driver's
+    own `io.cyberwave.image.channel-tag` and applying it to a sibling). Only the
+    driver's build knows both its ros distro and its train, and for piper that
+    information exists nowhere else: its channel tag is a bare `dev`.
+    """
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "dev")
+    labels = {ds._MOVEIT_TAG_LABEL: "humble-dev"}
+    assert ds._resolve_moveit_tag(labels, "dev") == ("humble-dev", ds._MOVEIT_TAG_LABEL)
+
+
+def test_a_distro_in_the_channel_tag_derives_the_moveit_tag(monkeypatch: Any) -> None:
+    """The fallback for a driver image built before the label existed: read the
+    distro the driver already carries, pair it with this environment."""
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "dev")
+    assert ds._resolve_moveit_tag({}, "jazzy-dev") == ("jazzy-dev", "CYBERWAVE_ENVIRONMENT")
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "staging")
+    assert ds._resolve_moveit_tag({}, "humble-pr-1-sha-abc") == (
+        "humble-staging",
+        "CYBERWAVE_ENVIRONMENT",
+    )
+
+
+def test_production_takes_the_bare_distro_tag(monkeypatch: Any) -> None:
+    """`ros2-moveit` publishes `{distro}` (plus a version) on production, not
+    `{distro}-production` — so this mapping is not the proxy's flat set."""
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "production")
+    assert ds._resolve_moveit_tag({}, "jazzy-dev") == ("jazzy", "CYBERWAVE_ENVIRONMENT")
+
+
+def test_a_distro_is_read_from_the_front_not_found_anywhere(monkeypatch: Any) -> None:
+    """`startswith`, not a substring test. A sha that happens to spell a distro
+    must not be mistaken for one — it would derive a real-looking tag from an
+    image that is not on that distro at all."""
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "dev")
+    tag, source = ds._resolve_moveit_tag({}, "dev-sha-humblexyz")
+    assert tag == "", f"a distro inside a sha must not resolve, got {tag!r} from {source}"
+
+
+def test_a_channel_tag_with_no_distro_refuses_rather_than_guessing() -> None:
+    """The piper case, and the reason this returns empty rather than a default.
+
+    Its channel tag is `dev`. There is no distro to pair with an environment, and
+    `ros2-moveit:dev` has never been published — so any non-empty answer here
+    would be a fabrication that docker accepts at create time.
+    """
+    tag, source = ds._resolve_moveit_tag({}, "dev")
+    assert tag == ""
+    assert "no ros distro" in source
+
+
+def test_an_unpublished_environment_refuses_too(monkeypatch: Any) -> None:
+    """`local` is a real value on a developer box and names no published tag.
+    Unlike the sim proxy there is no safe `dev` fallback to take: guessing the
+    environment here would silently cross release trains."""
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "local")
+    tag, source = ds._resolve_moveit_tag({}, "jazzy-dev")
+    assert tag == ""
+    assert "local" in source
+
+
+def test_a_graph_needing_moveit_is_refused_when_it_cannot_resolve(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """End to end: the declaration names the placeholder, nothing resolves it, so
+    the whole graph is refused BEFORE any container is created. Returning the
+    graph with a literal `${CW_MOVEIT_TAG}` would defer the failure to
+    `docker start`, several phases and one health-gate budget away from here."""
+    labels = _label_set(_moveit_doc())
+    # A piper-shaped channel tag: no distro anywhere in it, and no moveit label.
+    labels[ds._CHANNEL_TAG_LABEL] = "dev"
+    _labels(monkeypatch, labels)
+    with caplog.at_level("ERROR"):
+        assert ds.get_image_declared_services("cyberwaveos/piper-driver:dev") is None
+    assert ds.MOVEIT_TAG_ENV in caplog.text, (
+        "the refusal must name the variable that fixes it, or an operator has to "
+        "read this module to get unstuck"
+    )
+    assert ds._MOVEIT_TAG_LABEL in caplog.text
+
+
+def test_a_graph_not_needing_moveit_is_unaffected(monkeypatch: Any) -> None:
+    """The Go2's graph, and every metadata-driven twin. An unresolvable third
+    train must not refuse a declaration that never references it — that would
+    turn this addition into a regression for every existing robot."""
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    resolved = ds.get_image_declared_services("cyberwaveos/go2-ros2-driver:humble")
+    assert resolved is not None
+    assert [spec.name for spec in resolved[0]] == ["plant", "bridges"]
+
+
+def test_a_resolvable_moveit_tag_reaches_the_image_reference(monkeypatch: Any) -> None:
+    """The happy path, asserted on the rendered image rather than on the
+    substitution map: the tag exists to name a puller-visible image."""
+    monkeypatch.setenv(ds.MOVEIT_TAG_ENV, "jazzy-dev")
+    _labels(monkeypatch, _label_set(_moveit_doc()))
+    resolved = ds.get_image_declared_services("cyberwaveos/kinova-ros2-driver:jazzy-dev")
+    assert resolved is not None
+    moveit = next(spec for spec in resolved[0] if spec.name == "moveit")
+    assert moveit.image == "cyberwaveos/ros2-moveit:jazzy-dev"
+    assert "${" not in moveit.image
+
+
+def test_the_resolved_moveit_source_is_logged(monkeypatch: Any, caplog: Any) -> None:
+    """Same reason the channel and proxy sources are logged: when a graph comes
+    up on the wrong images, "which train, and why" is the question, and every
+    sibling is a plausible image that pulls and runs."""
+    monkeypatch.setenv(ds.MOVEIT_TAG_ENV, "humble-staging")
+    _labels(monkeypatch, _label_set(_moveit_doc()))
+    with caplog.at_level("INFO"):
+        assert ds.get_image_declared_services("cyberwaveos/kinova-ros2-driver:humble") is not None
+    assert "moveit=humble-staging" in caplog.text
+    assert ds.MOVEIT_TAG_ENV in caplog.text
+
+
+def test_an_unused_moveit_train_is_logged_as_unused(monkeypatch: Any, caplog: Any) -> None:
+    """A Go2 log line must not imply it resolved a MoveIt image it never names."""
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    with caplog.at_level("INFO"):
+        assert ds.get_image_declared_services("cyberwaveos/go2-ros2-driver:humble") is not None
+    assert "moveit=<unused>" in caplog.text
