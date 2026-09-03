@@ -1551,6 +1551,9 @@ def _image_declared_services_for_twin(
     before ``start_pinging``, so a multi-gigabyte ROS image pulled here with no
     ``EXTEND_TIMEOUT_USEC`` heartbeat can outrun ``TimeoutStartSec`` and have
     systemd kill the boot -- the failure CYB-2049 added that heartbeat to stop.
+
+    The returned ``shared_env`` is the TWIN's, not the translator's -- see the
+    substitution at the end of this function.
     """
     candidate, _params, _prefer_gpu, _gpu = _get_best_driver_image_and_params(
         drivers, child_registry_ids=child_registry_ids
@@ -1577,7 +1580,46 @@ def _image_declared_services_for_twin(
             )
             return None
 
-    return get_image_declared_services(image, twin_uuid=twin_uuid)
+    declared = get_image_declared_services(image, twin_uuid=twin_uuid)
+    if declared is None:
+        return None
+    specs, _translator_shared_env, shared_params = declared
+
+    # The twin's `shared_env`, in place of the translator's empty one.
+    #
+    # `get_image_declared_services` returns `(specs, {}, [])` BY CONSTRUCTION: a
+    # rendered Compose document has no shared-env concept, because
+    # `docker compose config` already expanded every anchor into each service. So
+    # that `{}` is the right answer from the translator and the wrong one to hand
+    # the launcher, which merges it as the middle layer of
+    # `{**shared_env, **svc.env}`.
+    #
+    # Nothing was filling that layer. The compose files leave
+    # `${NAME:-default}` for the container shell to expand -- the translator
+    # passes that form through untouched precisely so a host can answer it -- and
+    # `drivers.<profile>.shared_env` was read only by the inline-`services` form
+    # (`_get_driver_services`). A twin trimmed from `services` to a bare
+    # `docker_image` therefore lost every key silently: the Go2's
+    # GO2_LOCAL_COSTMAP_FPS fell from 10 back to the launch default of 5 and
+    # GO2_GLOBAL_COSTMAP_FPS from 10 to 2, with nothing reporting a downgrade
+    # because the bridges publish either way. cyberwave-sim already substitutes
+    # here (`DeclaredTopologyContainers.start`); the robot path did not.
+    #
+    # Same resolver that just picked `image` above, so the env comes from the
+    # profile the image came from -- a cloud node cannot end up reading the
+    # Jetson variant's values against an x86 image, which is silent because both
+    # variants look plausible. That shared-resolver property is why
+    # `select_driver_shared_env` exists rather than each caller re-matching.
+    #
+    # Precedence is unchanged and stays the launcher's: the declaration's own
+    # `environment:` still wins (the image owns its graph), so this can answer a
+    # placeholder the declaration left open but never overrule a value it states
+    # outright.
+    return (
+        specs,
+        select_driver_shared_env(drivers, child_registry_ids=child_registry_ids),
+        shared_params,
+    )
 
 
 def _pull_driver_images_parallel(
@@ -3731,6 +3773,9 @@ from .driver_selection import (
 from .driver_selection import _get_driver_services as _get_driver_services  # noqa: E402
 from .driver_selection import (  # noqa: E402
     get_image_declared_services as get_image_declared_services,
+)
+from .driver_selection import (  # noqa: E402
+    select_driver_shared_env as select_driver_shared_env,
 )
 
 
