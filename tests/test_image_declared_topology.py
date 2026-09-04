@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import base64
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import cyberwave_edge_core.driver_selection as ds
+import cyberwave_edge_core.startup as startup
 
 
 @pytest.fixture(autouse=True)
@@ -1108,3 +1110,110 @@ def test_an_unused_moveit_train_is_logged_as_unused(monkeypatch: Any, caplog: An
     with caplog.at_level("INFO"):
         assert ds.get_image_declared_services("cyberwaveos/go2-ros2-driver:humble") is not None
     assert "moveit=<unused>" in caplog.text
+
+
+# ── the twin shared_env actually reaches the launcher ─────────────────────────
+#
+# The tests above prove `select_driver_shared_env` reads the right profile. They
+# did NOT prove anyone calls it: `_image_declared_services_for_twin` returned
+# `get_image_declared_services(...)` verbatim, whose middle element is `{}` by
+# construction, so every key was resolved correctly and then dropped one frame
+# later. cyberwave-sim substituted its own; the robot path did not, and the gap
+# was invisible because the Go2's compose files hardcode most of the same values
+# -- what actually moved was GO2_LOCAL_COSTMAP_FPS 10 -> 5 and
+# GO2_GLOBAL_COSTMAP_FPS 10 -> 2, silently, because the bridges publish either
+# way. These tests pin the substitution at the seam rather than the resolver.
+
+
+@pytest.fixture
+def _declared_graph_on_disk(monkeypatch: Any) -> list[Any]:
+    """Stub the image side of `_image_declared_services_for_twin`.
+
+    Leaves profile matching real -- that is what decides WHICH shared_env is
+    returned, so stubbing it would defeat the point of these tests.
+    """
+    specs = [ds._ServiceSpec(image="drv:x86", name="plant")]
+    monkeypatch.setattr(startup, "_resolve_driver_image_tag", lambda image: image)
+    monkeypatch.setattr(startup, "_maybe_rewrite_jetson_tag", lambda image, _name="": image)
+    monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _image: True)
+    monkeypatch.setattr(
+        startup,
+        "get_image_declared_services",
+        lambda _image, **_kw: (specs, {}, []),
+    )
+    return specs
+
+
+def _declared_for(drivers: dict[str, Any], **kwargs: Any) -> Any:
+    return startup._image_declared_services_for_twin(
+        drivers,
+        SimpleNamespace(name="go2-1"),
+        "abcd1234-0000-0000-0000-000000000000",
+        child_registry_ids=set(),
+        token=None,
+        **kwargs,
+    )
+
+
+def test_the_twin_shared_env_replaces_the_translators_empty_one(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    """The regression. Before the fix this returned `{}` and the twin's costmap
+    rates fell back to the launch-file defaults."""
+    drivers = {
+        "default": {
+            "docker_image": "drv:x86",
+            "shared_env": {
+                "GO2_LOCAL_COSTMAP_FPS": "10",
+                "WAIT_FOR_START_MAPPING": "false",
+            },
+        }
+    }
+    specs, shared_env, shared_params = _declared_for(drivers)
+    assert specs is _declared_graph_on_disk
+    assert shared_env == {
+        "GO2_LOCAL_COSTMAP_FPS": "10",
+        "WAIT_FOR_START_MAPPING": "false",
+    }
+    assert shared_params == []
+
+
+def test_the_substituted_env_comes_from_the_profile_the_image_came_from(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any]
+) -> None:
+    """One resolver for both, or a Jetson host reads the x86 profile's env
+    against the Jetson profile's image -- silent, because both look plausible."""
+    # `_platform_driver_keys`, not `platform.system`/`machine`: `ds.platform` IS
+    # the stdlib module, so patching its members reaches every other test in the
+    # process for the duration of this one. Patching the seam keeps it local.
+    monkeypatch.setattr(ds, "_platform_driver_keys", lambda: ["linux-aarch64-jetson"])
+    drivers = {
+        "default": {"docker_image": "drv:x86", "shared_env": {"WHO": "default"}},
+        "linux-aarch64-jetson": {
+            "docker_image": "drv:jetson",
+            "shared_env": {"WHO": "jetson"},
+        },
+    }
+    _specs, shared_env, _params = _declared_for(drivers)
+    assert shared_env == {"WHO": "jetson"}
+
+
+def test_a_twin_with_no_shared_env_is_unchanged(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    """The overwhelmingly common case, and the one that must not start failing:
+    a bare `docker_image` with nothing to say still yields an empty middle layer,
+    which the launcher merges to exactly the declaration's own env."""
+    _specs, shared_env, _params = _declared_for({"default": {"docker_image": "drv:x86"}})
+    assert shared_env == {}
+
+
+def test_an_image_that_declares_nothing_still_falls_back_to_metadata(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any]
+) -> None:
+    """None must survive the unpack the fix added -- returning a `(None, env, [])`
+    triple here would put the launcher into multi-container mode with no
+    services, so the twin would start no driver at all and report no error."""
+    monkeypatch.setattr(startup, "get_image_declared_services", lambda _i, **_k: None)
+    drivers = {"default": {"docker_image": "drv:x86", "shared_env": {"A": "1"}}}
+    assert _declared_for(drivers) is None
