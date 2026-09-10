@@ -7,6 +7,7 @@ Covers:
 - Zenoh env var helper
 - start() skips container when no worker files present
 - status() reflects correct state
+- container_started_after_worker_writes: the redundant-hot-reload predicate
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -2350,3 +2352,171 @@ class TestWorkerStartupFailureAlertWiring:
 
         assert results == [True, True]
         assert calls == ["cyberwaveos/edge-ml-worker:dev"]
+
+
+def _started_at(value_ns: int) -> dict:
+    """A minimal ``docker inspect`` payload whose StartedAt is *value_ns*."""
+    whole, frac = divmod(value_ns, 1_000_000_000)
+    stamp = datetime.fromtimestamp(whole, tz=timezone.utc)
+    return {
+        "State": {
+            "Status": "running",
+            "StartedAt": f"{stamp.strftime('%Y-%m-%dT%H:%M:%S')}.{frac:09d}Z",
+        }
+    }
+
+
+class TestNewestWorkerWriteNs:
+    def test_missing_directory_has_no_answer(self, tmp_path: Path):
+        assert wm_module._newest_worker_write_ns(tmp_path / "absent") is None
+
+    def test_empty_directory_falls_back_to_the_directory_itself(self, tmp_path: Path):
+        assert wm_module._newest_worker_write_ns(tmp_path) == tmp_path.stat().st_mtime_ns
+
+    def test_takes_the_newest_worker_file(self, tmp_path: Path):
+        (tmp_path / "wf_old.py").write_text("# old\n")
+        time.sleep(0.02)
+        newer = tmp_path / "wf_new.py"
+        newer.write_text("# new\n")
+        assert wm_module._newest_worker_write_ns(tmp_path) >= newer.stat().st_mtime_ns
+
+    def test_unlink_bumps_the_directory_mtime(self, tmp_path: Path):
+        """The OS behaviour the removal case depends on, asserted rather than assumed.
+
+        If a filesystem ever failed to bump the directory mtime on unlink, a
+        deactivate would look like "nothing changed" and the worker would keep
+        running the workflow the user just switched off. That is the one
+        failure this whole predicate must never produce, so it is pinned here.
+        """
+        worker = tmp_path / "wf_deadbeef.py"
+        worker.write_text("# worker\n")
+        before = wm_module._newest_worker_write_ns(tmp_path)
+        time.sleep(0.02)
+        worker.unlink()
+        after = wm_module._newest_worker_write_ns(tmp_path)
+        assert before is not None and after is not None
+        assert after > before
+
+
+class TestContainerStartedAfterWorkerWrites:
+    """The predicate behind skipping a redundant hot-reload.
+
+    Measured on a Jetson: 21 of 25 ``immediate-worker-sync`` restarts fired a
+    median 0.04 s *after* the container came up, i.e. they bounced a container
+    that already had the new ``wf_*.py`` and threw away a boot in progress.
+
+    Every case that cannot prove the container is newer than the writes must
+    return False, because False is the unconditional restart that shipped
+    before this check existed.
+    """
+
+    @pytest.fixture
+    def workers_dir(self, worker_manager: WorkerManager) -> Path:
+        path = worker_manager._workers_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "wf_deadbeef.py").write_text("# worker\n")
+        return path
+
+    def test_container_newer_than_the_writes_is_current(
+        self, worker_manager: WorkerManager, workers_dir: Path
+    ):
+        newest = wm_module._newest_worker_write_ns(workers_dir)
+        assert newest is not None
+        assert (
+            worker_manager.container_started_after_worker_writes(
+                _started_at(newest + 5_000_000_000)
+            )
+            is True
+        )
+
+    def test_container_older_than_the_writes_is_stale(
+        self, worker_manager: WorkerManager, workers_dir: Path
+    ):
+        newest = wm_module._newest_worker_write_ns(workers_dir)
+        assert newest is not None
+        assert (
+            worker_manager.container_started_after_worker_writes(
+                _started_at(newest - 5_000_000_000)
+            )
+            is False
+        )
+
+    def test_equal_timestamps_are_stale(self, worker_manager: WorkerManager, workers_dir: Path):
+        # ext4 stamps from a coarse clock, so a write landing in the same tick
+        # as the container start shares its mtime. Equality is not an ordering.
+        newest = wm_module._newest_worker_write_ns(workers_dir)
+        assert newest is not None
+        assert worker_manager.container_started_after_worker_writes(_started_at(newest)) is False
+
+    def test_a_single_nanosecond_is_not_rounded_away(
+        self, worker_manager: WorkerManager, workers_dir: Path
+    ):
+        """Regression: comparing floats or datetimes got this backwards.
+
+        ``st_mtime`` is a float64 with no bits left for nanoseconds at epoch
+        magnitude, and ``datetime`` truncates to microseconds. A draft of this
+        predicate reported "already current" for a write that landed 1 ns
+        after the container started -- i.e. it skipped a restart the edge
+        needed, which is the unsafe direction.
+        """
+        newest = wm_module._newest_worker_write_ns(workers_dir)
+        assert newest is not None
+        assert (
+            worker_manager.container_started_after_worker_writes(_started_at(newest - 1)) is False
+        )
+        assert worker_manager.container_started_after_worker_writes(_started_at(newest + 1)) is True
+
+    def test_removing_the_last_worker_is_stale(
+        self, worker_manager: WorkerManager, workers_dir: Path
+    ):
+        """The deactivate path, which needs no special-casing.
+
+        The container legitimately has the file, so the predicate says
+        "current". Then the unlink bumps the directory mtime past StartedAt
+        and it says "stale" -- which is required, because the unlinked module
+        stays imported and would keep executing the deactivated workflow.
+        """
+        newest = wm_module._newest_worker_write_ns(workers_dir)
+        assert newest is not None
+        inspect = _started_at(newest + 1_000_000)
+        assert worker_manager.container_started_after_worker_writes(inspect) is True
+
+        time.sleep(0.05)
+        (workers_dir / "wf_deadbeef.py").unlink()
+        assert worker_manager.container_started_after_worker_writes(inspect) is False
+
+    @pytest.mark.parametrize(
+        "inspect",
+        [
+            None,
+            {},
+            {"State": None},
+            {"State": "not-a-dict"},
+            {"State": {}},
+            {"State": {"StartedAt": ""}},
+            {"State": {"StartedAt": "0001-01-01T00:00:00Z"}},
+            {"State": {"StartedAt": "not a timestamp"}},
+        ],
+        ids=[
+            "inspect-failed",
+            "no-state",
+            "null-state",
+            "state-not-a-dict",
+            "no-started-at",
+            "empty-started-at",
+            "never-started",
+            "unparseable",
+        ],
+    )
+    def test_uncertain_inputs_fall_through_to_a_restart(
+        self, worker_manager: WorkerManager, workers_dir: Path, inspect
+    ):
+        assert worker_manager.container_started_after_worker_writes(inspect) is False
+
+    def test_missing_workers_dir_falls_through_to_a_restart(self, worker_manager: WorkerManager):
+        # No ``workers_dir`` fixture, so the directory was never created.
+        assert not worker_manager._workers_dir().exists()
+        assert (
+            worker_manager.container_started_after_worker_writes(_started_at(time.time_ns()))
+            is False
+        )

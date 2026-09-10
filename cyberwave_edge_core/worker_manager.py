@@ -37,6 +37,7 @@ from .docker_helpers import (
     docker_rm,
     docker_stop,
     group_gid,
+    parse_docker_timestamp_ns,
 )
 from .driver_selection import (
     MIN_JETSON_L4T_MAJOR,
@@ -213,6 +214,29 @@ DEFAULT_WORKER_IMAGE = f"{_WORKER_IMAGE_BASE}:latest"
 # edge-restart flows — from racing on docker rm + docker run for the same name.
 _CONTAINER_START_LOCKS: dict[str, threading.Lock] = {}
 _CONTAINER_START_LOCKS_MUTEX = threading.Lock()
+
+
+def _newest_worker_write_ns(workers_dir: Path) -> int | None:
+    """Newest ``st_mtime_ns`` across *workers_dir* and its ``*.py`` files.
+
+    The directory itself is included because ``unlink`` bumps its mtime. That
+    is what lets one timestamp cover both changes a sync can make: a worker
+    written, and a worker removed — the latter leaving nothing behind to stat.
+
+    Returns None when the directory cannot be read, or when a file disappears
+    mid-scan. Both mean "no reliable answer", which callers must treat as
+    "assume the container is stale" rather than as a zero timestamp.
+    """
+    try:
+        newest = workers_dir.stat().st_mtime_ns
+    except OSError:
+        return None
+    for path in workers_dir.glob("*.py"):
+        try:
+            newest = max(newest, path.stat().st_mtime_ns)
+        except OSError:
+            return None
+    return newest
 
 
 def _get_container_start_lock(container_name: str) -> threading.Lock:
@@ -692,6 +716,41 @@ class WorkerManager:
 
     def _models_dir(self) -> Path:
         return self._config_dir / "models"
+
+    def container_started_after_worker_writes(self, inspect: dict[str, Any] | None) -> bool:
+        """Whether the running container already loaded every current worker.
+
+        ``load_workers`` imports the workers directory once, at process start,
+        so a container that came up *after* the newest change in that
+        directory is already running the current graph. Restarting it then
+        buys nothing and discards a boot already in progress.
+
+        Deliberately conservative: every uncertain input returns False, which
+        is the unconditional-restart behaviour this check was added to narrow.
+        That covers a failed inspect, a missing or unparseable ``StartedAt``,
+        an unreadable workers directory, and timestamps that compare equal —
+        ext4 stamps from a coarse clock, so two events inside one tick carry
+        the same mtime and cannot be assumed ordered.
+
+        It also returns False on the *deactivate* path without having to know
+        about it: unlinking a ``wf_*.py`` bumps the directory mtime past
+        ``StartedAt``. That restart is load-bearing rather than merely eager,
+        because the unlinked module stays imported in the running container
+        and would otherwise keep executing the workflow the user just
+        deactivated.
+        """
+        if inspect is None:
+            return False
+        state = inspect.get("State")
+        if not isinstance(state, dict):
+            return False
+        started_ns = parse_docker_timestamp_ns(str(state.get("StartedAt") or ""))
+        if started_ns is None:
+            return False
+        newest_ns = _newest_worker_write_ns(self._workers_dir())
+        if newest_ns is None:
+            return False
+        return started_ns > newest_ns
 
     def _has_worker_files(self, workers_dir: Path) -> bool:
         if not workers_dir.exists():

@@ -4582,9 +4582,13 @@ def _hot_reload_running_worker(
     :meth:`WorkerWatcher.force_restart` so model pre-download, failure
     alerts, and watcher state-sync happen the same way as the file-watch
     restart path. No-op when nothing changed, no watcher is registered
-    yet (cold-boot), or the container is not currently ``running``.
+    yet (cold-boot), the container is not currently ``running``, or the
+    container started after the writes and therefore already loaded them.
     """
-    from .docker_helpers import docker_container_status  # noqa: PLC0415
+    from .docker_helpers import (  # noqa: PLC0415
+        container_status_of,
+        docker_inspect,
+    )
 
     if not summary.get("written") and not summary.get("removed"):
         return
@@ -4593,18 +4597,31 @@ def _hot_reload_running_worker(
     if watcher is None:
         return
 
+    container_name = watcher.worker_manager.container_name
+    # One inspect, two questions: is it running, and is it newer than the
+    # files we just wrote. ``container_status_of`` reads the same payload.
     try:
-        status = docker_container_status(watcher.worker_manager.container_name)
+        inspect = docker_inspect(container_name)
     except Exception:
         logger.debug("Worker container status lookup failed", exc_info=True)
         return
 
-    if status != "running":
+    if container_status_of(inspect) != "running":
+        return
+
+    if watcher.worker_manager.container_started_after_worker_writes(inspect):
+        logger.info(
+            "Skipping hot-reload of worker container %s (reason=%r): it started "
+            "after the newest change in the workers directory, so it already "
+            "loaded them",
+            container_name,
+            reason,
+        )
         return
 
     logger.info(
         "Hot-reloading worker container %s (reason=%r, written=%d, removed=%d)",
-        watcher.worker_manager.container_name,
+        container_name,
         reason,
         summary.get("written", 0),
         summary.get("removed", 0),

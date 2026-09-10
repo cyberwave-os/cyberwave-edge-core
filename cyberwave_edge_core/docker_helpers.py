@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
+from datetime import datetime
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -150,15 +152,66 @@ def docker_image_exists_locally(image: str) -> bool:
         return False
 
 
-def docker_container_status(container_name: str) -> str:
-    """Return the container status string (e.g. 'running', 'exited', 'none')."""
-    data = docker_inspect(container_name)
-    if data is None:
+def container_status_of(inspect: Optional[dict[str, Any]]) -> str:
+    """Read the status out of an already-fetched ``docker inspect`` payload.
+
+    Split out of :func:`docker_container_status` so a caller that needs more
+    than one ``State`` field can inspect once and share the result rather than
+    paying a second subprocess for it.
+    """
+    if inspect is None:
         return "none"
-    state = data.get("State")
+    state = inspect.get("State")
     if not isinstance(state, dict):
         return "unknown"
     return str(state.get("Status", "unknown")).lower()
+
+
+def docker_container_status(container_name: str) -> str:
+    """Return the container status string (e.g. 'running', 'exited', 'none')."""
+    return container_status_of(docker_inspect(container_name))
+
+
+# Docker renders timestamps as RFC 3339 with nine fractional digits, e.g.
+# ``2026-09-08T14:22:44.233126554Z``.
+_DOCKER_TIMESTAMP = re.compile(
+    r"^(?P<stamp>\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<frac>\d+))?"
+    r"(?P<offset>[Zz]|[+-]\d{2}:?\d{2})$"
+)
+
+
+def parse_docker_timestamp_ns(raw: str) -> Optional[int]:
+    """Parse a ``docker inspect`` timestamp into integer nanoseconds.
+
+    Integer nanoseconds rather than a ``datetime`` or a float because callers
+    compare the result against filesystem ``st_mtime_ns``, and both
+    alternatives lose precision in the one direction that matters: a float has
+    no bits left for nanoseconds at epoch magnitude, and ``datetime``
+    truncates to microseconds. Either can make one side of that comparison
+    look older than it really is.
+
+    Returns None for anything not confidently parseable, which includes
+    docker's ``0001-01-01T00:00:00Z`` placeholder for a container that has
+    never run. Callers are expected to treat None as "unknown", not as zero.
+    """
+    if not raw or raw.startswith("0001-01-01"):
+        return None
+    match = _DOCKER_TIMESTAMP.match(raw.strip())
+    if match is None:
+        return None
+    offset = match.group("offset")
+    if offset in ("Z", "z"):
+        offset = "+00:00"
+    elif ":" not in offset:
+        # ``fromisoformat`` wants ``+01:00``, not ``+0100``, on 3.10.
+        offset = f"{offset[:3]}:{offset[3:]}"
+    try:
+        whole = datetime.fromisoformat(f"{match.group('stamp')}{offset}")
+    except ValueError:
+        return None
+    frac = (match.group("frac") or "")[:9].ljust(9, "0")
+    return int(whole.timestamp()) * 1_000_000_000 + int(frac)
 
 
 def docker_ps_by_prefix(prefix: str, *, include_stopped: bool = False) -> list[str]:

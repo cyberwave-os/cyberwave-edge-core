@@ -406,14 +406,34 @@ class TestHotReload:
         monkeypatch.setattr(startup, "_ACTIVE_WORKER_WATCHER", None)
         yield
 
-    def _stub_running(self, monkeypatch, *, status: str = "running"):
+    def _stub_running(
+        self,
+        monkeypatch,
+        *,
+        status: str = "running",
+        already_loaded: bool = False,
+    ):
+        """Stub a running container.
+
+        ``already_loaded`` is the predicate's answer: whether the container
+        came up after the newest write and therefore needs no bounce. It
+        defaults to False -- the pre-existing unconditional-restart
+        behaviour -- so the tests written before that check keep asserting
+        what they always asserted. A ``MagicMock`` would otherwise return a
+        truthy mock here and silently skip every restart.
+        """
         watcher = MagicMock()
         watcher.worker_manager.container_name = "cyberwave-worker"
+        watcher.worker_manager.container_started_after_worker_writes.return_value = already_loaded
         monkeypatch.setattr(startup, "_get_active_worker_watcher", lambda: watcher)
 
         from cyberwave_edge_core import docker_helpers
 
-        monkeypatch.setattr(docker_helpers, "docker_container_status", lambda _: status)
+        monkeypatch.setattr(
+            docker_helpers,
+            "docker_inspect",
+            lambda _: {"State": {"Status": status, "StartedAt": "2026-09-08T14:22:44Z"}},
+        )
         return watcher
 
     def test_restarts_running_container_via_watcher(self, monkeypatch):
@@ -425,6 +445,58 @@ class TestHotReload:
         )
 
         watcher.force_restart.assert_called_once_with(reason="immediate-worker-sync")
+
+    def test_noop_when_container_already_started_after_the_writes(self, monkeypatch):
+        """The redundant restart this check exists to remove.
+
+        Measured on a Jetson, 21 of 25 activate-side hot-reloads fired a
+        median 0.04 s after the container came up: the container already had
+        the new ``wf_*.py`` and the bounce only discarded a boot in progress.
+        """
+        watcher = self._stub_running(monkeypatch, already_loaded=True)
+
+        startup._hot_reload_running_worker(
+            {"written": 1, "removed": 0, "unchanged": 0, "errors": 0},
+            reason="immediate-worker-sync",
+        )
+
+        watcher.force_restart.assert_not_called()
+
+    def test_predicate_is_asked_with_the_inspect_payload(self, monkeypatch):
+        """One inspect answers both questions; the predicate must not re-fetch."""
+        watcher = self._stub_running(monkeypatch)
+
+        startup._hot_reload_running_worker(
+            {"written": 1, "removed": 0, "unchanged": 0, "errors": 0},
+            reason="immediate-worker-sync",
+        )
+
+        predicate = watcher.worker_manager.container_started_after_worker_writes
+        predicate.assert_called_once()
+        (payload,) = predicate.call_args.args
+        assert payload["State"]["StartedAt"] == "2026-09-08T14:22:44Z"
+
+    def test_unavailable_inspect_stops_at_the_not_running_guard(self, monkeypatch):
+        """A failed inspect must not be read as "already current".
+
+        It reads as "not running", which was the behaviour before this check
+        too: a hot-reload of a container that is not up is meaningless, and
+        ``reconcile_worker_lifecycle`` will start it -- loading the files as
+        a side effect of starting.
+        """
+        watcher = self._stub_running(monkeypatch)
+        from cyberwave_edge_core import docker_helpers
+
+        monkeypatch.setattr(docker_helpers, "docker_inspect", lambda _: None)
+
+        startup._hot_reload_running_worker(
+            {"written": 1, "removed": 0, "unchanged": 0, "errors": 0},
+            reason="immediate-worker-sync",
+        )
+
+        # ``container_status_of(None)`` is "none", so this stops at the
+        # existing not-running guard rather than reaching the predicate.
+        watcher.force_restart.assert_not_called()
 
     def test_noop_when_container_not_running(self, monkeypatch):
         watcher = self._stub_running(monkeypatch, status="exited")

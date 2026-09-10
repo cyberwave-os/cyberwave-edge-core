@@ -8,6 +8,8 @@ Covers:
 - docker_inspect: valid JSON, bad JSON, empty list, non-list, subprocess errors
 - docker_image_exists_locally: present, absent, errors
 - docker_container_status: running, exited, inspect returns None, bad State type
+- container_status_of: reads an already-fetched payload
+- parse_docker_timestamp_ns: nanosecond fidelity, offsets, unparseable input
 - docker_ps_by_prefix: returns names, filters by prefix, handles errors,
   include_stopped passes -a flag
 - docker_has_nvidia_runtime: nvidia present, absent, empty output, bad JSON, errors
@@ -1106,3 +1108,78 @@ class TestIsSdCardRoot:
 
         monkeypatch.setattr(builtins, "open", fake_open)
         assert dh.is_sd_card_root() is False
+
+
+class TestContainerStatusOf:
+    """``docker_container_status`` split so one inspect can answer two questions."""
+
+    def test_reads_status_from_an_existing_payload(self):
+        assert dh.container_status_of({"State": {"Status": "Running"}}) == "running"
+
+    def test_none_payload_is_none_status(self):
+        assert dh.container_status_of(None) == "none"
+
+    @pytest.mark.parametrize("payload", [{}, {"State": "not-a-dict"}, {"State": []}])
+    def test_unusable_state_is_unknown(self, payload):
+        assert dh.container_status_of(payload) == "unknown"
+
+    def test_docker_container_status_delegates(self, monkeypatch):
+        monkeypatch.setattr(dh, "docker_inspect", lambda _: {"State": {"Status": "exited"}})
+        assert dh.docker_container_status("c") == "exited"
+
+
+class TestParseDockerTimestampNs:
+    """Timestamps are compared against ``st_mtime_ns``, so precision is load-bearing.
+
+    A float cannot represent nanoseconds at epoch magnitude and ``datetime``
+    truncates to microseconds; either can make one side of that comparison
+    look older than it is, which would skip a restart the edge needed.
+    """
+
+    def test_keeps_all_nine_fractional_digits(self):
+        assert (
+            dh.parse_docker_timestamp_ns("2026-09-08T14:22:44.233126554Z") == 1788877364_233126554
+        )
+
+    def test_no_fractional_part(self):
+        assert dh.parse_docker_timestamp_ns("2026-09-08T14:22:44Z") == 1788877364_000000000
+
+    def test_short_fractional_part_is_padded_not_misread(self):
+        assert dh.parse_docker_timestamp_ns("2026-09-08T14:22:44.5Z") == 1788877364_500000000
+
+    def test_more_than_nine_digits_is_truncated(self):
+        assert (
+            dh.parse_docker_timestamp_ns("2026-09-08T14:22:44.233126554999Z")
+            == 1788877364_233126554
+        )
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "2026-09-08T15:22:44.5+01:00",
+            "2026-09-08T15:22:44.5+0100",
+        ],
+    )
+    def test_non_utc_offsets_are_honoured(self, raw):
+        assert dh.parse_docker_timestamp_ns(raw) == 1788877364_500000000
+
+    def test_never_started_placeholder_is_unknown(self):
+        # Docker reports this for a container that has never run. It must read
+        # as "no answer", never as an ancient timestamp that compares older
+        # than every possible file mtime.
+        assert dh.parse_docker_timestamp_ns("0001-01-01T00:00:00Z") is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "   ",
+            "not a timestamp",
+            "2026-09-08",
+            "2026-09-08T14:22:44",  # no offset at all
+            "2026-13-45T99:99:99Z",
+            "2026-09-08T14:22:44.233126554X",
+        ],
+    )
+    def test_unparseable_input_is_unknown(self, raw):
+        assert dh.parse_docker_timestamp_ns(raw) is None
