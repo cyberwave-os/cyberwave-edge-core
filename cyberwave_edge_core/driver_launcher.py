@@ -556,9 +556,12 @@ def _run_docker_image(
                 ):
                     params = s._strip_video_device_mappings(params)
 
-    base_url = s.get_runtime_env_var("CYBERWAVE_BASE_URL")
-    if base_url:
-        container_env["CYBERWAVE_BASE_URL"] = s._rewrite_macos_container_base_url(base_url)
+    # Driver services must use the same control-plane endpoint as Edge Core.
+    # ``get_runtime_env_var`` preserves the operator-configured process-env ->
+    # credentials precedence for staging, dev and local URLs; production is the
+    # only implicit fallback, matching every Edge Core API client.
+    base_url = s.get_runtime_env_var("CYBERWAVE_BASE_URL", s.DEFAULT_API_URL) or s.DEFAULT_API_URL
+    control_plane_url = s._rewrite_macos_container_base_url(base_url)
     mqtt_host = s.get_runtime_env_var("CYBERWAVE_MQTT_HOST")
     if mqtt_host:
         container_env["CYBERWAVE_MQTT_HOST"] = s._rewrite_macos_container_hostname(
@@ -803,6 +806,13 @@ def _run_docker_image(
 
     if service_env:
         container_env.update(service_env)
+
+    # Control-plane routing is owned by Edge Core, not by asset metadata.  In
+    # particular, old multi-service metadata can contain a production URL; it
+    # must not redirect a staging/dev/local Edge Core back to production.  Keep
+    # the legacy alias in sync for services that have not migrated to BASE_URL.
+    container_env["CYBERWAVE_BASE_URL"] = control_plane_url
+    container_env["CYBERWAVE_API_URL"] = control_plane_url
 
     env_vars: List[str] = []
     for key, value in container_env.items():
