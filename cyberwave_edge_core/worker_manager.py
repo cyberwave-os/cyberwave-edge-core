@@ -491,6 +491,11 @@ class WorkerManager:
         self._image = image
         self._resource_limits = resource_limits
         self._container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
+        # ``worker_starting`` alerts held open across one startup: raised
+        # before the pull, resolved once the container is confirmed running.
+        # Held on the manager (rather than a local) so the pull helper can
+        # adopt them and ``_send_startup_failure_alert`` can close them.
+        self._starting_alert_ctxs: list[Any] = []
         self._health_monitor: Optional["WorkerHealthMonitor"] = None
 
     def set_health_monitor(self, monitor: "WorkerHealthMonitor") -> None:
@@ -991,7 +996,10 @@ class WorkerManager:
                 alert_ctxs.append(ctx)
 
         def _fail(error_str: str, *, phase: str) -> bool:
-            if is_final_attempt:
+            # Only retire a card this call created.  An adopted card belongs to
+            # ``_run_container``, which may still fall back to another image —
+            # killing it here would blank the rest of the startup.
+            if is_final_attempt and owns_alert_ctxs:
                 for ctx in alert_ctxs:
                     ctx.mark_failed_and_resolve(error_str, phase=phase)
             else:
@@ -1092,8 +1100,12 @@ class WorkerManager:
         )
         pull_succeeded = False
         # Reused across retries so a later-attempt success doesn't leave a stray critical alert.
-        alert_ctxs: list[Any] = []
-        if self._twin_uuids:
+        # When ``_run_container`` has already opened the startup alerts, adopt those rather than
+        # raising a second set — and leave them open, because the card has to survive past the
+        # pull to cover the container start.
+        owns_alerts = not self._starting_alert_ctxs
+        alert_ctxs: list[Any] = list(self._starting_alert_ctxs)
+        if owns_alerts and self._twin_uuids:
             from .utils import WorkerStartingAlertContext  # noqa: PLC0415
 
             for twin_uuid in self._twin_uuids:
@@ -1123,8 +1135,9 @@ class WorkerManager:
                     is_final_attempt=attempt == max_attempts,
                 ):
                     pull_succeeded = True
-                    for ctx in alert_ctxs:
-                        ctx.resolve()
+                    if owns_alerts:
+                        for ctx in alert_ctxs:
+                            ctx.resolve()
                     return True
             return False
         finally:
@@ -1133,8 +1146,74 @@ class WorkerManager:
                 pull_succeeded or _docker_image_present(image),
             )
 
-    def _send_startup_failure_alert(self, detail: str = "") -> None:
-        """Best-effort alert to all linked twins when worker startup fails."""
+    def _open_starting_alerts(self, image: str) -> None:
+        """Raise one ``worker_starting`` alert per linked twin for this startup.
+
+        Opened *before* the pull and held until the container is confirmed
+        running, so the user is told the worker is coming up for the whole
+        download → install → start sequence rather than only while bytes are
+        moving. A locally-present image skips the pull entirely, and that is
+        precisely the case where the startup was previously silent.
+        """
+        if self._starting_alert_ctxs or not self._twin_uuids:
+            return
+        try:
+            from .utils import WorkerStartingAlertContext  # noqa: PLC0415
+        except Exception:
+            logger.debug("worker_starting alert context unavailable", exc_info=True)
+            return
+        for twin_uuid in self._twin_uuids:
+            try:
+                ctx = WorkerStartingAlertContext(
+                    twin_uuid=twin_uuid,
+                    image=image,
+                    container_name=self._container_name,
+                )
+                ctx.create()
+                self._starting_alert_ctxs.append(ctx)
+            except Exception:
+                logger.debug(
+                    "Could not open worker_starting alert for twin %s",
+                    twin_uuid,
+                    exc_info=True,
+                )
+
+    def _update_starting_alerts(self, patch: dict[str, Any]) -> None:
+        """Push a phase/metadata patch to every open startup alert."""
+        for ctx in self._starting_alert_ctxs:
+            try:
+                ctx.update_metadata(patch, force=True)
+            except Exception:
+                logger.debug("Could not update worker_starting alert", exc_info=True)
+
+    def _close_starting_alerts(self, *, failure: str = "", phase: str = "") -> None:
+        """Resolve the startup alerts, optionally marking them failed first."""
+        ctxs, self._starting_alert_ctxs = self._starting_alert_ctxs, []
+        for ctx in ctxs:
+            try:
+                if failure:
+                    ctx.mark_failed_and_resolve(failure, phase=phase or "container_start_failed")
+                else:
+                    ctx.resolve()
+            except Exception:
+                logger.debug("Could not close worker_starting alert", exc_info=True)
+
+    def _send_startup_failure_alert(
+        self, detail: str = "", *, phase: str = "container_start_failed"
+    ) -> None:
+        """Best-effort alert to all linked twins when worker startup fails.
+
+        *phase* keys the plain-language copy in ``_WORKER_FAILED_DESCRIPTIONS``,
+        so callers pass the phase that actually failed — a pull that never
+        produced an image should not read "could not start your worker".
+        """
+        # Always retire the in-progress card first: whatever the suppression
+        # rules below decide about the failure alert, leaving a spinner up
+        # forever is never the right answer.
+        self._close_starting_alerts(
+            failure=detail or "worker startup failed",
+            phase=phase,
+        )
         if not self._twin_uuids:
             return
         if is_worker_image_pull_in_progress():
@@ -1303,6 +1382,8 @@ class WorkerManager:
 
         logger.info("Starting worker container %s from image %s", self._container_name, image)
 
+        self._open_starting_alerts(image)
+
         if not self._pull_worker_image_with_progress(image):
             if non_gpu_image:
                 # Covers both the ``-gpu`` (discrete NVIDIA) and ``-jetson``
@@ -1316,8 +1397,11 @@ class WorkerManager:
                 )
                 image = non_gpu_image
                 cmd[-1] = image
+                self._update_starting_alerts({"image": image, "phase": "pull_started"})
                 if not self._pull_worker_image_with_progress(image):
-                    self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
+                    self._send_startup_failure_alert(
+                        f"image {image} unavailable and no local copy", phase="pull_failed"
+                    )
                     return False
             elif non_hailo_image:
                 # The Hailo image hasn't been published / is unreachable; fall
@@ -1332,12 +1416,19 @@ class WorkerManager:
                 )
                 image = non_hailo_image
                 cmd[-1] = image
+                self._update_starting_alerts({"image": image, "phase": "pull_started"})
                 if not self._pull_worker_image_with_progress(image):
-                    self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
+                    self._send_startup_failure_alert(
+                        f"image {image} unavailable and no local copy", phase="pull_failed"
+                    )
                     return False
             else:
-                self._send_startup_failure_alert(f"image {image} unavailable and no local copy")
+                self._send_startup_failure_alert(
+                    f"image {image} unavailable and no local copy", phase="pull_failed"
+                )
                 return False
+
+        self._update_starting_alerts({"phase": "starting_container", "image": image})
 
         try:
             subprocess.run(
@@ -1437,6 +1528,8 @@ class WorkerManager:
 
             if last_status == "running":
                 logger.info("Worker container %s is running", self._container_name)
+                self._update_starting_alerts({"phase": "container_running"})
+                self._close_starting_alerts()
                 return True
 
             if last_status in {"exited", "dead"}:

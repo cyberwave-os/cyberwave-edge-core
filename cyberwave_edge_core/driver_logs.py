@@ -718,14 +718,21 @@ class _DockerPullTracker:
             return False
 
         self._layer_state[layer_id] = state
-        if state in ("downloading", "extracting"):
+        if state == "downloading":
             cur = _coerce_int(detail.get("current"))
             tot = _coerce_int(detail.get("total"))
             if tot > 0:
                 self._layer_total[layer_id] = tot
             if cur > 0:
                 self._layer_downloaded[layer_id] = cur
-        elif state in ("downloaded", "complete"):
+        elif state in ("downloaded", "extracting", "complete"):
+            # The layer's full download has landed by now, so credit its
+            # compressed total — the same rule ``_apply_layer_event`` uses on
+            # the subprocess path.  ``extracting`` must NOT feed the byte
+            # counters: docker reports extraction in *uncompressed* bytes
+            # restarting from zero, so honouring it would swap a compressed
+            # total for a larger uncompressed one mid-pull and walk the
+            # percentage backwards.
             self._layer_downloaded[layer_id] = self._layer_total.get(
                 layer_id,
                 self._layer_downloaded.get(layer_id, 0),

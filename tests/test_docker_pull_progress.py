@@ -280,6 +280,82 @@ class TestDockerPullTracker:
         assert tracker.progress.phase == _PULL_PHASE_COMPLETE
         assert tracker.progress.percent() == 100
 
+    def test_feed_event_extraction_does_not_walk_the_percentage_backwards(self):
+        """``Extracting`` reports *uncompressed* bytes restarting from zero.
+
+        Honouring its ``progressDetail`` would swap the layer's compressed
+        total for a larger uncompressed one mid-pull, so the denominator would
+        grow while the numerator reset — and the user would watch the
+        percentage fall during the install phase.
+        """
+        tracker = _DockerPullTracker("cyberwaveos/edge-ml-worker:dev-jetson")
+        for layer in ("layer-a", "layer-b"):
+            tracker.feed_event({"status": "Pulling fs layer", "progressDetail": {}, "id": layer})
+            tracker.feed_event(
+                {
+                    "status": "Downloading",
+                    "progressDetail": {"current": 1_000_000, "total": 1_000_000},
+                    "id": layer,
+                }
+            )
+        assert tracker.progress.total_bytes == 2_000_000
+        assert tracker.progress.percent() == 100
+
+        # Decompression: docker reports ~4x the compressed size, from zero.
+        tracker.feed_event(
+            {
+                "status": "Extracting",
+                "progressDetail": {"current": 4096, "total": 4_000_000},
+                "id": "layer-a",
+            }
+        )
+
+        assert tracker.progress.total_bytes == 2_000_000
+        assert tracker.progress.downloaded_bytes == 2_000_000
+        assert tracker.progress.percent() == 100
+
+        # Only once every layer is past downloading does the phase move on —
+        # a layer still pulling bytes keeps the honest "downloading" label.
+        assert tracker.progress.phase == _PULL_PHASE_DOWNLOADING
+        tracker.feed_event(
+            {
+                "status": "Extracting",
+                "progressDetail": {"current": 4096, "total": 4_000_000},
+                "id": "layer-b",
+            }
+        )
+        assert tracker.progress.phase == _PULL_PHASE_INSTALLING
+        assert tracker.progress.percent() == 100
+
+    def test_feed_event_extraction_matches_the_subprocess_path(self):
+        """Both drivers must agree: a layer that reaches ``extracting`` is
+        credited its full compressed bytes, never a partial figure."""
+        engine = _DockerPullTracker("foo:latest")
+        engine.feed_event({"status": "Pulling fs layer", "progressDetail": {}, "id": "l1"})
+        engine.feed_event(
+            {
+                "status": "Downloading",
+                "progressDetail": {"current": 500, "total": 1000},
+                "id": "l1",
+            }
+        )
+        engine.feed_event(
+            {
+                "status": "Extracting",
+                "progressDetail": {"current": 10, "total": 9999},
+                "id": "l1",
+            }
+        )
+
+        subproc = _DockerPullTracker("foo:latest")
+        subproc.feed("l1: Pulling fs layer")
+        subproc.feed("l1: Downloading [=====>    ]  500B/1kB")
+        subproc.feed("l1: Extracting")
+
+        assert engine.progress.downloaded_bytes == subproc.progress.downloaded_bytes
+        assert engine.progress.total_bytes == subproc.progress.total_bytes
+        assert engine.progress.percent() == subproc.progress.percent()
+
     def test_feed_event_ignores_non_dict_and_statusless_events(self):
         tracker = _DockerPullTracker("foo:latest")
         assert tracker.feed_event(None) is False

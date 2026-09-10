@@ -25,19 +25,39 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Phases where edge-core is actively transferring image layers from the
-#: registry.  ``installing`` is handled separately (fixed 57% bucket).
+#: registry.  ``installing`` is handled separately (layer-driven band).
 _STARTUP_PULLING_PHASES: frozenset[str] = frozenset({"pull_started", "pulling", "downloading"})
 
+#: Band edges for :func:`_compute_overall_progress_percent`, in percent.
+#: Sized against measured wall-clock on a multi-GB pull (CYB-3854): the
+#: extraction tail runs at least as long as the download it follows, so the
+#: two get comparable shares.  Container start is the short phase, but it is
+#: reported in discrete steps rather than continuously, so it keeps enough
+#: room for those steps to read as progress.
+_DOWNLOAD_BAND_END = 45
+_INSTALL_BAND_END = 80
 
-def _compute_overall_progress_percent(phase: str, download_percent: float) -> int | None:
+
+def _compute_overall_progress_percent(
+    phase: str,
+    download_percent: float,
+    *,
+    layers_complete: int = 0,
+    layers_total: int = 0,
+) -> int | None:
     """Map *phase* + *download_percent* (0–100) to an overall startup percentage.
 
     The lifecycle is split into three buckets so the user sees a single
     monotonically-increasing number from 0 to 100:
 
-    * **Download** (0–55 %) — driven by layer-byte progress from docker pull.
-    * **Install**  (57 %)   — brief post-download extraction window.
-    * **Container** (60–100 %) — create → start → probe → running.
+    * **Download** (0–45 %) — driven by layer-byte progress from docker pull.
+    * **Install**  (45–80 %) — decompression, driven by layer completion.
+    * **Container** (80–100 %) — create → start → probe → running.
+
+    The bands are deliberately not equal-width: they are sized against how
+    long each phase actually takes on a large image, not against how many
+    steps it has.  Install gets a share comparable to download because the
+    extraction tail outlasts the bytes; container start gets the remainder.
 
     Returns ``None`` for phases where no meaningful percentage can be
     computed (e.g. unrecognised or backward-compat phases like
@@ -45,19 +65,35 @@ def _compute_overall_progress_percent(phase: str, download_percent: float) -> in
     gracefully rather than publishing a stale value.
     """
     if phase == "installing":
-        return 57
+        # Byte progress is 100 % by definition once the last layer lands, so
+        # it says nothing about the extraction that follows — and extraction
+        # is layer-serial and runs for minutes on a multi-GB image. Drive the
+        # band from layer completion instead of pinning a number the user
+        # watches stand still.
+        install_span = _INSTALL_BAND_END - _DOWNLOAD_BAND_END
+        if layers_total > 0:
+            fraction = max(0.0, min(1.0, layers_complete / layers_total))
+            return _DOWNLOAD_BAND_END + round(fraction * install_span)
+        # No layer counts published (older edge, or a transport that doesn't
+        # report them): sit mid-band rather than claim either edge.
+        return _DOWNLOAD_BAND_END + install_span // 2
     if phase in _STARTUP_PULLING_PHASES or phase == "":
         clamped = max(0.0, min(100.0, download_percent))
-        return round(clamped * 0.55)
+        return round(clamped * _DOWNLOAD_BAND_END / 100)
     if phase in ("pull_complete", "pull_skipped"):
-        return 60
+        return _INSTALL_BAND_END
     if phase == "starting_container":
-        return 65
+        return 85
     if phase == "container_created":
-        return 80
+        return 92
     if phase == "container_running":
         return 100
     return None
+
+
+def _coerce_layer_count(value: Any) -> int:
+    """Read a layer count out of alert metadata, tolerating junk."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +135,7 @@ _WORKER_FAILED_DESCRIPTIONS: dict[str, str] = {
     "docker_run_timeout": "Your worker took too long to start. Please try again.",
     "container_startup_timeout": "Your worker took too long to start. Please try again.",
     "container_unhealthy": "Your worker stopped unexpectedly. Please try again.",
+    "container_start_failed": "Could not start your worker. Please try again.",
     "image_missing": "Worker software not found. Please contact support.",
     "pull_failed": "Could not download the worker software. Check your connection and try again.",
     "pull_failed_using_local": "Could not download the worker software. Check your connection and try again.",
@@ -201,6 +238,8 @@ class DriverStartingAlertContext:
             overall = _compute_overall_progress_percent(
                 phase,
                 float(download_pct) if isinstance(download_pct, (int, float)) else 0.0,
+                layers_complete=_coerce_layer_count(merged.get("layers_complete")),
+                layers_total=_coerce_layer_count(merged.get("layers_total")),
             )
             if overall is not None:
                 merged["overall_progress_percent"] = overall
@@ -241,17 +280,20 @@ class DriverStartingAlertContext:
         """
         if not self._alert:
             return
-        user_description = _DRIVER_FAILED_DESCRIPTIONS.get(phase, description)
         try:
             from cyberwave._error_metadata import redact
 
+            # Fall back to the *redacted* detail, never the raw one: an
+            # unmapped phase must not put unscrubbed daemon output on screen.
+            redacted = redact(description)
+            user_description = _DRIVER_FAILED_DESCRIPTIONS.get(phase, redacted)
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {
                 **prev,
                 "phase": phase,
                 "failed": True,
                 "failed_at": time.time(),
-                "technical_detail": redact(description),
+                "technical_detail": redacted,
             }
             self._alert = self._alert.update(
                 description=user_description,
@@ -367,6 +409,8 @@ class WorkerStartingAlertContext:
             overall = _compute_overall_progress_percent(
                 phase,
                 float(download_pct) if isinstance(download_pct, (int, float)) else 0.0,
+                layers_complete=_coerce_layer_count(merged.get("layers_complete")),
+                layers_total=_coerce_layer_count(merged.get("layers_total")),
             )
             if overall is not None:
                 merged["overall_progress_percent"] = overall
@@ -402,17 +446,20 @@ class WorkerStartingAlertContext:
         """
         if self._alert is None:
             return
-        user_description = _WORKER_FAILED_DESCRIPTIONS.get(phase, description)
         try:
             from cyberwave._error_metadata import redact
 
+            # Fall back to the *redacted* detail, never the raw one: an
+            # unmapped phase must not put unscrubbed daemon output on screen.
+            redacted = redact(description)
+            user_description = _WORKER_FAILED_DESCRIPTIONS.get(phase, redacted)
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {
                 **prev,
                 "phase": phase,
                 "failed": True,
                 "failed_at": time.time(),
-                "technical_detail": redact(description),
+                "technical_detail": redacted,
             }
             self._alert = self._alert.update(
                 description=user_description,

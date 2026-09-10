@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import logging
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -2520,3 +2521,211 @@ class TestContainerStartedAfterWorkerWrites:
             worker_manager.container_started_after_worker_writes(_started_at(time.time_ns()))
             is False
         )
+
+
+class _RecordingAlertCtx:
+    """Stand-in for ``WorkerStartingAlertContext`` that records its lifecycle."""
+
+    instances: list["_RecordingAlertCtx"] = []
+
+    def __init__(self, *, twin_uuid: str, image: str, container_name: str) -> None:
+        self.twin_uuid = twin_uuid
+        self.image = image
+        self.container_name = container_name
+        self.created = False
+        self.resolved = False
+        self.failed: str | None = None
+        self.patches: list[dict] = []
+        _RecordingAlertCtx.instances.append(self)
+
+    def create(self) -> None:
+        self.created = True
+
+    def update_metadata(self, patch: dict, *, force: bool = False) -> None:
+        # The real context drops its alert handle on resolve and every method
+        # short-circuits afterwards; mirror that, or a test cannot tell a live
+        # card from a dead one still sitting in the list.
+        if self.resolved:
+            return
+        self.patches.append(patch)
+
+    def resolve(self) -> None:
+        self.resolved = True
+
+    def mark_failed_and_resolve(self, description: str, *, phase: str = "pull_failed") -> None:
+        if self.resolved:
+            return
+        self.failed = phase
+        self.resolved = True
+
+    @property
+    def phases(self) -> list[str]:
+        return [p["phase"] for p in self.patches if "phase" in p]
+
+
+class TestWorkerStartingNotification:
+    """The ``worker_starting`` card must cover the whole startup.
+
+    It used to be raised inside the image pull and resolved the moment the
+    pull finished, so a user watching a worker come up saw nothing at all
+    while the container was actually being created and booted — and nothing
+    whatsoever when the image was already on disk.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_alerts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Patch the attribute rather than the module: ``startup`` imports other
+        # names from ``utils``, so swapping the whole module breaks the import.
+        import cyberwave_edge_core.utils as utils_module
+
+        _RecordingAlertCtx.instances = []
+        monkeypatch.setattr(
+            utils_module, "WorkerStartingAlertContext", _RecordingAlertCtx, raising=False
+        )
+
+    def _stub_container_start(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        status: str = "running",
+    ) -> None:
+        monkeypatch.setattr(wm_module.subprocess, "run", lambda cmd, **kw: MagicMock(returncode=0))
+        monkeypatch.setattr(wm_module, "docker_rm", lambda *_a, **_kw: True)
+        monkeypatch.setattr(
+            wm_module, "docker_inspect", lambda *_a, **_kw: {"State": {"Status": status}}
+        )
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: False)
+        _stub_runtime_env(monkeypatch)
+
+    def test_alert_opens_before_the_pull_and_survives_it(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pull must adopt the open card, not raise and retire its own."""
+        self._stub_container_start(monkeypatch)
+        pull_state: dict[str, object] = {}
+
+        def fake_pull(image: str, timeout: int = 600) -> bool:
+            # Snapshot what the card looked like mid-pull.
+            pull_state["open"] = len(worker_manager._starting_alert_ctxs)
+            pull_state["resolved"] = [c.resolved for c in _RecordingAlertCtx.instances]
+            return True
+
+        monkeypatch.setattr(worker_manager, "_pull_worker_image_with_progress", fake_pull)
+
+        assert worker_manager._run_container() is True
+
+        # One card per linked twin, opened before the pull ran.
+        assert len(_RecordingAlertCtx.instances) == 2
+        assert pull_state["open"] == 2
+        assert pull_state["resolved"] == [False, False]
+        assert all(ctx.created for ctx in _RecordingAlertCtx.instances)
+
+    def test_reports_starting_then_running_then_resolves(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.phases == ["starting_container", "container_running"]
+            assert ctx.resolved is True
+            assert ctx.failed is None
+
+    def test_notifies_even_when_the_image_is_already_local(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A skipped pull is exactly the case that used to be silent."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        assert _RecordingAlertCtx.instances
+        assert all("starting_container" in ctx.phases for ctx in _RecordingAlertCtx.instances)
+
+    def test_startup_failure_retires_the_card(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A spinner left up forever is worse than a failure message."""
+        self._stub_container_start(monkeypatch, status="exited")
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+        monkeypatch.setattr(wm_module, "docker_inspect", lambda *_a, **_kw: None)
+        monkeypatch.setattr(wm_module.time, "sleep", lambda *_a: None)
+
+        worker_manager._run_container()
+
+        assert _RecordingAlertCtx.instances
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is True
+            assert ctx.failed == "container_start_failed"
+
+    def test_no_twins_means_no_card(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager = WorkerManager(
+            config_dir=tmp_config,
+            environment_uuid="aabbccdd-eeff-0011-2233-445566778899",
+            token="testtoken1234",
+            twin_uuids=[],
+        )
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True)
+
+        assert manager._run_container() is True
+        assert _RecordingAlertCtx.instances == []
+
+    def test_accelerator_fallback_keeps_the_card_alive(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed ``-gpu`` pull must not retire the card the fallback needs.
+
+        The pull helper adopts the card ``_run_container`` opened, so it must
+        not mark it failed on its own account — ``_run_container`` may still
+        fall back to the CPU image, and the user has to see that download.
+        """
+        import cyberwave_edge_core.driver_logs as dl_module
+
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_docker_image_present", lambda *_a, **_kw: False)
+        monkeypatch.setattr(wm_module, "_image_tag_is_mutable", lambda *_a, **_kw: True)
+        monkeypatch.setattr(wm_module, "_begin_worker_image_pull", lambda *_a, **_kw: True)
+        monkeypatch.setattr(wm_module, "_finish_worker_image_pull", lambda *_a, **_kw: None)
+        monkeypatch.setenv("CYBERWAVE_WORKER_IMAGE_PULL_RETRIES", "1")
+        worker_manager._image = "cyberwaveos/edge-ml-worker:dev"
+
+        def fake_multi(image: str, *, contexts, token, timeout):  # noqa: ANN001
+            if image.endswith("-gpu"):
+                raise subprocess.CalledProcessError(1, "docker pull", stderr="manifest unknown")
+            for ctx in contexts:
+                if ctx.driver_alert_ctx:
+                    ctx.driver_alert_ctx.update_metadata(
+                        {"phase": "downloading", "progress_percent": 50.0}, force=True
+                    )
+
+        monkeypatch.setattr(dl_module, "_pull_docker_image_with_progress_multi", fake_multi)
+
+        assert worker_manager._run_container() is True
+
+        # One card per twin, still the originals — no second set was raised.
+        assert len(_RecordingAlertCtx.instances) == 2
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.failed is None, "a successful startup must not report failure"
+            assert ctx.resolved is True
+            # The whole sequence lands on the one card, fallback download included.
+            assert ctx.phases == [
+                "pull_failed",
+                "pull_started",
+                "downloading",
+                "starting_container",
+                "container_running",
+            ]

@@ -189,3 +189,103 @@ def test_restart_alert_transition_swallows_generic_errors(monkeypatch, caplog):
         and "Could not transition edge_core_restart alert" in r.getMessage()
         for r in caplog.records
     )
+
+
+class TestOverallProgressPercent:
+    """The lifecycle-wide 0–100 number the UI's progress bar reads."""
+
+    def test_download_band_tracks_bytes(self):
+        assert utils._compute_overall_progress_percent("downloading", 0.0) == 0
+        assert (
+            utils._compute_overall_progress_percent("downloading", 100.0)
+            == utils._DOWNLOAD_BAND_END
+        )
+
+    def test_install_band_tracks_layer_completion(self):
+        """Extraction is layer-serial and slow; byte progress is pinned at
+        100 % throughout it, so the band must move on layer counts instead."""
+        early = utils._compute_overall_progress_percent(
+            "installing", 100.0, layers_complete=0, layers_total=14
+        )
+        mid = utils._compute_overall_progress_percent(
+            "installing", 100.0, layers_complete=7, layers_total=14
+        )
+        done = utils._compute_overall_progress_percent(
+            "installing", 100.0, layers_complete=14, layers_total=14
+        )
+        assert early == utils._DOWNLOAD_BAND_END
+        assert mid == 63
+        assert done == utils._INSTALL_BAND_END
+        assert early < mid < done
+
+    def test_install_band_is_wide_enough_to_read_as_progress(self):
+        """CYB-3854: the extraction tail outlasts the download, so its band
+        has to be worth comparable travel — a 5-point slice made the bar look
+        frozen through the longest part of the wait."""
+        span = utils._INSTALL_BAND_END - utils._DOWNLOAD_BAND_END
+        assert span >= utils._DOWNLOAD_BAND_END * 0.6
+
+        # Every layer of a 14-layer image must move the number by >= 1 point,
+        # otherwise completions land invisibly.
+        steps = [
+            utils._compute_overall_progress_percent(
+                "installing", 100.0, layers_complete=n, layers_total=14
+            )
+            for n in range(15)
+        ]
+        assert all(b - a >= 1 for a, b in zip(steps, steps[1:]))
+
+    def test_install_band_falls_back_when_counts_are_unknown(self):
+        """No layer counts: sit mid-band rather than claim either edge."""
+        assert utils._compute_overall_progress_percent("installing", 100.0) == 62
+
+    def test_install_band_never_leaves_the_band(self):
+        """Junk counts must not push the install phase past the container band."""
+        assert (
+            utils._compute_overall_progress_percent(
+                "installing", 100.0, layers_complete=99, layers_total=14
+            )
+            == utils._INSTALL_BAND_END
+        )
+
+    def test_bands_stay_ordered_across_the_lifecycle(self):
+        download = utils._compute_overall_progress_percent("downloading", 100.0)
+        install = utils._compute_overall_progress_percent(
+            "installing", 100.0, layers_complete=1, layers_total=14
+        )
+        container = utils._compute_overall_progress_percent("starting_container", 0.0)
+        running = utils._compute_overall_progress_percent("container_running", 0.0)
+        assert download <= install < container < running
+
+
+class TestCoerceLayerCount:
+    def test_reads_a_plain_count(self):
+        assert utils._coerce_layer_count(14) == 14
+
+    def test_rejects_junk_from_unvalidated_metadata(self):
+        for junk in (None, "14", -1, 3.5, True):
+            assert utils._coerce_layer_count(junk) == 0
+
+
+class TestFailureCopyIsUserFacing:
+    """Every phase a startup can fail on needs plain-language copy.
+
+    ``mark_failed_and_resolve`` falls back to the raw technical detail for an
+    unmapped phase, which puts docker daemon output on the user's card.
+    """
+
+    def test_every_phase_the_worker_fails_on_is_mapped(self):
+        # Phases ``WorkerManager`` can close a ``worker_starting`` card with.
+        for phase in (
+            "container_start_failed",
+            "pull_failed",
+            "pull_timeout",
+            "pull_oserror",
+            "pull_unexpected",
+        ):
+            assert phase in utils._WORKER_FAILED_DESCRIPTIONS, phase
+
+    def test_copy_never_leaks_the_technical_detail(self):
+        for phase, copy in utils._WORKER_FAILED_DESCRIPTIONS.items():
+            assert copy.endswith("."), phase
+            assert "docker" not in copy.lower(), phase
