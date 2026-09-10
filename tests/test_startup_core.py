@@ -1494,6 +1494,59 @@ class TestDriverSelection:
         assert gpu_spec == "device=0,2"
 
 
+class TestJetsonL4T:
+    """L4T release parsing and the JetPack 7 floor for ``-jetson`` images."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_l4t_cache(self, monkeypatch):
+        monkeypatch.setattr(driver_selection, "_l4t_major", None)
+        monkeypatch.setattr(driver_selection, "_l4t_major_probed", False)
+        monkeypatch.delenv("CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T", raising=False)
+
+    def _stub_release(self, monkeypatch, tmp_path, contents):
+        path = tmp_path / "nv_tegra_release"
+        path.write_text(contents)
+        monkeypatch.setattr(driver_selection, "_NV_TEGRA_RELEASE", path)
+        return path
+
+    def test_reads_jetpack_6_release(self, monkeypatch, tmp_path):
+        self._stub_release(
+            monkeypatch,
+            tmp_path,
+            "# R36 (release), REVISION: 4.7, GCID: 42132812, BOARD: generic, "
+            "EABI: aarch64, DATE: Thu Sep 18 22:54:44 UTC 2025\n"
+            "# KERNEL_VARIANT: oot\n",
+        )
+        assert driver_selection.jetson_l4t_major() == 36
+        assert driver_selection.jetson_accelerator_supported() is False
+
+    def test_reads_jetpack_7_release(self, monkeypatch, tmp_path):
+        self._stub_release(monkeypatch, tmp_path, "# R38 (release), REVISION: 2.0\n")
+        assert driver_selection.jetson_l4t_major() == 38
+        assert driver_selection.jetson_accelerator_supported() is True
+
+    def test_missing_file_is_unknown_not_unsupported(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(driver_selection, "_NV_TEGRA_RELEASE", tmp_path / "absent")
+        assert driver_selection.jetson_l4t_major() is None
+        assert driver_selection.jetson_accelerator_supported() is True
+
+    def test_unparseable_header_is_unknown(self, monkeypatch, tmp_path):
+        self._stub_release(monkeypatch, tmp_path, "not a release header\n")
+        assert driver_selection.jetson_l4t_major() is None
+        assert driver_selection.jetson_accelerator_supported() is True
+
+    def test_override_opts_an_old_release_back_in(self, monkeypatch, tmp_path):
+        self._stub_release(monkeypatch, tmp_path, "# R36 (release), REVISION: 4.7\n")
+        monkeypatch.setenv("CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T", "1")
+        assert driver_selection.jetson_accelerator_supported() is True
+
+    def test_release_is_read_once(self, monkeypatch, tmp_path):
+        release = self._stub_release(monkeypatch, tmp_path, "# R36 (release), REVISION: 4.7\n")
+        assert driver_selection.jetson_l4t_major() == 36
+        release.unlink()
+        assert driver_selection.jetson_l4t_major() == 36
+
+
 class TestPullDockerImageWithProgress:
     class _FakeProcess:
         def __init__(self, output: str, *, returncode: int = 0):

@@ -38,7 +38,12 @@ from .docker_helpers import (
     docker_stop,
     group_gid,
 )
-from .driver_selection import is_jetson
+from .driver_selection import (
+    MIN_JETSON_L4T_MAJOR,
+    is_jetson,
+    jetson_accelerator_supported,
+    jetson_l4t_major,
+)
 from .zenoh_config import ZenohConfig, build_zenoh_env_vars
 
 if TYPE_CHECKING:
@@ -279,6 +284,21 @@ def _apply_jetson_image_tag(image: str) -> str:
     if image.endswith("-jetson") or image.endswith("-hailo") or image.endswith("-gpu"):
         return image
     return f"{image}-jetson"
+
+
+def _strip_jetson_image_tag(image: str) -> str:
+    """Inverse of :func:`_apply_jetson_image_tag`, for the L4T-floor demotion.
+
+    Only touches our own worker image. An operator who pinned
+    ``cyberwaveos/edge-ml-worker:<tag>-jetson`` on a pre-JetPack-7 board gets
+    the plain multi-arch tag, which is the one that actually runs there — so
+    the demotion warning names the image the container really starts from.
+    """
+    if not image.startswith(f"{_WORKER_IMAGE_BASE}:"):
+        return image
+    if not image.endswith("-jetson"):
+        return image
+    return image[: -len("-jetson")]
 
 
 def _build_hailo_passthrough_args() -> list[str]:
@@ -1110,9 +1130,10 @@ class WorkerManager:
         # and ``docker_has_nvidia_runtime()`` return true — the L4T install
         # ships the nvidia-container-runtime — but the amd64 ``-gpu`` blob
         # does not run on Tegra (different libcuda ABI, wrong PTX arch), so
-        # we must pick the ``-jetson`` sibling here.
+        # we must pick the ``-jetson`` sibling here — but only on a JetPack 7
+        # host; older L4T falls through to the multi-arch CPU image.
         #
-        # On Jetson JP7 (L4T r39, CUDA 13.x), the nvidia-container-runtime uses
+        # On Jetson JP7 (L4T r38+, CUDA 13.x), the nvidia-container-runtime uses
         # CSV mode to inject GPU device files and the libcuda.so.1 driver.  The
         # injection is triggered by NVIDIA_VISIBLE_DEVICES=all; ``--gpus all`` in
         # Docker CLI sets that env var, but passing it explicitly via ``-e`` is
@@ -1122,19 +1143,40 @@ class WorkerManager:
         gpu_args: list[str] = []
         non_gpu_image: str | None = None
         if is_jetson():
-            gpu_args = [
-                "--runtime", "nvidia",
-                "-e", "NVIDIA_VISIBLE_DEVICES=all",
-                "-e", "NVIDIA_DRIVER_CAPABILITIES=all",
-            ]
-            rewritten = _apply_jetson_image_tag(image)
-            if rewritten != image:
-                non_gpu_image = image
-                image = rewritten
-                logger.info("Jetson host detected; using Jetson image %s", image)
+            # The floor speaks for OUR ``-jetson`` image only. A
+            # ``CYBERWAVE_WORKER_IMAGE`` pinned elsewhere is unknowable from
+            # here and had the runtime before the floor existed — keep it.
+            is_our_worker_image = image.startswith(f"{_WORKER_IMAGE_BASE}:")
+            if jetson_accelerator_supported() or not is_our_worker_image:
+                gpu_args = [
+                    "--runtime", "nvidia",
+                    "-e", "NVIDIA_VISIBLE_DEVICES=all",
+                    "-e", "NVIDIA_DRIVER_CAPABILITIES=all",
+                ]
+                rewritten = _apply_jetson_image_tag(image)
+                if rewritten != image:
+                    non_gpu_image = image
+                    image = rewritten
+                    logger.info("Jetson host detected; using Jetson image %s", image)
+                else:
+                    logger.info(
+                        "Jetson host detected; adding NVIDIA runtime env to worker container %s",
+                        image,
+                    )
             else:
-                logger.info(
-                    "Jetson host detected; adding NVIDIA runtime env to worker container %s",
+                # Pre-JetPack-7 driver: the ``-jetson`` wheels cannot load
+                # against it and every matmul dies in cuBLAS (CYB-3841). The
+                # plain tag is multi-arch, so arm64 CPU inference works.
+                # Demote a pinned ``-jetson`` tag too, so the warning names
+                # the image the container actually starts from.
+                image = _strip_jetson_image_tag(image)
+                logger.warning(
+                    "Jetson host detected but L4T r%s is older than r%d (JetPack 7); "
+                    "the -jetson worker image needs a newer CUDA driver than this "
+                    "host provides. Starting %s on CPU instead. Set "
+                    "CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T=1 to use the GPU anyway.",
+                    jetson_l4t_major(),
+                    MIN_JETSON_L4T_MAJOR,
                     image,
                 )
         elif docker_has_nvidia_runtime():

@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import cyberwave_edge_core.driver_selection as driver_selection
 import cyberwave_edge_core.worker_manager as wm_module
 from cyberwave_edge_core.worker_manager import WorkerManager, get_zenoh_env_vars
 
@@ -794,15 +796,14 @@ class TestJetsonHelpers:
 
 
 class TestWorkerManagerJetson:
-    """Verify Jetson image tag rewrite + ``--gpus all`` passthrough.
+    """Verify Jetson image tag rewrite + ``--runtime nvidia`` passthrough.
 
     On a Jetson host the L4T install ships nvidia-container-runtime, so
     ``docker_has_nvidia_runtime()`` also returns True. The resolver has to
     pick the ``-jetson`` sibling anyway because the amd64 ``-gpu`` blob has
     the wrong ``libcuda.so`` ABI for Tegra. These tests pin that precedence
-    with both signals asserted on and confirm ``--gpus all`` still lands in
-    the ``docker run`` command (nvidia-container-runtime handles the Tegra
-    iGPU passthrough the same way).
+    with both signals asserted on, and pin the JetPack 7 floor below which
+    the whole GPU path is skipped.
     """
 
     def _stub_docker_run(
@@ -841,8 +842,9 @@ class TestWorkerManagerJetson:
 
         docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
         assert docker_run_cmd is not None
-        assert "--gpus" in docker_run_cmd
-        assert "all" in docker_run_cmd
+        assert docker_run_cmd[docker_run_cmd.index("--runtime") + 1] == "nvidia"
+        assert "NVIDIA_VISIBLE_DEVICES=all" in docker_run_cmd
+        assert "--gpus" not in docker_run_cmd
         # No Hailo device passthrough — Jetson-and-Hailo isn't a real host,
         # but the guard is here to catch a resolver refactor that leaks the
         # Hailo branch into the Jetson code path.
@@ -872,7 +874,7 @@ class TestWorkerManagerJetson:
 
         docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
         assert docker_run_cmd is not None
-        assert "--gpus" in docker_run_cmd
+        assert docker_run_cmd[docker_run_cmd.index("--runtime") + 1] == "nvidia"
         assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-jetson"
 
     def test_custom_image_override_left_untouched_on_jetson(
@@ -881,9 +883,9 @@ class TestWorkerManagerJetson:
         """``CYBERWAVE_WORKER_IMAGE`` overrides bypass the ``-jetson`` rewrite.
 
         Same shape as :func:`TestWorkerManagerHailo.test_custom_image_override_left_untouched`
-        and the GPU counterpart: ``--gpus all`` still lands (nvidia-container-runtime
-        needs it regardless of what image the operator chose), but the image
-        reference is left alone.
+        and the GPU counterpart: ``--runtime nvidia`` still lands (the container
+        runtime needs it regardless of what image the operator chose), but the
+        image reference is left alone.
         """
         workers_dir = tmp_config / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
@@ -905,8 +907,180 @@ class TestWorkerManagerJetson:
 
         docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
         assert docker_run_cmd is not None
-        assert "--gpus" in docker_run_cmd
+        assert docker_run_cmd[docker_run_cmd.index("--runtime") + 1] == "nvidia"
         assert docker_run_cmd[-1] == "myregistry.local/cyberwave/custom-worker:dev"
+
+    @pytest.fixture(autouse=True)
+    def _stub_image_pull(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep these off the network — the tags here are real public images.
+
+        Every assertion in this class is about the ``docker run`` argv, so the
+        pull is pure latency (and a ~10 min class runtime without this).
+        """
+        monkeypatch.setattr(
+            wm_module.WorkerManager,
+            "_pull_worker_image_with_progress",
+            lambda self, image, timeout=600: True,
+        )
+
+    def test_jetpack_6_host_falls_back_to_cpu_image(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """L4T r36 can't load the ``-jetson`` wheels — take the CPU image.
+
+        The plain tag is a multi-arch build, so arm64 CPU inference works on
+        the same host. Falling through to the ``--gpus all`` branch would be
+        worse than useless: that rewrites to the amd64 ``-gpu`` blob.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: True)
+        monkeypatch.setattr(wm_module, "jetson_accelerator_supported", lambda: False)
+        monkeypatch.setattr(wm_module, "jetson_l4t_major", lambda: 36)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with caplog.at_level(logging.WARNING, logger="cyberwave_edge_core.worker_manager"):
+            with patch.object(
+                wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+            ):
+                worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--runtime" not in docker_run_cmd
+        assert "--gpus" not in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest"
+        assert any("L4T r36" in record.getMessage() for record in caplog.records)
+
+    def test_jetpack_6_keeps_runtime_for_pinned_custom_image(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The L4T floor gates our image, not somebody else's.
+
+        A ``CYBERWAVE_WORKER_IMAGE`` pinned to a third-party build got
+        ``--runtime nvidia`` before the floor existed, and nothing here can
+        tell whether that build is JetPack-6-correct. Withdrawing the runtime
+        would silently halve its inference speed on upgrade and leave the
+        operator hunting for an opt-out env var they have no reason to read.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        worker_manager._image = "myregistry.local/cyberwave/custom-worker:dev"
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: True)
+        monkeypatch.setattr(wm_module, "jetson_accelerator_supported", lambda: False)
+        monkeypatch.setattr(wm_module, "jetson_l4t_major", lambda: 36)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert docker_run_cmd[docker_run_cmd.index("--runtime") + 1] == "nvidia"
+        assert "NVIDIA_VISIBLE_DEVICES=all" in docker_run_cmd
+        assert docker_run_cmd[-1] == "myregistry.local/cyberwave/custom-worker:dev"
+
+    def test_jetpack_6_demotes_a_pinned_jetson_tag_to_the_plain_one(
+        self,
+        worker_manager: WorkerManager,
+        tmp_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Pinning ``-jetson`` on an r36 board lands on the plain tag.
+
+        Our own image is the one the floor speaks for, however it was chosen.
+        Demoting the reference as well as the GPU args keeps the warning
+        honest: the image it names is the one the container starts from.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        worker_manager._image = "cyberwaveos/edge-ml-worker:latest-jetson"
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: True)
+        monkeypatch.setattr(wm_module, "jetson_accelerator_supported", lambda: False)
+        monkeypatch.setattr(wm_module, "jetson_l4t_major", lambda: 36)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with caplog.at_level(logging.WARNING, logger="cyberwave_edge_core.worker_manager"):
+            with patch.object(
+                wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+            ):
+                worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert "--runtime" not in docker_run_cmd
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest"
+        assert any(
+            "Starting cyberwaveos/edge-ml-worker:latest on CPU" in record.getMessage()
+            for record in caplog.records
+        ), "the warning must name the image the container actually starts from"
+
+    def test_jetpack_6_override_restores_gpu_path(
+        self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T`` opts an r36 host back in.
+
+        Runs the real predicate over a stubbed r36 release file rather than
+        patching :func:`jetson_accelerator_supported` away.
+        """
+        workers_dir = tmp_config / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        (workers_dir / "model.py").write_text("pass\n")
+
+        release = tmp_config / "nv_tegra_release"
+        release.write_text("# R36 (release), REVISION: 4.7, BOARD: generic\n")
+        monkeypatch.setattr(driver_selection, "_NV_TEGRA_RELEASE", release)
+        monkeypatch.setattr(driver_selection, "_l4t_major", None)
+        monkeypatch.setattr(driver_selection, "_l4t_major_probed", False)
+
+        run_calls: list[list[str]] = []
+        self._stub_docker_run(monkeypatch, run_calls)
+        _stub_runtime_env(monkeypatch)
+        # After _stub_runtime_env: it swaps os.environ for an empty dict.
+        monkeypatch.setenv("CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T", "1")
+        monkeypatch.setattr(wm_module, "is_jetson", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: True)
+        monkeypatch.setattr(wm_module, "_hailo_device_present", lambda: False)
+
+        with patch.object(
+            wm_module, "docker_inspect", return_value={"State": {"Status": "running"}}
+        ):
+            worker_manager._run_container()
+
+        docker_run_cmd = next((c for c in run_calls if c and c[0] == "docker" and "run" in c), None)
+        assert docker_run_cmd is not None
+        assert docker_run_cmd[docker_run_cmd.index("--runtime") + 1] == "nvidia"
+        assert docker_run_cmd[-1] == "cyberwaveos/edge-ml-worker:latest-jetson"
 
     def test_jetson_image_not_gpu_suffixed_on_nvidia_host(
         self, worker_manager: WorkerManager, tmp_config: Path, monkeypatch: pytest.MonkeyPatch

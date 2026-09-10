@@ -446,6 +446,7 @@ Set `CYBERWAVE_BATTERY_WH` to your battery pack's watt-hour capacity to enable a
 | `CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT` | `true` | Enable/disable auto-detected memory limits on ≤4 GB hosts |
 | `CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS` | `30` | Seconds to wait for the worker container to reach `running` state after `docker run` |
 | `CYBERWAVE_BATTERY_WH` | _(unset)_ | Battery pack capacity in watt-hours. Enables the battery uptime estimate in the Edge details panel of the dashboard. |
+| `CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T` | _(unset)_ | Set to `1` to use the `-jetson` worker image and NVIDIA runtime on a Jetson below L4T r38 (JetPack 7). See the accelerator precedence list below. |
 
 ### GPU support
 
@@ -453,10 +454,13 @@ When an NVIDIA container runtime is detected (`docker info` reports `nvidia` run
 
 For the worker image, Edge Core also rewrites the tag to point at the accelerator-specific sibling. The precedence is:
 
-1. **Jetson host** (`/etc/nv_tegra_release` present, or `CYBERWAVE_PLATFORM_VARIANT=jetson`) → `cyberwaveos/edge-ml-worker:<tag>-jetson` + `--gpus all`. Wins over the plain `-gpu` branch: on Jetson the nvidia-container-runtime is present too, but the amd64 `-gpu` blob has the wrong `libcuda.so` ABI (desktop/server CUDA vs Tegra CUDA). Requires JetPack 7 (Ubuntu 24.04 / L4T r38); JetPack 6 hosts are not supported.
-2. **NVIDIA container runtime detected (not Jetson)** → `cyberwaveos/edge-ml-worker:<tag>-gpu` + `--gpus all`.
-3. **`/dev/hailo0` present and no GPU runtime** → `cyberwaveos/edge-ml-worker:<tag>-hailo` + device passthrough.
-4. **None** → CPU base image.
+1. **Jetson host on JetPack 7** (`/etc/nv_tegra_release` reports L4T r38 or newer, or `CYBERWAVE_PLATFORM_VARIANT=jetson`) → `cyberwaveos/edge-ml-worker:<tag>-jetson` + `--runtime nvidia`. Wins over the plain `-gpu` branch: on Jetson the nvidia-container-runtime is present too, but the amd64 `-gpu` blob has the wrong `libcuda.so` ABI (desktop/server CUDA vs Tegra CUDA).
+2. **Jetson host on JetPack 6 or older** (L4T r36 and below) → plain `cyberwaveos/edge-ml-worker:<tag>`, no GPU passthrough, with a warning. The `-jetson` image's CUDA 12.9 wheels cannot load against a JetPack 6 driver — cuBLAS fails on the first matmul while convolutions still succeed, so the model loads and then detects nothing. The plain tag is multi-arch, so arm64 CPU inference works on the same host. A `-jetson` tag pinned via `CYBERWAVE_WORKER_IMAGE` is demoted the same way; a pin to an image outside `cyberwaveos/edge-ml-worker` keeps the NVIDIA runtime, since the floor only speaks for our own build. Set `CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T=1` to force the GPU path anyway (e.g. for a hand-built JetPack 6 image).
+
+   The choice is made when the worker container is **created**. A board that already has a `-jetson` worker running keeps it across an Edge Core upgrade — startup skips image selection entirely when the container is already up, and its `--restart unless-stopped` policy survives reboots. Run `docker rm -f cyberwave-worker` once to pick up the new selection.
+3. **NVIDIA container runtime detected (not Jetson)** → `cyberwaveos/edge-ml-worker:<tag>-gpu` + `--gpus all`.
+4. **`/dev/hailo0` present and no GPU runtime** → `cyberwaveos/edge-ml-worker:<tag>-hailo` + device passthrough.
+5. **None** → CPU base image.
 
 If the accelerator-specific tag cannot be pulled (e.g. the sibling isn't published for your channel yet), Edge Core falls back to the base tag and logs the demotion — the worker still comes up, just on CPU.
 
@@ -491,7 +495,7 @@ If the NVIDIA runtime is available but not configured as the default in `daemon.
 
 ### Jetson detection
 
-Edge Core auto-detects NVIDIA Jetson hardware via `/etc/nv_tegra_release`. When running on a Jetson:
+Edge Core auto-detects NVIDIA Jetson hardware via `/etc/nv_tegra_release`, and reads the L4T major release (`R36` = JetPack 6, `R38` and up = JetPack 7) from its first line. The release gates the ML worker image only — the `jetson-` driver images below build from the same ROS base as their plain counterparts and differ only in a resource profile (smaller pointcloud budget, software H.264, capped publish rates), so they link no CUDA and carry no L4T floor. When running on a Jetson:
 
 - The platform key `linux-aarch64-jetson` is added to the driver resolution order, allowing asset metadata to specify a Jetson-optimised image.
 - If no `linux-aarch64-jetson` driver key exists in metadata, Edge Core rewrites the image tag by prepending `jetson-` (e.g. `cyberwaveos/go2-ros2-driver:humble` → `cyberwaveos/go2-ros2-driver:jetson-humble`). If the Jetson-prefixed image is not available, it falls back to the original tag automatically.

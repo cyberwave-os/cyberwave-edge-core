@@ -23,11 +23,26 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+_NV_TEGRA_RELEASE = Path("/etc/nv_tegra_release")
+
+# JetPack 7 (L4T r38) is the floor for our ``-jetson`` images: their torch
+# wheels come from the Jetson AI Lab ``cu129`` bucket and need a CUDA driver
+# newer than JetPack 6 (r36) ships.
+MIN_JETSON_L4T_MAJOR = 38
+
+# Header line, e.g. ``# R36 (release), REVISION: 4.7, GCID: 42132812, ...``
+_L4T_RELEASE_RE = re.compile(r"R(\d+)\s*\(release\)", re.IGNORECASE)
+
 _jetson_detected: Optional[bool] = None
+_l4t_major: Optional[int] = None
+_l4t_major_probed = False
 
 
 def is_jetson() -> bool:
     """Detect NVIDIA Jetson hardware via ``/etc/nv_tegra_release``.
+
+    Hardware only; :func:`jetson_accelerator_supported` answers whether the
+    L4T release on it can run our GPU images.
 
     Also honours the ``CYBERWAVE_PLATFORM_VARIANT=jetson`` env override.
     """
@@ -40,8 +55,57 @@ def is_jetson() -> bool:
         _jetson_detected = True
         return True
 
-    _jetson_detected = Path("/etc/nv_tegra_release").exists()
+    _jetson_detected = _NV_TEGRA_RELEASE.exists()
     return _jetson_detected
+
+
+def jetson_l4t_major() -> Optional[int]:
+    """Return the L4T major release: 36 for JetPack 6, 38/39 for JetPack 7.
+
+    ``None`` when the file is absent or its header carries no release — that
+    means "unknown", not "unsupported".
+    """
+    global _l4t_major, _l4t_major_probed
+    if _l4t_major_probed:
+        return _l4t_major
+
+    _l4t_major_probed = True
+    try:
+        with _NV_TEGRA_RELEASE.open(encoding="utf-8", errors="replace") as handle:
+            header = handle.readline()
+    except OSError:
+        return None
+
+    match = _L4T_RELEASE_RE.search(header)
+    if match is None:
+        logger.debug("No L4T release in %s header %r", _NV_TEGRA_RELEASE, header.strip())
+        return None
+
+    _l4t_major = int(match.group(1))
+    return _l4t_major
+
+
+def jetson_accelerator_supported() -> bool:
+    """Whether this Jetson's L4T release can run our ``-jetson`` worker image.
+
+    ``False`` only for a release we positively read as older than
+    :data:`MIN_JETSON_L4T_MAJOR`. ``CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T=1``
+    forces ``True``.
+
+    Scope is the ML worker image and nothing else. The ``jetson-`` *driver*
+    images (``go2-ros2-driver:jetson-humble`` and siblings, selected by
+    :func:`_platform_driver_keys` and the tag rewrite in ``startup.py``) build
+    from the same ``ros2-base-sdk`` as their plain counterparts and differ only
+    in a resource profile — smaller pointcloud budget, software H.264, capped
+    publish rates. They link no CUDA and carry no L4T floor, so they stay on
+    the hardware-only :func:`is_jetson`.
+    """
+    override = os.environ.get("CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T", "").strip().lower()
+    if override in {"1", "true", "yes"}:
+        return True
+
+    major = jetson_l4t_major()
+    return major is None or major >= MIN_JETSON_L4T_MAJOR
 
 
 def _platform_driver_keys() -> list[str]:
