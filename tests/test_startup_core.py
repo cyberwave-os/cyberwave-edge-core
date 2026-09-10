@@ -802,6 +802,123 @@ class TestRunDockerImagePullFallback:
         assert env_map["CYBERWAVE_REGION"] == "eu-west-1"
         assert env_map["CYBERWAVE_EXTRA"] == "enabled"
 
+    def test_driver_container_receives_default_production_base_url(
+        self, tmp_path, monkeypatch
+    ):
+        commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
+        assert env_map["CYBERWAVE_BASE_URL"] == startup.DEFAULT_API_URL
+        assert env_map["CYBERWAVE_API_URL"] == startup.DEFAULT_API_URL
+
+    @pytest.mark.parametrize(
+        "environment,base_url",
+        [
+            ("staging", "https://api-staging.cyberwave.com"),
+            ("dev", "https://api-dev.cyberwave.com"),
+            ("local", "http://192.168.1.20:8000"),
+        ],
+    )
+    def test_driver_container_preserves_configured_environment_base_url(
+        self, tmp_path, monkeypatch, environment, base_url
+    ):
+        commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
+            if name == "CYBERWAVE_ENVIRONMENT":
+                return environment
+            if name == "CYBERWAVE_BASE_URL":
+                return base_url
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _runtime_env)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+        )
+
+        assert success is True
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
+        assert env_map["CYBERWAVE_BASE_URL"] == base_url
+        assert env_map["CYBERWAVE_API_URL"] == base_url
+        assert env_map["CYBERWAVE_ENVIRONMENT"] == environment
+
+    @pytest.mark.parametrize(
+        "environment,base_url",
+        [
+            ("staging", "https://api-staging.cyberwave.com"),
+            ("dev", "https://api-dev.cyberwave.com"),
+            ("local", "http://192.168.1.20:8000"),
+        ],
+    )
+    def test_runtime_base_url_overrides_stale_service_metadata(
+        self, tmp_path, monkeypatch, environment, base_url
+    ):
+        commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        def _runtime_env(name, default=None):  # type: ignore[no-untyped-def]
+            if name == "CYBERWAVE_ENVIRONMENT":
+                return environment
+            if name == "CYBERWAVE_BASE_URL":
+                return base_url
+            return default
+
+        monkeypatch.setattr(startup, "get_runtime_env_var", _runtime_env)
+
+        success = startup._run_docker_image(
+            "cyberwave-step14-driver:latest",
+            [],
+            twin_uuid=self._TWIN_UUID,
+            token="test-token",
+            service_env={
+                "CYBERWAVE_BASE_URL": "https://api.cyberwave.com",
+                "CYBERWAVE_API_URL": "https://api.cyberwave.com",
+            },
+        )
+
+        assert success is True
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
+        assert env_map["CYBERWAVE_BASE_URL"] == base_url
+        assert env_map["CYBERWAVE_API_URL"] == base_url
+
     def test_runs_macos_bridge_command_before_docker_run(self, tmp_path, monkeypatch):
         commands: list[list[str]] = []
         self._patch_common(tmp_path, monkeypatch, commands=commands)
@@ -872,6 +989,7 @@ class TestRunDockerImagePullFallback:
         docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
         env_map = self._extract_env_map(docker_create_cmd)
         assert env_map["CYBERWAVE_BASE_URL"] == "http://host.docker.internal:8000"
+        assert env_map["CYBERWAVE_API_URL"] == "http://host.docker.internal:8000"
 
     def test_macos_driver_container_rewrites_localhost_mqtt_host(self, tmp_path, monkeypatch):
         commands: list[list[str]] = []
