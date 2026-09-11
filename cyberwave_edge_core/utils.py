@@ -25,8 +25,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Phases where edge-core is actively transferring image layers from the
-#: registry.  ``installing`` is handled separately (layer-driven band).
+#: registry.  ``installing`` is its own stage.
 _STARTUP_PULLING_PHASES: frozenset[str] = frozenset({"pull_started", "pulling", "downloading"})
+
 
 #: Band edges for :func:`_compute_overall_progress_percent`, in percent.
 #: Sized against measured wall-clock on a multi-GB pull (CYB-3854): the
@@ -38,6 +39,49 @@ _DOWNLOAD_BAND_END = 45
 _INSTALL_BAND_END = 80
 
 
+def _compute_stage_progress_percent(
+    phase: str,
+    download_percent: float,
+    *,
+    layers_complete: int = 0,
+    layers_total: int = 0,
+) -> int | None:
+    """Progress *within the current startup stage*, 0–100.
+
+    Startup runs three stages — download, install, container start — and this
+    gives each its own 0–100. The alert's phase copy names the stage on screen
+    ("Downloading worker image", "Installing worker image", "Starting worker
+    container"), so a stage that reads 100 % is one the user can check against
+    what they are being told.
+
+    This is published as ``stage_progress_percent``. It is deliberately *not*
+    what the card's bar reads — see :func:`_compute_overall_progress_percent`.
+
+    Returns ``None`` for phases with nothing meaningful to report (e.g.
+    ``container_probe_unconfirmed``) so callers omit the field rather than
+    publishing a stale value.
+    """
+    if phase == "installing":
+        # Extraction is layer-serial and outlasts the download on a large
+        # image; layer completion is the only signal that moves here.
+        if layers_total > 0:
+            fraction = max(0.0, min(1.0, layers_complete / layers_total))
+            return round(fraction * 100)
+        return 50
+    if phase in _STARTUP_PULLING_PHASES or phase == "":
+        return round(max(0.0, min(100.0, download_percent)))
+    if phase in ("pull_complete", "pull_skipped", "pull_stream_finished"):
+        return 100
+    # Container start reports discrete steps rather than a continuous signal.
+    if phase == "starting_container":
+        return 33
+    if phase == "container_created":
+        return 66
+    if phase == "container_running":
+        return 100
+    return None
+
+
 def _compute_overall_progress_percent(
     phase: str,
     download_percent: float,
@@ -45,55 +89,67 @@ def _compute_overall_progress_percent(
     layers_complete: int = 0,
     layers_total: int = 0,
 ) -> int | None:
-    """Map *phase* + *download_percent* (0–100) to an overall startup percentage.
+    """Lifecycle-wide 0–100, monotone across download → install → start.
 
-    The lifecycle is split into three buckets so the user sees a single
-    monotonically-increasing number from 0 to 100:
+    The workbench renders one bar with no stage segmentation and no ``key``
+    between phases, so a stage that restarts its own 0–100 animates as a
+    *rewind*: the fill slid from 83 % back to empty at the download → install
+    hand-off, and again from full to a third when the container came up
+    (CYB-3867).  Banding the per-stage number keeps the bar honest about the
+    only question it is asked — is this moving? — while the phase copy above
+    it still names the stage, and ``stage_progress_percent`` carries the
+    per-stage figure for a stage-aware bar to use once one exists.
 
-    * **Download** (0–45 %) — driven by layer-byte progress from docker pull.
-    * **Install**  (45–80 %) — decompression, driven by layer completion.
-    * **Container** (80–100 %) — create → start → probe → running.
-
-    The bands are deliberately not equal-width: they are sized against how
-    long each phase actually takes on a large image, not against how many
-    steps it has.  Install gets a share comparable to download because the
-    extraction tail outlasts the bytes; container start gets the remainder.
-
-    Returns ``None`` for phases where no meaningful percentage can be
-    computed (e.g. unrecognised or backward-compat phases like
-    ``container_probe_unconfirmed``), so callers can omit the field
-    gracefully rather than publishing a stale value.
+    Returns ``None`` on the same phases :func:`_compute_stage_progress_percent`
+    does.
     """
+    stage = _compute_stage_progress_percent(
+        phase,
+        download_percent,
+        layers_complete=layers_complete,
+        layers_total=layers_total,
+    )
+    if stage is None:
+        return None
     if phase == "installing":
-        # Byte progress is 100 % by definition once the last layer lands, so
-        # it says nothing about the extraction that follows — and extraction
-        # is layer-serial and runs for minutes on a multi-GB image. Drive the
-        # band from layer completion instead of pinning a number the user
-        # watches stand still.
-        install_span = _INSTALL_BAND_END - _DOWNLOAD_BAND_END
-        if layers_total > 0:
-            fraction = max(0.0, min(1.0, layers_complete / layers_total))
-            return _DOWNLOAD_BAND_END + round(fraction * install_span)
-        # No layer counts published (older edge, or a transport that doesn't
-        # report them): sit mid-band rather than claim either edge.
-        return _DOWNLOAD_BAND_END + install_span // 2
+        span = _INSTALL_BAND_END - _DOWNLOAD_BAND_END
+        return _DOWNLOAD_BAND_END + round(stage * span / 100)
     if phase in _STARTUP_PULLING_PHASES or phase == "":
-        clamped = max(0.0, min(100.0, download_percent))
-        return round(clamped * _DOWNLOAD_BAND_END / 100)
-    if phase in ("pull_complete", "pull_skipped"):
+        return round(stage * _DOWNLOAD_BAND_END / 100)
+    if phase in ("pull_complete", "pull_skipped", "pull_stream_finished"):
         return _INSTALL_BAND_END
-    if phase == "starting_container":
-        return 85
-    if phase == "container_created":
-        return 92
-    if phase == "container_running":
-        return 100
-    return None
+    return _INSTALL_BAND_END + round(stage * (100 - _INSTALL_BAND_END) / 100)
 
 
 def _coerce_layer_count(value: Any) -> int:
     """Read a layer count out of alert metadata, tolerating junk."""
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _inject_progress_percentages(merged: dict[str, Any]) -> None:
+    """Derive both startup percentages from *merged* alert metadata, in place.
+
+    ``overall_progress_percent`` is what the card's bar reads;
+    ``stage_progress_percent`` is the same startup expressed per stage.
+    Either is omitted when the phase has nothing meaningful to report, so a
+    stale value is never republished.
+    """
+    phase = str(merged.get("phase") or "")
+    download_pct = merged.get("progress_percent")
+    download = float(download_pct) if isinstance(download_pct, (int, float)) else 0.0
+    complete = _coerce_layer_count(merged.get("layers_complete"))
+    total = _coerce_layer_count(merged.get("layers_total"))
+
+    overall = _compute_overall_progress_percent(
+        phase, download, layers_complete=complete, layers_total=total
+    )
+    if overall is not None:
+        merged["overall_progress_percent"] = overall
+    stage = _compute_stage_progress_percent(
+        phase, download, layers_complete=complete, layers_total=total
+    )
+    if stage is not None:
+        merged["stage_progress_percent"] = stage
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +252,7 @@ class DriverStartingAlertContext:
                 "service_name": self.service_name,
                 "started_at": time.time(),
                 "overall_progress_percent": 0,
+                "stage_progress_percent": 0,
             }
             service_suffix = f" ({self.service_name})" if self.service_name else ""
             description = "Your robot is starting up. This may take a few minutes."
@@ -219,10 +276,10 @@ class DriverStartingAlertContext:
     def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
         """Merge *patch* into alert metadata, optionally throttled.
 
-        Automatically injects ``overall_progress_percent`` (0–100) derived
-        from the merged ``phase`` and ``progress_percent`` values so the UI
-        can show a single startup-wide percentage rather than a
-        download-only one.
+        Automatically injects ``overall_progress_percent`` (0–100, the
+        lifecycle-wide number the bar reads) and ``stage_progress_percent``
+        (the same startup expressed per stage), both derived from the merged
+        ``phase`` and ``progress_percent`` values.
         """
         if not self._alert:
             return
@@ -233,16 +290,7 @@ class DriverStartingAlertContext:
         try:
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {**prev, **patch}
-            phase = str(merged.get("phase") or "")
-            download_pct = merged.get("progress_percent")
-            overall = _compute_overall_progress_percent(
-                phase,
-                float(download_pct) if isinstance(download_pct, (int, float)) else 0.0,
-                layers_complete=_coerce_layer_count(merged.get("layers_complete")),
-                layers_total=_coerce_layer_count(merged.get("layers_total")),
-            )
-            if overall is not None:
-                merged["overall_progress_percent"] = overall
+            _inject_progress_percentages(merged)
             self._alert = self._alert.update(metadata=merged)
         except Exception as exc:
             logger.warning(
@@ -378,6 +426,7 @@ class WorkerStartingAlertContext:
                     "container_name": self.container_name,
                     "started_at": time.time(),
                     "overall_progress_percent": 0,
+                    "stage_progress_percent": 0,
                 },
                 force=True,
             )
@@ -392,8 +441,9 @@ class WorkerStartingAlertContext:
     def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
         """Merge *patch* into alert metadata, optionally throttled.
 
-        Automatically injects ``overall_progress_percent`` derived from the
-        merged ``phase`` and ``progress_percent`` values.
+        Automatically injects ``overall_progress_percent`` and
+        ``stage_progress_percent`` derived from the merged ``phase`` and
+        ``progress_percent`` values.
         """
         if self._alert is None:
             return
@@ -404,16 +454,7 @@ class WorkerStartingAlertContext:
         try:
             prev = self._alert.metadata if isinstance(self._alert.metadata, dict) else {}
             merged = {**prev, **patch}
-            phase = str(merged.get("phase") or "")
-            download_pct = merged.get("progress_percent")
-            overall = _compute_overall_progress_percent(
-                phase,
-                float(download_pct) if isinstance(download_pct, (int, float)) else 0.0,
-                layers_complete=_coerce_layer_count(merged.get("layers_complete")),
-                layers_total=_coerce_layer_count(merged.get("layers_total")),
-            )
-            if overall is not None:
-                merged["overall_progress_percent"] = overall
+            _inject_progress_percentages(merged)
             self._alert = self._alert.update(metadata=merged)
         except Exception as exc:
             logger.warning(

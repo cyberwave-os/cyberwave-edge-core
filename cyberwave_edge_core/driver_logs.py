@@ -502,6 +502,26 @@ _PULL_PHASE_DOWNLOADING = "downloading"
 _PULL_PHASE_INSTALLING = "installing"
 _PULL_PHASE_COMPLETE = "pull_complete"
 
+#: A pull only moves forward. Docker interleaves layers, so the raw states
+#: read "nothing is downloading" (all in-flight layers verifying) moments
+#: before the next batch starts — without this the phase, and the stage the
+#: card names, flip back and forth mid-pull.
+_PULL_PHASE_RANK: dict[str, int] = {
+    _PULL_PHASE_STARTED: 0,
+    _PULL_PHASE_DOWNLOADING: 1,
+    _PULL_PHASE_INSTALLING: 2,
+    _PULL_PHASE_COMPLETE: 3,
+}
+
+#: Ceiling before the pull is confirmed complete, so neither rounding nor a
+#: fully-cached prefix can show "100 %" early.
+_INCOMPLETE_PERCENT_CEILING = 99
+
+#: Layer states in which the layer's bytes are all on disk.
+_LAYER_FETCHED_STATES: frozenset[str] = frozenset(
+    {"downloaded", "verifying", "extracting", "complete"}
+)
+
 
 class _EngineAPIUnavailableError(RuntimeError):
     """SDK missing or daemon unreachable; dispatcher falls back to subprocess."""
@@ -578,12 +598,32 @@ class _DockerPullProgress:
     layers_active: int = 0
     phase: str = _PULL_PHASE_STARTED
     last_line: str = ""
+    #: Layers fetched so far, the one in flight counted as its byte
+    #: fraction. Drives the percentage: a byte ratio can't, because docker
+    #: only declares a layer's size when it starts fetching it, so the
+    #: denominator is unknown for most of the pull (CYB-3854).
+    layers_fetched: float = 0.0
+    #: True while some layer has not declared its size, i.e. ``total_bytes``
+    #: is a partial sum rather than the image's size.
+    total_bytes_partial: bool = False
 
     def percent(self) -> int:
-        if self.total_bytes <= 0:
-            return 100 if self.phase == _PULL_PHASE_COMPLETE else 0
-        pct = 100.0 * self.downloaded_bytes / self.total_bytes
-        return max(0, min(100, int(round(pct))))
+        """Fetched layers over announced layers, 0–99 until docker says done.
+
+        Monotone for a fixed layer set — states only advance and byte counts
+        only grow — so no ratchet is needed on top. The one thing that can
+        lower it is docker announcing more layers, which genuinely means
+        there is more to do than the last reading implied; pinning the old,
+        higher number there would be a lie rather than a smoothing.
+        """
+        if self.phase == _PULL_PHASE_COMPLETE:
+            return 100
+        if self.layers_total <= 0:
+            return 0
+        # Short of the stream's terminator the layer list can still grow, so
+        # "every layer we know about is fetched" is not "done" — reserve 100.
+        pct = 100.0 * self.layers_fetched / self.layers_total
+        return max(0, min(_INCOMPLETE_PERCENT_CEILING, int(round(pct))))
 
     def format_summary(self) -> str:
         if self.phase == _PULL_PHASE_COMPLETE:
@@ -594,10 +634,16 @@ class _DockerPullProgress:
                     f"{self.image} installing ({self.layers_complete}/{self.layers_total} layers)"
                 )
             return f"{self.image} installing"
-        if self.total_bytes > 0:
+        if self.total_bytes > 0 and not self.total_bytes_partial:
             return (
                 f"{self.image} {_format_bytes(self.downloaded_bytes)} of "
                 f"{_format_bytes(self.total_bytes)} ({self.percent()}%)"
+            )
+        if self.total_bytes > 0:
+            # Image size not known yet — report what has landed, not a ratio.
+            return (
+                f"{self.image} {_format_bytes(self.downloaded_bytes)} downloaded, "
+                f"{self.layers_fetched:.1f}/{self.layers_total} layers ({self.percent()}%)"
             )
         if self.layers_total > 0:
             return f"{self.image} pulling ({self.layers_active}/{self.layers_total} layers)"
@@ -613,7 +659,15 @@ class _DockerPullProgress:
             "downloaded_human": (
                 _format_bytes(self.downloaded_bytes) if self.total_bytes > 0 else None
             ),
-            "total_human": (_format_bytes(self.total_bytes) if self.total_bytes > 0 else None),
+            # Withheld until every layer is sized: the UI renders "X of Y"
+            # verbatim, and a partial Y reads as a wrong number.
+            "total_human": (
+                _format_bytes(self.total_bytes)
+                if self.total_bytes > 0 and not self.total_bytes_partial
+                else None
+            ),
+            "total_bytes_partial": self.total_bytes_partial,
+            "layers_fetched": round(self.layers_fetched, 2),
             "layers_total": self.layers_total,
             "layers_complete": self.layers_complete,
             "layers_active": self.layers_active,
@@ -634,6 +688,10 @@ class _DockerPullTracker:
         self._layer_downloaded: dict[str, int] = {}
         self._layer_total: dict[str, int] = {}
         self._signature: tuple[Any, ...] = ()
+        # Only the stream's terminator (``Status: …``) or ``mark_finished``
+        # prove a pull is over: docker announces cached layers as ``Already
+        # exists`` before saying anything about the ones it still has to fetch.
+        self._stream_finished = False
 
     def feed(self, line: str) -> bool:
         message = line.strip()
@@ -642,9 +700,7 @@ class _DockerPullTracker:
         self.progress.last_line = message[:500]
 
         if message.startswith("Status:"):
-            # Cap each known layer at its declared total so percent reads 100 %.
-            for layer_id, total in self._layer_total.items():
-                self._layer_downloaded[layer_id] = total
+            self._finalize_layer_bytes()
             self._recompute(force_phase=_PULL_PHASE_COMPLETE)
             return self._refresh_signature()
 
@@ -664,9 +720,17 @@ class _DockerPullTracker:
         return self._refresh_signature()
 
     def mark_finished(self) -> None:
+        self._finalize_layer_bytes()
+        self._recompute(force_phase=_PULL_PHASE_COMPLETE)
+
+    def _finalize_layer_bytes(self) -> None:
+        """Close the books: every layer is fetched and capped at its
+        declared total, so the percentage reads exactly 100 %."""
+        self._stream_finished = True
         for layer_id, total in self._layer_total.items():
             self._layer_downloaded[layer_id] = total
-        self._recompute(force_phase=_PULL_PHASE_COMPLETE)
+        for layer_id in self._layer_state:
+            self._layer_state[layer_id] = "complete"
 
     def _apply_layer_event(self, layer_id: str, state: str, rest: str) -> None:
         self._layer_state[layer_id] = state
@@ -704,8 +768,7 @@ class _DockerPullTracker:
             self.progress.last_line = status[:500]
 
         if status.startswith("Status:"):
-            for lid, total in self._layer_total.items():
-                self._layer_downloaded[lid] = total
+            self._finalize_layer_bytes()
             self._recompute(force_phase=_PULL_PHASE_COMPLETE)
             return self._refresh_signature()
 
@@ -740,9 +803,53 @@ class _DockerPullTracker:
         self._recompute()
         return self._refresh_signature()
 
+    def _unsized_layer_count(self) -> int:
+        """Announced layers that will contribute bytes we can't see yet.
+
+        A layer declares its size on its first ``Downloading`` event. Cached
+        layers are excluded: they land as ``complete`` without a size because
+        they transfer nothing.
+        """
+        return sum(
+            1
+            for layer_id, state in self._layer_state.items()
+            if layer_id not in self._layer_total and state != "complete"
+        )
+
+    def _fetched_layer_count(self) -> float:
+        """Layers whose bytes are on disk, the in-flight one counted as its
+        byte fraction so the number moves between layer boundaries."""
+        fetched = 0.0
+        for layer_id, state in self._layer_state.items():
+            if state in _LAYER_FETCHED_STATES:
+                fetched += 1.0
+                continue
+            total = self._layer_total.get(layer_id, 0)
+            if state == "downloading" and total > 0:
+                got = self._layer_downloaded.get(layer_id, 0)
+                fetched += max(0.0, min(1.0, got / total))
+        return fetched
+
+    def _resolve_phase(self) -> str:
+        states = set(self._layer_state.values())
+        if not states:
+            return _PULL_PHASE_STARTED
+        if states & {"downloading", "waiting", "pending"}:
+            return _PULL_PHASE_DOWNLOADING
+        if states <= {"complete"}:
+            # Every layer seen so far is done — the end of the pull only if
+            # the stream said so, otherwise this is the opening burst of
+            # ``Already exists`` on a re-pull.
+            return _PULL_PHASE_COMPLETE if self._stream_finished else _PULL_PHASE_DOWNLOADING
+        return _PULL_PHASE_INSTALLING
+
     def _recompute(self, *, force_phase: Optional[str] = None) -> None:
         self.progress.downloaded_bytes = sum(self._layer_downloaded.values())
         self.progress.total_bytes = sum(self._layer_total.values())
+        self.progress.total_bytes_partial = (
+            not self._stream_finished and self._unsized_layer_count() > 0
+        )
+        self.progress.layers_fetched = self._fetched_layer_count()
         self.progress.layers_total = len(self._layer_state)
         self.progress.layers_complete = sum(
             1 for s in self._layer_state.values() if s == "complete"
@@ -753,17 +860,10 @@ class _DockerPullTracker:
 
         if force_phase is not None:
             self.progress.phase = force_phase
-            return
-
-        states = set(self._layer_state.values())
-        if not states:
-            self.progress.phase = _PULL_PHASE_STARTED
-        elif states <= {"complete"}:
-            self.progress.phase = _PULL_PHASE_COMPLETE
-        elif states & {"downloading", "waiting", "pending"}:
-            self.progress.phase = _PULL_PHASE_DOWNLOADING
         else:
-            self.progress.phase = _PULL_PHASE_INSTALLING
+            resolved = self._resolve_phase()
+            if _PULL_PHASE_RANK.get(resolved, 0) >= _PULL_PHASE_RANK.get(self.progress.phase, 0):
+                self.progress.phase = resolved
 
     def _refresh_signature(self) -> bool:
         sig = (

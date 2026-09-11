@@ -94,7 +94,12 @@ class TestDockerPullTracker:
         assert tracker.progress.downloaded_bytes == 100_000_000
         assert tracker.progress.percent() == 50
 
+        # Every byte of every known layer is down, but docker has not said
+        # the pull is over — 100 % is reserved for that.
         tracker.feed("abc: Downloading [==========>] 200MB/200MB")
+        assert tracker.progress.percent() == 99
+
+        tracker.feed("Status: Downloaded newer image for foo:latest")
         assert tracker.progress.percent() == 100
 
     def test_already_exists_layer_credits_zero_bytes(self):
@@ -108,7 +113,41 @@ class TestDockerPullTracker:
         assert tracker.progress.layers_total == 2
         assert tracker.progress.layers_complete == 2
         assert tracker.progress.total_bytes == 0
+
+    def test_cached_layers_do_not_end_the_pull_before_the_stream_does(self):
+        """A re-pull opens with ``Already exists`` for every cached layer,
+        which used to read as ``pull_complete`` — the frontend hides the
+        startup card on that phase, so the bar flashed up and vanished
+        while the layers that actually had to be fetched were still to be
+        announced (CYB-3854)."""
+        tracker = _DockerPullTracker("foo:latest")
+
+        tracker.feed("abc: Already exists")
+        tracker.feed("def: Already exists")
+        assert tracker.progress.phase == _PULL_PHASE_DOWNLOADING
+
+        # …and the layer docker had not gotten to yet arrives afterwards.
+        tracker.feed("ghi: Pulling fs layer")
+        tracker.feed("ghi: Downloading [==>] 50MB/100MB")
+        assert tracker.progress.phase == _PULL_PHASE_DOWNLOADING
+        # Two cached layers plus half of the third: 2.5 of 3.
+        assert tracker.progress.percent() == 83
+
+        tracker.feed("ghi: Pull complete")
+        tracker.feed("Status: Downloaded newer image for foo:latest")
         assert tracker.progress.phase == _PULL_PHASE_COMPLETE
+        assert tracker.progress.percent() == 100
+
+    def test_fully_cached_pull_completes_on_the_status_line(self):
+        """The all-cached case still resolves — just on the terminator
+        rather than on the first ``Already exists``."""
+        tracker = _DockerPullTracker("foo:latest")
+
+        tracker.feed("abc: Already exists")
+        tracker.feed("Status: Image is up to date for foo:latest")
+
+        assert tracker.progress.phase == _PULL_PHASE_COMPLETE
+        assert tracker.progress.percent() == 100
 
     def test_phase_walks_downloading_then_installing_then_complete(self):
         tracker = _DockerPullTracker("foo:latest")
@@ -138,10 +177,127 @@ class TestDockerPullTracker:
         tracker.feed("b: Download complete")
         tracker.feed("c: Downloading [=====>] 350MB/700MB")
 
-        # 50 + 200 + 350 = 600 MB / 1000 MB = 60 %.
         assert tracker.progress.total_bytes == 1_000_000_000
         assert tracker.progress.downloaded_bytes == 600_000_000
-        assert tracker.progress.percent() == 60
+        # Half of `a`, all of `b`, half of `c`: 2 layers of 3.
+        assert tracker.progress.percent() == 67
+
+    def test_unsized_layers_keep_the_percentage_off_100(self):
+        """Docker fetches three layers at a time and only declares a
+        layer's size when it starts fetching it. A byte ratio over the
+        sized layers alone had numerator equal to denominator every time
+        the in-flight batch drained, so the bar read 100 % with most of the
+        image still queued — the "100 % half-way" report on CYB-3854.
+        """
+        tracker = _DockerPullTracker("foo:latest")
+        # Docker announces all six layers up front …
+        for layer in ("a", "b", "c", "d", "e", "f"):
+            tracker.feed(f"{layer}: Pulling fs layer")
+        # … then fetches the first three, which are 100 MB each.
+        for layer in ("a", "b", "c"):
+            tracker.feed(f"{layer}: Downloading [>] 0B/100MB")
+        for layer in ("a", "b", "c"):
+            tracker.feed(f"{layer}: Download complete")
+
+        # Bytes say 300 MB of 300 MB; layers say 3 of 6.
+        assert tracker.progress.downloaded_bytes == tracker.progress.total_bytes
+        assert tracker.progress.total_bytes_partial is True
+        assert tracker.progress.layers_fetched == 3.0
+        assert tracker.progress.percent() == 50
+        assert tracker.progress.phase == _PULL_PHASE_DOWNLOADING
+
+    def test_rounding_cannot_report_100_with_a_layer_outstanding(self):
+        """On a many-layered image the last fraction rounds to 100 — which
+        the user reads as "done" while a layer is still coming down."""
+        tracker = _DockerPullTracker("foo:latest")
+        for i in range(100):
+            tracker.feed(f"l{i}: Pulling fs layer")
+        for i in range(99):
+            tracker.feed(f"l{i}: Pull complete")
+        tracker.feed("l99: Downloading [=>] 99MB/100MB")
+
+        assert tracker.progress.layers_fetched == pytest.approx(99.99)
+        assert tracker.progress.percent() == 99
+
+    def test_layer_sizes_landing_late_do_not_move_the_percentage(self):
+        """Counting layers rather than bytes is what makes the percentage
+        stable: a layer turning out to be ten times the size of its
+        neighbour revises no denominator, so there is nothing to walk back
+        and no ratchet needed to hold it (CYB-3867)."""
+        tracker = _DockerPullTracker("foo:latest")
+        tracker.feed("a: Pulling fs layer")
+        tracker.feed("b: Pulling fs layer")
+        tracker.feed("a: Downloading [>] 50MB/100MB")
+        # Half of `a`, none of `b`: 0.5 layers of 2.
+        assert tracker.progress.percent() == 25
+
+        # ``b`` turns out to be ten times the size of ``a``.
+        tracker.feed("b: Downloading [>] 0B/1000MB")
+        # A byte ratio would now read 50 / 1100 ≈ 5 %; the layer count holds.
+        assert tracker.progress.percent() == 25
+
+    def test_percentage_is_monotone_across_a_whole_pull(self):
+        """Nothing downstream ratchets this, so the tracker owes callers a
+        number that only moves forward once the layer set has settled."""
+        tracker = _DockerPullTracker("foo:latest")
+        announced = [f"{layer}: Pulling fs layer" for layer in ("a", "b", "c")]
+        for line in announced:
+            tracker.feed(line)
+
+        seen = [tracker.progress.percent()]
+        for line in (
+            "a: Downloading [>] 50MB/100MB",
+            "a: Downloading [==>] 100MB/100MB",
+            "a: Verifying Checksum",
+            "a: Download complete",
+            "b: Downloading [>] 10MB/200MB",
+            "a: Extracting [>] 5MB/100MB",
+            "b: Downloading [==>] 200MB/200MB",
+            "b: Download complete",
+            "a: Pull complete",
+            "c: Downloading [>] 0B/50MB",
+            "c: Download complete",
+            "b: Pull complete",
+            "c: Pull complete",
+            "Status: Downloaded newer image for foo:latest",
+        ):
+            tracker.feed(line)
+            seen.append(tracker.progress.percent())
+
+        assert all(b >= a for a, b in zip(seen, seen[1:])), seen
+        assert seen[-1] == 100
+
+    def test_phase_does_not_fall_back_to_downloading_after_installing(self):
+        """Docker interleaves: a layer can start downloading while an
+        earlier one extracts. The phase drives the percentage band, so
+        letting it drop back to ``downloading`` rewinds the bar."""
+        tracker = _DockerPullTracker("foo:latest")
+        tracker.feed("a: Downloading [>] 50MB/100MB")
+        tracker.feed("a: Extracting [>] 10MB/100MB")
+        assert tracker.progress.phase == _PULL_PHASE_INSTALLING
+
+        tracker.feed("b: Downloading [>] 0B/100MB")
+        assert tracker.progress.phase == _PULL_PHASE_INSTALLING
+
+    def test_metadata_withholds_a_partial_image_size(self):
+        tracker = _DockerPullTracker("foo:latest")
+        tracker.feed("a: Pulling fs layer")
+        tracker.feed("b: Pulling fs layer")
+        tracker.feed("a: Downloading [>] 50MB/100MB")
+
+        metadata = tracker.progress.to_metadata()
+        assert metadata["total_bytes_partial"] is True
+        assert metadata["layers_fetched"] == 0.5
+        # A partial sum must not reach the UI as a hard "of Y".
+        assert metadata["total_human"] is None
+        assert metadata["downloaded_human"] == "50.0 MB"
+
+        tracker.feed("b: Downloading [>] 0B/100MB")
+        tracker.feed("b: Download complete")
+        tracker.feed("Status: Downloaded newer image for foo:latest")
+        settled = tracker.progress.to_metadata()
+        assert settled["total_bytes_partial"] is False
+        assert settled["total_human"] == "200 MB"
 
     def test_feed_returns_false_when_summary_is_unchanged(self):
         tracker = _DockerPullTracker("foo:latest")
@@ -263,7 +419,7 @@ class TestDockerPullTracker:
             }
         )
         assert tracker.progress.phase == _PULL_PHASE_INSTALLING
-        assert tracker.progress.percent() == 100
+        assert tracker.progress.percent() == 99
 
         tracker.feed_event(
             {
@@ -299,7 +455,7 @@ class TestDockerPullTracker:
                 }
             )
         assert tracker.progress.total_bytes == 2_000_000
-        assert tracker.progress.percent() == 100
+        assert tracker.progress.percent() == 99
 
         # Decompression: docker reports ~4x the compressed size, from zero.
         tracker.feed_event(
@@ -312,7 +468,7 @@ class TestDockerPullTracker:
 
         assert tracker.progress.total_bytes == 2_000_000
         assert tracker.progress.downloaded_bytes == 2_000_000
-        assert tracker.progress.percent() == 100
+        assert tracker.progress.percent() == 99
 
         # Only once every layer is past downloading does the phase move on —
         # a layer still pulling bytes keeps the honest "downloading" label.
@@ -325,7 +481,7 @@ class TestDockerPullTracker:
             }
         )
         assert tracker.progress.phase == _PULL_PHASE_INSTALLING
-        assert tracker.progress.percent() == 100
+        assert tracker.progress.percent() == 99
 
     def test_feed_event_extraction_matches_the_subprocess_path(self):
         """Both drivers must agree: a layer that reaches ``extracting`` is
@@ -374,9 +530,43 @@ class TestDockerPullProgressFormatSummary:
             total_bytes=1_550_000_000,
             layers_total=12,
             layers_complete=4,
+            layers_fetched=5.75,
             phase=_PULL_PHASE_DOWNLOADING,
         )
         assert progress.format_summary() == "cyberwaveos/ugv-driver:dev 745 MB of 1.55 GB (48%)"
+
+    def test_renders_what_landed_while_the_image_size_is_unknown(self):
+        progress = _DockerPullProgress(
+            image="cyberwaveos/ugv-driver:dev",
+            downloaded_bytes=745_000_000,
+            total_bytes=745_000_000,
+            total_bytes_partial=True,
+            layers_total=12,
+            layers_fetched=3.0,
+            phase=_PULL_PHASE_DOWNLOADING,
+        )
+        assert (
+            progress.format_summary()
+            == "cyberwaveos/ugv-driver:dev 745 MB downloaded, 3.0/12 layers (25%)"
+        )
+
+    def test_partial_summary_layer_count_agrees_with_its_percentage(self):
+        """``layers_fetched`` is fractional. Rounding it to a whole number
+        put an operator-facing "4/5 layers (70%)" in the journal and in
+        ``systemctl status`` — two numbers that cannot both be right."""
+        progress = _DockerPullProgress(
+            image="cyberwaveos/ugv-driver:dev",
+            downloaded_bytes=50_000_000,
+            total_bytes=50_000_000,
+            total_bytes_partial=True,
+            layers_total=5,
+            layers_fetched=3.5,
+            phase=_PULL_PHASE_DOWNLOADING,
+        )
+        assert (
+            progress.format_summary()
+            == "cyberwaveos/ugv-driver:dev 50.0 MB downloaded, 3.5/5 layers (70%)"
+        )
 
     def test_renders_layer_count_during_install(self):
         progress = _DockerPullProgress(

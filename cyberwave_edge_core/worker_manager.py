@@ -1154,8 +1154,20 @@ class WorkerManager:
         download → install → start sequence rather than only while bytes are
         moving. A locally-present image skips the pull entirely, and that is
         precisely the case where the startup was previously silent.
+
+        Anything still held from an earlier startup is retired first:
+        returning early on a non-empty list meant one startup that leaked
+        its card (an exception escaping the probe, say) suppressed the card
+        for every later startup in the process — a progress bar that works
+        once after an edge-core restart and never again.
         """
-        if self._starting_alert_ctxs or not self._twin_uuids:
+        if self._starting_alert_ctxs:
+            logger.debug(
+                "Retiring %d worker_starting alert(s) left open by a previous startup",
+                len(self._starting_alert_ctxs),
+            )
+            self._close_starting_alerts()
+        if not self._twin_uuids:
             return
         try:
             from .utils import WorkerStartingAlertContext  # noqa: PLC0415

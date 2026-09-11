@@ -2668,6 +2668,42 @@ class TestWorkerStartingNotification:
             assert ctx.resolved is True
             assert ctx.failed == "container_start_failed"
 
+    def test_second_startup_gets_its_own_card_after_a_leak(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A card left behind by an earlier startup must not suppress the next.
+
+        ``_open_starting_alerts`` used to return early whenever the list was
+        non-empty, so one startup that left through a path which never closed
+        its card (an exception escaping the probe, say) silenced the progress
+        bar for every later startup in the process — it worked once after an
+        edge-core restart and never again.
+        """
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        # Simulate the leak: a previous startup left its contexts held.
+        leaked = _RecordingAlertCtx(
+            twin_uuid="leaked-twin",
+            image="cyberwaveos/edge-ml-worker:dev",
+            container_name=worker_manager._container_name,
+        )
+        leaked.create()
+        worker_manager._starting_alert_ctxs = [leaked]
+        _RecordingAlertCtx.instances = []
+
+        assert worker_manager._run_container() is True
+
+        # The stale card is retired rather than reused …
+        assert leaked.resolved is True
+        # … and this startup reports on cards of its own.
+        assert len(_RecordingAlertCtx.instances) == 2
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.phases == ["starting_container", "container_running"]
+            assert ctx.resolved is True
+
     def test_no_twins_means_no_card(
         self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

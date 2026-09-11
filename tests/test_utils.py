@@ -191,10 +191,99 @@ def test_restart_alert_transition_swallows_generic_errors(monkeypatch, caplog):
     )
 
 
-class TestOverallProgressPercent:
-    """The lifecycle-wide 0–100 number the UI's progress bar reads."""
+class TestStageProgressPercent:
+    """The per-stage 0–100 published as ``stage_progress_percent``."""
 
-    def test_download_band_tracks_bytes(self):
+    def test_download_stage_tracks_the_pull(self):
+        assert utils._compute_stage_progress_percent("downloading", 0.0) == 0
+        assert utils._compute_stage_progress_percent("downloading", 43.0) == 43
+        assert utils._compute_stage_progress_percent("downloading", 100.0) == 100
+
+    def test_install_stage_tracks_layer_completion(self):
+        """Extraction is layer-serial and slow; byte progress is pinned at
+        100 % throughout it, so the stage must move on layer counts."""
+        early = utils._compute_stage_progress_percent(
+            "installing", 100.0, layers_complete=0, layers_total=14
+        )
+        mid = utils._compute_stage_progress_percent(
+            "installing", 100.0, layers_complete=7, layers_total=14
+        )
+        done = utils._compute_stage_progress_percent(
+            "installing", 100.0, layers_complete=14, layers_total=14
+        )
+        assert (early, mid, done) == (0, 50, 100)
+
+    def test_install_stage_falls_back_when_counts_are_unknown(self):
+        assert utils._compute_stage_progress_percent("installing", 100.0) == 50
+
+    def test_install_stage_is_clamped(self):
+        """Junk counts must not push the stage past 100."""
+        assert (
+            utils._compute_stage_progress_percent(
+                "installing", 100.0, layers_complete=99, layers_total=14
+            )
+            == 100
+        )
+
+    def test_each_stage_ends_at_100(self):
+        """A stage that finishes says so, so the number can be checked
+        against the stage the alert copy names on screen."""
+        assert utils._compute_stage_progress_percent("downloading", 100.0) == 100
+        assert utils._compute_stage_progress_percent("pull_complete", 100.0) == 100
+        assert utils._compute_stage_progress_percent("pull_stream_finished", 100.0) == 100
+        assert (
+            utils._compute_stage_progress_percent(
+                "installing", 100.0, layers_complete=14, layers_total=14
+            )
+            == 100
+        )
+        assert utils._compute_stage_progress_percent("container_running", 0.0) == 100
+
+    def test_container_stage_steps_forward(self):
+        started = utils._compute_stage_progress_percent("starting_container", 0.0)
+        created = utils._compute_stage_progress_percent("container_created", 0.0)
+        running = utils._compute_stage_progress_percent("container_running", 0.0)
+        assert 0 < started < created < running == 100
+
+    def test_unknown_phase_publishes_nothing(self):
+        assert utils._compute_stage_progress_percent("container_probe_unconfirmed", 0.0) is None
+
+
+class TestOverallProgressPercent:
+    """The lifecycle-wide 0–100 the UI's progress bar reads."""
+
+    def test_never_walks_backwards_across_a_whole_startup(self):
+        """CYB-3867: the workbench renders one bar with no stage
+        segmentation and no ``key`` between phases, so a stage that restarts
+        its own 0–100 animates as a rewind — the fill slid from 83 % back to
+        empty when the last layer finished downloading and extraction had
+        not started."""
+        steps: list[int] = []
+        for percent in (0.0, 43.0, 83.0, 100.0):
+            steps.append(utils._compute_overall_progress_percent("downloading", percent))
+        for complete in range(15):
+            steps.append(
+                utils._compute_overall_progress_percent(
+                    "installing", 100.0, layers_complete=complete, layers_total=14
+                )
+            )
+        for phase in (
+            "pull_complete",
+            "starting_container",
+            "container_created",
+            "container_running",
+        ):
+            steps.append(
+                utils._compute_overall_progress_percent(
+                    phase, 100.0, layers_complete=14, layers_total=14
+                )
+            )
+
+        assert all(b >= a for a, b in zip(steps, steps[1:])), steps
+        assert steps[0] == 0
+        assert steps[-1] == 100
+
+    def test_download_band_tracks_the_pull(self):
         assert utils._compute_overall_progress_percent("downloading", 0.0) == 0
         assert (
             utils._compute_overall_progress_percent("downloading", 100.0)
@@ -202,31 +291,17 @@ class TestOverallProgressPercent:
         )
 
     def test_install_band_tracks_layer_completion(self):
-        """Extraction is layer-serial and slow; byte progress is pinned at
-        100 % throughout it, so the band must move on layer counts instead."""
         early = utils._compute_overall_progress_percent(
             "installing", 100.0, layers_complete=0, layers_total=14
-        )
-        mid = utils._compute_overall_progress_percent(
-            "installing", 100.0, layers_complete=7, layers_total=14
         )
         done = utils._compute_overall_progress_percent(
             "installing", 100.0, layers_complete=14, layers_total=14
         )
-        assert early == utils._DOWNLOAD_BAND_END
-        assert mid == 63
-        assert done == utils._INSTALL_BAND_END
-        assert early < mid < done
+        assert (early, done) == (utils._DOWNLOAD_BAND_END, utils._INSTALL_BAND_END)
 
-    def test_install_band_is_wide_enough_to_read_as_progress(self):
-        """CYB-3854: the extraction tail outlasts the download, so its band
-        has to be worth comparable travel — a 5-point slice made the bar look
-        frozen through the longest part of the wait."""
-        span = utils._INSTALL_BAND_END - utils._DOWNLOAD_BAND_END
-        assert span >= utils._DOWNLOAD_BAND_END * 0.6
-
-        # Every layer of a 14-layer image must move the number by >= 1 point,
-        # otherwise completions land invisibly.
+    def test_every_layer_completion_moves_the_bar(self):
+        """CYB-3854: a 5-point install band left completions invisible
+        through the longest part of the wait."""
         steps = [
             utils._compute_overall_progress_percent(
                 "installing", 100.0, layers_complete=n, layers_total=14
@@ -235,27 +310,29 @@ class TestOverallProgressPercent:
         ]
         assert all(b - a >= 1 for a, b in zip(steps, steps[1:]))
 
-    def test_install_band_falls_back_when_counts_are_unknown(self):
-        """No layer counts: sit mid-band rather than claim either edge."""
-        assert utils._compute_overall_progress_percent("installing", 100.0) == 62
+    def test_unknown_phase_publishes_nothing(self):
+        assert utils._compute_overall_progress_percent("container_probe_unconfirmed", 0.0) is None
 
-    def test_install_band_never_leaves_the_band(self):
-        """Junk counts must not push the install phase past the container band."""
-        assert (
-            utils._compute_overall_progress_percent(
-                "installing", 100.0, layers_complete=99, layers_total=14
-            )
-            == utils._INSTALL_BAND_END
-        )
 
-    def test_bands_stay_ordered_across_the_lifecycle(self):
-        download = utils._compute_overall_progress_percent("downloading", 100.0)
-        install = utils._compute_overall_progress_percent(
-            "installing", 100.0, layers_complete=1, layers_total=14
-        )
-        container = utils._compute_overall_progress_percent("starting_container", 0.0)
-        running = utils._compute_overall_progress_percent("container_running", 0.0)
-        assert download <= install < container < running
+class TestInjectProgressPercentages:
+    """Both numbers land on the alert metadata, from one merged patch."""
+
+    def test_publishes_both_percentages(self):
+        merged = {
+            "phase": "installing",
+            "progress_percent": 99,
+            "layers_complete": 7,
+            "layers_total": 14,
+        }
+        utils._inject_progress_percentages(merged)
+        assert merged["stage_progress_percent"] == 50
+        assert merged["overall_progress_percent"] == 63
+
+    def test_omits_both_on_a_phase_with_nothing_to_report(self):
+        merged = {"phase": "container_probe_unconfirmed"}
+        utils._inject_progress_percentages(merged)
+        assert "stage_progress_percent" not in merged
+        assert "overall_progress_percent" not in merged
 
 
 class TestCoerceLayerCount:
