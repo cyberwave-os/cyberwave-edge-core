@@ -6297,6 +6297,11 @@ def _reconcile_worker_watcher(
                 and any(workers_dir.glob("*.py"))
                 and not _edge_core_restart_in_progress()
             ),
+            # A container in ``running`` state whose worker is still loading
+            # models is healthy but not usable. The worker publishes its own
+            # milestones (see ``worker_readiness``), so ``worker status`` can
+            # finally tell the two apart; a single file stat per probe.
+            readiness_probe=worker_manager.is_worker_ready,
         )
         worker_manager.set_health_monitor(health_monitor)
         _set_monitored_worker_manager(worker_manager)
@@ -6334,6 +6339,15 @@ def _reconcile_worker_watcher(
 
     # Run health probe each cycle to detect spontaneous exits / crash loops.
     existing_watcher.check_health()
+
+    # Advance any open ``worker_starting`` card. A running container is not a
+    # usable worker — the process inside is still loading and warming up
+    # models — so the card is closed here, on the worker's own milestones,
+    # rather than when ``docker run`` returns.
+    try:
+        existing_watcher.worker_manager.poll_startup_readiness()
+    except Exception:
+        logger.exception("Unexpected error polling worker startup readiness")
 
     existing_watcher.reconcile_worker_files()
     return existing_watcher

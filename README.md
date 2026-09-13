@@ -379,6 +379,23 @@ After `docker run --detach`, Edge Core polls the container status for up to 30 s
 
 This resilient approach ensures that slow container startups on resource-constrained devices (e.g. Raspberry Pi) do not block the rest of Edge Core's boot sequence.
 
+### Worker readiness
+
+A `running` container is not yet a usable worker. The process inside still has to import your worker modules (downloading model weights the first time), connect to MQTT, subscribe its hooks and run warm-up inference — minutes on a cold device.
+
+The worker reports each of those milestones to `/run/cyberwave/worker-status.json`, which Edge Core mounts into the container and reads once per reconcile cycle (every 15 s). The `worker_starting` alert stays open across the whole sequence, so the dashboard shows `Loading models` or `Warming up models — 2 of 5 models` instead of going quiet the moment the container starts, and a workflow run dispatched to the device explains what it is waiting for rather than appearing stalled.
+
+- **`ready`**: the alert resolves.
+- **Container exits during startup**: the alert reports the failure and the phase it reached.
+- **`CYBERWAVE_WORKER_READY_TIMEOUT_SECONDS` elapsed** (default 15 minutes): the alert reports that the worker took too long to load its models.
+- **No status file within 60 seconds**: the worker image predates status reporting, so Edge Core falls back to treating a running container as started.
+
+The readiness timeout is measured from the container's own start timestamp rather than from when Edge Core began watching, so a long image pull does not eat into the worker's own startup budget and a container restart resets the clock by itself.
+
+The progress card does not survive an Edge Core restart, though. A graceful restart stops the worker container first, so the next start opens a fresh card. But if Edge Core is killed while the worker container keeps running — an out-of-memory kill, a watchdog reset, a crash loop — the card is resolved on the next boot and is not re-opened for that container, and the worker finishes loading with nothing on screen.
+
+`cat /run/cyberwave/worker-status.json` on the device shows the current phase directly. The file lives on tmpfs, so it costs no flash writes and does not survive a reboot.
+
 ### Worker health monitoring
 
 Edge Core continuously monitors the worker container for spontaneous exits and crash loops:
@@ -449,6 +466,8 @@ Set `CYBERWAVE_BATTERY_WH` to your battery pack's watt-hour capacity to enable a
 | `CYBERWAVE_HARDWARE_WATCHDOG` | `true` | Enable/disable the hardware watchdog (`/dev/watchdog`) |
 | `CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT` | `true` | Enable/disable auto-detected memory limits on ≤4 GB hosts |
 | `CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS` | `30` | Seconds to wait for the worker container to reach `running` state after `docker run` |
+| `CYBERWAVE_WORKER_READY_TIMEOUT_SECONDS` | `900` | Seconds to wait for the worker *process* to finish starting (load and warm up its models) once its container is running |
+| `CYBERWAVE_WORKER_STATUS_PATH` | `/run/cyberwave/worker-status.json` | Where the worker writes its startup milestones. Set by Edge Core on the worker container to match the directory it mounts; override only if `/run` is unavailable |
 | `CYBERWAVE_BATTERY_WH` | _(unset)_ | Battery pack capacity in watt-hours. Enables the battery uptime estimate in the Edge details panel of the dashboard. |
 | `CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T` | _(unset)_ | Set to `1` to use the `-jetson` worker image and NVIDIA runtime on a Jetson below L4T r38 (JetPack 7). See the accelerator precedence list below. |
 

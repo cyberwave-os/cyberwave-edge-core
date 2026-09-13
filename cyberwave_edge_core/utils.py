@@ -35,8 +35,26 @@ _STARTUP_PULLING_PHASES: frozenset[str] = frozenset({"pull_started", "pulling", 
 #: two get comparable shares.  Container start is the short phase, but it is
 #: reported in discrete steps rather than continuously, so it keeps enough
 #: room for those steps to read as progress.
-_DOWNLOAD_BAND_END = 45
-_INSTALL_BAND_END = 80
+#:
+#: The final band belongs to the worker process itself.  ``container_running``
+#: used to return 100, putting the bar at "done" as the slowest phase began.
+_DOWNLOAD_BAND_END = 40
+_INSTALL_BAND_END = 70
+_CONTAINER_BAND_END = 80
+
+#: Progress *within the worker-startup stage* for each phase the worker
+#: reports.  Mirrors the ``PHASE_*`` constants in the SDK's
+#: ``cyberwave.workers.status``.  ``warming_up`` is interpolated from model
+#: counts when the worker publishes them.
+_WORKER_STAGE_PERCENTS: dict[str, int] = {
+    "booting": 10,
+    "connecting_mqtt": 25,
+    "loading_models": 40,
+    "subscribed": 65,
+    "warming_up": 75,
+    "ready": 100,
+}
+_WARM_UP_STAGE_START = 75
 
 
 def _compute_stage_progress_percent(
@@ -45,11 +63,14 @@ def _compute_stage_progress_percent(
     *,
     layers_complete: int = 0,
     layers_total: int = 0,
+    models_ready: int = 0,
+    models_total: int = 0,
 ) -> int | None:
     """Progress *within the current startup stage*, 0–100.
 
-    Startup runs three stages — download, install, container start — and this
-    gives each its own 0–100. The alert's phase copy names the stage on screen
+    Startup runs four stages — download, install, container start, and the
+    worker's own boot inside the started container — and this gives each its
+    own 0–100. The alert's phase copy names the stage on screen
     ("Downloading worker image", "Installing worker image", "Starting worker
     container"), so a stage that reads 100 % is one the user can check against
     what they are being told.
@@ -79,7 +100,20 @@ def _compute_stage_progress_percent(
         return 66
     if phase == "container_running":
         return 100
-    return None
+
+    worker_stage = _WORKER_STAGE_PERCENTS.get(phase)
+    if worker_stage is None:
+        return None
+    if phase == "warming_up" and models_total > 0:
+        # Per-model completion, for the same reason ``installing`` tracks
+        # layers: warm-up is serial and slow, and a number that stands still
+        # through it reads as a hang.
+        fraction = max(0.0, min(1.0, models_ready / models_total))
+        span = 100 - _WARM_UP_STAGE_START
+        # Capped below 100: only ``ready`` claims completion, and it is
+        # published after the replay that follows the last model.
+        return _WARM_UP_STAGE_START + min(span - 1, round(fraction * span))
+    return worker_stage
 
 
 def _compute_overall_progress_percent(
@@ -88,6 +122,8 @@ def _compute_overall_progress_percent(
     *,
     layers_complete: int = 0,
     layers_total: int = 0,
+    models_ready: int = 0,
+    models_total: int = 0,
 ) -> int | None:
     """Lifecycle-wide 0–100, monotone across download → install → start.
 
@@ -100,6 +136,17 @@ def _compute_overall_progress_percent(
     it still names the stage, and ``stage_progress_percent`` carries the
     per-stage figure for a stage-aware bar to use once one exists.
 
+    The bands:
+
+    * **Download** (0–40 %) — layer-byte progress from docker pull.
+    * **Install**  (40–70 %) — decompression, driven by layer completion.
+    * **Container** (70–80 %) — create → start → probe → running.
+    * **Worker**   (80–100 %) — boot → connect → load models → warm up → ready.
+
+    Sized by how long each stage actually takes, not by how many steps it has:
+    extraction outlasts the bytes, and the worker's own startup outlasts the
+    container start by orders of magnitude on a cold device.
+
     Returns ``None`` on the same phases :func:`_compute_stage_progress_percent`
     does.
     """
@@ -108,6 +155,8 @@ def _compute_overall_progress_percent(
         download_percent,
         layers_complete=layers_complete,
         layers_total=layers_total,
+        models_ready=models_ready,
+        models_total=models_total,
     )
     if stage is None:
         return None
@@ -118,11 +167,21 @@ def _compute_overall_progress_percent(
         return round(stage * _DOWNLOAD_BAND_END / 100)
     if phase in ("pull_complete", "pull_skipped", "pull_stream_finished"):
         return _INSTALL_BAND_END
-    return _INSTALL_BAND_END + round(stage * (100 - _INSTALL_BAND_END) / 100)
+    if phase in _WORKER_STAGE_PERCENTS:
+        # The container is already up; this stage is the worker inside it.
+        span = 100 - _CONTAINER_BAND_END
+        overall = _CONTAINER_BAND_END + round(stage * span / 100)
+        # Only ``ready`` claims completion: the band is narrow enough that
+        # rounding the last warm-up step would otherwise land on 100.
+        return overall if phase == "ready" else min(99, overall)
+    return _INSTALL_BAND_END + round(
+        stage * (_CONTAINER_BAND_END - _INSTALL_BAND_END) / 100
+    )
 
 
 def _coerce_layer_count(value: Any) -> int:
-    """Read a layer count out of alert metadata, tolerating junk."""
+    """Read a non-negative count (layers, models) out of alert metadata.
+    Anything else reads as 0, degrading the bar rather than raising."""
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
@@ -140,13 +199,26 @@ def _inject_progress_percentages(merged: dict[str, Any]) -> None:
     complete = _coerce_layer_count(merged.get("layers_complete"))
     total = _coerce_layer_count(merged.get("layers_total"))
 
+    models_ready = _coerce_layer_count(merged.get("models_ready"))
+    models_total = _coerce_layer_count(merged.get("models_total"))
+
     overall = _compute_overall_progress_percent(
-        phase, download, layers_complete=complete, layers_total=total
+        phase,
+        download,
+        layers_complete=complete,
+        layers_total=total,
+        models_ready=models_ready,
+        models_total=models_total,
     )
     if overall is not None:
         merged["overall_progress_percent"] = overall
     stage = _compute_stage_progress_percent(
-        phase, download, layers_complete=complete, layers_total=total
+        phase,
+        download,
+        layers_complete=complete,
+        layers_total=total,
+        models_ready=models_ready,
+        models_total=models_total,
     )
     if stage is not None:
         merged["stage_progress_percent"] = stage
@@ -203,6 +275,13 @@ _WORKER_FAILED_DESCRIPTIONS: dict[str, str] = {
     "pull_oserror": "Could not start the download. Please try again.",
     "pull_oserror_using_local": "Could not start the download. Please try again.",
     "pull_unexpected": "An unexpected error occurred. Please contact support.",
+    # From ``poll_startup_readiness``: the container started but the worker
+    # inside never became usable. Distinct copy because the remedy differs —
+    # the container is up and its logs are worth reading.
+    "worker_ready_timeout": (
+        "Your worker started but took too long to load its models. Please try again."
+    ),
+    "worker_startup_exited": "Your worker stopped while starting up. Please try again.",
 }
 
 

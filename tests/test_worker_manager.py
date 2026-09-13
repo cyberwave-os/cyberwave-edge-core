@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import threading
@@ -24,6 +25,7 @@ import pytest
 
 import cyberwave_edge_core.driver_selection as driver_selection
 import cyberwave_edge_core.worker_manager as wm_module
+from cyberwave_edge_core._clock import FakeMonotonicClock
 from cyberwave_edge_core.worker_manager import WorkerManager, get_zenoh_env_vars
 
 
@@ -2573,7 +2575,7 @@ class TestWorkerStartingNotification:
     """
 
     @pytest.fixture(autouse=True)
-    def _stub_alerts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _stub_alerts(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         # Patch the attribute rather than the module: ``startup`` imports other
         # names from ``utils``, so swapping the whole module breaks the import.
         import cyberwave_edge_core.utils as utils_module
@@ -2581,6 +2583,18 @@ class TestWorkerStartingNotification:
         _RecordingAlertCtx.instances = []
         monkeypatch.setattr(
             utils_module, "WorkerStartingAlertContext", _RecordingAlertCtx, raising=False
+        )
+        # Keep the worker status file inside the test's tmp dir rather than
+        # the real ``/run/cyberwave``.
+        monkeypatch.setattr(wm_module, "default_status_dir", lambda _cfg: tmp_path / "run")
+
+    @staticmethod
+    def _publish_status(manager: WorkerManager, phase: str, **extra: object) -> None:
+        """Write what the worker inside the container would have written."""
+        status_path = manager._status_path()
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"version": 1, "phase": phase, **extra}), encoding="utf-8"
         )
 
     def _stub_container_start(
@@ -2608,7 +2622,7 @@ class TestWorkerStartingNotification:
 
         def fake_pull(image: str, timeout: int = 600) -> bool:
             # Snapshot what the card looked like mid-pull.
-            pull_state["open"] = len(worker_manager._starting_alert_ctxs)
+            pull_state["open"] = len(worker_manager._card.ctxs)
             pull_state["resolved"] = [c.resolved for c in _RecordingAlertCtx.instances]
             return True
 
@@ -2622,9 +2636,13 @@ class TestWorkerStartingNotification:
         assert pull_state["resolved"] == [False, False]
         assert all(ctx.created for ctx in _RecordingAlertCtx.instances)
 
-    def test_reports_starting_then_running_then_resolves(
+    def test_card_stays_open_when_the_container_reaches_running(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """``running`` is not the end of startup: the worker inside still has
+        to load and warm up its models. Resolving here — which this code used
+        to do — told the pending-reason copy and the stuck-run sweeper that the
+        device had finished starting."""
         self._stub_container_start(monkeypatch)
         monkeypatch.setattr(
             worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
@@ -2634,8 +2652,259 @@ class TestWorkerStartingNotification:
 
         for ctx in _RecordingAlertCtx.instances:
             assert ctx.phases == ["starting_container", "container_running"]
+            assert ctx.resolved is False, "the worker has not reported ready yet"
+            assert ctx.failed is None
+
+    def test_card_resolves_on_the_tick_after_the_worker_reports_ready(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole sequence: container up, worker reports, reconcile closes."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "ready")
+        worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
             assert ctx.resolved is True
             assert ctx.failed is None
+            assert ctx.phases[-1] == "ready"
+
+    def test_card_reports_the_worker_loading_its_models(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The phases that used to be invisible reach the card."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "warming_up", models_ready=1, models_total=3)
+        worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            warm = next(p for p in ctx.patches if p.get("phase") == "warming_up")
+            assert warm["models_ready"] == 1
+            assert warm["models_total"] == 3
+            assert ctx.resolved is False
+
+    def test_repeated_ticks_do_not_republish_an_unchanged_phase(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Alert updates bypass the throttle, so an unchanged phase must not
+        cost one API call per reconcile tick for the whole startup."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        for _ in range(5):
+            worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.phases.count("loading_models") == 1
+
+    def test_a_dead_container_fails_the_card_on_the_next_tick(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        monkeypatch.setattr(
+            wm_module, "docker_inspect", lambda *_a, **_kw: {"State": {"Status": "exited"}}
+        )
+        worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is True
+            assert ctx.failed == "worker_startup_exited"
+
+    def test_an_unanswered_inspect_during_the_pull_does_not_fail_the_card(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The card is opened *before* the pull, so for minutes there is no
+        container to inspect. ``docker_inspect`` returns ``None`` for that and
+        for a daemon that would not answer alike, and a reconcile tick landing
+        in that window must not report a worker that stopped while starting up
+        — the pull is still running and will succeed.
+        """
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(wm_module, "docker_inspect", lambda *_a, **_kw: None)
+        worker_manager._open_starting_alerts("img")
+
+        for _ in range(10):
+            worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is False
+            assert ctx.failed is None
+
+    def test_one_unanswered_inspect_does_not_fail_a_running_worker(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``docker inspect`` has its own 10 s timeout, and a device pulling a
+        multi-GB image is exactly where it blows. One unanswered sample is not
+        evidence that a worker mid-``loading_models`` has died."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        worker_manager.poll_startup_readiness()
+
+        monkeypatch.setattr(wm_module, "docker_inspect", lambda *_a, **_kw: None)
+        worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is False
+            assert ctx.failed is None
+
+    def test_a_container_that_stays_unobservable_is_eventually_reported_gone(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Tolerating a miss must not mean tolerating every miss: a container
+        removed under a live card still has to retire it rather than leave a
+        spinner up forever."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        worker_manager.poll_startup_readiness()
+
+        monkeypatch.setattr(wm_module, "docker_inspect", lambda *_a, **_kw: None)
+        for _ in range(wm_module._READINESS_INSPECT_MISS_LIMIT):
+            worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is True
+            assert ctx.failed == "worker_startup_exited"
+
+    def test_a_restart_does_not_inherit_the_previous_container_sighting(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A restart reuses the open card, so the readiness state behind it has
+        to start over with the new container.
+
+        ``_open_starting_alerts`` no-ops while a card is live, and the restart
+        ``docker rm``s the container before re-pulling. If the sighting of the
+        previous container survived that, the polls landing during the re-pull
+        would count missed inspects against a container already removed and
+        fail a startup that is proceeding normally.
+        """
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        worker_manager.poll_startup_readiness()  # sees the first container
+
+        def repull_with_reconcile_ticks(*_a: object, **_kw: object) -> bool:
+            # The container is gone and the image is downloading: what every
+            # tick during a multi-minute re-pull observes.
+            monkeypatch.setattr(wm_module, "docker_inspect", lambda *_a, **_kw: None)
+            for _ in range(wm_module._READINESS_INSPECT_MISS_LIMIT + 2):
+                worker_manager.poll_startup_readiness()
+            self._stub_container_start(monkeypatch)
+            return True
+
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", repull_with_reconcile_ticks
+        )
+
+        assert worker_manager._run_container() is True
+
+        # The restart retires the first startup's cards and opens fresh ones
+        # (see ``_open_starting_alerts``); those fresh ones are what must have
+        # survived the re-pull.
+        assert all(ctx.failed is None for ctx in _RecordingAlertCtx.instances)
+        live = [ctx for ctx in _RecordingAlertCtx.instances if not ctx.resolved]
+        assert len(live) == 2, "one live card per twin covering the restart"
+        for ctx in live:
+            assert ctx.phases[-1] == "container_running"
+
+    def test_a_phase_that_never_changes_still_keeps_the_card_alive(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``loading_models`` publishes once however long the weights take, so
+        without a keepalive the alert goes untouched until the backend's own
+        staleness window drops it and fails the run under a working device."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+        clock = FakeMonotonicClock()
+        monkeypatch.setattr(wm_module, "now_monotonic", clock)
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        worker_manager.poll_startup_readiness()
+        # Two keepalive intervals of the same phase, sampled every 15 s.
+        for _ in range(2 * wm_module._READINESS_KEEPALIVE_SECONDS // 15):
+            clock.advance(15)
+            worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.phases.count("loading_models") == 3, (
+                "the first publish plus one per keepalive interval, "
+                "not one per reconcile tick"
+            )
+            assert ctx.resolved is False
+
+    def test_polling_without_an_open_card_is_a_no_op(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The steady-state cost on every reconcile tick of an idle edge."""
+        self._stub_container_start(monkeypatch)
+        inspected: list[str] = []
+        monkeypatch.setattr(
+            wm_module,
+            "docker_inspect",
+            lambda name, *_a, **_kw: inspected.append(name),
+        )
+
+        worker_manager.poll_startup_readiness()
+
+        assert inspected == []
+        assert _RecordingAlertCtx.instances == []
+
+    def test_a_second_start_is_never_silent(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A restart while the first card is still open must still show one.
+
+        ``_open_starting_alerts`` no-ops while any card is open, so the second
+        startup relies on the first card still being live and being re-patched
+        rather than on a fresh one.
+        """
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        assert worker_manager._run_container() is True
+
+        live = [ctx for ctx in _RecordingAlertCtx.instances if not ctx.resolved]
+        assert len(live) == 2, "one live card per twin covering the second startup"
+        for ctx in live:
+            assert ctx.phases[-1] == "container_running"
 
     def test_notifies_even_when_the_image_is_already_local(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
@@ -2691,7 +2960,7 @@ class TestWorkerStartingNotification:
             container_name=worker_manager._container_name,
         )
         leaked.create()
-        worker_manager._starting_alert_ctxs = [leaked]
+        worker_manager._card.ctxs = [leaked]
         _RecordingAlertCtx.instances = []
 
         assert worker_manager._run_container() is True
@@ -2702,7 +2971,9 @@ class TestWorkerStartingNotification:
         assert len(_RecordingAlertCtx.instances) == 2
         for ctx in _RecordingAlertCtx.instances:
             assert ctx.phases == ["starting_container", "container_running"]
-            assert ctx.resolved is True
+            # Still open: `container_running` is no longer the end of startup,
+            # and `poll_startup_readiness` closes the card on a later tick.
+            assert ctx.resolved is False
 
     def test_no_twins_means_no_card(
         self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
@@ -2756,7 +3027,8 @@ class TestWorkerStartingNotification:
         assert len(_RecordingAlertCtx.instances) == 2
         for ctx in _RecordingAlertCtx.instances:
             assert ctx.failed is None, "a successful startup must not report failure"
-            assert ctx.resolved is True
+            # Still open: readiness polling closes it on a later tick.
+            assert ctx.resolved is False
             # The whole sequence lands on the one card, fallback download included.
             assert ctx.phases == [
                 "pull_failed",
@@ -2765,3 +3037,205 @@ class TestWorkerStartingNotification:
                 "starting_container",
                 "container_running",
             ]
+
+    def test_a_card_opened_by_one_manager_is_closed_by_the_reconcile_tick(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The card belongs to the container, not to whichever manager opened it.
+
+        Nothing in edge-core builds one ``WorkerManager`` and keeps it: the
+        boot path builds its own (``_start_worker_after_drivers``), the runtime
+        loop's watcher builds another — and the watcher's is the only one
+        ``poll_startup_readiness`` is ever called on. While the card lived on
+        the instance, the ordinary boot path therefore opened one that nothing
+        polled: it stayed up until the next edge-core boot, and the run's
+        ``pending_reason`` read "Starting the worker" for a worker already
+        serving runs.
+        """
+        self._stub_container_start(monkeypatch)
+
+        def build() -> WorkerManager:
+            return WorkerManager(
+                config_dir=tmp_config,
+                environment_uuid="aabbccdd-eeff-0011-2233-445566778899",
+                token="testtoken1234",
+                twin_uuids=["twin-uuid-1", "twin-uuid-2"],
+            )
+
+        boot_manager = build()
+        monkeypatch.setattr(
+            boot_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+        assert boot_manager._run_container() is True
+        assert _RecordingAlertCtx.instances
+        assert all(not ctx.resolved for ctx in _RecordingAlertCtx.instances)
+
+        watcher_manager = build()
+        assert watcher_manager is not boot_manager
+        self._publish_status(watcher_manager, "ready")
+        watcher_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is True, "the tick that polls is not the one that opened"
+            assert ctx.failed is None
+            assert ctx.phases[-1] == "ready"
+
+    def test_a_forward_clock_step_does_not_fail_a_healthy_worker(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Elapsed is ``now - StartedAt``, so a clock step lands on it whole.
+
+        A device without an RTC boots at the epoch and gets stepped forward
+        the moment NTP lands — and on the warm-image path there is no pull to
+        wait for, so the container starts seconds into boot and the step falls
+        squarely inside worker startup. A jump past the ready timeout would
+        report a worker that is loading normally as failed.
+        """
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+        clock = FakeMonotonicClock()
+        monkeypatch.setattr(wm_module, "now_monotonic", clock)
+
+        started_ns = time.time_ns() - 30 * 1_000_000_000
+        monkeypatch.setattr(wm_module, "docker_inspect", lambda *_a, **_kw: _started_at(started_ns))
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        worker_manager.poll_startup_readiness()
+
+        # NTP steps the clock an hour forward. Same instant, same container;
+        # ``StartedAt`` now reads an hour and a half back.
+        stepped_ns = started_ns - 3600 * 1_000_000_000
+        monkeypatch.setattr(wm_module, "docker_inspect", lambda *_a, **_kw: _started_at(stepped_ns))
+        clock.advance(15)
+        worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.failed is None, "an NTP step is not a worker that took too long"
+            assert ctx.resolved is False
+
+    def test_a_restarting_container_does_not_hold_the_card_open_forever(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A crash loop leaves no trace in the two facts the poll reads.
+
+        The worker runs under ``--restart unless-stopped``: between crash and
+        restart Docker parks the container in ``restarting``, which is not a
+        dead state, and every restart rewrites ``StartedAt``, which resets
+        elapsed. So neither the dead-container rule nor the readiness timeout
+        can fire, and a worker crash-looping on a missing checkpoint holds the
+        card open until the next edge-core boot.
+        """
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        self._publish_status(worker_manager, "loading_models")
+        monkeypatch.setattr(
+            wm_module,
+            "docker_inspect",
+            lambda *_a, **_kw: {"State": {"Status": "restarting"}, "RestartCount": 3},
+        )
+        worker_manager.poll_startup_readiness()
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is True
+            assert ctx.failed == "worker_startup_exited"
+
+    def test_stop_closes_a_card_left_by_a_container_that_already_exited(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``stop()`` short-circuits on a container that is already down —
+        which is exactly the state a container that died mid-startup is in,
+        with its card still open. Returning before the close left the spinner
+        up for a worker nobody is bringing back."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+        assert worker_manager._run_container() is True
+
+        monkeypatch.setattr(wm_module, "docker_available", lambda: True)
+        monkeypatch.setattr(wm_module, "docker_container_status", lambda *_a, **_kw: "exited")
+
+        assert worker_manager.stop(reason="workers-dir-empty") is True
+
+        for ctx in _RecordingAlertCtx.instances:
+            assert ctx.resolved is True
+            assert ctx.failed is None, "an operator stopping the worker is not a failure"
+
+    def test_a_worker_that_has_not_reported_yet_is_not_ready(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``clear_status()`` runs just before ``docker run``, so a new worker
+        has no record at all for its first seconds. Absence of a record means
+        "old image, assume ready" only once the card has closed — while one is
+        open it means the opposite."""
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(
+            worker_manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True
+        )
+
+        assert worker_manager._run_container() is True
+        assert worker_manager.is_worker_ready() is False
+
+        # ``evaluate_readiness`` closes the card on the grace window when no
+        # record ever arrives — the old-image case, which still needs the
+        # optimistic reading.
+        worker_manager._close_starting_alerts()
+        assert worker_manager.is_worker_ready() is True
+
+
+class TestStatusDirResolution:
+    def test_a_transient_failure_is_not_cached_for_the_process(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``/run`` can be unavailable very early in boot. Remembering that
+        answer disabled startup-phase reporting for the whole process — every
+        worker started afterwards reported nothing."""
+        monkeypatch.setattr(wm_module, "default_status_dir", lambda _cfg: tmp_path / "run")
+        broken = {"yes": True}
+
+        def flaky(path: Path) -> None:
+            if broken["yes"]:
+                raise OSError("/run is not mounted yet")
+
+        monkeypatch.setattr(wm_module, "_ensure_dir_writable_by_container_user", flaky)
+
+        assert worker_manager._status_dir() is None
+
+        broken["yes"] = False
+        assert worker_manager._status_dir() == tmp_path / "run"
+
+    def test_a_resolved_directory_is_cached(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The success path still resolves once: mkdir and chown per poll
+        would be a syscall pair on every reconcile tick."""
+        monkeypatch.setattr(wm_module, "default_status_dir", lambda _cfg: tmp_path / "run")
+        calls: list[Path] = []
+        monkeypatch.setattr(
+            wm_module, "_ensure_dir_writable_by_container_user", lambda p: calls.append(p)
+        )
+
+        assert worker_manager._status_dir() == tmp_path / "run"
+        assert worker_manager._status_dir() == tmp_path / "run"
+        assert len(calls) == 1
+
+
+def test_keepalive_stays_under_the_backend_staleness_window() -> None:
+    """Edge-core's keepalive must stay well under the backend's staleness
+    window, ``WORKER_STARTING_ALERT_STALE_SECONDS`` (900 s) in
+    ``src/app/services/workflow_execution_pending.py``.
+
+    If it ever exceeds it the failures correlate: a device that is working
+    goes silent, ``sweep_stuck_edge_manual_executions`` fails the row, *and*
+    ``retry_run_workflow_worker_command`` stops re-publishing, so the run
+    cannot recover either. Separate deployables, so neither end can import the
+    other's constant — this test and its backend twin are the only link.
+    """
+    assert wm_module._READINESS_KEEPALIVE_SECONDS <= 300

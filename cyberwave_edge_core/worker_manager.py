@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from ._clock import now_monotonic
 from .docker_args import (
     _rewrite_macos_container_base_url,
     _rewrite_macos_container_hostname,
@@ -45,6 +46,15 @@ from .driver_selection import (
     jetson_accelerator_supported,
     jetson_l4t_major,
 )
+from .worker_readiness import (
+    DEFAULT_READY_TIMEOUT_SECONDS,
+    READY_PHASE,
+    WORKER_STATUS_FILENAME,
+    clear_status,
+    default_status_dir,
+    evaluate_readiness,
+    read_status,
+)
 from .zenoh_config import ZenohConfig, build_zenoh_env_vars
 
 if TYPE_CHECKING:
@@ -64,6 +74,147 @@ _MUTABLE_TAG_BASENAMES = frozenset(
 )
 
 _DEFAULT_STARTUP_PROBE_SECONDS = 30
+
+#: Consecutive unobservable readiness ticks tolerated *after* the container
+#: has been seen once, before it is reported gone. ``docker_inspect`` cannot
+#: tell "no such container" from "the daemon would not answer", so a single
+#: miss is not evidence of a death.
+_READINESS_INSPECT_MISS_LIMIT = 4
+
+#: Re-send an unchanged startup patch at least this often. A phase that
+#: publishes once (``loading_models`` runs for as long as the weights take)
+#: would otherwise leave the alert untouched until the backend's own
+#: staleness window drops it and the run is failed under a working device.
+_READINESS_KEEPALIVE_SECONDS = 5 * 60
+
+
+def _readiness_timeout_seconds() -> float:
+    """How long to wait for the worker to report ``ready``. Override with
+    ``CYBERWAVE_WORKER_READY_TIMEOUT_SECONDS`` on slow-loading devices."""
+    from .startup import get_runtime_env_var
+
+    override = get_runtime_env_var("CYBERWAVE_WORKER_READY_TIMEOUT_SECONDS")
+    if override:
+        try:
+            return float(max(1, int(override)))
+        except ValueError:
+            logger.warning(
+                "Invalid CYBERWAVE_WORKER_READY_TIMEOUT_SECONDS=%r; using default %ds",
+                override,
+                DEFAULT_READY_TIMEOUT_SECONDS,
+            )
+    return float(DEFAULT_READY_TIMEOUT_SECONDS)
+
+
+def _inspect_status(inspect: dict[str, Any] | None) -> str:
+    """Container status from a ``docker inspect`` payload, ``"none"`` if absent."""
+    if inspect is None:
+        return "none"
+    state = inspect.get("State")
+    if not isinstance(state, dict):
+        return "unknown"
+    return str(state.get("Status", "unknown")).lower()
+
+
+def _container_uptime_seconds(inspect: dict[str, Any] | None) -> float | None:
+    """Seconds since the container started, from its own ``StartedAt``.
+
+    Docker is the clock, not this process, so the readiness timeout keeps
+    running across an edge-core restart. ``None`` when Docker did not say —
+    per ``parse_docker_timestamp_ns``, unknown is not zero, and the caller
+    decides what to substitute.
+    """
+    if inspect is None:
+        return None
+    state = inspect.get("State")
+    if not isinstance(state, dict):
+        return None
+    started_ns = parse_docker_timestamp_ns(str(state.get("StartedAt") or ""))
+    if started_ns is None:
+        return None
+    return max(0.0, time.time() - started_ns / 1_000_000_000)
+
+
+def _container_restart_count(inspect: dict[str, Any] | None) -> int:
+    """Docker's own count of restarts for this container, 0 when unknown."""
+    if inspect is None:
+        return 0
+    value = inspect.get("RestartCount")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 0
+
+
+@dataclass
+class _StartupCard:
+    """The ``worker_starting`` alerts held open for one container, and the
+    readiness state describing them.
+
+    Module-level and keyed by container name rather than held per
+    ``WorkerManager``, because the object that *opens* a card is routinely not
+    the object that closes it: the boot path builds one manager
+    (``_start_worker_after_drivers``), the runtime loop's watcher builds
+    another and is the only caller of ``poll_startup_readiness``, and the
+    edge-restart helper builds a third. A card that belonged to whichever
+    instance happened to open it was simply never polled on the ordinary boot
+    path, leaving a spinner up until the next edge-core boot.
+    """
+
+    ctxs: list[Any] = field(default_factory=list)
+    #: Last readiness patch pushed, so a tick that observes no change doesn't
+    #: re-send it (alert updates bypass the throttle), and when it went out,
+    #: so a phase that never changes still keeps the card alive for the
+    #: backend.
+    last_patch: dict[str, Any] | None = None
+    last_patch_at: float = 0.0
+    #: Whether ``docker inspect`` has answered for this startup yet, and how
+    #: many ticks running it has not. Until it answers once, "no container" is
+    #: the pull still being in flight, not a death.
+    container_seen: bool = False
+    inspect_misses: int = 0
+    #: Container age at our first sighting, and the monotonic reading taken
+    #: alongside it. Together they project an elapsed time that a wall-clock
+    #: step cannot move — see :meth:`WorkerManager._readiness_elapsed_seconds`.
+    uptime_baseline: float = 0.0
+    uptime_baseline_at: float | None = None
+
+    def reset_tracking(self) -> None:
+        """Forget everything learned about the startup currently being watched,
+        keeping the open contexts. Called wherever the card this state
+        describes is about to be re-used for a fresh container."""
+        self.last_patch = None
+        self.last_patch_at = 0.0
+        self.container_seen = False
+        self.inspect_misses = 0
+        self.uptime_baseline = 0.0
+        self.uptime_baseline_at = None
+
+    # A card is now reachable from more than one thread — the runtime loop
+    # polls it while an MQTT command handler can be starting a container. The
+    # two mutations are locked so a context opened by one cannot be dropped by
+    # the other's detach. Resolving is deliberately left outside the lock: it
+    # is network I/O.
+    def add_ctx(self, ctx: Any) -> None:
+        """Hold one more alert context open on this card."""
+        with _STARTUP_CARD_LOCK:
+            self.ctxs.append(ctx)
+
+    def take_ctxs(self) -> list[Any]:
+        """Detach every open context, leaving the card empty."""
+        with _STARTUP_CARD_LOCK:
+            ctxs, self.ctxs = self.ctxs, []
+        return ctxs
+
+
+_STARTUP_CARD_LOCK = threading.Lock()
+_STARTUP_CARDS: dict[str, _StartupCard] = {}
+
+
+def _startup_card(container_name: str) -> _StartupCard:
+    """The shared startup card for *container_name*, created on first use."""
+    with _STARTUP_CARD_LOCK:
+        return _STARTUP_CARDS.setdefault(container_name, _StartupCard())
+
 
 # Coordinates concurrent worker-image pulls so a second ``WorkerManager.start()``
 # waits for an in-flight pull instead of failing immediately with
@@ -491,12 +642,20 @@ class WorkerManager:
         self._image = image
         self._resource_limits = resource_limits
         self._container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
-        # ``worker_starting`` alerts held open across one startup: raised
-        # before the pull, resolved once the container is confirmed running.
-        # Held on the manager (rather than a local) so the pull helper can
-        # adopt them and ``_send_startup_failure_alert`` can close them.
-        self._starting_alert_ctxs: list[Any] = []
         self._health_monitor: Optional["WorkerHealthMonitor"] = None
+        # Resolved once (mkdir/chown) and reused; derived from ``config_dir``.
+        self._status_dir_cache: Optional[Path] = None
+        self._status_dir_resolved = False
+
+    @property
+    def _card(self) -> _StartupCard:
+        """The ``worker_starting`` card for this manager's container.
+
+        Shared across every ``WorkerManager`` built for the same container:
+        the card is a property of the startup, not of whichever instance
+        opened it. See :class:`_StartupCard`.
+        """
+        return _startup_card(self._container_name)
 
     def set_health_monitor(self, monitor: "WorkerHealthMonitor") -> None:
         """Attach a WorkerHealthMonitor to this manager.
@@ -596,6 +755,14 @@ class WorkerManager:
             return True
 
         current_status = docker_container_status(self._container_name)
+        # Nothing is starting up any more, whatever state the container is in:
+        # retire the card rather than let it time out into a startup failure
+        # for a worker the operator stopped. Above the short-circuit below,
+        # because a container that died mid-startup lands in ``exited`` with
+        # its card still open — exactly the case that must not be skipped.
+        # Both calls are idempotent and cost nothing when no card is open.
+        self._reset_readiness_tracking()
+        self._close_starting_alerts()
         if current_status in {"none", "exited", "created"}:
             logger.debug(
                 "Worker container %s already in non-running state %r; nothing to stop",
@@ -775,6 +942,9 @@ class WorkerManager:
             "CYBERWAVE_API_KEY": self._token,
             "CYBERWAVE_EDGE_CONFIG_DIR": "/app/.cyberwave",
             "CYBERWAVE_DATA_BACKEND": "zenoh",
+            # Same path inside the container as on the host, so one value
+            # describes both ends.
+            "CYBERWAVE_WORKER_STATUS_PATH": str(self._status_path()),
         }
 
         if self._environment_uuid:
@@ -857,7 +1027,7 @@ class WorkerManager:
         models_dir.mkdir(parents=True, exist_ok=True)
         _ensure_dir_writable_by_container_user(models_dir)
 
-        return [
+        args = [
             "-v",
             f"{config_dir}:/app/.cyberwave",
             "-v",
@@ -865,6 +1035,58 @@ class WorkerManager:
             "-v",
             f"{models_dir}:/app/models",
         ]
+
+        # The worker writes startup milestones here for the readiness
+        # watcher. If the directory can't be prepared the worker reports
+        # nothing and the watcher falls back to "running means started".
+        status_dir = self._status_dir()
+        if status_dir is not None:
+            args += ["-v", f"{status_dir}:{status_dir}"]
+        return args
+
+    def _status_dir(self) -> Path | None:
+        """Prepare and return the host dir holding the worker status file.
+
+        Prefers tmpfs, falling back to the config directory when that isn't
+        writable — edge-core does not always run as root, and reporting
+        nothing is worse than a handful of writes to disk. ``None`` when
+        neither works.
+        """
+        if self._status_dir_resolved:
+            return self._status_dir_cache
+
+        candidates = [default_status_dir(self._config_dir), self._config_dir / "run"]
+        for candidate in dict.fromkeys(candidates):  # de-dup, order preserved
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                _ensure_dir_writable_by_container_user(candidate)
+            except OSError:
+                logger.debug(
+                    "Could not prepare worker status dir %s", candidate, exc_info=True
+                )
+                continue
+            self._status_dir_cache = candidate
+            self._status_dir_resolved = True
+            return candidate
+
+        logger.warning(
+            "No writable worker status directory; worker startup phases "
+            "will not be reported for %s",
+            self._container_name,
+        )
+        # Deliberately not cached: ``/run`` can be unavailable very early in
+        # boot, and a transient failure there must not disable phase reporting
+        # for the rest of the process.
+        return None
+
+    def _status_path(self) -> Path:
+        """Full path to the worker status file on the host.
+
+        Resolves through :meth:`_status_dir` so the path handed to the
+        container is always the one actually mounted.
+        """
+        status_dir = self._status_dir() or default_status_dir(self._config_dir)
+        return status_dir / WORKER_STATUS_FILENAME
 
     def _build_network_args(self) -> list[str]:
         """Build network args; mirrors driver container networking."""
@@ -1103,8 +1325,8 @@ class WorkerManager:
         # When ``_run_container`` has already opened the startup alerts, adopt those rather than
         # raising a second set — and leave them open, because the card has to survive past the
         # pull to cover the container start.
-        owns_alerts = not self._starting_alert_ctxs
-        alert_ctxs: list[Any] = list(self._starting_alert_ctxs)
+        owns_alerts = not self._card.ctxs
+        alert_ctxs: list[Any] = list(self._card.ctxs)
         if owns_alerts and self._twin_uuids:
             from .utils import WorkerStartingAlertContext  # noqa: PLC0415
 
@@ -1149,22 +1371,25 @@ class WorkerManager:
     def _open_starting_alerts(self, image: str) -> None:
         """Raise one ``worker_starting`` alert per linked twin for this startup.
 
-        Opened *before* the pull and held until the container is confirmed
-        running, so the user is told the worker is coming up for the whole
-        download → install → start sequence rather than only while bytes are
-        moving. A locally-present image skips the pull entirely, and that is
-        precisely the case where the startup was previously silent.
+        Opened *before* the pull and held until the worker inside the
+        container reports itself ready, so the user is told the worker is
+        coming up for the whole download → install → start → load sequence
+        rather than only while bytes are moving. A locally-present image skips
+        the pull entirely, and that is precisely the case where the startup
+        was previously silent.
 
         Anything still held from an earlier startup is retired first:
         returning early on a non-empty list meant one startup that leaked
         its card (an exception escaping the probe, say) suppressed the card
         for every later startup in the process — a progress bar that works
-        once after an edge-core restart and never again.
+        once after an edge-core restart and never again. That matters more
+        now that a card outlives ``_run_container``, waiting on readiness.
         """
-        if self._starting_alert_ctxs:
+        card = self._card
+        if card.ctxs:
             logger.debug(
                 "Retiring %d worker_starting alert(s) left open by a previous startup",
-                len(self._starting_alert_ctxs),
+                len(card.ctxs),
             )
             self._close_starting_alerts()
         if not self._twin_uuids:
@@ -1182,7 +1407,7 @@ class WorkerManager:
                     container_name=self._container_name,
                 )
                 ctx.create()
-                self._starting_alert_ctxs.append(ctx)
+                card.add_ctx(ctx)
             except Exception:
                 logger.debug(
                     "Could not open worker_starting alert for twin %s",
@@ -1190,17 +1415,20 @@ class WorkerManager:
                     exc_info=True,
                 )
 
-    def _update_starting_alerts(self, patch: dict[str, Any]) -> None:
-        """Push a phase/metadata patch to every open startup alert."""
-        for ctx in self._starting_alert_ctxs:
+    @staticmethod
+    def _patch_alert_ctxs(ctxs: list[Any], patch: dict[str, Any]) -> None:
+        """Push a phase/metadata patch to *ctxs*."""
+        for ctx in ctxs:
             try:
                 ctx.update_metadata(patch, force=True)
             except Exception:
                 logger.debug("Could not update worker_starting alert", exc_info=True)
 
-    def _close_starting_alerts(self, *, failure: str = "", phase: str = "") -> None:
-        """Resolve the startup alerts, optionally marking them failed first."""
-        ctxs, self._starting_alert_ctxs = self._starting_alert_ctxs, []
+    @staticmethod
+    def _resolve_alert_ctxs(
+        ctxs: list[Any], *, failure: str = "", phase: str = ""
+    ) -> None:
+        """Resolve *ctxs*, optionally marking them failed first."""
         for ctx in ctxs:
             try:
                 if failure:
@@ -1209,6 +1437,159 @@ class WorkerManager:
                     ctx.resolve()
             except Exception:
                 logger.debug("Could not close worker_starting alert", exc_info=True)
+
+    def _update_starting_alerts(self, patch: dict[str, Any]) -> None:
+        """Push a phase/metadata patch to every alert the card still holds."""
+        self._patch_alert_ctxs(self._card.ctxs, patch)
+
+    def _close_starting_alerts(self, *, failure: str = "", phase: str = "") -> None:
+        """Resolve the card's alerts, optionally failing them first."""
+        self._resolve_alert_ctxs(
+            self._card.take_ctxs(), failure=failure, phase=phase
+        )
+
+    def _reset_readiness_tracking(self) -> None:
+        """Forget everything learned about the startup currently being watched.
+
+        Called wherever the card this state describes goes away or is about
+        to be replaced, so a new startup never inherits the previous one's
+        phase, keepalive deadline, container sightings or uptime baseline.
+        """
+        self._card.reset_tracking()
+
+    def _readiness_elapsed_seconds(self, inspect: dict[str, Any] | None) -> float:
+        """How long this container has been up, in seconds.
+
+        Docker's ``StartedAt`` is the primary source — it is the only one that
+        survives an edge-core restart, which is the whole reason the readiness
+        budget is measured from it. But it is read against *our* wall clock,
+        and a device without an RTC steps that clock the moment NTP lands,
+        which on the warm-image path is squarely inside worker startup. A
+        forward step of more than the ready timeout would fail a healthy
+        worker.
+
+        So the first sighting also records a monotonic baseline, and every
+        later reading takes the smaller of the two. A wall-clock step can then
+        delay a timeout — the safe direction — but never invent one. When
+        Docker declines to answer, the projection is all we have.
+        """
+        card = self._card
+        wall = _container_uptime_seconds(inspect)
+        now = now_monotonic()
+        if card.uptime_baseline_at is None:
+            if wall is None:
+                return 0.0
+            card.uptime_baseline = wall
+            card.uptime_baseline_at = now
+            return wall
+        projected = card.uptime_baseline + max(0.0, now - card.uptime_baseline_at)
+        if wall is None:
+            return projected
+        return min(wall, projected)
+
+    def poll_startup_readiness(self) -> None:
+        """Advance the open startup alert one step. Called once per reconcile tick.
+
+        No-ops unless a startup card is open, so the cost on a steady-state
+        edge is one attribute check. While one *is* open this reads the
+        worker's status file and either patches the card with the phase the
+        worker reports, or closes it — on ``ready``, on the container dying,
+        or on the readiness timeout.
+        """
+        card = self._card
+        if not card.ctxs:
+            return
+
+        inspect = docker_inspect(self._container_name)
+        if inspect is None:
+            if not self._record_inspect_miss():
+                return
+        else:
+            card.container_seen = True
+            card.inspect_misses = 0
+
+        outcome = evaluate_readiness(
+            read_status(self._status_path()),
+            container_status=_inspect_status(inspect),
+            elapsed_seconds=self._readiness_elapsed_seconds(inspect),
+            ready_timeout_seconds=_readiness_timeout_seconds(),
+            # ``--restart unless-stopped`` rewrites ``StartedAt`` on every
+            # restart, so a crash loop resets the elapsed clock and the
+            # timeout can never fire. The restart itself is the evidence.
+            restart_count=_container_restart_count(inspect),
+        )
+
+        now = now_monotonic()
+        # Re-send an unchanged patch on the keepalive interval, not never:
+        # the backend drops a ``worker_starting`` alert that has gone too
+        # long without a write, and ``loading_models`` publishes exactly
+        # once however long the weights take. The comparison still holds
+        # the steady-state cost to one call per interval, not one per tick.
+        if outcome.patch and (
+            outcome.patch != card.last_patch
+            or (now - card.last_patch_at) >= _READINESS_KEEPALIVE_SECONDS
+        ):
+            card.last_patch = outcome.patch
+            card.last_patch_at = now
+            logger.info(
+                "Worker container %s startup phase: %s",
+                self._container_name,
+                outcome.patch.get("phase"),
+            )
+            self._update_starting_alerts(outcome.patch)
+
+        if outcome.close:
+            if outcome.failure:
+                logger.error(
+                    "Worker container %s startup failed: %s",
+                    self._container_name,
+                    outcome.failure,
+                )
+            else:
+                logger.info("Worker container %s is ready", self._container_name)
+            self._reset_readiness_tracking()
+            self._close_starting_alerts(failure=outcome.failure, phase=outcome.phase)
+
+    def _record_inspect_miss(self) -> bool:
+        """Count one unanswered ``docker inspect``; is the container now gone?
+
+        ``docker_inspect`` returns ``None`` for a container that does not
+        exist *and* for a daemon that would not answer — a transient error,
+        or its own 10 s timeout on a device busy pulling a multi-GB image.
+        The card is opened before the pull, so "no container" is the normal
+        state for minutes; failing the startup on it would report a crash on
+        a device that is working. ``_run_container``'s own probe loop
+        re-samples rather than concluding, and this does the same: the
+        container counts as gone only once it has been seen and has then
+        stayed unobservable for :data:`_READINESS_INSPECT_MISS_LIMIT` ticks.
+        """
+        card = self._card
+        card.inspect_misses += 1
+        if not card.container_seen:
+            return False
+        return card.inspect_misses >= _READINESS_INSPECT_MISS_LIMIT
+
+    def is_worker_ready(self) -> bool:
+        """Whether the worker process has reported itself ready.
+
+        Wired as the ``WorkerHealthMonitor`` readiness probe, and surfaced by
+        ``cyberwave worker status``. Absence of a record reads as ready *once
+        the startup card is closed*: an older worker image never writes one,
+        and before this probe existed the monitor treated every running
+        container as ready.
+
+        While a card is open the same absence means the opposite — the status
+        file was cleared for this startup and the worker has not reached its
+        first milestone. Reporting ``ready`` there labelled the gap between
+        ``clear_status()`` and ``booting`` as a usable worker. The card is
+        itself what resolves the ambiguity: ``evaluate_readiness`` closes it
+        after the grace window when no record ever arrives, which is precisely
+        the old-image case.
+        """
+        record = read_status(self._status_path())
+        if record is None:
+            return not self._card.ctxs
+        return record.get("phase") == READY_PHASE
 
     def _send_startup_failure_alert(
         self, detail: str = "", *, phase: str = "container_start_failed"
@@ -1251,6 +1632,15 @@ class WorkerManager:
     def _run_container(self) -> bool:
         """Pull (if needed) and run the worker container. Returns True on success."""
         from .startup import DEFAULT_ENVIRONMENT, get_runtime_env_var
+
+        # A restart reuses the card the first startup opened
+        # (``_open_starting_alerts`` no-ops while one is live), so without
+        # this the sighting of the *previous* container survives the
+        # ``docker rm`` and the re-pull below — and a poll landing in that
+        # window would count missed inspects against a container this method
+        # has already removed. Everything from here to ``docker run`` is time
+        # in which there is legitimately nothing to inspect.
+        self._reset_readiness_tracking()
 
         image = self._image
         runtime_environment = (
@@ -1442,6 +1832,13 @@ class WorkerManager:
 
         self._update_starting_alerts({"phase": "starting_container", "image": image})
 
+        # A leftover ``ready`` from the previous container would resolve the
+        # alert on the next readiness poll. Reset again here because the pull
+        # above can have taken minutes, during which a poll may have recorded
+        # a phase from the container this run is replacing.
+        self._reset_readiness_tracking()
+        clear_status(self._status_path())
+
         try:
             subprocess.run(
                 cmd,
@@ -1540,8 +1937,13 @@ class WorkerManager:
 
             if last_status == "running":
                 logger.info("Worker container %s is running", self._container_name)
+                # Not the end of startup: the process inside still has to
+                # load and warm up its models. Resolving here — which this
+                # code used to do — told the pending-reason copy and the
+                # stuck-run sweeper that the device had finished starting
+                # while its slowest phase had not begun. The card stays open
+                # and ``poll_startup_readiness`` closes it on a later tick.
                 self._update_starting_alerts({"phase": "container_running"})
-                self._close_starting_alerts()
                 return True
 
             if last_status in {"exited", "dead"}:

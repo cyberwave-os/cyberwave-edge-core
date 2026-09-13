@@ -278,6 +278,18 @@ class TestOverallProgressPercent:
                     phase, 100.0, layers_complete=14, layers_total=14
                 )
             )
+        # ``container_running`` is no longer the end of the lifecycle: the
+        # worker inside still has to boot and load its models, and it reports
+        # its own phases across the final band.
+        for phase in ("booting", "connecting_mqtt", "loading_models", "subscribed"):
+            steps.append(utils._compute_overall_progress_percent(phase, 100.0))
+        for ready_count in range(4):
+            steps.append(
+                utils._compute_overall_progress_percent(
+                    "warming_up", 100.0, models_ready=ready_count, models_total=3
+                )
+            )
+        steps.append(utils._compute_overall_progress_percent("ready", 100.0))
 
         assert all(b >= a for a, b in zip(steps, steps[1:])), steps
         assert steps[0] == 0
@@ -326,7 +338,12 @@ class TestInjectProgressPercentages:
         }
         utils._inject_progress_percentages(merged)
         assert merged["stage_progress_percent"] == 50
-        assert merged["overall_progress_percent"] == 63
+        # Derived, not hardcoded: half the install stage is half the install
+        # band, whatever the band edges currently are.
+        span = utils._INSTALL_BAND_END - utils._DOWNLOAD_BAND_END
+        assert merged["overall_progress_percent"] == (
+            utils._DOWNLOAD_BAND_END + round(span * 0.5)
+        )
 
     def test_omits_both_on_a_phase_with_nothing_to_report(self):
         merged = {"phase": "container_probe_unconfirmed"}
@@ -366,3 +383,63 @@ class TestFailureCopyIsUserFacing:
         for phase, copy in utils._WORKER_FAILED_DESCRIPTIONS.items():
             assert copy.endswith("."), phase
             assert "docker" not in copy.lower(), phase
+
+
+class TestWorkerStartupStage:
+    """The 80–100 band the worker process reports about its own startup.
+
+    Docker says ``running`` long before the worker can accept a run — the
+    process still has to load models and warm them up. ``container_running``
+    used to return 100, so the bar read "done" at the exact moment the
+    slowest phase began.
+    """
+
+    def test_container_running_is_not_the_end_of_startup(self):
+        assert (
+            utils._compute_overall_progress_percent("container_running", 0.0)
+            == utils._CONTAINER_BAND_END
+        )
+        assert utils._CONTAINER_BAND_END < 100
+
+    def test_only_ready_claims_completion(self):
+        assert utils._compute_overall_progress_percent("ready", 0.0) == 100
+        for phase in ("booting", "connecting_mqtt", "loading_models", "subscribed"):
+            assert utils._compute_overall_progress_percent(phase, 0.0) < 100
+
+    def test_warm_up_tracks_model_completion(self):
+        """Warm-up inference is serial and slow, exactly like extraction, so
+        it moves on model counts rather than sitting at a fixed number."""
+        steps = [
+            utils._compute_overall_progress_percent(
+                "warming_up", 0.0, models_ready=n, models_total=4
+            )
+            for n in range(5)
+        ]
+        assert steps == sorted(steps)
+        # Strictly, not just monotonically: a constant list is also sorted, and
+        # a bar that stands still through warm-up is the failure this test
+        # exists to rule out.
+        assert steps[-1] > steps[0]
+        # Even the last model does not reach 100: ``ready`` is published after
+        # the buffered-message replay that follows warm-up.
+        assert steps[-1] < 100
+
+    def test_junk_model_counts_do_not_escape_the_band(self):
+        assert (
+            utils._compute_overall_progress_percent(
+                "warming_up", 0.0, models_ready=99, models_total=4
+            )
+            < 100
+        )
+
+    def test_stage_percent_is_published_for_worker_phases_too(self):
+        """``stage_progress_percent`` exists for a stage-aware bar to use; the
+        worker stage must not be the one gap in it."""
+        merged = {"phase": "warming_up", "models_ready": 2, "models_total": 4}
+        utils._inject_progress_percentages(merged)
+        assert merged["stage_progress_percent"] > 0
+        assert utils._CONTAINER_BAND_END < merged["overall_progress_percent"] < 100
+
+    def test_unknown_worker_phase_returns_none(self):
+        """A newer worker must degrade to "no percentage" rather than a lie."""
+        assert utils._compute_overall_progress_percent("some_future_phase", 0.0) is None
