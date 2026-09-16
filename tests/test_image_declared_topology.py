@@ -16,8 +16,10 @@ carried in an image label. These tests pin the parts that bit during design:
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
+import pathlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -189,11 +191,14 @@ def test_schema_one_refuses(monkeypatch: Any) -> None:
 def test_an_untranslated_key_is_refused_rather_than_dropped(monkeypatch: Any) -> None:
     """A key Edge Core cannot honour must not be silently ignored.
 
-    `docker compose config` accepts every legal Compose key, so `privileged`,
-    `devices` and `cap_add` all reach the label. Translating four keys and
-    quietly dropping the rest is how a robot ends up with a container that
-    reports healthy while lacking the hardware access it declared. Refuse the
-    graph instead, and say which keys did it.
+    `docker compose config` accepts every legal Compose key, so `privileged`
+    and `devices` both reach the label. Translating some keys and quietly
+    dropping the rest is how a robot ends up with a container that reports
+    healthy while lacking the hardware access it declared. Refuse the graph
+    instead, and say which keys did it.
+
+    `cap_add` and `ulimits` used to be in this list and are now translated --
+    see `test_cap_add_becomes_a_scoped_capability_flag` and its neighbours.
     """
     _labels(
         monkeypatch,
@@ -212,7 +217,7 @@ def test_the_refusal_names_the_offending_keys(monkeypatch: Any, caplog: Any) -> 
                     "plant": {
                         "image": "p:dev",
                         "devices": ["/dev/ttyUSB0"],
-                        "cap_add": ["SYS_ADMIN"],
+                        "privileged": True,
                     }
                 }
             }
@@ -220,7 +225,7 @@ def test_the_refusal_names_the_offending_keys(monkeypatch: Any, caplog: Any) -> 
     )
     with caplog.at_level("ERROR"):
         assert ds.get_image_declared_services("img:dev") is None
-    assert "cap_add" in caplog.text and "devices" in caplog.text
+    assert "privileged" in caplog.text and "devices" in caplog.text
 
 
 def test_edge_core_owned_keys_are_ignored_not_refused(monkeypatch: Any) -> None:
@@ -553,6 +558,159 @@ def test_volumes_become_bind_flags(monkeypatch: Any) -> None:
     assert "-v" in plant.params
     assert "/etc/cyberwave/x:/data" in plant.params
     assert "/etc/localtime:/etc/localtime:ro" in plant.params, "read_only must map to :ro"
+
+
+def _privilege_params(monkeypatch: Any, service: dict[str, Any]) -> list[str]:
+    """Render one service and hand back the docker flags it translated to."""
+    _labels(monkeypatch, _label_set({"services": {"plant": {"image": "p:dev", **service}}}))
+    specs, _, _ = ds.get_image_declared_services("img:dev")
+    return specs[0].params
+
+
+def test_cap_add_becomes_a_scoped_capability_flag(monkeypatch: Any) -> None:
+    """The Kinova plant needs CAP_SYS_NICE for SCHED_FIFO and must be able to say so.
+
+    Before this, the key reached the label and the whole graph was refused, so a
+    declaration could not express a requirement `docker compose` honours
+    natively.
+    """
+    params = _privilege_params(monkeypatch, {"cap_add": ["SYS_NICE", "NET_ADMIN"]})
+    assert params[params.index("--cap-add") + 1] == "SYS_NICE"
+    assert "NET_ADMIN" in params, "every declared capability, not just the first"
+
+
+def test_a_string_cap_add_emits_nothing_rather_than_one_flag_per_letter(
+    monkeypatch: Any,
+) -> None:
+    """A hand-written label could carry `cap_add: SYS_NICE` without the list.
+
+    Iterating that string yields characters, so the naive loop grants `S`, `Y`,
+    `S`... -- nine capabilities that do not exist, and none of the one asked
+    for. `config` always renders a list, so this only guards a label written by
+    hand, but granting nothing beats granting nonsense.
+    """
+    params = _privilege_params(monkeypatch, {"cap_add": "SYS_NICE"})
+    assert "--cap-add" not in params
+
+
+def test_a_scalar_ulimit_becomes_one_flag(monkeypatch: Any) -> None:
+    params = _privilege_params(monkeypatch, {"ulimits": {"rtprio": 99}})
+    assert "--ulimit" in params
+    assert "rtprio=99" in params
+
+
+def test_a_soft_hard_pair_becomes_dockers_colon_form(monkeypatch: Any) -> None:
+    """`config` renders the pair as a nested mapping; docker spells it soft:hard."""
+    params = _privilege_params(monkeypatch, {"ulimits": {"nofile": {"soft": 1024, "hard": 2048}}})
+    assert "nofile=1024:2048" in params
+
+
+def test_ulimits_render_in_a_stable_order(monkeypatch: Any) -> None:
+    """One declaration, one argv.
+
+    `config` emits a mapping and Python keeps its insertion order, so without
+    the sort the author's line order would decide the flag order -- and CI
+    compares the rendered graph byte-for-byte.
+    """
+    forward = _privilege_params(monkeypatch, {"ulimits": {"rtprio": 99, "memlock": -1}})
+    reverse = _privilege_params(monkeypatch, {"ulimits": {"memlock": -1, "rtprio": 99}})
+    assert forward == reverse
+    assert forward.index("memlock=-1") < forward.index("rtprio=99")
+
+
+def test_a_boolean_ulimit_is_dropped_rather_than_sent_as_one(monkeypatch: Any) -> None:
+    """`bool` is an `int` subclass, so `rtprio: true` would reach docker as `rtprio=1`.
+
+    That is a real limit one below the lowest useful RT priority -- the arm
+    would run unpromoted while the declaration claimed otherwise. Emitting
+    nothing at least fails the way an unset limit fails.
+    """
+    params = _privilege_params(monkeypatch, {"ulimits": {"rtprio": True}})
+    assert not any(p.startswith("rtprio") for p in params)
+
+
+def test_translating_cap_add_did_not_open_the_door_to_privileged(monkeypatch: Any) -> None:
+    """The narrow grants are translated; the blanket one is still refused.
+
+    This is the assertion that keeps the change narrow: a declaration may ask
+    for the capabilities it needs, and may not ask for all of them.
+    """
+    _labels(
+        monkeypatch,
+        _label_set(
+            {
+                "services": {
+                    "plant": {
+                        "image": "p:dev",
+                        "cap_add": ["SYS_NICE"],
+                        "privileged": True,
+                    }
+                }
+            }
+        ),
+    )
+    assert ds.get_image_declared_services("img:dev") is None
+
+
+def test_a_service_asking_for_no_privileges_gains_no_flags(monkeypatch: Any) -> None:
+    """Every graph that shipped before this change must render identically."""
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    specs, _, _ = ds.get_image_declared_services("img:tag")
+    for spec in specs:
+        assert "--cap-add" not in spec.params
+        assert "--ulimit" not in spec.params
+
+
+def test_the_driver_jobs_key_list_agrees_with_this_one() -> None:
+    """The second copy of the key list must not drift from the real one.
+
+    `drivers/tests/unitree/test_go2_compose_topology.py` carries its own
+    `TRANSLATED_SERVICE_KEYS` because it runs in the driver build job, which
+    does not install edge-core. That copy is the *build-time* gate -- it is what
+    stops an unsupported key reaching a published label at all -- so a key added
+    here and not there means CI green on a graph the robot will refuse, and a
+    key added there and not here means the opposite.
+
+    Read out of the source rather than imported, for the same reason the
+    namespace test reads `env_params.cpp`: the file is not importable from here
+    (it imports `pytest` fixtures and compose files that only exist in the
+    driver tree), but its literal is still checkable.
+    """
+    source = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "cyberwave-edge-runtime/runtime-services/drivers/tests/unitree"
+        / "test_go2_compose_topology.py"
+    )
+    if not source.exists():
+        pytest.skip("driver tree not checked out beside edge-core")
+
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    found: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        if target.id not in {"TRANSLATED_SERVICE_KEYS", "EDGE_CORE_OWNED_SERVICE_KEYS"}:
+            continue
+        func = node.value.func
+        if not (isinstance(func, ast.Name) and func.id == "frozenset"):
+            continue
+        found[target.id] = {
+            element.value
+            for element in ast.walk(node.value)
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        }
+
+    assert found.get("TRANSLATED_SERVICE_KEYS") == set(ds._TRANSLATED_SERVICE_KEYS), (
+        "the driver job's copy of TRANSLATED_SERVICE_KEYS has drifted from "
+        "driver_selection.py -- update both or the build-time gate and the "
+        "runtime refusal disagree about what a declaration may say"
+    )
+    assert found.get("EDGE_CORE_OWNED_SERVICE_KEYS") == set(ds._EDGE_CORE_OWNED_SERVICE_KEYS), (
+        "the driver job's copy of EDGE_CORE_OWNED_SERVICE_KEYS has drifted"
+    )
 
 
 def test_prefer_gpu_comes_from_the_extension_field(monkeypatch: Any) -> None:

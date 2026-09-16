@@ -474,10 +474,10 @@ _PLAIN_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # Which Compose service keys this module actually acts on. A key outside both
 # sets is NOT ignored -- it is refused, because ignoring it is the failure this
 # exists to prevent: `docker compose config` in CI validates the file, so an
-# author who writes `privileged: true`, `devices:` or `cap_add:` gets a green
-# build, a green label, and a container on the robot that quietly does not have
-# what it asked for. A container missing its USB device still reports healthy,
-# so nothing downstream notices either.
+# author who writes `privileged: true` or `devices:` gets a green build, a green
+# label, and a container on the robot that quietly does not have what it asked
+# for. A container missing its USB device still reports healthy, so nothing
+# downstream notices either.
 #
 # The primary gate is a build-time assertion over the checked-in files
 # (`drivers/tests/unitree/test_go2_compose_topology.py`); this runtime check is
@@ -496,6 +496,11 @@ _TRANSLATED_SERVICE_KEYS = frozenset(
         "healthcheck",
         "depends_on",
         "stop_signal",
+        # Narrow, additive privilege grants -- see `_compose_privilege_params`
+        # for why these two are translated while `privileged` and `devices`
+        # stay refused.
+        "cap_add",
+        "ulimits",
         "x-cyberwave",
     }
 )
@@ -957,6 +962,97 @@ def _compose_healthcheck_params(
     return params
 
 
+def _compose_ulimit_value(value: Any) -> str | None:
+    """``99`` -> ``"99"``; ``{"soft": 1024, "hard": 2048}`` -> ``"1024:2048"``.
+
+    Both shapes come back from `docker compose config --format json` (v5.1.1,
+    verified): a scalar stays scalar and a soft/hard pair renders as a nested
+    mapping. Docker's CLI spells the pair ``soft:hard`` and reads a bare value
+    as both halves.
+
+    ``bool`` is excluded before ``int`` on purpose -- it is an ``int`` subclass
+    in Python, so ``rtprio: true`` would otherwise reach Docker as
+    ``rtprio=1``: a real limit, one below the lowest useful RT priority, which
+    is a worse outcome than refusing to emit the flag at all.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        soft = value.get("soft")
+        hard = value.get("hard")
+        soft_ok = isinstance(soft, int) and not isinstance(soft, bool)
+        hard_ok = isinstance(hard, int) and not isinstance(hard, bool)
+        if soft_ok and hard_ok:
+            return f"{soft}:{hard}"
+        if soft_ok:
+            return str(soft)
+        if hard_ok:
+            return str(hard)
+    return None
+
+
+def _compose_privilege_params(
+    service: Dict[str, Any],
+    subs: Dict[str, str],
+) -> list[str]:
+    """Translate ``cap_add`` and ``ulimits`` into ``docker create`` flags.
+
+    WHY THESE TWO AND NOT THE REST. One declaration is read by three executors
+    -- `docker compose` on a dev box, Edge Core on a robot, cyberwave-sim on a
+    cloud node -- and a service that needs `SCHED_FIFO` could not say so in a
+    way all three honoured: the key reached the label and the whole graph was
+    refused. `cap_add` and `ulimits` are additive, narrow, and already honoured
+    natively by Compose, so translating them closes that gap without inventing
+    a Cyberwave-specific spelling for something Compose can already say.
+
+    REDUNDANT ON A ROBOT TODAY, AND DELIBERATELY SO. `_run_docker_image` passes
+    `--privileged` unconditionally, which grants every capability and, through
+    CAP_SYS_NICE, bypasses the RLIMIT_RTPRIO check a raised `rtprio` would
+    otherwise be needed for. So on hardware these flags change nothing now.
+    They are what keeps the other two executors in step, and what stays correct
+    if that blanket grant is ever narrowed to scoped capabilities.
+
+    STILL REFUSED: `privileged` and `devices`. Both are the cases whose silent
+    loss is unexplainable robot behaviour rather than a visible error, which is
+    the whole reason the refusal exists -- and `privileged` in particular would
+    let a declaration claim a blanket grant that reads as deliberate while
+    being indistinguishable from the one Edge Core already applies. `cap_drop`
+    is simply out of scope: nothing declares it yet, and next to the blanket
+    grant it would not do what its author expected.
+    """
+    params: list[str] = []
+
+    # `isinstance(list)` before iterating, not just truthiness: a bare string
+    # here iterates character by character and would emit one `--cap-add S`,
+    # `--cap-add Y`, ... per letter -- a container silently granted nothing it
+    # asked for, which is the failure mode the refusal above exists to avoid.
+    # `config` always renders a list; this is for a hand-written label.
+    raw_cap_add = service.get("cap_add")
+    if isinstance(raw_cap_add, list):
+        for capability in raw_cap_add:
+            if not isinstance(capability, str) or not capability.strip():
+                continue
+            params += ["--cap-add", _substitute(capability.strip(), subs)]
+
+    raw_ulimits = service.get("ulimits")
+    if isinstance(raw_ulimits, dict):
+        # Sorted, so one declaration renders one argv. `config` emits a mapping
+        # and Python preserves its insertion order, which would otherwise leak
+        # the author's line order into a flag sequence that is compared
+        # byte-for-byte by the render check in CI.
+        for name, value in sorted(raw_ulimits.items()):
+            limit = _compose_ulimit_value(value)
+            if limit is None:
+                continue
+            params += ["--ulimit", f"{name}={limit}"]
+
+    return params
+
+
 def _compose_dependency_conditions(service: Dict[str, Any]) -> dict[str, str]:
     """Map ``depends_on`` to ``{dependency: condition}``.
 
@@ -987,9 +1083,10 @@ def _compose_service_params(
     """Translate the Compose fields Edge Core's launcher understands.
 
     Returns ``(docker flags, networks to attach after create)``. Networking, bind
-    mounts and the healthcheck are read: everything else about the container
-    (restart policy, log rotation, naming) is Edge Core's to decide, and letting
-    the Compose file override those would give two owners for one setting.
+    mounts, the additive privilege grants (`_compose_privilege_params`) and the
+    healthcheck are read: everything else about the container (restart policy,
+    log rotation, naming) is Edge Core's to decide, and letting the Compose file
+    override those would give two owners for one setting.
     """
     params: list[str] = []
     extra_networks: list[str] = []
@@ -1048,6 +1145,8 @@ def _compose_service_params(
         if volume.get("read_only"):
             mount += ":ro"
         params += ["-v", mount]
+
+    params += _compose_privilege_params(service, subs)
 
     params += _compose_healthcheck_params(service.get("healthcheck"), subs)
 
