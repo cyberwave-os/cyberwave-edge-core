@@ -16,6 +16,7 @@ Covers:
 - docker_prune_stopped_cyberwave_containers: removes stopped containers, skips running
 - docker_prune_unused_images: success, failure, docker unavailable
 - docker_prune_dangling_volumes: command shape, success, failure paths
+- docker_prune_navigation_bundle_volumes: labelled named-volume reclamation
 - docker_logs_follow: returns Popen handle, docker unavailable, OSError on Popen
 - backing_device_for: longest-mountpoint match, sibling-prefix safety
 - is_sd_card_path / is_sd_card_root: detects mmcblk backing device on Linux
@@ -766,6 +767,83 @@ class TestDockerPruneDanglingVolumes:
         assert captured[0] == ["docker", "volume", "prune", "--force"]
         assert "--all" not in captured[0]
         assert "--filter" not in captured[0]
+
+
+class TestDockerPruneNavigationBundleVolumes:
+    def test_removes_only_labelled_unused_volumes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        captured: list[list[str]] = []
+
+        def run(command: list[str], **_kwargs: Any) -> MagicMock:
+            captured.append(command)
+            if command[1:3] == ["volume", "ls"]:
+                return _make_completed("bundle-old\nbundle-active\n")
+            if command[-1] == "bundle-active":
+                raise subprocess.CalledProcessError(1, command)
+            return _make_completed()
+
+        monkeypatch.setattr(dh.subprocess, "run", run)
+
+        assert dh.docker_prune_navigation_bundle_volumes() is True
+        assert captured[0] == [
+            "docker",
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            "label=io.cyberwave.navigation.bundle=1",
+        ]
+        assert captured[1:] == [
+            [
+                "docker",
+                "volume",
+                "inspect",
+                "--format",
+                '{{ index .Labels "io.cyberwave.navigation.created-at" }}',
+                "bundle-old",
+            ],
+            ["docker", "volume", "rm", "bundle-old"],
+            [
+                "docker",
+                "volume",
+                "inspect",
+                "--format",
+                '{{ index .Labels "io.cyberwave.navigation.created-at" }}',
+                "bundle-active",
+            ],
+            ["docker", "volume", "rm", "bundle-active"],
+        ]
+
+    def test_preserves_cached_and_newly_created_volumes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh.time, "time", lambda: 1_000.0)
+        captured: list[list[str]] = []
+
+        def run(command: list[str], **_kwargs: Any) -> MagicMock:
+            captured.append(command)
+            if command[1:3] == ["volume", "ls"]:
+                return _make_completed("bundle-cached\nbundle-new\n")
+            if command[1:3] == ["volume", "inspect"]:
+                return _make_completed("900\n")
+            return _make_completed()
+
+        monkeypatch.setattr(dh.subprocess, "run", run)
+
+        assert dh.docker_prune_navigation_bundle_volumes(
+            protected_volumes={"bundle-cached"}, min_age_seconds=300
+        ) is True
+        assert not any(command[1:3] == ["volume", "rm"] for command in captured)
+
+    def test_returns_false_when_listing_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(
+            dh.subprocess,
+            "run",
+            lambda *a, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired("docker", 30)),
+        )
+        assert dh.docker_prune_navigation_bundle_volumes() is False
 
 
 # ---------------------------------------------------------------------------

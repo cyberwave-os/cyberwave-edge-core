@@ -15,8 +15,11 @@ import logging
 import os
 import platform
 import re
+import secrets
 import shlex
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -445,6 +448,8 @@ def _get_driver_services(
 _COMPOSE_LABEL_PREFIX = "io.cyberwave.driver.compose"
 _COMPOSE_SCHEMA_LABEL = f"{_COMPOSE_LABEL_PREFIX}.schema"
 _CHANNEL_TAG_LABEL = "io.cyberwave.image.channel-tag"
+_NAVIGATION_CONFIG_PROFILE_LABEL = "io.cyberwave.navigation.config-profile"
+_NAVIGATION_ROS_DISTRO_LABEL = "io.cyberwave.navigation.ros-distro"
 # CANONICAL EXPLANATION -- the Dockerfile, the build workflow and the two test
 # suites point here rather than restating it.
 #
@@ -455,6 +460,12 @@ _CHANNEL_TAG_LABEL = "io.cyberwave.image.channel-tag"
 # neither character, so the payload is inert to that parser and any other. The
 # unencoded compose files ship at /opt/cyberwave/ for a human to read.
 _SUPPORTED_COMPOSE_SCHEMA = 2
+_SUPPORTED_NAVIGATION_BUNDLE_SCHEMA = 1
+_NAVIGATION_BUNDLE_LOCK = threading.Lock()
+_NAVIGATION_BUNDLE_CACHE: dict[str, tuple[str, str]] = {}
+_NAVIGATION_BUNDLE_SESSION = secrets.token_hex(4)
+_NAVIGATION_BUNDLE_SUBSTITUTION = "CW_NAVIGATION_BUNDLE"
+_NAVIGATION_BUNDLE_MARKER = ".cyberwave-navigation-bundle.sha256"
 
 # Plain ``${NAME}`` only. Compose's ``${NAME:-default}`` form is left alone so
 # it reaches the container shell that is meant to expand it.
@@ -624,6 +635,209 @@ def _image_labels(image: str) -> Optional[Dict[str, str]]:
     return {str(k): "" if v is None else str(v) for k, v in parsed.items()}
 
 
+def _docker_capture(argv: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    """Run one Docker metadata/materialisation command without a shell."""
+
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"docker command failed ({shlex.join(argv)}): {exc}") from exc
+
+
+def _navigation_bundle_spec(doc: Dict[str, Any]) -> tuple[str, str, str] | None:
+    """Return ``(image source, container target, relative profile)``.
+
+    The bundle belongs to the driver image. The orchestration extension only
+    describes how to expose it; robot-specific filenames and parameters never
+    become Edge Core knowledge.
+    """
+
+    extension = doc.get("x-cyberwave") or {}
+    if not isinstance(extension, dict):
+        raise ValueError("x-cyberwave must be a mapping")
+    raw = extension.get("navigation_bundle")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("x-cyberwave.navigation_bundle must be a mapping")
+    if raw.get("schema") != _SUPPORTED_NAVIGATION_BUNDLE_SCHEMA:
+        raise ValueError(
+            "unsupported x-cyberwave.navigation_bundle schema "
+            f"{raw.get('schema')!r}; expected {_SUPPORTED_NAVIGATION_BUNDLE_SCHEMA}"
+        )
+
+    source = str(raw.get("source") or "").strip()
+    target = str(raw.get("target") or "").strip()
+    profile = str(raw.get("profile") or "").strip()
+    if not source.startswith("/") or not target.startswith("/"):
+        raise ValueError("navigation bundle source and target must be absolute paths")
+    profile_path = Path(profile)
+    if not profile or profile_path.is_absolute() or ".." in profile_path.parts:
+        raise ValueError("navigation bundle profile must be a safe relative path")
+    return source, target, profile
+
+
+def _materialize_navigation_bundle(
+    image: str,
+    spec: tuple[str, str, str],
+) -> tuple[str, str]:
+    """Copy an image-owned bundle into an immutable Docker volume.
+
+    A named volume works on both a physical edge host and cyberwave-sim's
+    Docker-out-of-Docker supervisor. A host bind path would point at the
+    supervisor container's filesystem in the latter case and be invisible to
+    the Docker daemon that launches its siblings.
+
+    Returns ``(volume name, bundle digest)``. Any declared-but-unusable bundle
+    raises so startup cannot silently fall back to intelligence defaults.
+    """
+
+    source, _target, profile = spec
+    inspected = _docker_capture(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image], timeout=15
+    )
+    image_id = inspected.stdout.strip()
+    if inspected.returncode != 0 or not image_id:
+        raise ValueError(
+            f"cannot inspect driver image {image!r} for navigation bundle: "
+            f"{inspected.stderr.strip() or inspected.stdout.strip()}"
+        )
+    identity = hashlib.sha256(f"{image_id}\0{source}\0{profile}".encode()).hexdigest()
+    # Different Edge Core / simulator processes share one Docker daemon but not
+    # Python locks. Give each process its own immutable volume so one process can
+    # never clear another process's bundle while its containers are using it.
+    volume = f"cyberwave-navigation-{identity[:16]}-{_NAVIGATION_BUNDLE_SESSION}"
+
+    probe_script = (
+        'test -s "/bundle/' + _NAVIGATION_BUNDLE_MARKER + '" && '
+        'test -f "/bundle/$1" && cat "/bundle/' + _NAVIGATION_BUNDLE_MARKER + '"'
+    )
+
+    def probe_bundle(candidate: str) -> str:
+        probe = _docker_capture(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/sh",
+                "-v",
+                f"{candidate}:/bundle:ro",
+                image,
+                "-c",
+                probe_script,
+                "--",
+                profile,
+            ],
+            timeout=30,
+        )
+        return probe.stdout.strip().splitlines()[-1] if (
+            probe.returncode == 0 and probe.stdout.strip()
+        ) else ""
+
+    # Serialize at the mutation boundary rather than relying on every startup
+    # entry point to stay sequential. Re-probe the marker instead of trusting
+    # volume existence: an out-of-band delete followed by a `-v` mount can
+    # silently recreate the same named volume empty.
+    with _NAVIGATION_BUNDLE_LOCK:
+        cached = _NAVIGATION_BUNDLE_CACHE.get(identity)
+        if cached is not None:
+            cached_digest = probe_bundle(cached[0])
+            if cached_digest:
+                result = (cached[0], cached_digest)
+                _NAVIGATION_BUNDLE_CACHE[identity] = result
+                return result
+            _NAVIGATION_BUNDLE_CACHE.pop(identity, None)
+
+        created = _docker_capture(
+            [
+                "docker",
+                "volume",
+                "create",
+                "--label",
+                "io.cyberwave.navigation.bundle=1",
+                "--label",
+                f"io.cyberwave.navigation.image={image_id}",
+                "--label",
+                f"io.cyberwave.navigation.created-at={int(time.time())}",
+                volume,
+            ],
+            timeout=30,
+        )
+        if created.returncode != 0:
+            raise ValueError(
+                f"cannot create navigation bundle volume {volume!r}: "
+                f"{created.stderr.strip() or created.stdout.strip()}"
+            )
+
+        existing_digest = probe_bundle(volume)
+        if existing_digest:
+            result = (volume, existing_digest)
+            _NAVIGATION_BUNDLE_CACHE[identity] = result
+            return result
+
+        # The completion marker is absent throughout mutation and written last.
+        # An interrupted copy is therefore rejected on the next pass, while
+        # clearing this dedicated volume prevents removed files surviving a retry.
+        populate_script = (
+            'test -d "$1"; test -s "$1/' + _NAVIGATION_BUNDLE_MARKER + '"; '
+            'test -f "$1/$2"; '
+            'rm -f "/bundle/' + _NAVIGATION_BUNDLE_MARKER + '"; '
+            "find /bundle -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; "
+            'find "$1" -mindepth 1 -maxdepth 1 ! -name "'
+            + _NAVIGATION_BUNDLE_MARKER
+            + '" -exec cp -a -- {} /bundle/ \\;; '
+            'test -f "/bundle/$2"; '
+            'cp "$1/'
+            + _NAVIGATION_BUNDLE_MARKER
+            + '" "/bundle/'
+            + _NAVIGATION_BUNDLE_MARKER
+            + '"; cat "/bundle/'
+            + _NAVIGATION_BUNDLE_MARKER
+            + '"'
+        )
+        populated = _docker_capture(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/sh",
+                "-v",
+                f"{volume}:/bundle",
+                image,
+                "-ceu",
+                populate_script,
+                "--",
+                source,
+                profile,
+            ],
+            timeout=120,
+        )
+        digest = populated.stdout.strip().splitlines()[-1] if populated.stdout.strip() else ""
+        if populated.returncode != 0 or not digest:
+            raise ValueError(
+                f"driver image {image!r} could not materialize navigation bundle "
+                f"{source!r}: {populated.stderr.strip() or populated.stdout.strip()}"
+            )
+        result = (volume, digest)
+        _NAVIGATION_BUNDLE_CACHE[identity] = result
+        return result
+
+
+def navigation_bundle_cache_volumes() -> set[str]:
+    """Return volumes this process may reuse during its next reconciliation."""
+
+    with _NAVIGATION_BUNDLE_LOCK:
+        return {volume for volume, _digest in _NAVIGATION_BUNDLE_CACHE.values()}
+
+
 def _substitute(value: str, subs: Dict[str, str]) -> str:
     """Expand ``${NAME}`` placeholders and collapse Compose's ``$$`` escape.
 
@@ -767,6 +981,7 @@ def _compose_dependency_conditions(service: Dict[str, Any]) -> dict[str, str]:
 def _compose_service_params(
     service: Dict[str, Any],
     networks: Dict[str, Any],
+    volumes: Dict[str, Any],
     subs: Dict[str, str],
 ) -> tuple[list[str], list[str]]:
     """Translate the Compose fields Edge Core's launcher understands.
@@ -826,7 +1041,10 @@ def _compose_service_params(
         target = volume.get("target")
         if not source or not target:
             continue
-        mount = f"{_substitute(str(source), subs)}:{_substitute(str(target), subs)}"
+        declared_volume = volumes.get(source) or {}
+        volume_name = declared_volume.get("name") if isinstance(declared_volume, dict) else None
+        resolved_source = _substitute(str(volume_name or source), subs)
+        mount = f"{resolved_source}:{_substitute(str(target), subs)}"
         if volume.get("read_only"):
             mount += ":ro"
         params += ["-v", mount]
@@ -900,6 +1118,7 @@ def _specs_from_compose(
     if not isinstance(raw_services, dict) or not raw_services:
         return None
     networks = doc.get("networks") if isinstance(doc.get("networks"), dict) else {}
+    volumes = doc.get("volumes") if isinstance(doc.get("volumes"), dict) else {}
 
     specs: list[_ServiceSpec] = []
     for name in _order_by_dependencies(raw_services):
@@ -934,7 +1153,7 @@ def _specs_from_compose(
         if not isinstance(extension, dict):
             extension = {}
 
-        params, extra_networks = _compose_service_params(service, networks, subs)
+        params, extra_networks = _compose_service_params(service, networks, volumes, subs)
 
         specs.append(
             _ServiceSpec(
@@ -1151,6 +1370,10 @@ def compose_substitutions(
     twin_uuid: str = "",
     sim_proxy_tag: Optional[str] = None,
     moveit_tag: Optional[str] = None,
+    navigation_bundle: Optional[str] = None,
+    navigation_config_profile: Optional[str] = None,
+    navigation_ros_distro: Optional[str] = None,
+    navigation_profile: Optional[str] = None,
 ) -> Dict[str, str]:
     """Every ``${NAME}`` a rendered declaration may carry, and what it becomes.
 
@@ -1195,6 +1418,13 @@ def compose_substitutions(
     # far, so no caller has to notice the difference.
     if moveit_tag:
         substitutions[_MOVEIT_TAG_SUBSTITUTION] = moveit_tag
+    navigation_values = {
+        _NAVIGATION_BUNDLE_SUBSTITUTION: navigation_bundle,
+        "CW_CONFIG_PROFILE": navigation_config_profile,
+        "CW_ROS_DISTRO": navigation_ros_distro,
+        "CW_NAVIGATION_PROFILE": navigation_profile,
+    }
+    substitutions.update({name: value for name, value in navigation_values.items() if value})
     if twin_uuid:
         substitutions["CW_TWIN8"] = twin_uuid[:8]
         substitutions["CW_TWIN_NS"] = "twin_" + twin_uuid.lower().replace("-", "_")
@@ -1208,6 +1438,7 @@ def get_image_declared_services(
     twin_uuid: str = "",
     channel_tag: Optional[str] = None,
     moveit_tag: Optional[str] = None,
+    materialize_navigation_bundle: bool = True,
 ) -> tuple[list[_ServiceSpec], dict[str, str], list[str]] | None:
     """Service graph *image* declares for *variant*, or None when it declares none.
 
@@ -1233,6 +1464,15 @@ def get_image_declared_services(
     function returns None for something that is a genuine misconfiguration rather
     than an older image. A graph that never mentions the placeholder -- the Go2's,
     and every metadata-driven twin -- is unaffected.
+
+    When the graph declares ``x-cyberwave.navigation_bundle``, resolution also
+    materializes that driver-owned directory into a content-addressed Docker
+    volume and substitutes its name into the graph. This is intentionally fatal
+    on error: an explicitly declared robot profile must never degrade to an
+    intelligence image's implicit defaults.
+
+    Diagnostic callers may pass ``materialize_navigation_bundle=False`` to
+    inspect the declared service graph without creating volumes or containers.
 
     None rather than an exception for every "this image says nothing" case: an
     image built before these labels existed is not an error, it simply falls
@@ -1313,11 +1553,8 @@ def get_image_declared_services(
     channel_tag, channel_source = _resolve_channel_tag(image, labels, channel_tag)
     proxy_tag, proxy_source = _resolve_sim_proxy_tag()
     moveit_tag, moveit_source = _resolve_moveit_tag(labels, channel_tag, moveit_tag)
-    # Refuse BEFORE rendering, and only when this declaration actually needs the
-    # tag. An arm graph names ros2-moveit; the Go2's does not, and must not start
-    # paying for a train it never references. Checked against the raw document
-    # because that is the only place the placeholder still exists -- after
-    # `_specs_from_compose` it has already become a literal image tag.
+    # Reject unresolved graph-wide prerequisites before navigation bundle
+    # materialization, the most expensive and only mutating resolution step.
     if not moveit_tag and _MOVEIT_TAG_PLACEHOLDER in raw:
         logger.error(
             "Image %s declares a %r graph that needs ${%s}, which did not resolve "
@@ -1335,18 +1572,83 @@ def get_image_declared_services(
         )
         return None
 
-    substitutions = compose_substitutions(
+    try:
+        navigation_bundle = _navigation_bundle_spec(doc)
+        bundle_volume = ""
+        config_profile = ""
+        navigation_ros_distro = ""
+        if navigation_bundle is not None:
+            config_profile = labels.get(_NAVIGATION_CONFIG_PROFILE_LABEL, "").strip()
+            if not config_profile:
+                raise ValueError(f"image is missing {_NAVIGATION_CONFIG_PROFILE_LABEL}")
+            navigation_ros_distro = labels.get(_NAVIGATION_ROS_DISTRO_LABEL, "").strip()
+            if not navigation_ros_distro:
+                raise ValueError(f"image is missing {_NAVIGATION_ROS_DISTRO_LABEL}")
+            if config_profile != navigation_ros_distro and not (
+                config_profile == "jetson" and navigation_ros_distro == "humble"
+            ):
+                raise ValueError(
+                    "navigation config profile "
+                    f"{config_profile!r} does not match ROS distro "
+                    f"{navigation_ros_distro!r}"
+                )
+    except ValueError as exc:
+        raise RuntimeError(f"invalid navigation bundle in {image!r}: {exc}") from exc
+
+    navigation_profile = ""
+    if navigation_bundle is not None:
+        navigation_profile = f"{navigation_bundle[1].rstrip('/')}/{navigation_bundle[2]}"
+
+    # Validate/render the full graph before copying a potentially multi-GB
+    # image-owned bundle. A declaration rejected below must have no Docker
+    # volume side effects.
+    preflight_substitutions = compose_substitutions(
         channel_tag=channel_tag,
         twin_uuid=twin_uuid,
         sim_proxy_tag=proxy_tag,
         moveit_tag=moveit_tag,
+        navigation_bundle="cyberwave-navigation-preflight" if navigation_bundle else None,
+        navigation_config_profile=config_profile or None,
+        navigation_ros_distro=navigation_ros_distro or None,
+        navigation_profile=navigation_profile or None,
     )
-
     try:
-        resolved = _specs_from_compose(doc, substitutions)
+        resolved = _specs_from_compose(doc, preflight_substitutions)
     except ValueError:
         logger.exception("Image %s declares an unusable compose graph for %r", image, name)
         return None
+
+    if navigation_bundle is not None and materialize_navigation_bundle:
+        try:
+            bundle_volume, bundle_digest = _materialize_navigation_bundle(
+                image, navigation_bundle
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"invalid navigation bundle in {image!r}: {exc}") from exc
+        logger.info(
+            "navigation-bundle image=%s variant=%s schema=%d volume=%s "
+            "digest=%s profile=%s target=%s",
+            image,
+            name,
+            _SUPPORTED_NAVIGATION_BUNDLE_SCHEMA,
+            bundle_volume,
+            bundle_digest,
+            navigation_bundle[2],
+            navigation_bundle[1],
+        )
+        substitutions = compose_substitutions(
+            channel_tag=channel_tag,
+            twin_uuid=twin_uuid,
+            sim_proxy_tag=proxy_tag,
+            moveit_tag=moveit_tag,
+            navigation_bundle=bundle_volume,
+            navigation_config_profile=config_profile,
+            navigation_ros_distro=navigation_ros_distro,
+            navigation_profile=navigation_profile,
+        )
+        # Preflight already proved the graph shape; this pass only replaces the
+        # placeholder volume with the materialized one.
+        resolved = _specs_from_compose(doc, substitutions)
 
     if resolved is not None:
         logger.info(

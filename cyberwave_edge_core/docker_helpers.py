@@ -14,6 +14,8 @@ import platform
 import re
 import shutil
 import subprocess
+import time
+from collections.abc import Collection
 from datetime import datetime
 from typing import Any, Optional
 
@@ -459,6 +461,96 @@ def docker_prune_dangling_volumes() -> bool:
     except (subprocess.TimeoutExpired, OSError) as exc:
         logger.warning("Docker volume prune error: %s", exc)
         return False
+
+
+def docker_prune_navigation_bundle_volumes(
+    *,
+    protected_volumes: Collection[str] = (),
+    min_age_seconds: float = 300.0,
+) -> bool:
+    """Best-effort removal of unused driver-owned navigation bundles.
+
+    Bundle volumes are named, so the deliberately anonymous-only generic prune
+    above cannot reclaim them. Docker refuses to remove volumes referenced by
+    containers. The protection set preserves bundles cached for a restart,
+    while the age floor closes the gap between materialization and container
+    creation across independent Edge Core / simulator processes.
+    """
+    if not docker_available():
+        return False
+    try:
+        listed = subprocess.run(
+            [
+                "docker",
+                "volume",
+                "ls",
+                "-q",
+                "--filter",
+                "label=io.cyberwave.navigation.bundle=1",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to list navigation bundle volumes: %s", exc)
+        return False
+
+    protected = set(protected_volumes)
+    for volume in listed.stdout.split():
+        if volume in protected:
+            logger.debug("Keeping cached navigation bundle volume %s", volume)
+            continue
+
+        try:
+            inspected = subprocess.run(
+                [
+                    "docker",
+                    "volume",
+                    "inspect",
+                    "--format",
+                    '{{ index .Labels "io.cyberwave.navigation.created-at" }}',
+                    volume,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            created_at = float(inspected.stdout.strip())
+        except (ValueError, subprocess.CalledProcessError):
+            created_at = 0.0
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to inspect navigation bundle volume %s: %s", volume, exc)
+            continue
+
+        if created_at and time.time() - created_at < min_age_seconds:
+            logger.debug("Keeping newly-created navigation bundle volume %s", volume)
+            continue
+
+        try:
+            subprocess.run(
+                ["docker", "volume", "rm", volume],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            logger.info("Removed unused navigation bundle volume %s", volume)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or "").strip()
+            if "in use" in detail.lower():
+                logger.debug("Keeping navigation bundle volume %s because it is in use", volume)
+            else:
+                logger.warning(
+                    "Failed to remove navigation bundle volume %s: %s",
+                    volume,
+                    detail or exc,
+                )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Failed to remove navigation bundle volume %s: %s", volume, exc)
+    return True
 
 
 def backing_device_for(path: str) -> Optional[str]:

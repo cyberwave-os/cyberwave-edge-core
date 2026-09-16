@@ -47,6 +47,7 @@ def _no_inherited_variant(monkeypatch: Any) -> None:
     monkeypatch.delenv(ds.MOVEIT_TAG_ENV, raising=False)
     monkeypatch.delenv("CYBERWAVE_ENVIRONMENT", raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
+    ds._NAVIGATION_BUNDLE_CACHE.clear()
 
 
 def _labels(monkeypatch: Any, mapping: dict[str, str]) -> None:
@@ -64,6 +65,8 @@ def _label_set(doc: dict[str, Any], *, schema: str = "2", variant: str = "robot"
         ds._COMPOSE_SCHEMA_LABEL: schema,
         f"{ds._COMPOSE_LABEL_PREFIX}.{variant}": _encode(doc),
         ds._CHANNEL_TAG_LABEL: "jetson-humble-staging",
+        ds._NAVIGATION_CONFIG_PROFILE_LABEL: "jetson",
+        ds._NAVIGATION_ROS_DISTRO_LABEL: "humble",
     }
 
 
@@ -284,6 +287,148 @@ def test_channel_tag_is_substituted(monkeypatch: Any) -> None:
     specs, _, _ = ds.get_image_declared_services("img:tag")
     assert all("${CW_CHANNEL_TAG}" not in s.image for s in specs)
     assert all(s.image.endswith(":jetson-humble-staging") for s in specs)
+
+
+def test_driver_navigation_bundle_is_materialized_and_mounted_read_only(
+    monkeypatch: Any,
+) -> None:
+    doc = {
+        "x-cyberwave": {
+            "navigation_bundle": {
+                "schema": 1,
+                "source": "/opt/driver/navigation",
+                "target": "/opt/cyberwave/navigation",
+                "profile": "config/profiles/robot.yaml",
+            }
+        },
+        "volumes": {
+            "navigation-bundle": {
+                "external": True,
+                "name": "${CW_NAVIGATION_BUNDLE}",
+            }
+        },
+        "services": {
+            "nav2": {
+                "image": "nav2:${CW_CHANNEL_TAG}",
+                "environment": {
+                    "CONFIG_PROFILE": "${CW_CONFIG_PROFILE}",
+                    "ROBOT_NAV_PROFILE": "${CW_NAVIGATION_PROFILE}",
+                    "TEST_ROS_DISTRO": "${CW_ROS_DISTRO}",
+                },
+                "volumes": [
+                    {
+                        "type": "volume",
+                        "source": "navigation-bundle",
+                        "target": "/opt/cyberwave/navigation",
+                        "read_only": True,
+                    }
+                ],
+            }
+        },
+    }
+    _labels(monkeypatch, _label_set(doc))
+
+    materialized: list[tuple[str, tuple[str, str, str]]] = []
+
+    def _materialize(image: str, spec: tuple[str, str, str]) -> tuple[str, str]:
+        materialized.append((image, spec))
+        return "cyberwave-navigation-deadbeef", "bundle-sha256"
+
+    monkeypatch.setattr(
+        ds,
+        "_materialize_navigation_bundle",
+        _materialize,
+    )
+
+    diagnostic_specs, _, _ = ds.get_image_declared_services(
+        "driver:test", materialize_navigation_bundle=False
+    )
+    assert materialized == []
+    assert diagnostic_specs[0].params[-1].startswith("cyberwave-navigation-preflight:")
+
+    specs, _, _ = ds.get_image_declared_services("driver:test")
+
+    assert len(materialized) == 1
+    assert specs[0].params[-2:] == [
+        "-v",
+        "cyberwave-navigation-deadbeef:/opt/cyberwave/navigation:ro",
+    ]
+    assert specs[0].env["CONFIG_PROFILE"] == "jetson"
+    assert specs[0].env["TEST_ROS_DISTRO"] == "humble"
+    assert specs[0].env["ROBOT_NAV_PROFILE"] == (
+        "/opt/cyberwave/navigation/config/profiles/robot.yaml"
+    )
+
+
+def test_declared_navigation_bundle_failure_is_fatal(monkeypatch: Any) -> None:
+    doc = {
+        "x-cyberwave": {
+            "navigation_bundle": {
+                "schema": 99,
+                "source": "/bundle",
+                "target": "/bundle",
+                "profile": "profile.yaml",
+            }
+        },
+        "services": {"nav2": {"image": "nav2:test"}},
+    }
+    _labels(monkeypatch, _label_set(doc))
+
+    with pytest.raises(RuntimeError, match="invalid navigation bundle"):
+        ds.get_image_declared_services("driver:test")
+
+
+def test_materialized_bundle_is_content_addressed_and_reused(monkeypatch: Any) -> None:
+    calls: list[list[str]] = []
+
+    def fake_docker(argv: list[str], *, timeout: int = 60) -> SimpleNamespace:
+        calls.append(argv)
+        if argv[1:3] == ["image", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout="sha256:image-id\n", stderr="")
+        if argv[1:3] == ["volume", "create"]:
+            return SimpleNamespace(returncode=0, stdout=argv[-1] + "\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="bundle-digest\n", stderr="")
+
+    monkeypatch.setattr(ds, "_docker_capture", fake_docker)
+
+    volume, digest = ds._materialize_navigation_bundle(
+        "driver:test", ("/source", "/target", "profiles/robot.yaml")
+    )
+
+    assert volume.startswith("cyberwave-navigation-")
+    assert digest == "bundle-digest"
+    assert len(calls) == 3
+    assert calls[-1][calls[-1].index("-v") + 1] == f"{volume}:/bundle:ro"
+
+    calls.clear()
+    assert ds._materialize_navigation_bundle(
+        "driver:test", ("/source", "/target", "profiles/robot.yaml")
+    ) == (volume, digest)
+    assert [call[1:3] for call in calls] == [
+        ["image", "inspect"],
+        ["run", "--rm"],
+    ]
+
+
+def test_navigation_profile_must_match_ros_distro(monkeypatch: Any) -> None:
+    doc = {
+        "x-cyberwave": {
+            "navigation_bundle": {
+                "schema": 1,
+                "source": "/bundle",
+                "target": "/bundle",
+                "profile": "profile.yaml",
+            }
+        },
+        "services": {"nav2": {"image": "nav2:test"}},
+    }
+    labels = _label_set(doc)
+    labels[ds._NAVIGATION_CONFIG_PROFILE_LABEL] = "jazzy"
+    labels[ds._NAVIGATION_ROS_DISTRO_LABEL] = "humble"
+    _labels(monkeypatch, labels)
+
+    with pytest.raises(RuntimeError, match="does not match ROS distro"):
+        ds.get_image_declared_services("driver:test")
 
 
 def test_channel_tag_falls_back_to_the_image_tag(monkeypatch: Any) -> None:
@@ -836,6 +981,20 @@ def test_the_proxy_tag_is_always_substituted(monkeypatch: Any) -> None:
     assert "CW_SIM_PROXY_TAG" in ds.compose_substitutions(
         channel_tag="humble", twin_uuid="abcd1234-0000-0000-0000-000000000000"
     )
+
+
+def test_navigation_substitutions_are_explicit_optional_inputs() -> None:
+    subs = ds.compose_substitutions(
+        channel_tag="humble",
+        navigation_bundle="nav-volume",
+        navigation_config_profile="humble",
+        navigation_ros_distro="humble",
+        navigation_profile="/opt/cyberwave/navigation/config/profiles/robot.yaml",
+    )
+    assert subs["CW_NAVIGATION_BUNDLE"] == "nav-volume"
+    assert subs["CW_CONFIG_PROFILE"] == "humble"
+    assert subs["CW_ROS_DISTRO"] == "humble"
+    assert subs["CW_NAVIGATION_PROFILE"].endswith("/robot.yaml")
 
 
 # ── twin shared_env on the image-declared path ────────────────────────────────

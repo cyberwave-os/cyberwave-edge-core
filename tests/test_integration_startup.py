@@ -9,6 +9,7 @@ Unlike the fine-grained unit tests in test_startup_core.py, these tests verify
 that the individual pieces (credentials loading, token validation, MQTT, edge
 registration, environment linking, twin driver launching) all compose correctly.
 """
+
 from __future__ import annotations
 
 import json
@@ -173,9 +174,7 @@ class TestRunStartupChecksHappyPath:
         driver_image = "ghcr.io/org/my-driver:1.0"
         twin = _make_fake_twin(driver_image=driver_image)
 
-        monkeypatch.setattr(
-            startup, "Cyberwave", FakeCyberwave.factory(twins=[twin])
-        )
+        monkeypatch.setattr(startup, "Cyberwave", FakeCyberwave.factory(twins=[twin]))
         monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: _FINGERPRINT)
         monkeypatch.setattr(
             startup,
@@ -206,9 +205,7 @@ class TestRunStartupChecksHappyPath:
 
         foreign_twin = _make_fake_twin(fingerprint="other-edge-fingerprint")
 
-        monkeypatch.setattr(
-            startup, "Cyberwave", FakeCyberwave.factory(twins=[foreign_twin])
-        )
+        monkeypatch.setattr(startup, "Cyberwave", FakeCyberwave.factory(twins=[foreign_twin]))
         monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: _FINGERPRINT)
         monkeypatch.setattr(
             startup,
@@ -496,3 +493,32 @@ class TestFetchAndRunTwinDriversIntegration:
         assert results[0]["twin_uuid"] == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
         assert results[0]["success"] is True
         assert run_docker.call_count == 1
+
+    def test_invalid_declared_topology_only_skips_its_twin(self, tmp_path, monkeypatch):
+        """A bad bundle must not cancel the pull and launch passes for other twins."""
+        self._patch_common(tmp_path, monkeypatch)
+        bad_twin = _make_fake_twin(name="bad-twin")
+        good_twin = _make_fake_twin(
+            uuid="dddddddd-dddd-dddd-dddd-dddddddddddd",
+            name="good-twin",
+        )
+        client = self._make_client([bad_twin, good_twin])
+
+        monkeypatch.setattr(startup, "Cyberwave", lambda *a, **k: client)
+        monkeypatch.setattr(startup, "_send_alert_for_twin", MagicMock())
+
+        def declared(_drivers, twin, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            if twin.name == "bad-twin":
+                raise RuntimeError("invalid navigation bundle")
+            return None
+
+        monkeypatch.setattr(startup, "_image_declared_services_for_twin", declared)
+        run_docker = MagicMock(return_value=True)
+        monkeypatch.setattr(startup, "_run_docker_image", run_docker)
+
+        results = startup.fetch_and_run_twin_drivers(_TOKEN, _ENV_UUID, _FINGERPRINT)
+
+        assert [result["twin_uuid"] for result in results] == [good_twin.uuid]
+        assert results[0]["success"] is True
+        assert run_docker.call_count == 1
+        startup._send_alert_for_twin.assert_called_once()

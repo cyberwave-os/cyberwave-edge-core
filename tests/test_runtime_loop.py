@@ -375,6 +375,7 @@ class TestRunPeriodicDockerCleanup:
         startup._sd_card_pressure_logged = False
         monkeypatch.delenv("CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP", raising=False)
         import cyberwave_edge_core.docker_helpers as _dh
+
         monkeypatch.setattr(_dh, "is_sd_card_path", lambda _p: False)
         monkeypatch.setattr(_dh, "docker_data_root", lambda: "/var/lib/docker")
         yield
@@ -411,6 +412,10 @@ class TestRunPeriodicDockerCleanup:
             _dh,
             "docker_prune_unused_images",
             lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+        )
+        monkeypatch.setattr(_dh, "docker_prune_dangling_volumes", lambda: True)
+        monkeypatch.setattr(
+            _dh, "docker_prune_navigation_bundle_volumes", lambda **_kwargs: True
         )
 
         startup._run_periodic_docker_cleanup()
@@ -511,7 +516,7 @@ class TestRunPeriodicDockerCleanup:
         """Patch the three prune helpers and return their call counters."""
         import cyberwave_edge_core.docker_helpers as _dh
 
-        calls = {"container": 0, "image": 0, "volume": 0}
+        calls = {"container": 0, "image": 0, "volume": 0, "navigation_volume": 0}
 
         def _bump(key, retval):
             def _inner(*_args, **_kwargs):
@@ -520,11 +525,14 @@ class TestRunPeriodicDockerCleanup:
 
             return _inner
 
-        monkeypatch.setattr(
-            _dh, "docker_prune_stopped_cyberwave_containers", _bump("container", 0)
-        )
+        monkeypatch.setattr(_dh, "docker_prune_stopped_cyberwave_containers", _bump("container", 0))
         monkeypatch.setattr(_dh, "docker_prune_unused_images", _bump("image", True))
         monkeypatch.setattr(_dh, "docker_prune_dangling_volumes", _bump("volume", True))
+        monkeypatch.setattr(
+            _dh,
+            "docker_prune_navigation_bundle_volumes",
+            _bump("navigation_volume", True),
+        )
         return calls
 
     def test_defers_cleanup_on_healthy_sd_card(self, monkeypatch):
@@ -541,7 +549,12 @@ class TestRunPeriodicDockerCleanup:
 
         startup._run_periodic_docker_cleanup()
 
-        assert calls == {"container": 0, "image": 0, "volume": 0}
+        assert calls == {
+            "container": 0,
+            "image": 0,
+            "volume": 0,
+            "navigation_volume": 0,
+        }
         startup._docker_cleanup_disabled = None
 
     def test_runs_cleanup_on_full_sd_card(self, monkeypatch):
@@ -564,7 +577,12 @@ class TestRunPeriodicDockerCleanup:
 
         startup._run_periodic_docker_cleanup()
 
-        assert calls == {"container": 1, "image": 1, "volume": 1}
+        assert calls == {
+            "container": 1,
+            "image": 1,
+            "volume": 1,
+            "navigation_volume": 1,
+        }
         startup._docker_cleanup_disabled = None
 
     def test_pressure_warning_logged_once_per_crossing(self, monkeypatch, caplog):
@@ -616,7 +634,12 @@ class TestRunPeriodicDockerCleanup:
 
         startup._run_periodic_docker_cleanup()
 
-        assert calls == {"container": 0, "image": 0, "volume": 0}
+        assert calls == {
+            "container": 0,
+            "image": 0,
+            "volume": 0,
+            "navigation_volume": 0,
+        }
         startup._docker_cleanup_disabled = None
 
     def test_env_opt_out_beats_disk_pressure(self, monkeypatch):
@@ -633,7 +656,12 @@ class TestRunPeriodicDockerCleanup:
 
         startup._run_periodic_docker_cleanup()
 
-        assert calls == {"container": 0, "image": 0, "volume": 0}
+        assert calls == {
+            "container": 0,
+            "image": 0,
+            "volume": 0,
+            "navigation_volume": 0,
+        }
         startup._docker_cleanup_disabled = None
 
     def test_runs_cleanup_when_not_sd_card_and_no_env_var(self, monkeypatch):

@@ -3060,14 +3060,41 @@ def fetch_and_run_twin_drivers(
             child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
         )
         if multi is None:
-            multi = _image_declared_services_for_twin(
-                drivers,
-                twin,
-                twin_uuid,
-                child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
-                token=token,
-                watchdog=watchdog,
-            )
+            try:
+                multi = _image_declared_services_for_twin(
+                    drivers,
+                    twin,
+                    twin_uuid,
+                    child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+                    token=token,
+                    watchdog=watchdog,
+                )
+            except RuntimeError as exc:
+                # A declared bundle must not degrade to intelligence defaults,
+                # but its failure is local to this twin. Let the remaining
+                # twins proceed to the pull and launch passes.
+                logger.error(
+                    "Twin '%s' declares an unusable topology: %s", twin.name, exc
+                )
+                try:
+                    _send_alert_for_twin(
+                        twin_uuid,
+                        "Unusable declared topology",
+                        (
+                            f"Twin '{twin.name}' declares a topology this edge "
+                            f"cannot resolve: {exc}. Troubleshooting: "
+                            f"{DRIVER_TROUBLESHOOTING_URL}"
+                        ),
+                        "driver_start_failure",
+                        severity="error",
+                    )
+                except Exception as alert_exc:
+                    logger.warning(
+                        "Could not send declared-topology alert for twin %s: %s",
+                        twin_uuid,
+                        alert_exc,
+                    )
+                continue
         if multi is not None:
             svc_specs, shared_env, shared_params = multi
             logger.info(
@@ -5985,6 +6012,7 @@ def _run_periodic_docker_cleanup() -> None:
 
     from .docker_helpers import (
         docker_prune_dangling_volumes,
+        docker_prune_navigation_bundle_volumes,
         docker_prune_stopped_cyberwave_containers,
         docker_prune_unused_images,
     )
@@ -6007,9 +6035,14 @@ def _run_periodic_docker_cleanup() -> None:
 
     if now - _last_volume_prune_time >= VOLUME_PRUNE_INTERVAL_SECONDS:
         try:
+            from .driver_selection import navigation_bundle_cache_volumes
+
             docker_prune_dangling_volumes()
+            docker_prune_navigation_bundle_volumes(
+                protected_volumes=navigation_bundle_cache_volumes()
+            )
         except Exception:
-            logger.exception("Unexpected error during dangling-volume prune")
+            logger.exception("Unexpected error during volume prune")
         _last_volume_prune_time = now
 
 
