@@ -43,6 +43,7 @@ def _no_inherited_variant(monkeypatch: Any) -> None:
     # pins it, so a developer's own CYBERWAVE_ENVIRONMENT would otherwise decide
     # what the default tests mean.
     monkeypatch.delenv(ds.SIM_PROXY_TAG_ENV, raising=False)
+    monkeypatch.delenv("ZENOH_CONNECT", raising=False)
     # Third train, same hazard, and one more reason it matters here: an inherited
     # value would satisfy the refusal tests below for the wrong reason, turning
     # "this cannot resolve" into a silent pass.
@@ -1096,6 +1097,17 @@ def test_the_sim_proxy_tag_is_not_the_driver_channel(monkeypatch: Any) -> None:
     subs = ds.compose_substitutions(channel_tag="humble-pr-3749-sha-7f29d2c1c975")
     assert subs["CW_CHANNEL_TAG"] == "humble-pr-3749-sha-7f29d2c1c975"
     assert subs["CW_SIM_PROXY_TAG"] == "production"
+
+
+def test_zenoh_connect_is_always_resolved_for_declared_topologies(
+    monkeypatch: Any,
+) -> None:
+    """An optional endpoint is blank when absent and exact when configured."""
+    assert ds.compose_substitutions(channel_tag="humble")["ZENOH_CONNECT"] == ""
+    monkeypatch.setenv("ZENOH_CONNECT", "tcp/cyberwave-zenoh-router:7447")
+    assert ds.compose_substitutions(channel_tag="humble")["ZENOH_CONNECT"] == (
+        "tcp/cyberwave-zenoh-router:7447"
+    )
 
 
 def test_the_sim_proxy_tag_defaults_to_the_deployment_environment(

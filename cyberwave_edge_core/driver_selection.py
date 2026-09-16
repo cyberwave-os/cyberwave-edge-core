@@ -1502,7 +1502,16 @@ def compose_substitutions(
     distro), and callers refuse a declaration that needs an unresolvable one
     rather than render an image reference that has never been published.
     """
-    substitutions = {"CW_CHANNEL_TAG": channel_tag}
+    substitutions = {
+        "CW_CHANNEL_TAG": channel_tag,
+        # Optional, but it must still be substituted when absent. Leaving the
+        # plain Compose placeholder intact would pass the literal
+        # ``${ZENOH_CONNECT}`` to the container. An empty value preserves the
+        # normal peer-to-peer scouting topology; a configured value pins every
+        # participant to the same router and avoids multicast discovery races
+        # during a cold restart.
+        "ZENOH_CONNECT": os.environ.get("ZENOH_CONNECT", ""),
+    }
     # A SECOND train, resolved separately -- see `_resolve_sim_proxy_tag`. Always
     # present rather than conditional: an unrendered `${CW_SIM_PROXY_TAG}` would
     # reach docker as a literal image tag, which is the same class of failure as
