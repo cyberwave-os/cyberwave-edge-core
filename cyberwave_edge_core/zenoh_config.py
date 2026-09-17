@@ -133,7 +133,12 @@ class ZenohConfig:
     router_port: int = 0
     """Host port for the router.  Env: ``ZENOH_ROUTER_PORT``."""
 
+    session_mode: str = ""
+    """Optional SDK session mode (peer/client). Env: ``ZENOH_MODE``."""
+
     def __post_init__(self) -> None:
+        if not self.session_mode:
+            self.session_mode = os.environ.get("ZENOH_MODE", "").strip().lower()
         if not self.data_backend:
             self.data_backend = os.environ.get("CYBERWAVE_DATA_BACKEND", "zenoh").strip() or "zenoh"
 
@@ -211,6 +216,8 @@ def build_zenoh_env_vars(config: ZenohConfig) -> dict[str, str]:
         return env
 
     env["ZENOH_SHARED_MEMORY"] = "true" if config.shared_memory else "false"
+    if config.session_mode:
+        env["ZENOH_MODE"] = config.session_mode
 
     if config.connect_endpoints:
         env["ZENOH_CONNECT"] = ",".join(config.connect_endpoints)

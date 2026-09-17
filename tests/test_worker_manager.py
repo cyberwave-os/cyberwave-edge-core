@@ -111,6 +111,8 @@ class TestWorkerManagerEnvVars:
         def fake_get_runtime_env_var(name: str, default: object = None) -> object:
             if name == "ZENOH_CONNECT":
                 return "tcp/192.168.1.10:7447"
+            if name == "ZENOH_MODE":
+                return "client"
             return default
 
         monkeypatch.setattr(
@@ -122,6 +124,7 @@ class TestWorkerManagerEnvVars:
 
         env = worker_manager._build_env_vars()
         assert env["ZENOH_CONNECT"] == "tcp/192.168.1.10:7447"
+        assert env["ZENOH_MODE"] == "client"
 
     def test_zenoh_connect_absent_when_not_set(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
@@ -1158,7 +1161,7 @@ class TestGetZenohEnvVars:
 
     def test_zenoh_connect_included_when_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_get_runtime_env_var(name: str, default: object = None) -> object:
-            return "tcp/router:7447" if name == "ZENOH_CONNECT" else None
+            return {"ZENOH_CONNECT": "tcp/router:7447", "ZENOH_MODE": "client"}.get(name)
 
         monkeypatch.setattr(
             "cyberwave_edge_core.startup.get_runtime_env_var",
@@ -1166,6 +1169,7 @@ class TestGetZenohEnvVars:
         )
         env = get_zenoh_env_vars()
         assert env["ZENOH_CONNECT"] == "tcp/router:7447"
+        assert env["ZENOH_MODE"] == "client"
 
     def test_zenoh_connect_excluded_when_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -2333,16 +2337,12 @@ class TestWorkerStartupFailureAlertWiring:
 
         def _owner() -> None:
             results.append(
-                worker_manager._pull_worker_image_with_progress(
-                    "cyberwaveos/edge-ml-worker:dev"
-                )
+                worker_manager._pull_worker_image_with_progress("cyberwaveos/edge-ml-worker:dev")
             )
 
         def _waiter() -> None:
             results.append(
-                worker_manager._pull_worker_image_with_progress(
-                    "cyberwaveos/edge-ml-worker:dev"
-                )
+                worker_manager._pull_worker_image_with_progress("cyberwaveos/edge-ml-worker:dev")
             )
 
         owner = threading.Thread(target=_owner)
@@ -2862,8 +2862,7 @@ class TestWorkerStartingNotification:
 
         for ctx in _RecordingAlertCtx.instances:
             assert ctx.phases.count("loading_models") == 3, (
-                "the first publish plus one per keepalive interval, "
-                "not one per reconcile tick"
+                "the first publish plus one per keepalive interval, not one per reconcile tick"
             )
             assert ctx.resolved is False
 

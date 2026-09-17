@@ -56,6 +56,13 @@ DEFAULT_POLL_SECONDS = float(os.getenv("CYBERWAVE_DRIVER_DEPENDENCY_HEALTH_POLL_
 # ``(the container exists, its health status)``.
 Probe = Callable[[str], "tuple[bool, str]"]
 
+# Docker can retain a stale health result after the process exits. Both
+# orchestrators must inspect process state before trusting that cached result.
+HEALTH_STATUS_FORMAT = (
+    '{{if or (eq .State.Status "exited") (eq .State.Status "dead")}}'
+    "{{.State.Status}}{{else if .State.Health}}{{.State.Health.Status}}{{end}}"
+)
+
 
 def container_health_status(container_name: str) -> tuple[bool, str]:
     """``(the container exists, its health status)`` for one container.
@@ -78,7 +85,7 @@ def container_health_status(container_name: str) -> tuple[bool, str]:
                 "docker",
                 "inspect",
                 "--format",
-                "{{if .State.Health}}{{.State.Health.Status}}{{end}}",
+                HEALTH_STATUS_FORMAT,
                 container_name,
             ],
             check=True,
@@ -105,8 +112,10 @@ def wait_for_dependency_health(
 
     True means "as ready as it can be": healthy, or nothing to satisfy (no
     healthcheck declared, or no container to inspect). False means the budget
-    expired with the dependency still ``starting`` or ``unhealthy``. Either way
-    the caller starts the dependent -- see the module docstring.
+    expired with the dependency still ``starting`` or ``unhealthy``, or its
+    process has exited. Either way the caller starts the dependent -- see the
+    module docstring. An exited process cannot pass another healthcheck until
+    restarted; release the wait so supervision/recovery can handle it promptly.
 
     **The wait must heartbeat, or it kills the process it runs in.** On a robot
     this is called from the serial launch loop, which runs inline inside the
@@ -140,6 +149,14 @@ def wait_for_dependency_health(
             )
             return True
 
+        if status in {"exited", "dead"}:
+            log.error(
+                "Dependency %s is %s; releasing health wait for supervision",
+                container_name,
+                status,
+            )
+            return False
+
         if status == "healthy":
             return True
 
@@ -162,9 +179,7 @@ def wait_for_dependency_health(
             try:
                 watchdog.ping()
                 watchdog.extend_timeout(heartbeat_extend_seconds)
-                watchdog.notify_status(
-                    f"Waiting for {container_name} to become healthy ({status})"
-                )
+                watchdog.notify_status(f"Waiting for {container_name} to become healthy ({status})")
             except Exception:
                 log.debug("Watchdog heartbeat failed during health wait", exc_info=True)
 

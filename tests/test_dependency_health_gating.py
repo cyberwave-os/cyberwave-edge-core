@@ -28,6 +28,8 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+import pytest
+
 from cyberwave_edge_core import health_gating, startup
 from cyberwave_edge_core.docker_helpers import driver_container_name
 
@@ -107,6 +109,34 @@ def test_starting_dependency_is_polled_until_healthy(monkeypatch: Any) -> None:
     )
     assert _wait() is True
     assert len(asked) == 3
+
+
+@pytest.mark.parametrize("status", ["exited", "dead"])
+def test_exited_dependency_releases_the_wait_without_sleeping(
+    monkeypatch: Any, status: str
+) -> None:
+    probes: list[str] = []
+
+    def probe(name: str) -> tuple[bool, str]:
+        probes.append(name)
+        return True, status
+
+    monkeypatch.setattr(
+        health_gating.time, "sleep", lambda _: pytest.fail("waited on an exited process")
+    )
+    gate = health_gating.HealthGate(probe=probe, timeout_seconds=180)
+    assert gate.wait_once("plant") is False
+    assert gate.wait_once("plant") is False
+    assert probes == ["plant"]
+
+
+def test_restarting_dependency_can_recover(monkeypatch: Any) -> None:
+    states = iter(["restarting", "healthy"])
+    monkeypatch.setattr(health_gating.time, "sleep", lambda _: None)
+    assert (
+        health_gating.wait_for_dependency_health("plant", probe=lambda _: (True, next(states)))
+        is True
+    )
 
 
 # --- never stranding a dependent -------------------------------------------

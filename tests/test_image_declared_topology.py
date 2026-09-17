@@ -1103,6 +1103,10 @@ def test_zenoh_connect_is_always_resolved_for_declared_topologies(
     monkeypatch: Any,
 ) -> None:
     """An optional endpoint is blank when absent and exact when configured."""
+    monkeypatch.delenv("ZENOH_MODE", raising=False)
+    assert ds.compose_substitutions(channel_tag="humble")["ZENOH_MODE"] == ""
+    monkeypatch.setenv("ZENOH_MODE", "client")
+    assert ds.compose_substitutions(channel_tag="humble")["ZENOH_MODE"] == "client"
     assert ds.compose_substitutions(channel_tag="humble")["ZENOH_CONNECT"] == ""
     monkeypatch.setenv("ZENOH_CONNECT", "tcp/cyberwave-zenoh-router:7447")
     assert ds.compose_substitutions(channel_tag="humble")["ZENOH_CONNECT"] == (

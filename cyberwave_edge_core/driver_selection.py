@@ -742,9 +742,11 @@ def _materialize_navigation_bundle(
             ],
             timeout=30,
         )
-        return probe.stdout.strip().splitlines()[-1] if (
-            probe.returncode == 0 and probe.stdout.strip()
-        ) else ""
+        return (
+            probe.stdout.strip().splitlines()[-1]
+            if (probe.returncode == 0 and probe.stdout.strip())
+            else ""
+        )
 
     # Serialize at the mutation boundary rather than relying on every startup
     # entry point to stay sequential. Re-probe the marker instead of trusting
@@ -1511,6 +1513,7 @@ def compose_substitutions(
         # participant to the same router and avoids multicast discovery races
         # during a cold restart.
         "ZENOH_CONNECT": os.environ.get("ZENOH_CONNECT", ""),
+        "ZENOH_MODE": os.environ.get("ZENOH_MODE", ""),
     }
     # A SECOND train, resolved separately -- see `_resolve_sim_proxy_tag`. Always
     # present rather than conditional: an unrendered `${CW_SIM_PROXY_TAG}` would
@@ -1728,9 +1731,7 @@ def get_image_declared_services(
 
     if navigation_bundle is not None and materialize_navigation_bundle:
         try:
-            bundle_volume, bundle_digest = _materialize_navigation_bundle(
-                image, navigation_bundle
-            )
+            bundle_volume, bundle_digest = _materialize_navigation_bundle(image, navigation_bundle)
         except ValueError as exc:
             raise RuntimeError(f"invalid navigation bundle in {image!r}: {exc}") from exc
         logger.info(

@@ -43,6 +43,7 @@ def _config(**kwargs) -> ZenohConfig:
     cfg.router_enabled = kwargs.get("router_enabled", False)
     cfg.router_image = kwargs.get("router_image", "eclipse/zenoh:latest")
     cfg.router_port = kwargs.get("router_port", 7447)
+    cfg.session_mode = kwargs.get("session_mode", "")
     return cfg
 
 
@@ -202,6 +203,13 @@ class TestBuildZenohEnvVars:
         cfg = _config(connect_endpoints=[])
         env = build_zenoh_env_vars(cfg)
         assert "ZENOH_CONNECT" not in env
+
+    def test_optional_session_mode_is_shared_by_managed_containers(self, monkeypatch):
+        monkeypatch.delenv("ZENOH_MODE", raising=False)
+        assert "ZENOH_MODE" not in build_zenoh_env_vars(_config())
+        monkeypatch.setenv("ZENOH_MODE", "client")
+        assert build_zenoh_env_vars(ZenohConfig())["ZENOH_MODE"] == "client"
+        assert build_zenoh_env_vars(_config(session_mode="peer"))["ZENOH_MODE"] == "peer"
 
     def test_all_values_are_strings(self):
         cfg = _config(shared_memory=True, connect_endpoints=["tcp/localhost:7447"])

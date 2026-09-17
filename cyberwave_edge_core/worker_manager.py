@@ -397,6 +397,7 @@ def _get_container_start_lock(container_name: str) -> threading.Lock:
             _CONTAINER_START_LOCKS[container_name] = threading.Lock()
         return _CONTAINER_START_LOCKS[container_name]
 
+
 #: Host device node exposed by the Hailo PCIe driver (HailoRT). Presence of
 #: this path is the cheapest way to detect a Hailo accelerator on the host
 #: without paying the cost of forking ``hailortcli``.
@@ -982,9 +983,10 @@ class WorkerManager:
         if runtime_environment != "production":
             env["CYBERWAVE_ENVIRONMENT"] = runtime_environment
 
-        zenoh_connect = get_runtime_env_var("ZENOH_CONNECT")
-        if zenoh_connect:
-            env["ZENOH_CONNECT"] = zenoh_connect
+        for key in ("ZENOH_CONNECT", "ZENOH_MODE"):
+            value = get_runtime_env_var(key)
+            if value:
+                env[key] = value
 
         # Expose a TCP listener so the CLI monitor can connect from the host.
         zenoh_listen = get_runtime_env_var("ZENOH_LISTEN")
@@ -1061,9 +1063,7 @@ class WorkerManager:
                 candidate.mkdir(parents=True, exist_ok=True)
                 _ensure_dir_writable_by_container_user(candidate)
             except OSError:
-                logger.debug(
-                    "Could not prepare worker status dir %s", candidate, exc_info=True
-                )
+                logger.debug("Could not prepare worker status dir %s", candidate, exc_info=True)
                 continue
             self._status_dir_cache = candidate
             self._status_dir_resolved = True
@@ -1226,9 +1226,7 @@ class WorkerManager:
                     ctx.mark_failed_and_resolve(error_str, phase=phase)
             else:
                 for ctx in alert_ctxs:
-                    ctx.update_metadata(
-                        {"phase": phase, "last_error": error_str[:500]}, force=True
-                    )
+                    ctx.update_metadata({"phase": phase, "last_error": error_str[:500]}, force=True)
             return False
 
         contexts = [
@@ -1265,11 +1263,7 @@ class WorkerManager:
                 return True
             error_str = (getattr(exc, "stderr", None) or str(exc))[:500]
             logger.error("Failed to pull worker image %s: %s", image, error_str)
-            phase = (
-                "pull_timeout"
-                if isinstance(exc, subprocess.TimeoutExpired)
-                else "pull_failed"
-            )
+            phase = "pull_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "pull_failed"
             return _fail(error_str, phase=phase)
         except OSError as exc:
             if has_local:
@@ -1306,9 +1300,7 @@ class WorkerManager:
         copy present are identical to those of :meth:`_ensure_image_pulled`.
         """
         if not _begin_worker_image_pull(image):
-            waited = _wait_for_worker_image_pull(
-                image, timeout=float(timeout) + 30.0
-            )
+            waited = _wait_for_worker_image_pull(image, timeout=float(timeout) + 30.0)
             if waited is True or _docker_image_present(image):
                 return True
             if waited is False:
@@ -1425,9 +1417,7 @@ class WorkerManager:
                 logger.debug("Could not update worker_starting alert", exc_info=True)
 
     @staticmethod
-    def _resolve_alert_ctxs(
-        ctxs: list[Any], *, failure: str = "", phase: str = ""
-    ) -> None:
+    def _resolve_alert_ctxs(ctxs: list[Any], *, failure: str = "", phase: str = "") -> None:
         """Resolve *ctxs*, optionally marking them failed first."""
         for ctx in ctxs:
             try:
@@ -1444,9 +1434,7 @@ class WorkerManager:
 
     def _close_starting_alerts(self, *, failure: str = "", phase: str = "") -> None:
         """Resolve the card's alerts, optionally failing them first."""
-        self._resolve_alert_ctxs(
-            self._card.take_ctxs(), failure=failure, phase=phase
-        )
+        self._resolve_alert_ctxs(self._card.take_ctxs(), failure=failure, phase=phase)
 
     def _reset_readiness_tracking(self) -> None:
         """Forget everything learned about the startup currently being watched.
@@ -1611,8 +1599,7 @@ class WorkerManager:
             return
         if is_worker_image_pull_in_progress():
             logger.info(
-                "Suppressing worker_start_failure alert while worker image pull "
-                "is in progress: %s",
+                "Suppressing worker_start_failure alert while worker image pull is in progress: %s",
                 detail or "(no detail)",
             )
             return
@@ -1689,9 +1676,12 @@ class WorkerManager:
             is_our_worker_image = image.startswith(f"{_WORKER_IMAGE_BASE}:")
             if jetson_accelerator_supported() or not is_our_worker_image:
                 gpu_args = [
-                    "--runtime", "nvidia",
-                    "-e", "NVIDIA_VISIBLE_DEVICES=all",
-                    "-e", "NVIDIA_DRIVER_CAPABILITIES=all",
+                    "--runtime",
+                    "nvidia",
+                    "-e",
+                    "NVIDIA_VISIBLE_DEVICES=all",
+                    "-e",
+                    "NVIDIA_DRIVER_CAPABILITIES=all",
                 ]
                 rewritten = _apply_jetson_image_tag(image)
                 if rewritten != image:
@@ -1721,7 +1711,11 @@ class WorkerManager:
                 )
         elif docker_has_nvidia_runtime():
             gpu_args = ["--gpus", "all"]
-            if image.startswith("cyberwaveos/edge-ml-worker:") and not image.endswith("-gpu") and not image.endswith("-jetson"):
+            if (
+                image.startswith("cyberwaveos/edge-ml-worker:")
+                and not image.endswith("-gpu")
+                and not image.endswith("-jetson")
+            ):
                 non_gpu_image = image
                 image = f"{image}-gpu"
                 logger.info("NVIDIA runtime detected; using GPU image %s", image)
@@ -1859,9 +1853,7 @@ class WorkerManager:
                         "docker rm timed out for %s during conflict recovery; cannot retry",
                         self._container_name,
                     )
-                    self._send_startup_failure_alert(
-                        "docker rm timed out during conflict recovery"
-                    )
+                    self._send_startup_failure_alert("docker rm timed out during conflict recovery")
                     return False
                 # Brief pause so Docker's daemon finishes cleaning up the container
                 # record before we retry docker run.  The race window is sub-second;
@@ -2007,8 +1999,9 @@ def get_zenoh_env_vars() -> dict[str, str]:
         "CYBERWAVE_DATA_BACKEND": "zenoh",
     }
 
-    zenoh_connect = get_runtime_env_var("ZENOH_CONNECT")
-    if zenoh_connect:
-        env["ZENOH_CONNECT"] = zenoh_connect
+    for key in ("ZENOH_CONNECT", "ZENOH_MODE"):
+        value = get_runtime_env_var(key)
+        if value:
+            env[key] = value
 
     return env
