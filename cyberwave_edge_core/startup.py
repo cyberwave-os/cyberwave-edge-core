@@ -64,6 +64,11 @@ except ImportError:  # pragma: no cover - defensive
 
 
 from . import __version__ as PACKAGE_EDGE_CORE_VERSION
+from .jetson_power import (
+    JETSON_NVP_MODEL_ENV,
+    configure_jetson_nvpmodel,
+    resolve_jetson_nvpmodel_request,
+)
 from .utils import (
     EDGE_CORE_RESTART_PHASE_COMPLETED,
     EDGE_CORE_RESTART_PHASE_FAILED,
@@ -3325,6 +3330,13 @@ def fetch_and_run_twin_drivers(
     # dead plant from costing the health budget once per dependent -- see
     # health_gating.HealthGate.
     health_gate = _health_gate(watchdog)
+    requested_nvpmodel = resolve_jetson_nvpmodel_request(
+        (spec.service_env or {}).get(JETSON_NVP_MODEL_ENV)
+        for spec in driver_specs
+        if pull_results.get(spec.driver_image, False)
+    )
+    if requested_nvpmodel is not None:
+        configure_jetson_nvpmodel(requested_nvpmodel)
 
     for idx, spec in enumerate(driver_specs):
         alert_ctx = alert_by_spec_index.get(idx)
