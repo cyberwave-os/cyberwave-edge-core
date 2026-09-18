@@ -37,7 +37,9 @@ _DOCKERFILE = Path(__file__).parent / "stub_worker.Dockerfile"
 
 STUB_IMAGE_IT = "cyberwave-worker-stub:it"
 STUB_IMAGE_IMMUTABLE = "cyberwave-worker-stub:v1"
-STUB_IMAGE_MUTABLE = "cyberwave-worker-stub:local"
+# ``:dev``, not ``:local``: a local build is immutable, so it would skip
+# the pull this fixture exists to observe.
+STUB_IMAGE_MUTABLE = "cyberwave-worker-stub:dev"
 STUB_IMAGE_TAGS = (STUB_IMAGE_IT, STUB_IMAGE_IMMUTABLE, STUB_IMAGE_MUTABLE)
 
 
@@ -130,7 +132,7 @@ def stub_worker_image() -> Iterator[str]:
     * ``cyberwave-worker-stub:it`` — primary tag used by most tests.
     * ``cyberwave-worker-stub:v1`` — immutable tag (no entry in
       :data:`cyberwave_edge_core.worker_manager._MUTABLE_TAG_BASENAMES`).
-    * ``cyberwave-worker-stub:local`` — mutable tag (``local`` is in
+    * ``cyberwave-worker-stub:dev`` — mutable tag (``dev`` is in
       the mutable basenames list).
     """
     if not _have_docker():
@@ -163,7 +165,7 @@ def stub_worker_image() -> Iterator[str]:
         )
 
     # Retag must succeed: Phase 8 needs both ``:v1`` (immutable) and
-    # ``:local`` (mutable) present locally to exercise the pull policy.
+    # ``:dev`` (mutable) present locally to exercise the pull policy.
     # If a retag silently failed, ``WorkerManager._ensure_image_pulled``
     # would try to fetch the missing tag from docker.io, hanging up to
     # 600 s. Skip the suite with a clear reason instead.

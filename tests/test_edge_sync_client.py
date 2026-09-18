@@ -380,6 +380,72 @@ class TestEdgeSyncClientTwoStrikesCleanup:
         assert any("wf_x.py" in r.removed for r in second_empty)
         assert "wf_x.py" not in previously_missing, "strike state should clear on delete"
 
+    def test_a_failed_fetch_is_not_read_as_a_deactivation(self, tmp_path):
+        """An outage must not unlink the workers the device is running.
+
+        ``_sync_one`` returns an empty expected-map when the request raises,
+        which is byte-identical to "this twin has no workflows any more". Left
+        to run, cleanup would give every file a strike per failed sync and
+        delete the lot on the second — so a cloud outage, an expired token or a
+        DNS blip spanning two sync periods would leave the edge with nothing to
+        load until the backend came back.
+        """
+        previously_missing: set[str] = set()
+        client = EdgeSyncClient(
+            workers_dir=tmp_path / "workers",
+            base_url="http://localhost:8000",
+            token="test-token",
+            previously_missing=previously_missing,
+        )
+        full_payload = _make_payload(workflows=[_wf_entry("wf_x.py", "# source\n")])
+        worker_path = tmp_path / "workers" / "wf_x.py"
+
+        with patch.object(client, "_fetch_sync_payload", return_value=full_payload):
+            client.sync_all(["twin-1"])
+        assert worker_path.exists()
+
+        with patch.object(
+            client, "_fetch_sync_payload", side_effect=RuntimeError("edge-sync unreachable")
+        ):
+            first = client.sync_all(["twin-1"])
+            second = client.sync_all(["twin-1"])
+
+        assert worker_path.exists(), "a failed fetch must never delete a worker"
+        assert not previously_missing, "a failed fetch must not even count as a strike"
+        assert all(r.errors for r in (*first, *second))
+
+    def test_one_twins_failure_defers_cleanup_for_all_of_them(self, tmp_path):
+        """Cleanup needs a complete picture, and a failed twin is a hole in it."""
+        previously_missing: set[str] = set()
+        client = EdgeSyncClient(
+            workers_dir=tmp_path / "workers",
+            base_url="http://localhost:8000",
+            token="test-token",
+            previously_missing=previously_missing,
+        )
+        worker_path = tmp_path / "workers" / "wf_x.py"
+
+        with patch.object(client, "_fetch_sync_payload", return_value=_make_payload(
+            workflows=[_wf_entry("wf_x.py", "# source\n")]
+        )):
+            client.sync_all(["twin-1", "twin-2"])
+        assert worker_path.exists()
+
+        # twin-1 now genuinely claims nothing, but twin-2 never answered, so the
+        # file may still belong to twin-2. Two rounds, still no deletion.
+        def _twin1_empty_twin2_fails(twin_uuid: str):
+            if twin_uuid == "twin-2":
+                raise RuntimeError("edge-sync unreachable")
+            return _make_payload(workflows=[])
+
+        with patch.object(
+            client, "_fetch_sync_payload", side_effect=_twin1_empty_twin2_fails
+        ):
+            client.sync_all(["twin-1", "twin-2"])
+            client.sync_all(["twin-1", "twin-2"])
+
+        assert worker_path.exists()
+
     def test_file_recovering_clears_strike(self, tmp_path):
         """Strike count must reset when the cloud re-claims the file,
         so a later transient miss starts fresh from strike 1 instead
@@ -434,3 +500,31 @@ class TestAtomicWrite:
         dest = tmp_path / "subdir" / "output.py"
         EdgeSyncClient._atomic_write(dest, "# content\n")
         assert dest.exists()
+
+
+class TestExecutionTargetFilter:
+    """``execution_target`` narrows the payload to one runtime.
+
+    A device edge leaves it unset and asks for everything, as it always has. The
+    sim plant's co-located worker sets ``simulation``, so a twin that also has a
+    real edge does not get its live workflows started a second time beside the
+    plant.
+    """
+
+    def test_a_device_edge_sends_no_query_parameter(self, tmp_path):
+        client = _make_client(tmp_path)
+        assert client._sync_url("twin-1") == (
+            "http://localhost:8000/api/v1/workflows/edge-sync/twin-1"
+        )
+
+    def test_a_simulation_worker_asks_for_its_own_target(self, tmp_path):
+        client = EdgeSyncClient(
+            workers_dir=tmp_path / "workers",
+            base_url="http://localhost:8000",
+            token="test-token",
+            execution_target="simulation",
+        )
+        assert client._sync_url("twin-1") == (
+            "http://localhost:8000/api/v1/workflows/edge-sync/twin-1"
+            "?execution_target=simulation"
+        )

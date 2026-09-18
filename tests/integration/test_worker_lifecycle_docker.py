@@ -522,7 +522,7 @@ def test_phase_08_image_pull_policy_mutable_vs_immutable(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """Immutable tag (``:v1``) skips ``docker pull``; mutable tag (``:local``) always attempts it.
+    """Immutable tag (``:v1``) skips ``docker pull``; mutable tag (``:dev``) always attempts it.
 
     The mutable pull fails (the stub image is local-only) and falls back
     to the local copy via ``_pull_worker_image_with_progress``'s exception path; we

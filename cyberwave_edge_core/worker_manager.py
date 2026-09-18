@@ -69,8 +69,12 @@ logger = logging.getLogger(__name__)
 # remember to ``docker rmi`` first. Immutable tags (e.g. ``v1.2.3``,
 # sha digests, dated build IDs) keep the previous fast-path that skips
 # the pull when the image is already present locally.
+#
+# ``local`` is absent on purpose: nothing publishes it, so a ``:local``
+# image is whatever the last local build produced and a pull can only fail.
+# A missing ``:local`` is still pulled, like any other absent tag.
 _MUTABLE_TAG_BASENAMES = frozenset(
-    {"latest", "dev", "local", "staging", "nightly", "edge", "main", "master"}
+    {"latest", "dev", "staging", "nightly", "edge", "main", "master"}
 )
 
 _DEFAULT_STARTUP_PROBE_SECONDS = 30
@@ -278,7 +282,7 @@ def _image_tag_is_mutable(image: str) -> bool:
         ``cyberwaveos/edge-ml-worker:latest``    -> True
         ``cyberwaveos/edge-ml-worker:dev``       -> True
         ``cyberwaveos/edge-ml-worker:dev-gpu``   -> True
-        ``cyberwaveos/edge-ml-worker:local``     -> True
+        ``cyberwaveos/edge-ml-worker:local``     -> False (built on the box)
         ``cyberwaveos/edge-ml-worker:v1.2.3``    -> False
         ``cyberwaveos/edge-ml-worker@sha256:...`` -> False
         ``myregistry.io:5000/cyberwaveos/img``   -> True (registry port, no tag)
@@ -511,8 +515,8 @@ def resolve_worker_image() -> str:
        round-tripping through cloud config.  Useful for hot-patches and
        SDK debugging.  When the override resolves to a tag that the
        registry does not have, ``_ensure_image_pulled`` falls back to
-       the locally-present image (same code path the ``:local`` tag
-       relies on for camera drivers).
+       the locally-present image — and a ``:local`` tag skips the doomed
+       pull altogether, being immutable.
     2. ``CYBERWAVE_ENVIRONMENT`` env var (``dev``, ``staging`` …) maps
        to the matching image tag.
     3. Production and unknown environments use ``:latest``.
@@ -624,6 +628,21 @@ class WorkerManager:
     An optional ``WorkerHealthMonitor`` can be attached via
     ``set_health_monitor()``.  When attached, ``restart()`` records restart
     events and respects circuit-breaker state to prevent crash loops.
+
+    ``network`` overrides the default host networking with a named Docker
+    network.  An edge device wants ``--network host`` — the drivers publishing
+    its data run there.  A caller whose producer is itself a container on a
+    user-defined bridge (cyberwave-sim's plant) has to put the worker on that
+    bridge instead, or the two Zenoh peers never scout each other.
+
+    ``alert_twin_uuids`` narrows who hears about a startup *failure*, for a
+    caller whose ``twin_uuids`` is deliberately wider than the twins a workflow
+    references (cyberwave-sim syncs every twin in the environment so a workflow
+    activated mid-run is reachable).  A failure raises one error-severity card
+    per twin reading "no workflow on this edge will run", which is noise on a
+    twin that has no workflow to lose.  ``None`` defaults to ``twin_uuids``, so
+    an edge device is unaffected; an empty list means exactly that, and silences
+    the fan-out.
     """
 
     def __init__(
@@ -633,15 +652,27 @@ class WorkerManager:
         environment_uuid: str,
         token: str,
         twin_uuids: Optional[list[str]] = None,
+        alert_twin_uuids: Optional[list[str]] = None,
         image: str = DEFAULT_WORKER_IMAGE,
         resource_limits: Optional[ResourceLimits] = None,
+        network: Optional[str] = None,
     ) -> None:
         self._config_dir = config_dir
         self._environment_uuid = environment_uuid
         self._token = token
         self._twin_uuids: list[str] = list(twin_uuids or [])
+        # ``None`` defaults to the full set, which is what an edge device wants:
+        # every twin bound to the node is one whose workflows this worker runs.
+        # An explicitly empty list is a different answer and is honoured as
+        # given — "none of these twins has a workflow to lose yet" — which is
+        # what cyberwave-sim passes for a simulation started before any workflow
+        # was written against it.
+        self._alert_twin_uuids: list[str] = list(
+            self._twin_uuids if alert_twin_uuids is None else alert_twin_uuids
+        )
         self._image = image
         self._resource_limits = resource_limits
+        self._network = (network or "").strip() or None
         self._container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
         self._health_monitor: Optional["WorkerHealthMonitor"] = None
         # Resolved once (mkdir/chown) and reused; derived from ``config_dir``.
@@ -1089,7 +1120,13 @@ class WorkerManager:
         return status_dir / WORKER_STATUS_FILENAME
 
     def _build_network_args(self) -> list[str]:
-        """Build network args; mirrors driver container networking."""
+        """Build network args; mirrors driver container networking.
+
+        An explicit ``network`` wins on every platform: a caller that names one
+        knows where its data producer lives, which the platform default cannot.
+        """
+        if self._network:
+            return ["--network", self._network]
         if platform.system() == "Darwin":
             return [
                 "--add-host",
@@ -1103,13 +1140,13 @@ class WorkerManager:
     def _ensure_image_pulled(image: str, timeout: int = 600) -> bool:
         """Pull *image* and make it ready for ``docker run``.
 
-        For mutable tags (``latest``, ``dev``, ``local``, ``staging``,
-        ``nightly``, ``edge`` and any of those with arch/runtime suffixes
-        like ``dev-gpu``) we always issue ``docker pull`` so a developer
-        who just rebuilt or pushed a new image gets the new digest on the
-        next worker recycle. For immutable tags (e.g. ``v1.2.3``, sha256
-        digests) we keep the previous fast-path of skipping the pull when
-        the image is already present locally.
+        For mutable tags (``latest``, ``dev``, ``staging``, ``nightly``,
+        ``edge`` and any of those with arch/runtime suffixes like
+        ``dev-gpu``) we always issue ``docker pull`` so a developer who
+        just pushed a new image gets the new digest on the next worker
+        recycle. For immutable tags (e.g. ``v1.2.3``, sha256 digests, and
+        the locally built ``:local``) we keep the previous fast-path of
+        skipping the pull when the image is already present locally.
 
         If ``docker pull`` fails but a local copy exists, we fall back to
         the local copy and warn — losing connectivity should not knock
@@ -1607,7 +1644,7 @@ class WorkerManager:
             from .startup import _send_worker_start_failure_alerts  # noqa: PLC0415
 
             _send_worker_start_failure_alerts(
-                twin_uuids=self._twin_uuids,
+                twin_uuids=self._alert_twin_uuids,
                 error=detail,
             )
         except Exception:

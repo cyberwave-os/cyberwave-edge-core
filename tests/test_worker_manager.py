@@ -1484,6 +1484,40 @@ class TestWorkerManagerNetworkArgs:
         assert "--network" in args
         assert "host" in args
 
+    def test_explicit_network_wins_on_every_platform(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller naming a network knows where its producer lives.
+
+        cyberwave-sim runs the plant as a container on a user-defined bridge, so
+        a worker on host networking never scouts it over multicast.
+        """
+        manager = WorkerManager(
+            config_dir=tmp_config,
+            environment_uuid="aabbccdd-eeff-0011-2233-445566778899",
+            token="testtoken1234",
+            network="cyberwave-sim_default",
+        )
+        for platform_name in ("Linux", "Darwin"):
+            monkeypatch.setattr(wm_module.platform, "system", lambda: platform_name)
+            assert manager._build_network_args() == [
+                "--network",
+                "cyberwave-sim_default",
+            ]
+
+    def test_blank_network_falls_back_to_the_platform_default(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset Terraform/CI variable renders as an empty string."""
+        manager = WorkerManager(
+            config_dir=tmp_config,
+            environment_uuid="aabbccdd-eeff-0011-2233-445566778899",
+            token="testtoken1234",
+            network="   ",
+        )
+        monkeypatch.setattr(wm_module.platform, "system", lambda: "Linux")
+        assert manager._build_network_args() == ["--network", "host"]
+
 
 # ---------------------------------------------------------------------------
 # WorkerManager._run_container failure paths
@@ -2129,7 +2163,7 @@ class TestResolveWorkerImage:
 
 
 class TestImageTagMutability:
-    """:dev / :local / :latest etc. must be re-pulled on every worker start."""
+    """:dev / :latest etc. must be re-pulled on every worker start."""
 
     @pytest.mark.parametrize(
         "image",
@@ -2141,9 +2175,6 @@ class TestImageTagMutability:
             "cyberwaveos/edge-ml-worker:dev-cpu",
             "cyberwaveos/edge-ml-worker:dev-jetson",
             "cyberwaveos/edge-ml-worker:dev-hailo",
-            "cyberwaveos/edge-ml-worker:local",
-            "cyberwaveos/edge-ml-worker:local-arm64",
-            "cyberwaveos/edge-ml-worker:local-jetson",
             "cyberwaveos/edge-ml-worker:staging",
             "cyberwaveos/edge-ml-worker:nightly",
             "cyberwaveos/edge-ml-worker:edge",
@@ -2165,6 +2196,10 @@ class TestImageTagMutability:
             "cyberwaveos/edge-ml-worker:1.2.3",
             "cyberwaveos/edge-ml-worker:20260501",
             "cyberwaveos/edge-ml-worker:release-v1.2.3",
+            # Never published, so a pull could only fail.
+            "cyberwaveos/edge-ml-worker:local",
+            "cyberwaveos/edge-ml-worker:local-arm64",
+            "cyberwaveos/edge-ml-worker:local-jetson",
             "cyberwaveos/edge-ml-worker@sha256:" + "0" * 64,
             # Registry with a port AND an immutable tag.
             "myregistry.io:5000/cyberwaveos/edge-ml-worker:v1.2.3",

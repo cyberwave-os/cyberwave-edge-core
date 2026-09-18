@@ -73,6 +73,11 @@ class EdgeSyncClient:
         Cyberwave API base URL.
     token:
         API auth token.
+    execution_target:
+        Optional runtime to narrow the payload to (``"live"`` or
+        ``"simulation"``). A device edge leaves it unset and receives every
+        workflow for the twin; the sim plant's co-located worker sets
+        ``"simulation"`` so it does not also run the twin's live workflows.
     """
 
     def __init__(
@@ -81,10 +86,12 @@ class EdgeSyncClient:
         base_url: str,
         token: str,
         previously_missing: set[str] | None = None,
+        execution_target: str | None = None,
     ) -> None:
         self._workers_dir = Path(workers_dir)
         self._base_url = base_url.rstrip("/")
         self._token = token
+        self._execution_target = execution_target
         # Two-strikes cleanup state — see :meth:`_cleanup_stale`. The
         # caller owns the set so the strike count survives across
         # separate ``sync_all`` invocations even when a fresh
@@ -120,7 +127,8 @@ class EdgeSyncClient:
         This is the preferred entry-point when multiple twins share the same
         ``workers_dir``.  Files are only deleted after **every** twin's
         payload has been fetched, preventing twin A's sync from removing
-        twin B's workers.
+        twin B's workers — and only when every twin fetched *cleanly*, so a
+        failed request is never read as a deactivation.
         """
         all_expected: dict[str, str] = {}
         results: list[EdgeSyncResult] = []
@@ -130,6 +138,20 @@ class EdgeSyncClient:
             expected = self._sync_one(twin_uuid, result)
             all_expected.update(expected)
             results.append(result)
+
+        # A twin whose fetch failed returns an empty expected-map, which is
+        # indistinguishable from "this twin has no workflows any more". Running
+        # cleanup on that picture lets an outage, an expired token or a DNS blip
+        # spanning two sync periods unlink every worker on the device, leaving it
+        # with nothing to load until the backend is reachable again. Deletion
+        # needs a complete picture, so one error defers it to the next sync.
+        if any(result.errors for result in results):
+            logger.warning(
+                "Skipping stale-worker cleanup: %d of %d twin(s) did not sync cleanly",
+                sum(1 for result in results if result.errors),
+                len(results),
+            )
+            return results
 
         # Remove stale wf_*.py files not claimed by any twin.
         cleanup_result = EdgeSyncResult(twin_uuid="__cleanup__")
@@ -277,12 +299,21 @@ class EdgeSyncClient:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _sync_url(self, twin_uuid: str) -> str:
+        """Endpoint URL for *twin_uuid*, carrying the target filter when set."""
+        url = f"{self._base_url}/api/v1/workflows/edge-sync/{twin_uuid}"
+        if self._execution_target:
+            from urllib.parse import urlencode
+
+            url = f"{url}?{urlencode({'execution_target': self._execution_target})}"
+        return url
+
     def _fetch_sync_payload(self, twin_uuid: str) -> dict[str, Any]:
         """Call the backend edge-sync endpoint and return the parsed payload."""
         try:
             import requests
 
-            url = f"{self._base_url}/api/v1/workflows/edge-sync/{twin_uuid}"
+            url = self._sync_url(twin_uuid)
             headers = {"Authorization": f"Bearer {self._token}"}
             response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
@@ -295,9 +326,8 @@ class EdgeSyncClient:
         import urllib.error
         import urllib.request
 
-        url = f"{self._base_url}/api/v1/workflows/edge-sync/{twin_uuid}"
         req = urllib.request.Request(
-            url,
+            self._sync_url(twin_uuid),
             headers={"Authorization": f"Bearer {self._token}"},
         )
         try:
