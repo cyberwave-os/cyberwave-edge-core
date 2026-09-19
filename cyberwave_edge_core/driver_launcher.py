@@ -299,6 +299,7 @@ def _run_docker_image(
     container_name = driver_container_name(twin_uuid, service_name)
     image = s._resolve_driver_image_tag(image)
     params = s._ensure_linux_microphone_docker_params(image, params)
+    params = s._ensure_linux_camera_docker_params(image, params)
     runtime_environment = (
         s.get_runtime_env_var("CYBERWAVE_ENVIRONMENT", s.DEFAULT_ENVIRONMENT) or s.DEFAULT_ENVIRONMENT
     ).lower()

@@ -3027,6 +3027,50 @@ class TestEnsureLinuxMicrophoneDockerParams:
         )
 
 
+class TestEnsureLinuxCameraDockerParams:
+    def test_mounts_v4l_tree_for_camera_image(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda path: path == "/dev/v4l")
+        params = startup._ensure_linux_camera_docker_params(
+            "cyberwaveos/camera-driver:latest",
+            ["--device", "/dev/video0:/dev/video0"],
+        )
+        assert params[-2:] == ["-v", "/dev/v4l:/dev/v4l:ro"]
+
+    def test_does_not_mount_missing_host_tree(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda _path: False)
+        params = ["--device", "/dev/video0:/dev/video0"]
+        assert (
+            startup._ensure_linux_camera_docker_params(
+                "cyberwaveos/camera-driver:latest", params
+            )
+            == params
+        )
+
+    def test_idempotent_when_v4l_mount_exists(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda path: path == "/dev/v4l")
+        params = ["-v", "/dev/v4l:/dev/v4l:ro"]
+        assert (
+            startup._ensure_linux_camera_docker_params(
+                "cyberwaveos/camera-driver:latest", params
+            )
+            == params
+        )
+
+    def test_does_not_mount_v4l_for_unrelated_image(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda path: path == "/dev/v4l")
+        params = ["--device", "/dev/video0:/dev/video0"]
+        assert (
+            startup._ensure_linux_camera_docker_params(
+                "cyberwaveos/so101-driver:latest", params
+            )
+            == params
+        )
+
+
 class TestMacosAudioStreamInjection:
     _TWIN_UUID = "046aa803-b3e7-46a4-8c3d-9c877fb772ab"
 

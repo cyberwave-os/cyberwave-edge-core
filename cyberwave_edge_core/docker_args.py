@@ -194,6 +194,12 @@ def _is_snd_device_path(value: str) -> bool:
     return normalized == "/dev/snd" or normalized.startswith("/dev/snd/")
 
 
+def _is_v4l_device_path(value: str) -> bool:
+    """Return True when *value* refers to the V4L stable-name tree."""
+    normalized = value.strip()
+    return normalized == "/dev/v4l" or normalized.startswith("/dev/v4l/")
+
+
 # Linux ALSA character devices use major 116. A static ``--device /dev/snd``
 # snapshot does not pick up USB mics plugged in after container start; bind
 # mounting ``/dev/snd`` plus this cgroup rule allows hot-plugged nodes.
@@ -255,6 +261,13 @@ def _strip_snd_device_mappings(params: list[str]) -> list[str]:
 def _docker_params_include_snd_volume(params: list[str]) -> bool:
     for host_path, container_path in _extract_docker_volume_mappings(params):
         if _is_snd_device_path(host_path) or _is_snd_device_path(container_path):
+            return True
+    return False
+
+
+def _docker_params_include_v4l_volume(params: list[str]) -> bool:
+    for host_path, container_path in _extract_docker_volume_mappings(params):
+        if _is_v4l_device_path(host_path) or _is_v4l_device_path(container_path):
             return True
     return False
 

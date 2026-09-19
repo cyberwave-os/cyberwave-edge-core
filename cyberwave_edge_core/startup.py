@@ -813,6 +813,11 @@ def _is_generic_microphone_driver_image(image: str) -> bool:
     return "generic-microphone" in lowered or "microphone-driver" in lowered
 
 
+def _is_camera_driver_image(image: str) -> bool:
+    lowered = image.lower()
+    return "camera-driver" in lowered or "camera_driver" in lowered
+
+
 def _is_generic_speaker_driver_image(image: str) -> bool:
     lowered = image.lower()
     return "generic-speaker" in lowered or "speaker-driver" in lowered
@@ -862,6 +867,28 @@ def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> lis
         idx += 1
     if not has_audio_group:
         updated.extend(["--group-add", "audio"])
+    return updated
+
+
+def _ensure_linux_camera_docker_params(image: str, params: list[str]) -> list[str]:
+    """Expose host V4L stable-name symlinks to Linux camera containers.
+
+    ``--device /dev/videoN`` exposes only that device node. Serial selection
+    resolves through udev's separate ``/dev/v4l/by-id`` tree, whose relative
+    symlinks then target the already-passed-through ``/dev/videoN`` node.
+    """
+    if (
+        platform.system() != "Linux"
+        or not _is_camera_driver_image(image)
+        or not os.path.isdir("/dev/v4l")
+    ):
+        return params
+
+    from .docker_args import _docker_params_include_v4l_volume
+
+    updated = list(params)
+    if not _docker_params_include_v4l_volume(updated):
+        updated.extend(["-v", "/dev/v4l:/dev/v4l:ro"])
     return updated
 
 
