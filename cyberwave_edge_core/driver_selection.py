@@ -537,8 +537,8 @@ CHANNEL_TAG_ENV = "CYBERWAVE_DRIVER_CHANNEL_TAG"
 # ros2-slam are built together by edge-ros2-go2-driver-build-and-push.yml, whose
 # tags carry a ROS distro (`humble-pr-<n>-sha-<sha12>`, `jetson-humble`, ...).
 # ros2-sim-proxy is not in that stack. It is built by
-# ros2-sim-runtime-build-and-push.yml alongside the sim runtime, and its tags
-# have no distro dimension at all -- `pr-<n>-<sha12>` on a PR, the moving
+# ros2-sim-proxy-build-and-push.yml, and its tags have no distro dimension at
+# all -- `pr-<n>-<sha12>` on a PR, the moving
 # `<branch>` tag on a push to dev/staging/production.
 #
 # So no rendering of CW_CHANNEL_TAG can ever name a tag ros2-sim-proxy

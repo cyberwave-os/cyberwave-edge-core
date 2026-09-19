@@ -1083,7 +1083,7 @@ def test_a_short_payload_is_shown_whole_rather_than_split():
 # --- the sim-proxy train ------------------------------------------------------
 #
 # ros2-sim-proxy is the one service in the sim graph that is NOT from the driver
-# stack. It is built by ros2-sim-runtime-build-and-push.yml, whose tags carry no
+# stack. It is built by ros2-sim-proxy-build-and-push.yml, whose tags carry no
 # ROS distro (`pr-<n>-<sha12>`, or the moving `<branch>`), while the driver, nav2
 # and slam are built by edge-ros2-go2-driver-build-and-push.yml as
 # `<distro>-pr-<n>-sha-<sha12>`. Rendering CW_CHANNEL_TAG for the proxy asked for
