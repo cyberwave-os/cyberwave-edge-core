@@ -2861,7 +2861,13 @@ class TestLoadSelectedCameraDevice:
         # No twin_uuid still uses the fallback.
         assert startup._load_selected_camera_device() == "/dev/video0"
 
-    def test_invalid_mapping_values_are_ignored(self, tmp_path, monkeypatch):
+    def test_non_index_mapping_values_pass_through_as_pins(self, tmp_path, monkeypatch):
+        """A non-numeric, non-``/dev/`` value names one camera, per the driver.
+
+        It is forwarded rather than replaced by ``selected_device``: the
+        injected env var wins over the twin's own ``metadata.video_device``, so
+        replacing it would silently bind a substitute camera.
+        """
         self._patch_config_paths(monkeypatch, tmp_path)
         (tmp_path / "cameras.json").write_text(
             json.dumps(
@@ -2871,7 +2877,7 @@ class TestLoadSelectedCameraDevice:
                 }
             )
         )
-        assert startup._load_selected_camera_device("twin-a") == "/dev/video1"
+        assert startup._load_selected_camera_device("twin-a") == "not-a-number"
 
 
 class TestEdgeJsonFileHelpers:

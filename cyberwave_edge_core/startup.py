@@ -993,13 +993,54 @@ def _load_serial_bridge_ports() -> list[int]:
     return ports
 
 
+# udev's stable-name trees, as published by the CLI into ``twin_to_device``.
+_V4L_STABLE_PREFIXES = ("/dev/v4l/by-id/", "/dev/v4l/by-path/")
+# Prefix the CLI uses for a hardware serial it could not resolve to a local
+# node. A serial is not a video source -- see ``_load_selected_camera_device``.
+_SERIAL_SOURCE_PREFIX = "serial:"
+
+
+def _is_stable_camera_source(value: str) -> bool:
+    """True when *value* names one specific camera and must pass through intact.
+
+    Mirrors the camera driver's ``_is_stable_device_identifier`` and the CLI's
+    ``_is_stable_camera_device``: a bare index or a ``/dev/...`` node is
+    positional and substitutable; anything else -- a ``by-id`` / ``by-path``
+    entry, a ``scheme://`` URL, or any other explicit source -- names one
+    device.
+
+    This was previously a narrower allow-list (udev trees and URLs only), which
+    made the three definitions disagree. A value the CLI accepted as a pin but
+    this function rejected was silently replaced by the global
+    ``selected_device``, and because the injected env var wins over the twin's
+    own ``metadata.video_device`` (the driver entrypoint skips a variable that
+    is already set), the twin opened a substitute camera with no prompt and no
+    warning. Matching the driver means an unresolvable pin fails loudly in the
+    driver, which is what a pin is for.
+    """
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate.startswith(_V4L_STABLE_PREFIXES):
+        return True
+    if candidate.startswith("/dev/"):
+        return False
+    try:
+        int(candidate)
+    except ValueError:
+        return True
+    return False
+
+
 def _load_selected_camera_device(twin_uuid: Optional[str] = None) -> Optional[str]:
     """Read the selected video device from ``cameras.json``.
 
     When ``twin_uuid`` is provided, first look it up in the optional
     ``twin_to_device`` mapping persisted by the CLI.  Fall back to the global
     ``selected_device`` value for backward compatibility.  Returns the
-    ``/dev/video<N>`` path, or ``None`` when no selection is available.
+    ``/dev/video<N>`` path for an index entry, the stored source verbatim for
+    a stable one, ``None`` for a ``serial:`` entry (which is not a video
+    source at all), or ``None`` when no selection is available.
     """
     data = _read_cameras_config()
     if data is None:
@@ -1007,7 +1048,29 @@ def _load_selected_camera_device(twin_uuid: Optional[str] = None) -> Optional[st
 
     if twin_uuid:
         mapping = data.get("twin_to_device") or {}
-        mapped = _coerce_video_index(mapping.get(str(twin_uuid)))
+        raw = mapping.get(str(twin_uuid))
+        # The string forms are checked BEFORE ``_coerce_video_index``: a
+        # librealsense serial is an all-digit string, so ``int()`` accepts it
+        # and the index branch would render ``/dev/video213722070420``.
+        if isinstance(raw, str):
+            candidate = raw.strip()
+            if candidate.startswith(_SERIAL_SOURCE_PREFIX):
+                # A serial reaches the driver as
+                # ``CYBERWAVE_METADATA_SERIAL_NUMBER``, exported from the twin
+                # JSON. Returning None leaves
+                # ``CYBERWAVE_METADATA_VIDEO_DEVICE`` unset so the twin's own
+                # ``metadata.video_device`` (if any) still applies; inventing a
+                # device here would only shadow it and log a spurious
+                # "device does not exist inside the container" warning.
+                return None
+            # A stable source the CLI resolved once -- a ``by-id`` path, a
+            # stream URL, or any other explicit source -- must reach the driver
+            # verbatim: rendering it as ``/dev/video{N}`` would hand the driver
+            # a positional path it is allowed to substitute away from, which is
+            # exactly the identity the pin exists to preserve.
+            if _is_stable_camera_source(candidate):
+                return candidate
+        mapped = _coerce_video_index(raw)
         if mapped is not None:
             return f"/dev/video{mapped}"
 
