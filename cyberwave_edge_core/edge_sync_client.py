@@ -32,6 +32,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# twin_uuid -> the skipped workflows last logged for it, so an uncompilable
+# workflow is logged once per change rather than on every sync. Module-level
+# because both callers build a fresh client each sync, and the sim plant syncs
+# every 15 s.
+_LOGGED_SKIPS: dict[str, frozenset[tuple[str, str]]] = {}
+
 
 @dataclass
 class EdgeSyncResult:
@@ -190,6 +196,27 @@ class EdgeSyncClient:
             return {}
 
         workflows: list[dict[str, Any]] = payload.get("workflows", [])
+
+        # A workflow the cloud considers eligible for this twin but could not
+        # ship -- most often one that fails to compile. Without this the only
+        # symptom at the edge is a zero-count EdgeSyncResult, which reads
+        # exactly like "this twin has no workflows"; the cause is visible only
+        # in the backend's own log. Absent on a backend too old to send it.
+        skipped: list[dict[str, Any]] = payload.get("skipped_workflows") or []
+        skip_signature = frozenset(
+            (str(entry.get("workflow_uuid")), str(entry.get("reason")))
+            for entry in skipped
+        )
+        if skip_signature != _LOGGED_SKIPS.get(twin_uuid, frozenset()):
+            _LOGGED_SKIPS[twin_uuid] = skip_signature
+            for entry in skipped:
+                logger.warning(
+                    "Cloud skipped workflow %s (%s) for twin %s: %s",
+                    entry.get("workflow_name") or "?",
+                    entry.get("workflow_uuid") or "?",
+                    twin_uuid,
+                    entry.get("reason") or "no reason given",
+                )
 
         expected: dict[str, str] = {}
         for wf in workflows:

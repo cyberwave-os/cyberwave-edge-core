@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cyberwave_edge_core import edge_sync_client
 from cyberwave_edge_core.edge_sync_client import EdgeSyncClient, EdgeSyncResult
 
 
@@ -528,3 +529,69 @@ class TestExecutionTargetFilter:
             "http://localhost:8000/api/v1/workflows/edge-sync/twin-1"
             "?execution_target=simulation"
         )
+
+
+class TestEdgeSyncClientSkippedWorkflows:
+    """The cloud can decline to ship a workflow; that has to reach the log.
+
+    Without this the only local evidence is a zero-count EdgeSyncResult, which
+    is identical to the result for a twin that simply has no workflows.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_logged_skips(self):
+        edge_sync_client._LOGGED_SKIPS.clear()
+        yield
+        edge_sync_client._LOGGED_SKIPS.clear()
+
+    @staticmethod
+    def _skipped_payload(reason: str = "Send MQTT node references a node not upstream.") -> dict:
+        payload = _make_payload(workflows=[])
+        payload["skipped_workflows"] = [
+            {"workflow_uuid": "wf-123", "workflow_name": "Detect pose", "reason": reason}
+        ]
+        return payload
+
+    def test_logs_a_workflow_the_cloud_skipped(self, tmp_path, caplog):
+        client = _make_client(tmp_path)
+        payload = self._skipped_payload()
+
+        with patch.object(client, "_fetch_sync_payload", return_value=payload):
+            with caplog.at_level("WARNING"):
+                result = client.sync("twin-1")
+
+        assert result.written == []
+        assert "Detect pose" in caplog.text
+        assert "not upstream" in caplog.text
+
+    def test_logs_an_unchanged_skip_once(self, tmp_path, caplog):
+        """The sim plant syncs every 15 s; the same skip must not repeat."""
+        with caplog.at_level("WARNING"):
+            for _ in range(3):
+                payload = self._skipped_payload()
+                with patch.object(EdgeSyncClient, "_fetch_sync_payload", return_value=payload):
+                    _make_client(tmp_path).sync("twin-1")
+
+        assert caplog.text.count("Cloud skipped workflow") == 1
+
+    def test_logs_again_when_the_reason_changes(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            for reason in ("first reason", "second reason"):
+                payload = self._skipped_payload(reason)
+                with patch.object(EdgeSyncClient, "_fetch_sync_payload", return_value=payload):
+                    _make_client(tmp_path).sync("twin-1")
+
+        assert "first reason" in caplog.text
+        assert "second reason" in caplog.text
+
+    def test_absent_key_is_not_an_error(self, tmp_path, caplog):
+        """A backend predating the field must sync exactly as before."""
+        client = _make_client(tmp_path)
+        payload = _make_payload(workflows=[])
+
+        with patch.object(client, "_fetch_sync_payload", return_value=payload):
+            with caplog.at_level("WARNING"):
+                result = client.sync("twin-1")
+
+        assert result.errors == []
+        assert "skipped" not in caplog.text.lower()
