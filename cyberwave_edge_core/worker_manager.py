@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from ._clock import now_monotonic
+from .container_spec import WORKER_SERVICE, DockerRunSpec
 from .docker_args import (
     _rewrite_macos_container_base_url,
     _rewrite_macos_container_hostname,
@@ -34,6 +35,7 @@ from .docker_helpers import (
     docker_available,
     docker_container_status,
     docker_has_nvidia_runtime,
+    docker_image_id,
     docker_inspect,
     docker_rm,
     docker_stop,
@@ -1793,9 +1795,10 @@ class WorkerManager:
 
         user_args = build_user_args()
 
-        cmd = [
-            "docker",
-            "run",
+        # Everything but the image, which the pull fallbacks below may still
+        # change. The argv is rendered from a DockerRunSpec once the image is
+        # final, so the spec-hash label covers exactly what ``docker run`` gets.
+        run_options = (
             "--detach",
             "--restart",
             "unless-stopped",
@@ -1810,8 +1813,7 @@ class WorkerManager:
             *volume_args,
             *env_args,
             *resource_env_args,
-            image,
-        ]
+        )
 
         logger.info("Starting worker container %s from image %s", self._container_name, image)
 
@@ -1829,7 +1831,6 @@ class WorkerManager:
                     non_gpu_image,
                 )
                 image = non_gpu_image
-                cmd[-1] = image
                 self._update_starting_alerts({"image": image, "phase": "pull_started"})
                 if not self._pull_worker_image_with_progress(image):
                     self._send_startup_failure_alert(
@@ -1848,7 +1849,6 @@ class WorkerManager:
                     non_hailo_image,
                 )
                 image = non_hailo_image
-                cmd[-1] = image
                 self._update_starting_alerts({"image": image, "phase": "pull_started"})
                 if not self._pull_worker_image_with_progress(image):
                     self._send_startup_failure_alert(
@@ -1862,6 +1862,10 @@ class WorkerManager:
                 return False
 
         self._update_starting_alerts({"phase": "starting_container", "image": image})
+
+        cmd = DockerRunSpec(
+            options=run_options, image=image, image_id=docker_image_id(image)
+        ).run_argv(service=WORKER_SERVICE)
 
         # A leftover ``ready`` from the previous container would resolve the
         # alert on the next readiness poll. Reset again here because the pull

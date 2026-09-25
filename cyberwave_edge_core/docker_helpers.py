@@ -154,6 +154,31 @@ def docker_image_exists_locally(image: str) -> bool:
         return False
 
 
+def docker_image_id(image: str, *, timeout: int = 10) -> Optional[str]:
+    """Return the local image ID (``sha256:...``) of *image*, or None when unknown.
+
+    Best effort and never raises: it only feeds the container spec-hash label,
+    so a failed lookup must not block a launch.
+    """
+    if not docker_available():
+        return None
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    stdout = proc.stdout
+    if proc.returncode != 0 or not isinstance(stdout, str):
+        return None
+    image_id = stdout.strip()
+    return image_id if image_id.startswith("sha256:") else None
+
+
 def container_status_of(inspect: Optional[dict[str, Any]]) -> str:
     """Read the status out of an already-fetched ``docker inspect`` payload.
 

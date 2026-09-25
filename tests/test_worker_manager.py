@@ -509,6 +509,7 @@ def _stub_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wm_module, "docker_available", lambda: True)
     monkeypatch.setattr(wm_module, "docker_container_status", lambda name: "none")
     monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+    monkeypatch.setattr(wm_module, "docker_image_id", lambda image: None)
     monkeypatch.setattr(wm_module.time, "sleep", lambda s: None)
     monkeypatch.setattr(
         "cyberwave_edge_core.startup.get_runtime_env_var",
@@ -1534,6 +1535,9 @@ class TestWorkerManagerRunContainerFailures:
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+        # The spec-hash image lookup is its own subprocess call; keep it out of
+        # the docker run call counts these tests assert on.
+        monkeypatch.setattr(wm_module, "docker_image_id", lambda image: None)
         monkeypatch.setattr(
             WorkerManager,
             "_pull_worker_image_with_progress",
@@ -1792,6 +1796,9 @@ class TestWorkerStartupProbeWindow:
         monkeypatch.setattr(wm_module, "docker_available", lambda: True)
         monkeypatch.setattr(wm_module, "docker_has_nvidia_runtime", lambda: False)
         monkeypatch.setattr(wm_module, "docker_rm", lambda name, **kw: True)
+        # The spec-hash image lookup is its own subprocess call; keep it out of
+        # the docker run call counts these tests assert on.
+        monkeypatch.setattr(wm_module, "docker_image_id", lambda image: None)
         monkeypatch.setattr(
             WorkerManager,
             "_pull_worker_image_with_progress",

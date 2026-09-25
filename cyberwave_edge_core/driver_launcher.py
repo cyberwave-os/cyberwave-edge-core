@@ -11,10 +11,11 @@ import shutil
 import subprocess
 from typing import Any, List, Optional
 
-# Module-level is safe: docker_args is stdlib-only, so this cannot reintroduce
-# the cycle the lazy ``_startup()`` accessor below exists to break.
+# Module-level is safe: container_spec and docker_args are stdlib-only, so this
+# cannot reintroduce the cycle the lazy ``_startup()`` accessor below exists to break.
+from .container_spec import DockerRunSpec
 from .docker_args import build_log_args
-from .docker_helpers import driver_container_name
+from .docker_helpers import docker_image_id, driver_container_name
 
 logger = logging.getLogger(__name__)
 
@@ -893,29 +894,34 @@ def _run_docker_image(
     # build_log_args defers to anything the driver's own params already pin.
     log_args = build_log_args(params_pass)
 
-    cmd = [
-        "docker",
-        "run",
-        "--detach",
-        "--init",
-        "--stop-timeout",
-        "5",
-        "--restart",
-        "unless-stopped",
-        "--privileged",
-        *log_args,
-        *gpu_args,
-        *pid_args,
-        *usbip_device_args,
-        *network_args,
-        "--name",
-        container_name,
-        *params_pass,
-        *envvars_pass,
-        *env_flags,
-        image,
-        *(command or []),
-    ]
+    # The argv and the spec-hash label come from this one spec, so every flag
+    # passed to Docker is covered by the hash (see container_spec).
+    run_spec = DockerRunSpec(
+        options=(
+            "--detach",
+            "--init",
+            "--stop-timeout",
+            "5",
+            "--restart",
+            "unless-stopped",
+            "--privileged",
+            *log_args,
+            *gpu_args,
+            *pid_args,
+            *usbip_device_args,
+            *network_args,
+            "--name",
+            container_name,
+            *params_pass,
+            *envvars_pass,
+            *env_flags,
+        ),
+        image=image,
+        command=tuple(command or ()),
+        extra_networks=tuple(extra_networks or ()),
+        image_id=docker_image_id(image),
+    )
+    cmd = run_spec.run_argv(twin_uuid=twin_uuid, service=service_name)
     if logger.isEnabledFor(logging.DEBUG):
         debug_env_vars: list[str] = []
         for index, item in enumerate(env_vars):
@@ -972,7 +978,7 @@ def _run_docker_image(
         run_argv=cmd,
         get_runtime_env_var=s.get_runtime_env_var,
         on_container_created=_on_container_created,
-        extra_networks=extra_networks or (),
+        extra_networks=run_spec.extra_networks,
         on_running=_on_running,
         on_failure=_on_failure,
         stream_logs=_stream_logs,
