@@ -20,6 +20,8 @@ import ast
 import base64
 import json
 import pathlib
+import shutil
+import subprocess
 from types import SimpleNamespace
 from typing import Any
 
@@ -660,6 +662,141 @@ def test_a_service_asking_for_no_privileges_gains_no_flags(monkeypatch: Any) -> 
     for spec in specs:
         assert "--cap-add" not in spec.params
         assert "--ulimit" not in spec.params
+
+
+SPOT_TMPFS = "/run/cyberwave:rw,noexec,nosuid,mode=0700,size=1m"
+
+
+def _flag_values(params: list[str], flag: str) -> list[str]:
+    return [params[i + 1] for i, p in enumerate(params) if p == flag]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # `config` leaves a bare string as a string (v5.1.1, verified), so unlike
+        # `cap_add` the string form is a real render and must translate.
+        ("/run/x:size=1m", ["/run/x:size=1m"]),
+        # Options verbatim: `mode=0700` is what keeps the Spot credential file
+        # readable by its owner only.
+        ([SPOT_TMPFS, "/tmp"], [SPOT_TMPFS, "/tmp"]),
+        (["${CW_TEST_TMPFS_ROOT}/x:size=1m"], ["/run/cw/x:size=1m"]),
+        ([], []),
+    ],
+)
+def test_tmpfs_becomes_one_flag_per_entry(monkeypatch: Any, raw: Any, expected: list[str]) -> None:
+    monkeypatch.setenv("CW_TEST_TMPFS_ROOT", "/run/cw")
+    params = _privilege_params(monkeypatch, {"tmpfs": raw})
+    assert _flag_values(params, "--tmpfs") == expected
+
+
+def _assert_plant_refused(monkeypatch: Any, caplog: Any, service: dict[str, Any]) -> None:
+    _labels(monkeypatch, _label_set({"services": {"plant": {"image": "p:dev", **service}}}))
+    with caplog.at_level("ERROR"):
+        assert ds.get_image_declared_services("img:dev") is None
+    assert "tmpfs" in caplog.text and "'plant'" in caplog.text
+
+
+@pytest.mark.parametrize("raw", [5, {"/run/x": "size=1m"}, [5], [""], ["run/x:size=1m"]])
+def test_a_malformed_tmpfs_refuses_the_graph(monkeypatch: Any, caplog: Any, raw: Any) -> None:
+    """Emitting nothing for this key is indistinguishable from success.
+
+    The Spot password would land in the container's overlay layer on disk and
+    the plant would still report healthy, so a value Edge Core cannot read
+    refuses the graph -- and the log names the service that carried it.
+    """
+    _assert_plant_refused(monkeypatch, caplog, {"tmpfs": raw})
+
+
+def test_a_long_form_tmpfs_volume_becomes_a_tmpfs_mount(monkeypatch: Any) -> None:
+    """`config` renders `mode: 0700` as the decimal int 448 while Docker's
+    `tmpfs-mode` reads octal, so it has to be converted back, not passed on."""
+    params = _privilege_params(
+        monkeypatch,
+        {
+            "volumes": [
+                {
+                    "type": "tmpfs",
+                    "target": "/run/c",
+                    "read_only": True,
+                    "tmpfs": {"size": 1048576, "mode": 448},
+                },
+                {"type": "tmpfs", "target": "/run/d", "tmpfs": {"size": "1m"}},
+                {"type": "tmpfs", "target": "/run/e"},
+            ]
+        },
+    )
+    assert _flag_values(params, "--mount") == [
+        "type=tmpfs,destination=/run/c,tmpfs-size=1048576,tmpfs-mode=700,readonly",
+        "type=tmpfs,destination=/run/d,tmpfs-size=1m",
+        "type=tmpfs,destination=/run/e",
+    ]
+    assert "-v" not in params
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        {"type": "tmpfs"},
+        {"type": "tmpfs", "target": "/run/c", "tmpfs": "size=1m"},
+        {"type": "tmpfs", "target": "/run/c", "tmpfs": {"size": True}},
+        {"type": "tmpfs", "target": "/run/c", "tmpfs": {"mode": "0700"}},
+        {"type": "tmpfs", "target": "/run/c", "tmpfs": {"noexec": True}},
+        {"type": "tmpfs", "target": "/run/c", "consistency": "cached"},
+    ],
+)
+def test_a_long_form_tmpfs_volume_edge_core_cannot_honour_is_refused(
+    monkeypatch: Any, caplog: Any, volume: dict[str, Any]
+) -> None:
+    """An option the translation would drop refuses the graph instead."""
+    _assert_plant_refused(monkeypatch, caplog, {"volumes": [volume]})
+
+
+def test_the_real_spot_robot_graph_mounts_its_credential_tmpfs() -> None:
+    """The case this translation exists for, from the files that ship.
+
+    Rendered by the real `docker compose config`, because its output shape --
+    not a hand-copied fixture -- is what reaches the label.
+    """
+    spot = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "cyberwave-edge-runtime/runtime-services/drivers/ros2/robots"
+        / "boston-dynamics/spot"
+    )
+    if not (spot / "compose.robot.yaml").exists():
+        pytest.skip("driver tree not checked out beside edge-core")
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI not available to render the compose files")
+    # `--no-interpolate` leaves `${SPOT_PASSWORD:?...}` unevaluated, so no
+    # credentials are needed to render.
+    rendered = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(spot / "compose.base.yaml"),
+            "-f",
+            str(spot / "compose.robot.yaml"),
+            "config",
+            "--no-interpolate",
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if rendered.returncode != 0 and "is not a docker command" in rendered.stderr:
+        pytest.skip("docker compose plugin not available")
+    assert rendered.returncode == 0, rendered.stderr
+
+    resolved = ds._specs_from_compose(
+        json.loads(rendered.stdout), ds.compose_substitutions(channel_tag="humble")
+    )
+    assert resolved is not None
+    plant = next(s for s in resolved[0] if s.name == "plant")
+    assert _flag_values(plant.params, "--tmpfs") == [SPOT_TMPFS]
 
 
 def test_the_driver_jobs_key_list_agrees_with_this_one() -> None:

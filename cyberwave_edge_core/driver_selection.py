@@ -501,6 +501,8 @@ _TRANSLATED_SERVICE_KEYS = frozenset(
         # stay refused.
         "cap_add",
         "ulimits",
+        # RAM-backed mounts -- see `_compose_tmpfs_params`.
+        "tmpfs",
         "x-cyberwave",
     }
 )
@@ -1055,6 +1057,101 @@ def _compose_privilege_params(
     return params
 
 
+def _compose_tmpfs_params(service: Dict[str, Any], subs: Dict[str, str]) -> list[str]:
+    """Translate the service-level ``tmpfs`` key into ``docker create --tmpfs`` flags.
+
+    WHY IT IS TRANSLATED. The Spot plant's entrypoint writes the robot
+    credentials to ``/run/cyberwave/spot.json``, because the upstream driver only
+    reads them from a ROS parameter file, and the declaration mounts a tmpfs
+    there so the plaintext password lives in RAM and never on the device disk.
+    Dropping the key would land that file in the container's overlay layer on
+    disk while the container still reports healthy.
+
+    SHAPES. `docker compose config --format json` (v5.1.1, verified) does NOT
+    normalise this key: ``tmpfs: /run/x:size=1m`` stays a bare string and a list
+    stays a list, so both arrive. Each entry is ``PATH[:OPTIONS]`` and is passed
+    through verbatim -- ``--tmpfs`` takes exactly that syntax, and ``mode=0700``
+    must reach Docker as the author wrote it, not reinterpreted here.
+
+    Anything else is refused rather than skipped. `config` itself rejects a
+    non-string scalar ("services.x.tmpfs must be a string"), so a malformed
+    value can only come from a hand-written label -- and for this key, emitting
+    nothing is the one outcome indistinguishable from success.
+    """
+    raw = service.get("tmpfs")
+    if raw is None:
+        return []
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list):
+        raise ValueError(f"compose tmpfs must be a string or a list of strings, got {raw!r}")
+
+    params: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError(f"compose tmpfs entry must be a string, got {entry!r}")
+        resolved = _substitute(entry.strip(), subs)
+        # Checked after substitution so `${DIR}/x` is judged by what reaches
+        # Docker. Also rejects an empty entry.
+        if not resolved.startswith("/"):
+            raise ValueError(f"compose tmpfs entry {entry!r} is not an absolute PATH[:OPTIONS]")
+        params += ["--tmpfs", resolved]
+    return params
+
+
+# What `config` renders for a `type: tmpfs` volume (v5.1.1, verified); anything
+# else would be dropped by the translation, so it is refused.
+_TMPFS_VOLUME_KEYS = frozenset({"type", "target", "read_only", "tmpfs"})
+_TMPFS_VOLUME_OPTION_KEYS = frozenset({"size", "mode"})
+
+
+def _compose_tmpfs_volume_params(volume: Dict[str, Any], subs: Dict[str, str]) -> list[str]:
+    """Translate a long-form ``volumes: - type: tmpfs`` entry into ``--mount``.
+
+    Such an entry has no ``source``, so the bind-mount loop would skip it and the
+    container would start with the path on disk instead of in RAM.
+
+    ``--mount type=tmpfs`` rather than ``--tmpfs`` because that is what Compose
+    itself does with the long form (a tmpfs *mount*, as opposed to the
+    service-level key's HostConfig tmpfs), and because its options are
+    structured instead of a kernel option string:
+
+      ``size``  int bytes or a string like ``"1m"``; Docker's ``tmpfs-size``
+                parses both.
+      ``mode``  `config` renders ``mode: 0700`` as the DECIMAL int ``448``, and
+                ``tmpfs-mode`` is parsed as OCTAL -- passing it through would
+                mount the directory ``0700`` as ``0448``. Hence the conversion.
+    """
+    unknown = sorted(set(volume) - _TMPFS_VOLUME_KEYS)
+    if unknown:
+        raise ValueError(f"compose tmpfs volume keys {unknown} are not translated by Edge Core")
+    target = volume.get("target")
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError(f"compose tmpfs volume has no target: {volume!r}")
+
+    fields = ["type=tmpfs", f"destination={_substitute(target.strip(), subs)}"]
+    options = volume.get("tmpfs") or {}
+    if not isinstance(options, dict):
+        raise ValueError(f"compose tmpfs volume options must be a mapping, got {options!r}")
+    unknown = sorted(set(options) - _TMPFS_VOLUME_OPTION_KEYS)
+    if unknown:
+        raise ValueError(f"compose tmpfs volume options {unknown} are not translated by Edge Core")
+
+    size = options.get("size")
+    if size is not None:
+        # `bool` first: it is an `int`, and `size: true` would mount one byte.
+        if isinstance(size, bool) or not isinstance(size, (int, str)) or not str(size).strip():
+            raise ValueError(f"compose tmpfs volume size must be bytes or a string, got {size!r}")
+        fields.append(f"tmpfs-size={_substitute(str(size).strip(), subs)}")
+    mode = options.get("mode")
+    if mode is not None:
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0:
+            raise ValueError(f"compose tmpfs volume mode must be an integer, got {mode!r}")
+        fields.append(f"tmpfs-mode={mode:o}")
+    if volume.get("read_only"):
+        fields.append("readonly")
+    return ["--mount", ",".join(fields)]
+
+
 def _compose_dependency_conditions(service: Dict[str, Any]) -> dict[str, str]:
     """Map ``depends_on`` to ``{dependency: condition}``.
 
@@ -1085,10 +1182,11 @@ def _compose_service_params(
     """Translate the Compose fields Edge Core's launcher understands.
 
     Returns ``(docker flags, networks to attach after create)``. Networking, bind
-    mounts, the additive privilege grants (`_compose_privilege_params`) and the
-    healthcheck are read: everything else about the container (restart policy,
-    log rotation, naming) is Edge Core's to decide, and letting the Compose file
-    override those would give two owners for one setting.
+    and tmpfs mounts (`_compose_tmpfs_params`), the additive privilege grants
+    (`_compose_privilege_params`) and the healthcheck are read: everything else
+    about the container (restart policy, log rotation, naming) is Edge Core's to
+    decide, and letting the Compose file override those would give two owners
+    for one setting.
     """
     params: list[str] = []
     extra_networks: list[str] = []
@@ -1136,6 +1234,9 @@ def _compose_service_params(
     for volume in service.get("volumes") or []:
         if not isinstance(volume, dict):
             continue
+        if volume.get("type") == "tmpfs":
+            params += _compose_tmpfs_volume_params(volume, subs)
+            continue
         source = volume.get("source")
         target = volume.get("target")
         if not source or not target:
@@ -1147,6 +1248,8 @@ def _compose_service_params(
         if volume.get("read_only"):
             mount += ":ro"
         params += ["-v", mount]
+
+    params += _compose_tmpfs_params(service, subs)
 
     params += _compose_privilege_params(service, subs)
 
@@ -1254,7 +1357,12 @@ def _specs_from_compose(
         if not isinstance(extension, dict):
             extension = {}
 
-        params, extra_networks = _compose_service_params(service, networks, volumes, subs)
+        try:
+            params, extra_networks = _compose_service_params(service, networks, volumes, subs)
+        except ValueError as exc:
+            # The translators refuse a malformed value without knowing which
+            # service carried it; the log line has to say.
+            raise ValueError(f"compose service {name!r}: {exc}") from exc
 
         specs.append(
             _ServiceSpec(
