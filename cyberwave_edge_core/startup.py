@@ -250,6 +250,10 @@ from .driver_logs import (  # noqa: E402
 # Map container names to twin UUIDs so log threads can publish telemetry.
 _CONTAINER_TWIN_MAP: dict[str, str] = {}
 
+# Containers whose relaunch this process refused only on their restart floor;
+# revival brings them back even when they are declared ``restart: "no"``.
+_RESTART_FLOOR_DEFERRED: set[str] = set()
+
 # Shared MQTT client for publishing driver log telemetry.
 _shared_mqtt_client: Optional[Any] = None
 _shared_mqtt_lock = threading.Lock()
@@ -2252,6 +2256,10 @@ def reconcile_driver_revival(
     tick — used when the flap detector just stopped a driver, so we
     don't immediately undo its decision.
 
+    An exited ``restart: "no"`` service stays down, unless its relaunch was
+    refused on its floor, and one with a ``min_restart_interval_s`` floor
+    waits until the floor has passed.
+
     Returns a summary dict.  All values default to 0 so callers can log
     a single line regardless of which branch fired.
     """
@@ -2259,6 +2267,8 @@ def reconcile_driver_revival(
     summary = {
         "down": 0,
         "skipped_orphan": 0,
+        "skipped_restart_no": 0,
+        "skipped_restart_floor": 0,
         "skipped_flap_protection": 0,
         "skipped_debounce": 0,
         "skipped_no_credentials": 0,
@@ -2302,6 +2312,11 @@ def reconcile_driver_revival(
         summary["skipped_debounce"] = len(down_names)
         return summary
 
+    # After the debounce: it inspects every down container.
+    down_names = _revivable_driver_containers(down_names, summary)
+    if not down_names:
+        return summary
+
     token = load_token()
     fingerprint = load_saved_fingerprint()
     environment_uuid = load_environment_uuid()
@@ -2323,6 +2338,69 @@ def reconcile_driver_revival(
         logger.exception("Driver revival run failed")
 
     return summary
+
+
+def _revivable_driver_containers(down_names: list[str], summary: dict[str, int]) -> list[str]:
+    """The down containers revival may recreate now, counting the rest in *summary*.
+
+    An uninspectable container is revived as before.
+    """
+    from .docker_helpers import MIN_RESTART_INTERVAL_LABEL, docker_inspect
+    from .driver_launcher import _restart_floor_decision
+
+    eligible: list[str] = []
+    for name in down_names:
+        inspect = docker_inspect(name)
+        if not isinstance(inspect, dict):
+            eligible.append(name)
+            continue
+        host_config = inspect.get("HostConfig")
+        host_config = host_config if isinstance(host_config, dict) else {}
+        policy = host_config.get("RestartPolicy")
+        policy = policy if isinstance(policy, dict) else {}
+        # restart=no is about the driver exiting on its own, not about the
+        # stop-then-refuse edge-core did itself (a restart inside the floor).
+        if str(policy.get("Name") or "") == "no" and name not in _RESTART_FLOOR_DEFERRED:
+            summary["skipped_restart_no"] += 1
+            logger.debug(
+                "Driver container %s exited and is declared restart=no; leaving it stopped",
+                name,
+            )
+            continue
+        config = inspect.get("Config") if isinstance(inspect.get("Config"), dict) else {}
+        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+        try:
+            floor_s = int(labels.get(MIN_RESTART_INTERVAL_LABEL) or 0)
+        except (TypeError, ValueError):
+            floor_s = 0
+        if floor_s > 0:
+            decision, detail = _restart_floor_decision(inspect, min_restart_interval_s=floor_s)
+            if decision == "refuse":
+                summary["skipped_restart_floor"] += 1
+                logger.debug(
+                    "Driver container %s finished too recently to restart; retry in %s s",
+                    name,
+                    detail.get("retry_after_s"),
+                )
+                continue
+        eligible.append(name)
+    return eligible
+
+
+def _launch_deferred_by_restart_floor(spec: Any) -> bool:
+    """Whether *spec*'s failed launch was refused only by its restart floor.
+
+    Re-asks the launcher's question; a floor that has since passed reads as a failure.
+    """
+    floor_s = getattr(spec, "min_restart_interval_s", None)
+    if not floor_s:
+        return False
+    from .docker_helpers import docker_inspect
+    from .driver_launcher import _restart_floor_decision
+
+    inspect = docker_inspect(driver_container_name(spec.twin_uuid, spec.service_name))
+    decision, _ = _restart_floor_decision(inspect, min_restart_interval_s=floor_s)
+    return decision == "refuse"
 
 
 _cameras_json_mtime: Optional[float] = None
@@ -2496,32 +2574,58 @@ def reconcile_camera_config_drift() -> bool:
     return True
 
 
-def _stop_and_prune_driver_containers() -> list[str]:
-    """Force-remove edge-core driver containers and prune stopped containers."""
+def _stop_and_prune_driver_containers() -> tuple[list[str], list[str]]:
+    """Force-remove edge-core driver containers and prune stopped containers.
+
+    A restart-floor container is stopped gracefully and kept instead: SIGKILL
+    strands the arm in its servoing mode, and removal loses the
+    ``State.FinishedAt`` the relaunch measures the floor from.
+
+    Returns the names of the ``(removed, stopped and kept)`` containers.
+    """
+    from .docker_helpers import MIN_RESTART_INTERVAL_LABEL, docker_names_with_label
+
     containers = _list_driver_containers(include_stopped=True)
+    floor_names = docker_names_with_label(MIN_RESTART_INTERVAL_LABEL)
+    if floor_names is None:
+        # Unknown which ones hold a robot session: a graceful stop is safe for all.
+        logger.warning("Could not list restart-floor containers; stopping every driver gracefully")
+        floor_names = set(containers)
     removed: list[str] = []
+    stopped: list[str] = []
     for container_name in containers:
         try:
-            subprocess.run(
-                ["docker", "rm", "-f", "-v", container_name],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            removed.append(container_name)
+            if container_name in floor_names:
+                _stop_driver_container_gracefully(container_name)
+                stopped.append(container_name)
+            else:
+                subprocess.run(
+                    ["docker", "rm", "-f", "-v", container_name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                removed.append(container_name)
             _CONTAINER_TWIN_MAP.pop(container_name, None)
             _CONTAINER_LOG_THREADS.pop(container_name, None)
             _CONTAINER_LOG_LAST_SEEN.pop(container_name, None)
             _CONTAINER_LAST_RESTART_COUNT.pop(container_name, None)
             _CONTAINER_RESTART_HISTORY.pop(container_name, None)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-            logger.warning("Failed to remove driver container %s: %s", container_name, exc)
+            logger.warning("Failed to stop or remove driver container %s: %s", container_name, exc)
 
     if shutil.which("docker"):
         try:
             subprocess.run(
-                ["docker", "container", "prune", "--force"],
+                [
+                    "docker",
+                    "container",
+                    "prune",
+                    "--force",
+                    "--filter",
+                    f"label!={MIN_RESTART_INTERVAL_LABEL}",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -2530,7 +2634,30 @@ def _stop_and_prune_driver_containers() -> list[str]:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
             logger.warning("Failed to prune stopped containers: %s", exc)
 
-    return removed
+    return removed, stopped
+
+
+def _stop_driver_container_gracefully(container_name: str) -> None:
+    """``docker stop`` without ``-t`` so the container's own stop timeout applies; raises."""
+    from .docker_helpers import docker_inspect
+
+    inspect = docker_inspect(container_name) or {}
+    config = inspect.get("Config") if isinstance(inspect.get("Config"), dict) else {}
+    stop_timeout = config.get("StopTimeout")
+    if not isinstance(stop_timeout, int) or isinstance(stop_timeout, bool) or stop_timeout < 0:
+        stop_timeout = 60
+    logger.info(
+        "Stopping %s gracefully (up to %d s); it declares a restart floor, so it is kept",
+        container_name,
+        stop_timeout,
+    )
+    subprocess.run(
+        ["docker", "stop", container_name],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=stop_timeout + 30,
+    )
 
 
 def _remove_cached_twin_json_files() -> list[str]:
@@ -2979,6 +3106,12 @@ def fetch_and_run_twin_drivers(
         # ``{dependency service: compose condition}``; only ``service_healthy``
         # makes the launch loop wait. See _wait_for_dependency_health.
         depends_on: dict[str, str] | None = None
+        # Inline-``services`` lifecycle fields (see _ServiceSpec).
+        restart: str = "unless-stopped"
+        stop_timeout_s: int = 5
+        privileged: bool = True
+        min_restart_interval_s: int | None = None
+        host_env_file: str | None = None
 
     driver_specs: list[_DriverSpec] = []
 
@@ -3150,12 +3283,12 @@ def fetch_and_run_twin_drivers(
         # --- Multi-container mode: metadata first, then the image ---------
         # Twin metadata wins so a robot pinned to a one-off topology keeps it;
         # the image-declared graph is what a trimmed twin resolves to. CYB-3469.
-        multi = _get_driver_services(
-            drivers,
-            child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
-        )
-        if multi is None:
-            try:
+        try:
+            multi = _get_driver_services(
+                drivers,
+                child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+            )
+            if multi is None:
                 multi = _image_declared_services_for_twin(
                     drivers,
                     twin,
@@ -3164,32 +3297,31 @@ def fetch_and_run_twin_drivers(
                     token=token,
                     watchdog=watchdog,
                 )
-            except RuntimeError as exc:
-                # A declared bundle must not degrade to intelligence defaults,
-                # but its failure is local to this twin. Let the remaining
-                # twins proceed to the pull and launch passes.
-                logger.error(
-                    "Twin '%s' declares an unusable topology: %s", twin.name, exc
+        except (RuntimeError, ValueError) as exc:
+            # A declared bundle must not degrade to intelligence defaults,
+            # but its failure (an unusable image graph, or invalid inline
+            # ``services`` metadata) is local to this twin. Let the remaining
+            # twins proceed to the pull and launch passes.
+            logger.error("Twin '%s' declares an unusable topology: %s", twin.name, exc)
+            try:
+                _send_alert_for_twin(
+                    twin_uuid,
+                    "Unusable declared topology",
+                    (
+                        f"Twin '{twin.name}' declares a topology this edge "
+                        f"cannot resolve: {exc}. Troubleshooting: "
+                        f"{DRIVER_TROUBLESHOOTING_URL}"
+                    ),
+                    "driver_start_failure",
+                    severity="error",
                 )
-                try:
-                    _send_alert_for_twin(
-                        twin_uuid,
-                        "Unusable declared topology",
-                        (
-                            f"Twin '{twin.name}' declares a topology this edge "
-                            f"cannot resolve: {exc}. Troubleshooting: "
-                            f"{DRIVER_TROUBLESHOOTING_URL}"
-                        ),
-                        "driver_start_failure",
-                        severity="error",
-                    )
-                except Exception as alert_exc:
-                    logger.warning(
-                        "Could not send declared-topology alert for twin %s: %s",
-                        twin_uuid,
-                        alert_exc,
-                    )
-                continue
+            except Exception as alert_exc:
+                logger.warning(
+                    "Could not send declared-topology alert for twin %s: %s",
+                    twin_uuid,
+                    alert_exc,
+                )
+            continue
         if multi is not None:
             svc_specs, shared_env, shared_params = multi
             logger.info(
@@ -3216,6 +3348,11 @@ def fetch_and_run_twin_drivers(
                     service_env=merged_env,
                     extra_networks=list(svc.extra_networks),
                     depends_on=dict(svc.depends_on),
+                    restart=svc.restart,
+                    stop_timeout_s=svc.stop_timeout_s,
+                    privileged=svc.privileged,
+                    min_restart_interval_s=svc.min_restart_interval_s,
+                    host_env_file=svc.host_env_file,
                 ))
             continue
 
@@ -3505,6 +3642,7 @@ def fetch_and_run_twin_drivers(
                 service_env=spec.service_env,
                 extra_networks=spec.extra_networks,
                 driver_alert_ctx=alert_ctx,
+                **_driver_spec_lifecycle_kwargs(spec),
             )
             result_entry: Dict[str, Any] = {
                 "twin_uuid": spec.twin_uuid,
@@ -3534,7 +3672,14 @@ def fetch_and_run_twin_drivers(
                         spec.twin_uuid,
                         alert_exc,
                     )
-            if not success:
+            if not success and _launch_deferred_by_restart_floor(spec):
+                # Not a hardware fault: revival starts it once the floor has passed.
+                logger.info(
+                    "Driver %s for twin '%s' is waiting out its restart floor",
+                    spec.driver_image,
+                    spec.twin.name,
+                )
+            elif not success:
                 try:
                     startup_failure_message = (
                         f"Driver image '{spec.driver_image}' for twin '{spec.twin.name}' "
@@ -3900,6 +4045,9 @@ from .driver_selection import (
     _get_best_driver_image_and_params as _get_best_driver_image_and_params,  # noqa: E402
 )
 from .driver_selection import _get_driver_services as _get_driver_services  # noqa: E402
+from .driver_selection import (  # noqa: E402
+    _service_lifecycle_overrides as _driver_spec_lifecycle_kwargs,
+)
 from .driver_selection import (  # noqa: E402
     get_image_declared_services as get_image_declared_services,
 )
@@ -4335,7 +4483,7 @@ def _perform_edge_core_restart(
 
     _stop_worker_container_for_restart()
     removed_json_files = _remove_cached_twin_json_files()
-    removed_containers = _stop_and_prune_driver_containers()
+    removed_containers, stopped_containers = _stop_and_prune_driver_containers()
 
     _clear_stale_driver_starting_alerts(
         twin_uuids_to_clear,
@@ -4355,6 +4503,7 @@ def _perform_edge_core_restart(
             "environment_uuid": None,
             "removed_twin_json_files": removed_json_files,
             "removed_driver_containers": removed_containers,
+            "stopped_driver_containers": stopped_containers,
             "drivers_started": 0,
             "drivers_discovered": 0,
         }
@@ -4387,16 +4536,18 @@ def _perform_edge_core_restart(
         "environment_uuid": environment_uuid,
         "removed_twin_json_files": removed_json_files,
         "removed_driver_containers": removed_containers,
+        "stopped_driver_containers": stopped_containers,
         "drivers_started": started,
         "drivers_discovered": len(results),
         "worker_started": worker_started,
     }
     logger.info(
         "Edge-core restart complete: env=%s removed_json=%d removed_containers=%d "
-        "started=%d/%d worker_started=%s",
+        "stopped_containers=%d started=%d/%d worker_started=%s",
         environment_uuid,
         len(removed_json_files),
         len(removed_containers),
+        len(stopped_containers),
         started,
         len(results),
         worker_started,
@@ -6113,6 +6264,7 @@ def _run_periodic_docker_cleanup() -> None:
     global _last_container_prune_time, _last_image_prune_time, _last_volume_prune_time
 
     from .docker_helpers import (
+        MIN_RESTART_INTERVAL_LABEL,
         docker_prune_dangling_volumes,
         docker_prune_navigation_bundle_volumes,
         docker_prune_stopped_cyberwave_containers,
@@ -6123,7 +6275,7 @@ def _run_periodic_docker_cleanup() -> None:
 
     if now - _last_container_prune_time >= CONTAINER_PRUNE_INTERVAL_SECONDS:
         try:
-            docker_prune_stopped_cyberwave_containers()
+            docker_prune_stopped_cyberwave_containers(keep_label=MIN_RESTART_INTERVAL_LABEL)
         except Exception:
             logger.exception("Unexpected error during stopped-container prune")
         _last_container_prune_time = now
@@ -6225,10 +6377,12 @@ def run_runtime_loop(
             elif revival_summary["down"] or revival_summary["skipped_orphan"]:
                 logger.debug(
                     "Driver revival reconcile skipped "
-                    "(down=%d, orphans=%d, flap_protected=%d, "
-                    "debounced=%d, no_credentials=%d)",
+                    "(down=%d, orphans=%d, restart_no=%d, restart_floor=%d, "
+                    "flap_protected=%d, debounced=%d, no_credentials=%d)",
                     revival_summary["down"],
                     revival_summary["skipped_orphan"],
+                    revival_summary["skipped_restart_no"],
+                    revival_summary["skipped_restart_floor"],
                     revival_summary["skipped_flap_protection"],
                     revival_summary["skipped_debounce"],
                     revival_summary["skipped_no_credentials"],

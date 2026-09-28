@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 # for that not to happen.
 DRIVER_CONTAINER_PREFIX = "cyberwave-driver-"
 
+# Marks a driver with a restart floor: its exited container holds the
+# ``State.FinishedAt`` the floor is measured from, so it is never pruned or
+# ``rm -f``'d.
+MIN_RESTART_INTERVAL_LABEL = "cyberwave.min_restart_interval_s"
+
 
 def driver_container_name(twin_uuid: str, service_name: str | None = None) -> str:
     """Container name for a twin's driver, or for one service of a multi-service driver."""
@@ -177,6 +182,78 @@ def docker_image_id(image: str, *, timeout: int = 10) -> Optional[str]:
         return None
     image_id = stdout.strip()
     return image_id if image_id.startswith("sha256:") else None
+
+
+def docker_image_env(image: str) -> dict[str, str]:
+    """The ``ENV`` baked into the local *image*; empty when it is not local or unreadable."""
+    if not docker_available():
+        return {}
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{json .Config.Env}}", image],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        entries = json.loads(result.stdout or "null")
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+        json.JSONDecodeError,
+    ):
+        return {}
+    return container_env_of({"Config": {"Env": entries}})
+
+
+def docker_inspect_running_containers() -> Optional[list[dict[str, Any]]]:
+    """``docker inspect`` of every running container; None (not []) if docker could not say."""
+    if not docker_available():
+        return None
+    try:
+        listed = subprocess.run(
+            ["docker", "ps", "--quiet", "--no-trunc"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to list running containers: %s", exc)
+        return None
+    ids = listed.stdout.split()
+    if not ids:
+        return []
+    try:
+        # No check=True: an ID that vanished makes ``docker inspect`` exit 1
+        # while it still prints the rest.
+        result = subprocess.run(
+            ["docker", "inspect", *ids],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        payload = json.loads(result.stdout or "[]")
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to inspect running containers: %s", exc)
+        return None
+    if not isinstance(payload, list):
+        return None
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def container_env_of(inspect: Optional[dict[str, Any]]) -> dict[str, str]:
+    """``Config.Env`` of a ``docker inspect`` payload as a dict (last entry wins, as in docker)."""
+    config = inspect.get("Config") if isinstance(inspect, dict) else None
+    entries = config.get("Env") if isinstance(config, dict) else None
+    env: dict[str, str] = {}
+    for entry in entries if isinstance(entries, list) else ():
+        if isinstance(entry, str):
+            key, sep, value = entry.partition("=")
+            if sep and key:
+                env[key] = value
+    return env
 
 
 def container_status_of(inspect: Optional[dict[str, Any]]) -> str:
@@ -340,8 +417,32 @@ def docker_has_nvidia_default_runtime() -> bool:
         return False
 
 
-def docker_prune_stopped_cyberwave_containers(prefix: str = "cyberwave") -> int:
+def docker_names_with_label(label: str) -> Optional[set[str]]:
+    """Names of all containers (any state) carrying *label*; None (not empty) on error."""
+    if not docker_available():
+        return None
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}", "--filter", f"label={label}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to list containers labelled %r: %s", label, exc)
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def docker_prune_stopped_cyberwave_containers(
+    prefix: str = "cyberwave",
+    *,
+    keep_label: str | None = None,
+) -> int:
     """Remove all stopped containers whose name starts with *prefix*.
+
+    Containers carrying *keep_label* are kept; if they cannot be listed, nothing is pruned.
 
     Returns the number of containers successfully removed.
     """
@@ -351,6 +452,11 @@ def docker_prune_stopped_cyberwave_containers(prefix: str = "cyberwave") -> int:
     stopped = docker_ps_by_prefix(prefix, include_stopped=True)
     running = set(docker_ps_by_prefix(prefix, include_stopped=False))
     to_remove = [name for name in stopped if name not in running]
+    if keep_label and to_remove:
+        kept = docker_names_with_label(keep_label)
+        if kept is None:
+            return 0
+        to_remove = [name for name in to_remove if name not in kept]
 
     if not to_remove:
         logger.debug("No stopped cyberwave containers to prune")

@@ -58,6 +58,11 @@ def _patch_driver_container_launch(monkeypatch: Any, captured_cmds: list[list[st
         "cyberwave_edge_core.docker_helpers.docker_inspect",
         lambda _: {"State": {"Status": "running"}},
     )
+    # Nothing else is running, so the second-driver guard lets every launch through.
+    monkeypatch.setattr(
+        "cyberwave_edge_core.docker_helpers.docker_inspect_running_containers",
+        lambda: [],
+    )
     # Pre-cleanup removal is covered by test_docker_launch; no-op it here so it
     # doesn't trip over the always-"running" docker_inspect mock above.
     monkeypatch.setattr(

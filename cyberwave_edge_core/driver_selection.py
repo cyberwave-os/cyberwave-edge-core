@@ -20,7 +20,7 @@ import shlex
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -301,6 +301,85 @@ class _ServiceSpec:
     # Docker's health state for ``service_healthy``; anything else is already
     # satisfied by starting in dependency order.
     depends_on: dict[str, str] = field(default_factory=dict)
+    # Inline ``services`` lifecycle fields; the defaults are the historical
+    # ``docker run`` flags, so an entry that sets none is unchanged.
+    restart: str = "unless-stopped"
+    stop_timeout_s: int = 5
+    privileged: bool = True
+    # Seconds after the previous container's ``State.FinishedAt`` before this
+    # service may start again (Kortex rejects a new session for ~60 s). Held
+    # only where edge-core (re)creates it: Docker restarting a crashed
+    # ``unless-stopped``/``on-failure`` container does not wait for it.
+    min_restart_interval_s: int | None = None
+    # ``--env-file`` relative to CONFIG_DIR, for what must stay out of twin
+    # metadata (robot IP, credentials).
+    host_env_file: str | None = None
+
+
+_SERVICE_RESTART_POLICIES = frozenset({"no", "on-failure", "unless-stopped"})
+
+#: `_ServiceSpec` fields forwarded to `_run_docker_image` as same-named kwargs.
+_SERVICE_LIFECYCLE_FIELDS = (
+    "restart",
+    "stop_timeout_s",
+    "privileged",
+    "min_restart_interval_s",
+    "host_env_file",
+)
+
+
+def _service_lifecycle_overrides(spec: Any) -> Dict[str, Any]:
+    """The lifecycle fields *spec* sets away from the `_ServiceSpec` defaults (duck-typed)."""
+    defaults = {
+        f.name: f.default for f in fields(_ServiceSpec) if f.name in _SERVICE_LIFECYCLE_FIELDS
+    }
+    return {
+        name: getattr(spec, name)
+        for name, default in defaults.items()
+        if getattr(spec, name, default) != default
+    }
+
+
+def _parse_service_lifecycle_fields(idx: int, svc: Dict[str, Any]) -> Dict[str, Any]:
+    """The lifecycle fields ``services[idx]`` sets, validated; a wrong value raises."""
+    out: Dict[str, Any] = {}
+
+    if svc.get("restart") is not None:
+        restart = svc["restart"]
+        if not isinstance(restart, str) or restart not in _SERVICE_RESTART_POLICIES:
+            raise ValueError(
+                f"services[{idx}].restart must be one of {sorted(_SERVICE_RESTART_POLICIES)}"
+            )
+        out["restart"] = restart
+
+    for key in ("stop_timeout_s", "min_restart_interval_s"):
+        if svc.get(key) is None:
+            continue
+        value = svc[key]
+        # bool is an int subclass; `true` is not a timeout.
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"services[{idx}].{key} must be a non-negative integer")
+        out[key] = value
+
+    if svc.get("privileged") is not None:
+        if not isinstance(svc["privileged"], bool):
+            raise ValueError(f"services[{idx}].privileged must be a boolean")
+        out["privileged"] = svc["privileged"]
+
+    if svc.get("host_env_file") is not None:
+        value = svc["host_env_file"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"services[{idx}].host_env_file must be a non-empty string")
+        rel = value.strip()
+        # Confined to CONFIG_DIR: backend-written metadata must not point
+        # --env-file at arbitrary host files.
+        if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+            raise ValueError(
+                f"services[{idx}].host_env_file must be a path relative to the edge config dir"
+            )
+        out["host_env_file"] = rel
+
+    return out
 
 
 def _get_driver_services(
@@ -415,6 +494,7 @@ def _get_driver_services(
                 params=params,
                 prefer_gpu=bool(svc.get("prefer_gpu", False)),
                 gpu_spec=str(svc.get("gpu", "all")),
+                **_parse_service_lifecycle_fields(idx, svc),
             )
         )
 

@@ -78,6 +78,7 @@ def remove_existing_container(
     container_name: str,
     *,
     get_runtime_env_var: GetRuntimeEnvVar,
+    min_timeout: int | None = None,
 ) -> bool:
     """Idempotently remove a same-named container before ``docker create``.
 
@@ -87,12 +88,17 @@ def remove_existing_container(
     3. ``docker rm -f`` with a generous, configurable timeout — neither call
        raises (both go through ``docker_helpers``).
 
+    *min_timeout* raises that bound so a longer ``--stop-timeout`` is not cut
+    short into ``rm -f``'s SIGKILL.
+
     Returns ``True`` when no container with that name remains afterwards.
     """
     if docker_helpers.docker_inspect(container_name) is None:
         return True
 
     timeout = driver_remove_timeout_seconds(get_runtime_env_var)
+    if min_timeout is not None:
+        timeout = max(timeout, min_timeout)
     docker_helpers.docker_stop(container_name, timeout=timeout)
     docker_helpers.docker_rm(container_name, timeout=timeout)
 

@@ -3413,7 +3413,7 @@ class TestPerformEdgeCoreRestart:
         for name, fn in {
             "_stop_worker_container_for_restart": lambda: events.append("stop_worker"),
             "_remove_cached_twin_json_files": lambda: ["a.json"],
-            "_stop_and_prune_driver_containers": lambda: [],
+            "_stop_and_prune_driver_containers": lambda: ([], []),
             "load_environment_uuid": lambda **_kw: "env-uuid",
             "get_or_create_fingerprint": lambda: "fp",
             "stop_zenoh_router": lambda _e: None,

@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import platform
 import shlex
 import shutil
 import subprocess
+import time
 from typing import Any, List, Optional
 
 # Module-level is safe: container_spec and docker_args are stdlib-only, so this
 # cannot reintroduce the cycle the lazy ``_startup()`` accessor below exists to break.
 from .container_spec import DockerRunSpec
 from .docker_args import build_log_args
-from .docker_helpers import docker_image_id, driver_container_name
+from .docker_helpers import (
+    MIN_RESTART_INTERVAL_LABEL,
+    container_env_of,
+    container_status_of,
+    docker_image_id,
+    driver_container_name,
+    parse_docker_timestamp_ns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +266,111 @@ def _run_macos_device_bridge_commands(
     return True, resolved_device_map
 
 
+# A container in one of these is holding whatever the driver drives.
+_LIVE_CONTAINER_STATES = frozenset({"running", "restarting", "paused"})
+
+
+def _restart_floor_decision(
+    inspect: Optional[dict[str, Any]],
+    *,
+    min_restart_interval_s: int,
+    now_ns: int | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Whether a service with a restart floor may be (re)created right now.
+
+    Returns ``("proceed", {})``, ``("adopt", {})`` or
+    ``("refuse", {"reason", "error", "retry_after_s"})``.
+
+    A live container is adopted, never replaced: stop-then-start is exactly
+    what the floor forbids (Kortex rejects a new session ~60 s after the last).
+    An exited one is measured from ``State.FinishedAt``; a never-run one has no floor.
+    """
+    status = container_status_of(inspect)
+    if inspect is None or status == "none":
+        return "proceed", {}
+    if status in _LIVE_CONTAINER_STATES:
+        return "adopt", {}
+
+    state = inspect.get("State") if isinstance(inspect.get("State"), dict) else {}
+    finished_ns = parse_docker_timestamp_ns(str(state.get("FinishedAt") or ""))
+    if finished_ns is None or min_restart_interval_s <= 0:
+        return "proceed", {}
+    now_ns = time.time_ns() if now_ns is None else now_ns
+    # A FinishedAt in the future (host clock stepped back) counts as "just now".
+    elapsed_s = max(0, now_ns - finished_ns) / 1e9
+    if elapsed_s >= min_restart_interval_s:
+        return "proceed", {}
+    retry_after_s = max(1, math.ceil(min_restart_interval_s - elapsed_s))
+    return "refuse", {
+        "reason": "restart_too_soon",
+        "error": (
+            f"The previous driver container finished {elapsed_s:.0f} s ago; this service "
+            f"needs {min_restart_interval_s} s between runs."
+        ),
+        "retry_after_s": retry_after_s,
+    }
+
+
+def _read_docker_env_file(path: Any) -> dict[str, str]:
+    """``KEY=value`` pairs of a ``docker run --env-file``, read as docker reads it.
+
+    Comments and blank lines are skipped, values are taken verbatim (no quote
+    stripping), and a bare ``KEY`` takes edge-core's own value, if it has one.
+    """
+    env: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.lstrip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep:
+            env[key] = value
+        elif key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
+def _robot_driver_conflict(
+    *,
+    twin_uuid: str,
+    image: str,
+    declared_env: dict[str, str],
+    running: list[dict[str, Any]],
+) -> Optional[str]:
+    """Why a driver for *twin_uuid* started now would be a second driver of its robot, or None.
+
+    A live container that is not one of this twin's own conflicts when it has
+    the same non-empty ``ROBOT_IP``. A shared ``ROS_DOMAIN_ID`` is not counted:
+    every robot declaration pins domain 42, so it cannot tell a second driver
+    of this robot from another robot or a camera on the same graph.
+    *declared_env* overlays the image ENV.
+    """
+    from .docker_helpers import docker_image_env
+
+    own_prefix = driver_container_name(twin_uuid)
+    # Read lazily: the image ENV is only needed once a live container names a robot.
+    own_ip: Optional[str] = None
+    for inspect in running:
+        name = str(inspect.get("Name") or "").lstrip("/")
+        if name == own_prefix or name.startswith(f"{own_prefix}-"):
+            continue
+        if container_status_of(inspect) not in _LIVE_CONTAINER_STATES:
+            continue
+        other_ip = (container_env_of(inspect).get("ROBOT_IP") or "").strip()
+        if not other_ip:
+            continue
+        if own_ip is None:
+            own_ip = ({**docker_image_env(image), **declared_env}.get("ROBOT_IP") or "").strip()
+        if own_ip != other_ip:
+            continue
+        return (
+            f"Another container ({name}) is already driving this robot "
+            f"(same ROBOT_IP {other_ip}). Stop it on the edge before running from Cyberwave."
+        )
+    return None
+
+
 def _run_docker_image(
     image: str,
     params: list[str],
@@ -273,6 +387,11 @@ def _run_docker_image(
     service_env: dict[str, str] | None = None,
     extra_networks: Optional[list[str]] = None,
     driver_alert_ctx: Optional[Any] = None,
+    restart: str = "unless-stopped",
+    stop_timeout_s: int = 5,
+    privileged: bool = True,
+    min_restart_interval_s: int | None = None,
+    host_env_file: str | None = None,
 ) -> bool:
     """Run a driver Docker container for a twin.
 
@@ -285,12 +404,17 @@ def _run_docker_image(
     ``driver_starting`` lifecycle.  When ``None`` a fresh alert is
     created (backwards-compatible with callers that skip the bulk pull).
 
-    The container is started in detached mode with ``--restart unless-stopped``
-    so it persists across reboots.  Environment variables are passed so the
-    driver can authenticate with the Cyberwave backend and know which twin it
-    controls.
+    The container is started in detached mode, by default with ``--restart
+    unless-stopped`` so it persists across reboots.  Environment variables are
+    passed so the driver can authenticate with the Cyberwave backend and know
+    which twin it controls. The lifecycle keyword defaults reproduce the
+    historical ``docker run`` flags (see ``_ServiceSpec``).
 
-    Returns ``True`` if the container was started successfully.
+    The launch is refused before anything is removed or pulled when another
+    live container already drives the same robot (:func:`_robot_driver_conflict`).
+
+    Returns ``True`` if the container was started successfully (or, for a
+    service with *min_restart_interval_s*, a running one was adopted).
     """
     s = _startup()
     if not shutil.which("docker"):
@@ -313,10 +437,96 @@ def _run_docker_image(
         )
         driver_alert_ctx.create()
 
+    def _refuse(reason: str, description: str) -> bool:
+        logger.error("Not starting %s (%s): %s", container_name, reason, description)
+        driver_alert_ctx.mark_failed_and_resolve(description, phase=reason)
+        return False
+
+    if min_restart_interval_s:
+        from .docker_helpers import docker_inspect
+
+        floor_inspect = docker_inspect(container_name)
+        decision, detail = _restart_floor_decision(
+            floor_inspect,
+            min_restart_interval_s=min_restart_interval_s,
+        )
+        if decision == "refuse":
+            # Keep it mapped so revival restarts it after the floor, not as an
+            # orphan, and marked so a restart=no one is restarted too.
+            s._CONTAINER_TWIN_MAP[container_name] = twin_uuid
+            s._RESTART_FLOOR_DEFERRED.add(container_name)
+            return _refuse(
+                detail["reason"],
+                f"{detail['error']} Retry in {detail['retry_after_s']} s.",
+            )
+        s._RESTART_FLOOR_DEFERRED.discard(container_name)
+        if decision == "adopt":
+            logger.info(
+                "Keeping running %s: it declares a %d s restart floor",
+                container_name,
+                min_restart_interval_s,
+            )
+            running_image = str(((floor_inspect or {}).get("Config") or {}).get("Image") or "")
+            if running_image and running_image != image:
+                # Applying it needs the stop-then-start the floor forbids.
+                logger.warning(
+                    "Adopted %s runs %s, not the requested %s; the requested image "
+                    "applies only once the container exits",
+                    container_name,
+                    running_image,
+                    image,
+                )
+            s._CONTAINER_TWIN_MAP[container_name] = twin_uuid
+            s._stream_container_logs(container_name, twin_uuid=twin_uuid, token=token)
+            driver_alert_ctx.update_metadata({"phase": "container_running"}, force=True)
+            driver_alert_ctx.resolve()
+            return True
+
+    # Declared-but-missing refuses: the driver cannot run without its robot
+    # address and credentials.
+    env_file_args: list[str] = []
+    host_env: dict[str, str] = {}
+    if host_env_file:
+        env_file_path = s.CONFIG_DIR / host_env_file
+        if not env_file_path.is_file():
+            return _refuse(
+                "host_env_file_missing",
+                f"Driver host env file {env_file_path} does not exist on this edge.",
+            )
+        env_file_args = ["--env-file", str(env_file_path)]
+        host_env = _read_docker_env_file(env_file_path)
+
+    from .docker_helpers import docker_inspect_running_containers
+
+    running = docker_inspect_running_containers()
+    if running is None:
+        return _refuse(
+            "docker_error",
+            "Could not list the running containers to check that no other container "
+            "is driving this robot.",
+        )
+    conflict = _robot_driver_conflict(
+        twin_uuid=twin_uuid,
+        image=image,
+        # Docker's precedence: --env-file < -e (service_env is merged over params).
+        declared_env={
+            **host_env,
+            **s._extract_docker_env_map(params),
+            **(service_env or {}),
+        },
+        running=running,
+    )
+    if conflict is not None:
+        return _refuse("driver_conflict", conflict)
+
     # Remove any existing container with the same name (idempotent re-runs).
     from .docker_launch import remove_existing_container
 
-    if not remove_existing_container(container_name, get_runtime_env_var=s.get_runtime_env_var):
+    if not remove_existing_container(
+        container_name,
+        get_runtime_env_var=s.get_runtime_env_var,
+        min_timeout=stop_timeout_s + 15,
+    ):
         driver_alert_ctx.mark_failed_and_resolve(
             f"Could not remove existing container {container_name} before starting the driver.",
             phase="container_remove_failed",
@@ -894,6 +1104,10 @@ def _run_docker_image(
     # build_log_args defers to anything the driver's own params already pin.
     log_args = build_log_args(params_pass)
 
+    label_args: list[str] = []
+    if min_restart_interval_s:
+        label_args = ["--label", f"{MIN_RESTART_INTERVAL_LABEL}={min_restart_interval_s}"]
+
     # The argv and the spec-hash label come from this one spec, so every flag
     # passed to Docker is covered by the hash (see container_spec).
     run_spec = DockerRunSpec(
@@ -901,15 +1115,17 @@ def _run_docker_image(
             "--detach",
             "--init",
             "--stop-timeout",
-            "5",
+            str(stop_timeout_s),
             "--restart",
-            "unless-stopped",
-            "--privileged",
+            restart,
+            *(["--privileged"] if privileged else []),
             *log_args,
             *gpu_args,
             *pid_args,
             *usbip_device_args,
             *network_args,
+            *label_args,
+            *env_file_args,
             "--name",
             container_name,
             *params_pass,

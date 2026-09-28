@@ -589,6 +589,14 @@ class TestDriverRevivalReconciliation:
     every healthy driver via the idempotent ``docker rm -f`` step.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_docker_inspect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Revival inspects each down container for its restart policy; an
+        # uninspectable one keeps the old behaviour (revived).
+        monkeypatch.setattr(
+            "cyberwave_edge_core.docker_helpers.docker_inspect", lambda _name: None
+        )
+
     def _reset_revival_state(self) -> None:
         startup._DRIVER_HEALTH_PREVIOUS.clear()
         startup._CONTAINER_TWIN_MAP.clear()
