@@ -20,6 +20,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -770,9 +771,75 @@ def _navigation_bundle_spec(doc: Dict[str, Any]) -> tuple[str, str, str] | None:
     return source, target, profile
 
 
+def _navigation_bundle_identity(image_id: str, source: str, profile: str) -> str:
+    return hashlib.sha256(f"{image_id}\0{source}\0{profile}".encode()).hexdigest()
+
+
+def _navigation_bundle_prefix(identity: str) -> str:
+    """Volume name up to, and excluding, the materializing process's session."""
+
+    return f"cyberwave-navigation-{identity[:16]}-"
+
+
+def _adopt_navigation_bundle(
+    image_id: str,
+    prefix: str,
+    probe_bundle: Callable[[str], str],
+) -> tuple[str, str] | None:
+    """Return a complete bundle volume an earlier process left mounted, if any.
+
+    The volume name carries the materializing process's session, so without
+    this every edge-core restart creates a new volume, which changes the ``-v``
+    mount and so the spec-hash of every container that mounts it.
+
+    Reuse never writes: the fill step only ever runs on a volume named with
+    this process's own session. A candidate must carry this image's labels and
+    identity prefix, be mounted by a running container (Docker will not remove
+    a volume in use) and still hold the completion marker. Caller holds
+    ``_NAVIGATION_BUNDLE_LOCK``.
+
+    Safe only for a caller that keeps those containers running. One that
+    removes and recreates them leaves the volume unmounted and older than the
+    prune age floor, so another process's unprotected
+    :func:`~cyberwave_edge_core.docker_helpers.docker_prune_navigation_bundle_volumes`
+    could delete it, and the next ``-v`` mount would silently recreate it empty.
+    """
+
+    listed = _docker_capture(
+        [
+            "docker",
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            "label=io.cyberwave.navigation.bundle=1",
+            "--filter",
+            f"label=io.cyberwave.navigation.image={image_id}",
+            "--filter",
+            f"name={prefix}",
+        ],
+        timeout=30,
+    )
+    if listed.returncode != 0:
+        return None
+    # Docker's name filter is a substring match, not a prefix match.
+    for candidate in sorted(v for v in listed.stdout.split() if v.startswith(prefix)):
+        in_use = _docker_capture(
+            ["docker", "ps", "-q", "--filter", f"volume={candidate}"], timeout=30
+        )
+        if in_use.returncode != 0 or not in_use.stdout.strip():
+            continue
+        digest = probe_bundle(candidate)
+        if digest:
+            return candidate, digest
+    return None
+
+
 def _materialize_navigation_bundle(
     image: str,
     spec: tuple[str, str, str],
+    *,
+    adopt_existing: bool = False,
 ) -> tuple[str, str]:
     """Copy an image-owned bundle into an immutable Docker volume.
 
@@ -780,6 +847,10 @@ def _materialize_navigation_bundle(
     Docker-out-of-Docker supervisor. A host bind path would point at the
     supervisor container's filesystem in the latter case and be invisible to
     the Docker daemon that launches its siblings.
+
+    With *adopt_existing*, reuse a complete volume a running container still
+    mounts, so its spec-hash survives an edge-core restart; only for callers
+    that keep those containers running (see :func:`_adopt_navigation_bundle`).
 
     Returns ``(volume name, bundle digest)``. Any declared-but-unusable bundle
     raises so startup cannot silently fall back to intelligence defaults.
@@ -795,11 +866,12 @@ def _materialize_navigation_bundle(
             f"cannot inspect driver image {image!r} for navigation bundle: "
             f"{inspected.stderr.strip() or inspected.stdout.strip()}"
         )
-    identity = hashlib.sha256(f"{image_id}\0{source}\0{profile}".encode()).hexdigest()
+    identity = _navigation_bundle_identity(image_id, source, profile)
     # Different Edge Core / simulator processes share one Docker daemon but not
     # Python locks. Give each process its own immutable volume so one process can
     # never clear another process's bundle while its containers are using it.
-    volume = f"cyberwave-navigation-{identity[:16]}-{_NAVIGATION_BUNDLE_SESSION}"
+    prefix = _navigation_bundle_prefix(identity)
+    volume = prefix + _NAVIGATION_BUNDLE_SESSION
 
     probe_script = (
         'test -s "/bundle/' + _NAVIGATION_BUNDLE_MARKER + '" && '
@@ -843,6 +915,13 @@ def _materialize_navigation_bundle(
                 _NAVIGATION_BUNDLE_CACHE[identity] = result
                 return result
             _NAVIGATION_BUNDLE_CACHE.pop(identity, None)
+
+        if adopt_existing:
+            adopted = _adopt_navigation_bundle(image_id, prefix, probe_bundle)
+            if adopted is not None:
+                # Cached so this process's own prune protects it.
+                _NAVIGATION_BUNDLE_CACHE[identity] = adopted
+                return adopted
 
         created = _docker_capture(
             [
@@ -1738,6 +1817,7 @@ def get_image_declared_services(
     channel_tag: Optional[str] = None,
     moveit_tag: Optional[str] = None,
     materialize_navigation_bundle: bool = True,
+    adopt_navigation_bundle: bool = False,
 ) -> tuple[list[_ServiceSpec], dict[str, str], list[str]] | None:
     """Service graph *image* declares for *variant*, or None when it declares none.
 
@@ -1772,6 +1852,9 @@ def get_image_declared_services(
 
     Diagnostic callers may pass ``materialize_navigation_bundle=False`` to
     inspect the declared service graph without creating volumes or containers.
+    ``adopt_navigation_bundle=True`` reuses a bundle volume a running container
+    already mounts; see :func:`_materialize_navigation_bundle` for when that is
+    safe.
 
     None rather than an exception for every "this image says nothing" case: an
     image built before these labels existed is not an error, it simply falls
@@ -1919,7 +2002,9 @@ def get_image_declared_services(
 
     if navigation_bundle is not None and materialize_navigation_bundle:
         try:
-            bundle_volume, bundle_digest = _materialize_navigation_bundle(image, navigation_bundle)
+            bundle_volume, bundle_digest = _materialize_navigation_bundle(
+                image, navigation_bundle, adopt_existing=adopt_navigation_bundle
+            )
         except ValueError as exc:
             raise RuntimeError(f"invalid navigation bundle in {image!r}: {exc}") from exc
         logger.info(

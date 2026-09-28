@@ -29,6 +29,7 @@ import pytest
 
 import cyberwave_edge_core.driver_selection as ds
 import cyberwave_edge_core.startup as startup
+from cyberwave_edge_core.container_spec import DockerRunSpec
 
 
 @pytest.fixture(autouse=True)
@@ -338,7 +339,7 @@ def test_driver_navigation_bundle_is_materialized_and_mounted_read_only(
 
     materialized: list[tuple[str, tuple[str, str, str]]] = []
 
-    def _materialize(image: str, spec: tuple[str, str, str]) -> tuple[str, str]:
+    def _materialize(image: str, spec: tuple[str, str, str], **_: Any) -> tuple[str, str]:
         materialized.append((image, spec))
         return "cyberwave-navigation-deadbeef", "bundle-sha256"
 
@@ -416,6 +417,224 @@ def test_materialized_bundle_is_content_addressed_and_reused(monkeypatch: Any) -
         ["image", "inspect"],
         ["run", "--rm"],
     ]
+
+
+_IMAGE_ID = "sha256:image-id"
+_BUNDLE_SPEC = ("/source", "/target", "profiles/robot.yaml")
+_BUNDLE_PREFIX = ds._navigation_bundle_prefix(
+    ds._navigation_bundle_identity(_IMAGE_ID, _BUNDLE_SPEC[0], _BUNDLE_SPEC[2])
+)
+_EARLIER = _BUNDLE_PREFIX + "0ldsess1"
+
+
+class _FakeBundleDocker:
+    """A Docker daemon holding navigation bundle volumes, for adoption tests.
+
+    *volumes* maps a name to its labels, *complete* is the set of volumes
+    holding the completion marker, and *mounted* the set a running container
+    mounts. *writes* records each ``volume create`` and fill run, in order.
+    """
+
+    def __init__(self) -> None:
+        self.volumes: dict[str, dict[str, str]] = {}
+        self.complete: set[str] = set()
+        self.mounted: set[str] = set()
+        self.calls: list[list[str]] = []
+        self.writes: list[str] = []
+
+    def add(
+        self,
+        name: str,
+        *,
+        image_id: str = _IMAGE_ID,
+        complete: bool = True,
+        mounted: bool = True,
+    ) -> None:
+        self.volumes[name] = {
+            "io.cyberwave.navigation.bundle": "1",
+            "io.cyberwave.navigation.image": image_id,
+        }
+        if complete:
+            self.complete.add(name)
+        if mounted:
+            self.mounted.add(name)
+
+    @staticmethod
+    def _ok(stdout: str = "") -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    def __call__(self, argv: list[str], *, timeout: int = 60) -> SimpleNamespace:
+        self.calls.append(argv)
+        if argv[1:3] == ["image", "inspect"]:
+            return self._ok(_IMAGE_ID + "\n")
+        if argv[1:3] == ["volume", "ls"]:
+            filters = [argv[i + 1] for i, token in enumerate(argv) if token == "--filter"]
+            labels = dict(f.removeprefix("label=").split("=", 1) for f in filters if "label=" in f)
+            name_part = next(f.removeprefix("name=") for f in filters if f.startswith("name="))
+            names = [
+                name
+                for name, have in self.volumes.items()
+                # Docker's name filter is a substring match.
+                if name_part in name and all(have.get(k) == v for k, v in labels.items())
+            ]
+            return self._ok("".join(f"{name}\n" for name in names))
+        if argv[1:3] == ["ps", "-q"]:
+            volume = argv[argv.index("--filter") + 1].removeprefix("volume=")
+            return self._ok("abc123\n" if volume in self.mounted else "")
+        if argv[1:3] == ["volume", "create"]:
+            self.writes.append("create")
+            labels = [argv[i + 1] for i, token in enumerate(argv) if token == "--label"]
+            self.volumes.setdefault(argv[-1], dict(label.split("=", 1) for label in labels))
+            return self._ok(argv[-1] + "\n")
+        if argv[1:3] == ["run", "--rm"]:
+            mount = argv[argv.index("-v") + 1]
+            volume = mount.split(":", 1)[0]
+            if not mount.endswith(":ro"):
+                self.writes.append("fill")
+                self.complete.add(volume)
+            elif volume not in self.complete:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")  # the probe
+            return self._ok("bundle-digest\n")
+        raise AssertionError(f"unexpected docker call: {argv}")
+
+
+def test_a_mounted_complete_bundle_from_an_earlier_session_is_adopted(
+    monkeypatch: Any,
+) -> None:
+    docker = _FakeBundleDocker()
+    docker.add(_EARLIER)
+    monkeypatch.setattr(ds, "_docker_capture", docker)
+
+    volume, digest = ds._materialize_navigation_bundle(
+        "driver:test", _BUNDLE_SPEC, adopt_existing=True
+    )
+
+    assert (volume, digest) == (_EARLIER, "bundle-digest")
+    assert docker.writes == []
+    # Cached, so this process's own prune keeps it and the next resolve reuses it.
+    assert ds.navigation_bundle_cache_volumes() == {_EARLIER}
+
+
+def test_adoption_is_off_unless_the_caller_asks(monkeypatch: Any) -> None:
+    docker = _FakeBundleDocker()
+    docker.add(_EARLIER)
+    monkeypatch.setattr(ds, "_docker_capture", docker)
+
+    volume, _ = ds._materialize_navigation_bundle("driver:test", _BUNDLE_SPEC)
+
+    assert volume == _BUNDLE_PREFIX + ds._NAVIGATION_BUNDLE_SESSION
+    assert not any(c[1:3] == ["volume", "ls"] for c in docker.calls)
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs"),
+    [
+        pytest.param(_EARLIER, {"mounted": False}, id="unmounted"),
+        pytest.param(_EARLIER, {"complete": False}, id="incomplete"),
+        pytest.param(_EARLIER, {"image_id": "sha256:other"}, id="other-image-label"),
+        pytest.param("x-" + _EARLIER, {}, id="name-substring-only"),
+    ],
+)
+def test_an_unusable_bundle_is_not_adopted(
+    monkeypatch: Any, name: str, kwargs: dict[str, Any]
+) -> None:
+    docker = _FakeBundleDocker()
+    docker.add(name, **kwargs)
+    monkeypatch.setattr(ds, "_docker_capture", docker)
+
+    volume, digest = ds._materialize_navigation_bundle(
+        "driver:test", _BUNDLE_SPEC, adopt_existing=True
+    )
+
+    own = _BUNDLE_PREFIX + ds._NAVIGATION_BUNDLE_SESSION
+    assert (volume, digest) == (own, "bundle-digest")
+    assert docker.writes == ["create", "fill"]
+    assert ds.navigation_bundle_cache_volumes() == {own}
+
+
+def _render_robot_graph(robot: str) -> dict[str, Any]:
+    """Render a shipped ``compose.base.yaml`` + ``compose.robot.yaml`` pair.
+
+    Rendered by the real `docker compose config`, the same render the driver
+    build bakes into the image label, because its output shape -- not a
+    hand-copied fixture -- is what reaches edge-core. `--no-interpolate` leaves
+    `${SPOT_PASSWORD:?...}` unevaluated, so no credentials are needed.
+    """
+    root = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "cyberwave-edge-runtime/runtime-services/drivers/ros2/robots"
+        / robot
+    )
+    if not (root / "compose.robot.yaml").exists():
+        pytest.skip("driver tree not checked out beside edge-core")
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI not available to render the compose files")
+    rendered = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(root / "compose.base.yaml"),
+            "-f",
+            str(root / "compose.robot.yaml"),
+            "config",
+            "--no-interpolate",
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if rendered.returncode != 0 and "is not a docker command" in rendered.stderr:
+        pytest.skip("docker compose plugin not available")
+    assert rendered.returncode == 0, rendered.stderr
+    return json.loads(rendered.stdout)
+
+
+def test_go2_spec_hashes_survive_an_edge_core_restart(monkeypatch: Any) -> None:
+    """The ``-v`` mount of every Go2 service names the bundle volume, so a new
+    volume per process would change all six spec-hashes and Phase D could never
+    keep those containers."""
+    doc = _render_robot_graph("unitree/go2")
+    _labels(monkeypatch, _label_set(doc))
+    docker = _FakeBundleDocker()
+    monkeypatch.setattr(ds, "_docker_capture", docker)
+
+    def hashes() -> dict[str, str]:
+        resolved = ds.get_image_declared_services(
+            "cyberwaveos/go2-ros2-driver:humble",
+            twin_uuid="11111111-2222-3333-4444-555555555555",
+            adopt_navigation_bundle=True,
+        )
+        assert resolved is not None
+        out = {}
+        for spec in resolved[0]:
+            env_flags = [t for k, v in sorted(spec.env.items()) for t in ("-e", f"{k}={v}")]
+            run_spec = DockerRunSpec(
+                options=(*spec.params, *env_flags),
+                image=spec.image,
+                command=tuple(spec.command or ()),
+                extra_networks=tuple(spec.extra_networks),
+            )
+            out[spec.name] = run_spec.spec_hash()
+        return out
+
+    monkeypatch.setattr(ds, "_NAVIGATION_BUNDLE_SESSION", "session1")
+    before = hashes()
+    assert len(before) == 6
+    first_volume = next(iter(ds.navigation_bundle_cache_volumes()))
+    docker.mounted.add(first_volume)  # its containers keep running
+
+    # Restart: a new process has a new session and an empty cache.
+    monkeypatch.setattr(ds, "_NAVIGATION_BUNDLE_SESSION", "session2")
+    ds._NAVIGATION_BUNDLE_CACHE.clear()
+    docker.writes.clear()
+
+    assert hashes() == before
+    assert docker.writes == []
+    assert ds.navigation_bundle_cache_volumes() == {first_volume}
 
 
 def test_navigation_profile_must_match_ros_distro(monkeypatch: Any) -> None:
@@ -753,47 +972,9 @@ def test_a_long_form_tmpfs_volume_edge_core_cannot_honour_is_refused(
 
 
 def test_the_real_spot_robot_graph_mounts_its_credential_tmpfs() -> None:
-    """The case this translation exists for, from the files that ship.
-
-    Rendered by the real `docker compose config`, because its output shape --
-    not a hand-copied fixture -- is what reaches the label.
-    """
-    spot = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "cyberwave-edge-runtime/runtime-services/drivers/ros2/robots"
-        / "boston-dynamics/spot"
-    )
-    if not (spot / "compose.robot.yaml").exists():
-        pytest.skip("driver tree not checked out beside edge-core")
-    if shutil.which("docker") is None:
-        pytest.skip("docker CLI not available to render the compose files")
-    # `--no-interpolate` leaves `${SPOT_PASSWORD:?...}` unevaluated, so no
-    # credentials are needed to render.
-    rendered = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-f",
-            str(spot / "compose.base.yaml"),
-            "-f",
-            str(spot / "compose.robot.yaml"),
-            "config",
-            "--no-interpolate",
-            "--format",
-            "json",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    if rendered.returncode != 0 and "is not a docker command" in rendered.stderr:
-        pytest.skip("docker compose plugin not available")
-    assert rendered.returncode == 0, rendered.stderr
-
-    resolved = ds._specs_from_compose(
-        json.loads(rendered.stdout), ds.compose_substitutions(channel_tag="humble")
-    )
+    """The case this translation exists for, from the files that ship."""
+    doc = _render_robot_graph("boston-dynamics/spot")
+    resolved = ds._specs_from_compose(doc, ds.compose_substitutions(channel_tag="humble"))
     assert resolved is not None
     plant = next(s for s in resolved[0] if s.name == "plant")
     assert _flag_values(plant.params, "--tmpfs") == [SPOT_TMPFS]
