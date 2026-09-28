@@ -2678,6 +2678,52 @@ class TestWorkerStartingNotification:
         assert pull_state["resolved"] == [False, False]
         assert all(ctx.created for ctx in _RecordingAlertCtx.instances)
 
+    def test_card_follows_the_alert_audience_not_the_sync_set(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One worker container is one startup, not one per twin on the node.
+
+        cyberwave-sim hands the manager every twin in the environment so a
+        workflow activated mid-run is reachable. Carding all of them announced
+        a worker starting on a table and a pedestal — twins that have no
+        worker and no workflow to lose.
+        """
+        manager = WorkerManager(
+            config_dir=tmp_config,
+            environment_uuid="aabbccdd-eeff-0011-2233-445566778899",
+            token="testtoken1234",
+            twin_uuids=["robot", "table", "pedestal"],
+            alert_twin_uuids=["robot"],
+        )
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True)
+
+        assert manager._run_container() is True
+
+        assert [ctx.twin_uuid for ctx in _RecordingAlertCtx.instances] == ["robot"]
+        # Narrowing the audience must not narrow what the worker syncs, or a
+        # workflow pointed at the table later would run nowhere.
+        assert manager._build_env_vars()["CYBERWAVE_TWIN_UUIDS"] == "robot,table,pedestal"
+
+    def test_no_card_when_the_audience_is_empty(
+        self, tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicitly empty audience is an answer, not a missing value:
+        a simulation started before any workflow exists has nobody waiting on
+        a run, so there is no progress to report."""
+        manager = WorkerManager(
+            config_dir=tmp_config,
+            environment_uuid="aabbccdd-eeff-0011-2233-445566778899",
+            token="testtoken1234",
+            twin_uuids=["robot", "table"],
+            alert_twin_uuids=[],
+        )
+        self._stub_container_start(monkeypatch)
+        monkeypatch.setattr(manager, "_pull_worker_image_with_progress", lambda *_a, **_kw: True)
+
+        assert manager._run_container() is True
+        assert _RecordingAlertCtx.instances == []
+
     def test_card_stays_open_when_the_container_reaches_running(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -637,14 +637,15 @@ class WorkerManager:
     user-defined bridge (cyberwave-sim's plant) has to put the worker on that
     bridge instead, or the two Zenoh peers never scout each other.
 
-    ``alert_twin_uuids`` narrows who hears about a startup *failure*, for a
-    caller whose ``twin_uuids`` is deliberately wider than the twins a workflow
-    references (cyberwave-sim syncs every twin in the environment so a workflow
-    activated mid-run is reachable).  A failure raises one error-severity card
-    per twin reading "no workflow on this edge will run", which is noise on a
-    twin that has no workflow to lose.  ``None`` defaults to ``twin_uuids``, so
-    an edge device is unaffected; an empty list means exactly that, and silences
-    the fan-out.
+    ``alert_twin_uuids`` narrows who hears about a startup, for a caller whose
+    ``twin_uuids`` is deliberately wider than the twins a workflow references
+    (cyberwave-sim syncs every twin in the environment so a workflow activated
+    mid-run is reachable).  One worker container raises one card per twin it is
+    given — the ``worker_starting`` progress card and the failure card alike —
+    so the wide set announces a worker starting on twins that have no worker
+    and no workflow to lose.  ``None`` defaults to ``twin_uuids``, so an edge
+    device is unaffected; an empty list means exactly that, and silences the
+    fan-out.
     """
 
     def __init__(
@@ -1216,7 +1217,7 @@ class WorkerManager:
     ) -> bool:
         """Single attempt to pull *image*. Reuses *alert_ctxs* across retries
         if given; *is_final_attempt* gates critical-escalation vs. just annotating."""
-        if not self._twin_uuids:
+        if not self._alert_twin_uuids:
             return self._ensure_image_pulled(image, timeout=timeout)
 
         from .driver_logs import (  # noqa: PLC0415
@@ -1247,7 +1248,7 @@ class WorkerManager:
         owns_alert_ctxs = alert_ctxs is None
         if alert_ctxs is None:
             alert_ctxs = []
-            for twin_uuid in self._twin_uuids:
+            for twin_uuid in self._alert_twin_uuids:
                 ctx = WorkerStartingAlertContext(
                     twin_uuid=twin_uuid,
                     image=image,
@@ -1274,7 +1275,7 @@ class WorkerManager:
                 container_name=self._container_name,
                 driver_alert_ctx=alert_ctxs[i],
             )
-            for i, twin_uuid in enumerate(self._twin_uuids)
+            for i, twin_uuid in enumerate(self._alert_twin_uuids)
         ]
 
         try:
@@ -1323,10 +1324,10 @@ class WorkerManager:
             return _fail(str(exc)[:500], phase="pull_unexpected")
 
     def _pull_worker_image_with_progress(self, image: str, timeout: int = 600) -> bool:
-        """Pull *image* with progress reporting to all linked twins.
+        """Pull *image* with progress reporting to the alert audience.
 
-        Creates a ``worker_starting`` alert on each linked twin for the
-        duration of the pull so the workbench can display a progress bar
+        Creates a ``worker_starting`` alert on each twin in the alert
+        audience for the duration of the pull so the workbench can show a bar
         (byte counts, percent) in analogy with the driver image pull.
 
         Concurrent callers for the same image wait for the in-flight pull
@@ -1334,9 +1335,10 @@ class WorkerManager:
         ``worker_start_failure`` alert.
 
         Falls back to the plain subprocess pull
-        (:meth:`_ensure_image_pulled`) when no twin UUIDs are attached to
-        this manager.  Fallback semantics for a failed pull with a local
-        copy present are identical to those of :meth:`_ensure_image_pulled`.
+        (:meth:`_ensure_image_pulled`) when the manager has no alert audience
+        — nobody is waiting on a run, so there is no bar to draw.  Fallback
+        semantics for a failed pull with a local copy present are identical to
+        those of :meth:`_ensure_image_pulled`.
         """
         if not _begin_worker_image_pull(image):
             waited = _wait_for_worker_image_pull(image, timeout=float(timeout) + 30.0)
@@ -1358,10 +1360,10 @@ class WorkerManager:
         # pull to cover the container start.
         owns_alerts = not self._card.ctxs
         alert_ctxs: list[Any] = list(self._card.ctxs)
-        if owns_alerts and self._twin_uuids:
+        if owns_alerts and self._alert_twin_uuids:
             from .utils import WorkerStartingAlertContext  # noqa: PLC0415
 
-            for twin_uuid in self._twin_uuids:
+            for twin_uuid in self._alert_twin_uuids:
                 ctx = WorkerStartingAlertContext(
                     twin_uuid=twin_uuid,
                     image=image,
@@ -1400,7 +1402,7 @@ class WorkerManager:
             )
 
     def _open_starting_alerts(self, image: str) -> None:
-        """Raise one ``worker_starting`` alert per linked twin for this startup.
+        """Raise one ``worker_starting`` alert per alert-audience twin.
 
         Opened *before* the pull and held until the worker inside the
         container reports itself ready, so the user is told the worker is
@@ -1423,14 +1425,14 @@ class WorkerManager:
                 len(card.ctxs),
             )
             self._close_starting_alerts()
-        if not self._twin_uuids:
+        if not self._alert_twin_uuids:
             return
         try:
             from .utils import WorkerStartingAlertContext  # noqa: PLC0415
         except Exception:
             logger.debug("worker_starting alert context unavailable", exc_info=True)
             return
-        for twin_uuid in self._twin_uuids:
+        for twin_uuid in self._alert_twin_uuids:
             try:
                 ctx = WorkerStartingAlertContext(
                     twin_uuid=twin_uuid,
@@ -1634,7 +1636,7 @@ class WorkerManager:
             failure=detail or "worker startup failed",
             phase=phase,
         )
-        if not self._twin_uuids:
+        if not self._alert_twin_uuids:
             return
         if is_worker_image_pull_in_progress():
             logger.info(

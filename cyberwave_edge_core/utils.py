@@ -459,7 +459,8 @@ class WorkerStartingAlertContext:
 
     Mirrors :class:`DriverStartingAlertContext` — same interface, same
     best-effort semantics — but uses the ``worker_starting`` alert type and
-    worker-specific description copy.
+    worker-specific description copy, and deduplicates on create where the
+    driver card forces a fresh row. See :meth:`create`.
 
     All API calls are best-effort; failures are logged and never block worker
     startup.
@@ -485,7 +486,18 @@ class WorkerStartingAlertContext:
         self._last_update_ts: float = 0.0
 
     def create(self) -> None:
-        """POST a new active alert (``force=True`` avoids dedupe collapsing repeats)."""
+        """POST an active alert, deduped onto any card a past startup left open.
+
+        Deliberately *not* ``force=True``. A card is only ever resolved by the
+        process that opened it, and every close is best-effort, so an edge-core
+        that is killed — or whose resolve call simply fails — strands one row
+        per twin with no owner left to close it. Forcing a fresh row each time
+        meant a device that restarts its worker often accrued a new stranded
+        card per restart. Deduping instead re-uses the abandoned row, because
+        the backend matches on ``status=ACTIVE`` only: a card that resolved
+        cleanly is no longer a candidate and the next startup gets a new row,
+        while one left hanging is adopted and its ``dedupe_count`` bumped.
+        """
         try:
             from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
 
@@ -493,22 +505,23 @@ class WorkerStartingAlertContext:
             token = load_token()
             client = Cyberwave(base_url=base_url, api_key=token)
             twin = client.twin(twin_id=self.twin_uuid)
+            baseline = {
+                "phase": "pull_started",
+                "image": self.image,
+                "container_name": self.container_name,
+                "started_at": time.time(),
+                "overall_progress_percent": 0,
+                "stage_progress_percent": 0,
+            }
             self._alert = twin.alerts.create(
                 name="Worker starting",
                 description="Your worker is starting up. This may take a few minutes.",
                 severity="info",
                 alert_type=WORKER_STARTING_ALERT_TYPE,
                 source_type="edge",
-                metadata={
-                    "phase": "pull_started",
-                    "image": self.image,
-                    "container_name": self.container_name,
-                    "started_at": time.time(),
-                    "overall_progress_percent": 0,
-                    "stage_progress_percent": 0,
-                },
-                force=True,
+                metadata=baseline,
             )
+            self._reset_adopted_card(baseline)
         except Exception as exc:
             logger.warning(
                 "Could not create worker_starting alert for twin %s: %s",
@@ -516,6 +529,34 @@ class WorkerStartingAlertContext:
                 exc,
             )
             self._alert = None
+
+    def _reset_adopted_card(self, baseline: dict[str, Any]) -> None:
+        """Overwrite a re-used card's metadata with *baseline*.
+
+        The backend's dedupe branch returns the existing row as-is: it bumps
+        ``dedupe_count`` and ``last_seen_at`` but never applies the posted
+        metadata, and deliberately leaves ``updated_at`` alone so a 10 fps
+        publisher cannot thrash it. Both matter to an adopted card. It would
+        otherwise report the abandoned startup's phase and byte counts, and
+        ``updated_at`` is the field the backend's staleness window reads to
+        decide whether a device is still coming up — so an adopted row would
+        look dead on arrival and let the execution sweeper fail a run that is
+        genuinely starting. One plain write fixes both.
+        """
+        alert = self._alert
+        if alert is None:
+            return
+        current = alert.metadata if isinstance(alert.metadata, dict) else {}
+        if current.get("started_at") == baseline["started_at"]:
+            return  # Fresh row — the POST already stored this baseline.
+        try:
+            self._alert = alert.update(metadata=baseline)
+        except Exception as exc:
+            logger.warning(
+                "Could not re-arm adopted worker_starting alert for twin %s: %s",
+                self.twin_uuid,
+                exc,
+            )
 
     def update_metadata(self, patch: dict[str, Any], *, force: bool = False) -> None:
         """Merge *patch* into alert metadata, optionally throttled.

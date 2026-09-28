@@ -443,3 +443,95 @@ class TestWorkerStartupStage:
     def test_unknown_worker_phase_returns_none(self):
         """A newer worker must degrade to "no percentage" rather than a lie."""
         assert utils._compute_overall_progress_percent("some_future_phase", 0.0) is None
+
+
+# ---------------------------------------------------------------------------
+# worker_starting card: dedupe on create
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerStartingCardDedupe:
+    """``create`` must not force a fresh row.
+
+    A card is only ever closed by the process that opened it, and every close
+    is best-effort, so a killed edge-core — or one whose resolve call simply
+    fails — strands one row per twin with nobody left to close it. Forcing a
+    new row each startup turned that into a growing pile. Deduping lets the
+    next startup adopt the stranded row instead.
+    """
+
+    @staticmethod
+    def _stub(monkeypatch, *, stale_metadata: dict[str, Any] | None) -> dict[str, Any]:
+        """Stub the SDK. ``stale_metadata`` None means the POST created a fresh
+        row and the backend echoed the posted metadata back."""
+        monkeypatch.setattr(startup, "load_token", lambda: "test-token")
+        monkeypatch.setattr(
+            startup, "get_runtime_env_var", lambda *_a, **_kw: "https://api.test"
+        )
+        calls: dict[str, Any] = {"create": None, "updates": []}
+
+        class _Alert:
+            def __init__(self, metadata: dict[str, Any]) -> None:
+                self.metadata = metadata
+
+            def update(self, **kwargs: Any) -> "_Alert":
+                calls["updates"].append(kwargs)
+                self.metadata = kwargs.get("metadata", self.metadata)
+                return self
+
+        class _Alerts:
+            def create(self, **kwargs: Any) -> _Alert:
+                calls["create"] = kwargs
+                if stale_metadata is None:
+                    return _Alert(dict(kwargs["metadata"]))
+                return _Alert(dict(stale_metadata))
+
+        class _Twin:
+            alerts = _Alerts()
+
+        class _Client:
+            def __init__(self, *_a: Any, **_kw: Any) -> None: ...
+
+            def twin(self, *, twin_id: str) -> _Twin:  # noqa: ARG002
+                return _Twin()
+
+        monkeypatch.setattr(utils, "Cyberwave", _Client)
+        return calls
+
+    def _context(self) -> Any:
+        return utils.WorkerStartingAlertContext(
+            twin_uuid="twin-1",
+            image="cyberwaveos/edge-ml-worker:dev",
+            container_name="cyberwave-worker-abc12345",
+        )
+
+    def test_create_does_not_force_a_fresh_row(self, monkeypatch):
+        calls = self._stub(monkeypatch, stale_metadata=None)
+
+        self._context().create()
+
+        assert not calls["create"].get("force"), "forcing defeats the dedupe"
+        assert calls["updates"] == [], "a fresh row already carries the baseline"
+
+    def test_adopted_card_is_re_armed_with_this_startup(self, monkeypatch):
+        """The dedupe branch returns the existing row untouched — it never
+        applies the posted metadata and deliberately leaves ``updated_at``
+        alone. Left as-is the card would report the abandoned startup, and
+        look stale to the backend window that decides whether a device is
+        still coming up."""
+        stale = {
+            "phase": "warming_up",
+            "started_at": 1.0,
+            "image": "cyberwaveos/edge-ml-worker:old",
+            "overall_progress_percent": 95,
+        }
+        calls = self._stub(monkeypatch, stale_metadata=stale)
+
+        self._context().create()
+
+        assert len(calls["updates"]) == 1
+        rearmed = calls["updates"][0]["metadata"]
+        assert rearmed["phase"] == "pull_started"
+        assert rearmed["overall_progress_percent"] == 0
+        assert rearmed["image"] == "cyberwaveos/edge-ml-worker:dev"
+        assert rearmed["started_at"] != stale["started_at"]
