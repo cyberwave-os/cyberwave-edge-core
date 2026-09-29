@@ -632,8 +632,8 @@ SIM_PROXY_TAG_ENV = "CYBERWAVE_SIM_PROXY_TAG"
 
 # Where the proxy tag comes from when nothing pins it: the deployment
 # environment, because that is exactly what the proxy's branch pushes publish.
-# The same set, for the same reason, as `ros2_autonomy.resolve_image()` uses to
-# pick the sim runtime image -- the other image on this train.
+# The same set, for the same reason, as `declared_topology._resolve_image()` uses
+# to pick the sim runtime image -- the other image on this train.
 _PUBLISHED_PROXY_ENVIRONMENTS = frozenset({"dev", "staging", "production"})
 
 # `dev` rather than `latest`, which is never published for this image.
@@ -1659,7 +1659,7 @@ def _resolve_sim_proxy_tag(sim_proxy_tag: Optional[str] = None) -> tuple[str, st
     The default is the deployment environment because that is what the proxy's
     branch pushes publish. An unknown or unset environment falls back to ``dev``
     rather than ``latest``, which is never published -- the same trade
-    ``ros2_autonomy.resolve_image()`` makes for the sim runtime image.
+    ``declared_topology._resolve_image()`` makes for the sim runtime image.
     """
     if sim_proxy_tag:
         return sim_proxy_tag, "argument"
