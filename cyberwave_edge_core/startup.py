@@ -46,7 +46,7 @@ from rich.console import Console
 # reintroduce the cycle the bottom-of-file relative imports exist to break.
 # Re-exported because DRIVER_CONTAINER_PREFIX was defined here historically and
 # other modules still read it off ``startup``.
-from . import health_gating
+from . import health_gating, remote_access
 from .docker_helpers import DRIVER_CONTAINER_PREFIX as DRIVER_CONTAINER_PREFIX
 from .docker_helpers import driver_container_name
 
@@ -4657,7 +4657,7 @@ def _handle_edge_command_message(*args: Any) -> None:
         return
 
     command = str(payload.get("command", "")).strip().lower()
-    if command != EDGE_COMMAND_RESTART:
+    if command != EDGE_COMMAND_RESTART and command not in remote_access.COMMANDS:
         return
 
     request_id = str(payload.get("request_id", "")).strip()
@@ -4665,6 +4665,10 @@ def _handle_edge_command_message(*args: Any) -> None:
         if request_id in _HANDLED_EDGE_COMMAND_REQUEST_IDS:
             return
         _HANDLED_EDGE_COMMAND_REQUEST_IDS.append(request_id)
+
+    if command in remote_access.COMMANDS:
+        remote_access.handle_command(command, payload)
+        return
 
     # ``alert_uuid`` is the lifecycle alert created by the backend in
     # ``POST /api/v1/edges/{uuid}/restart-core``.  Missing when the
@@ -4687,11 +4691,11 @@ def _handle_edge_command_message(*args: Any) -> None:
     worker.start()
 
 
-def _resolve_edge_command_topic(token: str) -> Optional[str]:
-    """Resolve the MQTT topic used for edge command messages."""
+def _resolve_edge_uuid(token: str) -> Optional[str]:
+    """Resolve this edge's backend UUID from its fingerprint."""
     fingerprint = get_or_create_fingerprint()
     if not fingerprint:
-        logger.warning("Cannot subscribe to edge commands: edge fingerprint unavailable")
+        logger.warning("Cannot resolve edge: edge fingerprint unavailable")
         return None
 
     client = _build_cyberwave_client(token)
@@ -4701,15 +4705,9 @@ def _resolve_edge_command_topic(token: str) -> Optional[str]:
 
     edge_uuid = str(getattr(edge, "uuid", "") or "")
     if not edge_uuid:
-        logger.warning("Cannot subscribe to edge commands: resolved edge has no UUID")
+        logger.warning("Cannot resolve edge: resolved edge has no UUID")
         return None
-
-    mqtt_client = _get_shared_mqtt_client(token)
-    if not mqtt_client:
-        logger.warning("Cannot subscribe to edge commands: MQTT client unavailable")
-        return None
-
-    return f"{mqtt_client.mqtt.topic_prefix}edges/{edge_uuid}/command"
+    return edge_uuid
 
 
 def ensure_edge_command_subscription() -> bool:
@@ -4726,14 +4724,21 @@ def ensure_edge_command_subscription() -> bool:
         if _EDGE_COMMAND_SUBSCRIBED:
             return True
 
-        topic = _resolve_edge_command_topic(token)
-        if not topic:
+        edge_uuid = _resolve_edge_uuid(token)
+        if not edge_uuid:
             return False
 
         mqtt_client = _get_shared_mqtt_client(token)
         if not mqtt_client:
+            logger.warning("Cannot subscribe to edge commands: MQTT client unavailable")
             return False
 
+        try:
+            remote_access.on_edge_resolved(edge_uuid)
+        except Exception:
+            logger.exception("Remote access setup failed")
+
+        topic = f"{mqtt_client.mqtt.topic_prefix}edges/{edge_uuid}/command"
         mqtt_client.mqtt.subscribe(topic, _handle_edge_command_message)
         _EDGE_COMMAND_SUBSCRIBED = True
         logger.info("Subscribed to edge command topic: %s", topic)
@@ -6488,6 +6493,11 @@ def run_runtime_loop(
 def _graceful_shutdown(worker_watcher: Optional[Any]) -> None:
     """Ordered shutdown: stop worker container, then driver containers."""
     logger.info("Graceful shutdown initiated — stopping managed containers")
+
+    try:
+        remote_access.shutdown()
+    except Exception:
+        logger.exception("Error stopping remote access tunnel during shutdown")
 
     # 1. Stop worker container via WorkerManager (sends SIGTERM to container).
     if worker_watcher is not None:
