@@ -1,0 +1,41 @@
+#!/bin/sh
+# postinst for cyberwave-edge-core (and its -dev / -staging / -pr channel
+# packages). Shared by every deb build: the monorepo's
+# edge-core-test-and-push.yml and the public repo's release-apt-get.yml.
+#
+# Re-renders /etc/systemd/system/cyberwave-edge-core.service from the
+# template that ships in the new binary, so a package upgrade also upgrades
+# the unit. It only touches a unit that already exists (hosts that ran
+# `cyberwave edge install`), runs `systemctl daemon-reload` only when the unit
+# changed, and never restarts the service: the new unit and binary take
+# effect on the next service start.
+#
+# It must never fail the package install, so every path exits 0. Running it
+# twice is a no-op the second time (the binary compares content first).
+
+set -u
+
+UNIT_PATH=/etc/systemd/system/cyberwave-edge-core.service
+BINARY=/usr/bin/cyberwave-edge-core
+
+case "${1:-}" in
+    configure) ;;
+    *) exit 0 ;;
+esac
+
+# Not booted with systemd (container, chroot, WSL without systemd): nothing to manage.
+[ -d /run/systemd/system ] || exit 0
+[ -f "$UNIT_PATH" ] || exit 0
+[ -x "$BINARY" ] || exit 0
+
+# </dev/null: apt may run this with the operator's terminal attached, and
+# `timeout` puts the command in its own (background) process group, where
+# reading the terminal would stop it and leave apt hanging.
+timeout 120 "$BINARY" __ensure-systemd-unit </dev/null
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "cyberwave-edge-core: could not refresh $UNIT_PATH (exit $rc);" \
+        "run 'sudo cyberwave edge install' to regenerate it." >&2
+fi
+
+exit 0

@@ -149,6 +149,53 @@ def selfcheck_sdk() -> None:
     raise click.exceptions.Exit(run_sdk_selfcheck())
 
 
+@cli.command(name="__ensure-systemd-unit", hidden=True)
+@click.option(
+    "--install",
+    is_flag=True,
+    default=False,
+    help="Create the unit even when none exists yet (used by 'cyberwave edge install').",
+)
+@click.option(
+    "--binary-path",
+    default=None,
+    help="ExecStart command. Defaults to the existing unit's, else /usr/bin/cyberwave-edge-core.",
+)
+@click.option(
+    "--config-dir",
+    default=None,
+    help="CYBERWAVE_EDGE_CONFIG_DIR for the unit. Defaults to the existing unit's value.",
+)
+def ensure_systemd_unit_command(
+    install: bool, binary_path: str | None, config_dir: str | None
+) -> None:
+    """Hidden: write the systemd unit if it changed, then daemon-reload. Never restarts."""
+    from .systemd_unit import EnsureOutcome, ensure_systemd_unit
+
+    try:
+        result = ensure_systemd_unit(
+            install=install, binary_path=binary_path, config_dir=config_dir
+        )
+    except OSError as exc:
+        click.echo(f"ensure-systemd-unit: cannot write unit: {exc}", err=True)
+        raise click.exceptions.Exit(1)
+
+    if result.outcome is EnsureOutcome.SKIPPED_NO_UNIT:
+        click.echo(f"ensure-systemd-unit: {result.unit_path} not present, nothing to do")
+    elif result.outcome is EnsureOutcome.UNCHANGED:
+        click.echo(f"ensure-systemd-unit: {result.unit_path} up to date")
+    else:
+        click.echo(f"ensure-systemd-unit: wrote {result.unit_path}")
+        if result.daemon_reload_error:
+            click.echo(
+                f"ensure-systemd-unit: systemctl daemon-reload failed: "
+                f"{result.daemon_reload_error}",
+                err=True,
+            )
+        elif result.daemon_reloaded:
+            click.echo("ensure-systemd-unit: systemd reloaded (service not restarted)")
+
+
 @cli.command()
 def status() -> None:
     """Show current credential, token, and MQTT status."""

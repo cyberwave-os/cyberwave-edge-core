@@ -78,6 +78,8 @@ Maintainer: Cyberwave <info@cyberwave.com>
 Description: cyberwave-edge-core compiled binary package
 EOF
 
+install -m 0755 packaging/debian/postinst "${PKG_DIR}/DEBIAN/postinst"
+
 dpkg-deb -Zgzip --build "${PKG_DIR}"
 
 mkdir -p "${OUTPUT_DIR}"

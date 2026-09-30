@@ -116,6 +116,9 @@ jobs:
           # Remove leading spaces from control file (heredoc artifact)
           sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
 
+          # Shared maintainer script: refreshes an existing systemd unit, never restarts.
+          install -m 0755 packaging/debian/postinst "${PKG_DIR}/DEBIAN/postinst"
+
           # Create copyright file
           cat > "${PKG_DIR}/usr/share/doc/${PACKAGE_NAME}/copyright" << EOF
           Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/

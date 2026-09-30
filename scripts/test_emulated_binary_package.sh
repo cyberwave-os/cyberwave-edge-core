@@ -51,4 +51,21 @@ dpkg -i "${PACKAGE_FILE}"
 echo "=== Verifying installed binary ==="
 /usr/bin/cyberwave-edge-core --help
 /usr/bin/cyberwave-edge-core __selfcheck_sdk
+
+echo "=== Verifying systemd unit ownership ==="
+# No unit and no --install: must be a no-op that exits 0.
+/usr/bin/cyberwave-edge-core __ensure-systemd-unit
+if [ -e /etc/systemd/system/cyberwave-edge-core.service ]; then
+    echo "ERROR: __ensure-systemd-unit created a unit without --install"
+    exit 1
+fi
+# The shipped postinst must succeed when re-run (idempotent, no systemd here).
+PACKAGE_NAME="$(dpkg-deb -f "${PACKAGE_FILE}" Package)"
+POSTINST="/var/lib/dpkg/info/${PACKAGE_NAME}.postinst"
+if [ ! -x "${POSTINST}" ]; then
+    echo "ERROR: package ships no executable postinst (${POSTINST})"
+    exit 1
+fi
+"${POSTINST}" configure
+"${POSTINST}" configure
 echo "✅ Package install works on ${DEVICE_NAME} (${DEVICE_DISTRO})"
