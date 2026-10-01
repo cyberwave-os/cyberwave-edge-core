@@ -79,7 +79,9 @@ class TestCliToEdgeCore:
         selected = startup._load_selected_camera_device(TWIN)
         assert selected == f"{sp.V4L_BY_ID_DIR}/{CAM}"
 
-        pins = sp.resolve_sensor_pins(sp.KIND_CAMERA, metadata, selected_camera_device=selected)
+        pins = sp.resolve_sensor_pins(
+            sp.KIND_CAMERA, metadata, extra_sources={"cameras.json": selected}
+        )
         assert [p.path for p in pins] == [f"{sp.V4L_BY_ID_DIR}/{CAM}"]
         assert pins[0].present
         assert metadata["serial_number"] == ""  # blanked, must not be read as a pin

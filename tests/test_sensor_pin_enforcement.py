@@ -88,7 +88,10 @@ def udev(tmp_path, monkeypatch):
         def unplug_mic(self):
             os.unlink(f"{dirs['alsa']}/{MIC_NAME}")
 
+        last_metadata: dict = {}
+
         def write_twin_json(self, metadata):
+            self.last_metadata = metadata
             (config / f"{TWIN}.json").write_text(json.dumps({"uuid": TWIN, "metadata": metadata}))
 
     yield Tree()
@@ -197,7 +200,7 @@ class TestLaunchGateCamera:
         assert alert["severity"] == "error"
         assert alert["twin"] == TWIN
         assert CAM_NAME in alert["description"]
-        assert alert["metadata"] == {"missing_devices": [udev.cam_path]}
+        assert alert["metadata"] == {"devices": [udev.cam_path], "reason": "missing"}
         assert out.ctx.failed and out.ctx.failed[0][0] == "sensor_device_missing"
         assert startup._SENSOR_PIN_WATCH[TWIN].held is True
 
@@ -360,7 +363,8 @@ class TestRuntimeMonitor:
         return calls
 
     def _watch(self, udev, kind="camera", **kw):
-        startup._SENSOR_PIN_WATCH[TWIN] = startup._SensorPinWatch(kind, "Cam A", **kw)
+        pins = tuple(startup._resolve_twin_sensor_pins(TWIN, kind, udev.last_metadata))
+        startup._SENSOR_PIN_WATCH[TWIN] = startup._SensorPinWatch(kind, "Cam A", pins=pins, **kw)
 
     def test_nothing_watched_is_a_noop(self, udev, alerts, relaunches):
         assert startup.reconcile_sensor_pins()["watched"] == 0
@@ -412,12 +416,6 @@ class TestRuntimeMonitor:
         assert summary["relaunch_attempted"] == 1
         assert len(relaunches) == 1
 
-    def test_held_twin_whose_pin_was_removed_is_relaunched(self, udev, alerts, relaunches):
-        udev.write_twin_json({"video_device": "/dev/video0"})
-        self._watch(udev, held=True, alerted=True)
-        startup.reconcile_sensor_pins()
-        assert len(relaunches) == 1
-
     def test_relaunch_is_debounced(self, udev, alerts, relaunches):
         udev.write_twin_json({"video_device": udev.cam_path})
         self._watch(udev, held=True, alerted=True)
@@ -431,9 +429,7 @@ class TestRuntimeMonitor:
     def test_camera_that_changed_node_is_recreated(self, udev, alerts, relaunches):
         udev.plug_camera()
         udev.write_twin_json({"video_device": udev.cam_path})
-        startup._SENSOR_PIN_WATCH[TWIN] = startup._SensorPinWatch(
-            "camera", "Cam A", targets={udev.cam_path: "/dev/video7"}
-        )
+        self._watch(udev, targets={udev.cam_path: "/dev/video7"})
         summary = startup.reconcile_sensor_pins()
         assert summary["relaunch_attempted"] == 1
         assert alerts.sent == []  # connected, so not an outage
@@ -441,17 +437,13 @@ class TestRuntimeMonitor:
     def test_audio_card_renumbering_is_recreated(self, udev, alerts, relaunches):
         udev.plug_mic()
         udev.write_twin_json({"audio_device": udev.mic_path})
-        startup._SENSOR_PIN_WATCH[TWIN] = startup._SensorPinWatch(
-            "audio", "Mic", targets={udev.mic_path: "/dev/snd/controlC9"}
-        )
+        self._watch(udev, "audio", targets={udev.mic_path: "/dev/snd/controlC9"})
         assert startup.reconcile_sensor_pins()["relaunch_attempted"] == 1
 
     def test_unchanged_node_is_left_alone(self, udev, alerts, relaunches):
         udev.plug_camera()
         udev.write_twin_json({"video_device": udev.cam_path})
-        startup._SENSOR_PIN_WATCH[TWIN] = startup._SensorPinWatch(
-            "camera", "Cam A", targets={udev.cam_path: os.path.realpath(udev.cam_path)}
-        )
+        self._watch(udev, targets={udev.cam_path: os.path.realpath(udev.cam_path)})
         assert startup.reconcile_sensor_pins()["relaunch_attempted"] == 0
 
     def test_launch_records_the_node_it_gave_the_driver(self, udev, alerts, monkeypatch):
@@ -460,31 +452,6 @@ class TestRuntimeMonitor:
         assert startup._SENSOR_PIN_WATCH[TWIN].targets == {
             udev.cam_path: os.path.realpath(udev.cam_path)
         }
-
-    def test_unreadable_twin_json_is_not_treated_as_recovery(self, udev, alerts, relaunches):
-        self._watch(udev, held=True, alerted=True)  # no twin json on disk
-        startup.reconcile_sensor_pins()
-        assert relaunches == [] and alerts.resolved == []
-        assert startup._SENSOR_PIN_WATCH[TWIN].alerted is True
-
-    def test_repin_is_picked_up_from_the_synced_twin_json(self, udev, alerts, relaunches):
-        udev.plug_camera()
-        udev.write_twin_json({"video_device": udev.cam_path})
-        self._watch(udev)
-        startup.reconcile_sensor_pins()
-        udev.write_twin_json({"video_device": f"{sp.V4L_BY_ID_DIR}/usb-NEW-video-index0"})
-        startup.reconcile_sensor_pins()
-        assert "usb-NEW-video-index0" in alerts.sent[0]["description"]
-
-    def test_cameras_json_repin_is_picked_up(self, udev, alerts, relaunches):
-        udev.plug_camera()
-        udev.write_twin_json({"video_device": udev.cam_path})
-        self._watch(udev)
-        (udev.config_dir / "cameras.json").write_text(
-            json.dumps({"twin_to_device": {TWIN: f"{sp.V4L_BY_ID_DIR}/usb-NEW-video-index0"}})
-        )
-        startup.reconcile_sensor_pins()
-        assert alerts.sent and "cameras.json" in alerts.sent[0]["description"]
 
     def test_no_credentials_means_no_relaunch(self, udev, alerts, relaunches, monkeypatch):
         monkeypatch.setattr(startup, "load_token", lambda: None)
@@ -587,3 +554,141 @@ class TestCameraDriftWithoutGlobalDevice:
         monkeypatch.setattr(startup, "_cameras_json_mtime", 0.0)
         assert startup.reconcile_camera_config_drift() is False
         assert calls == []
+
+
+class TestHoldLifecycle:
+    """Review findings: flapping on an unusable pin, duplicate and orphaned alerts."""
+
+    @pytest.fixture
+    def relaunches(self, monkeypatch):
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            startup, "fetch_and_run_twin_drivers", lambda *a, **k: calls.append(a) or []
+        )
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: FINGERPRINT)
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env")
+        return calls
+
+    def _ambiguous_mic(self, udev):
+        udev.plug_mic()
+        os.symlink("../controlC4", f"{udev.mic_dir}/usb-other_UMA16v2_00026-00")
+        os.symlink("../controlC5", f"{udev.mic_dir}/usb-third_UMA16v2_00026-00")
+        return {"audio_device": udev.mic_path}
+
+    def test_unusable_pin_does_not_flap(self, udev, alerts, relaunches, monkeypatch):
+        meta = self._ambiguous_mic(udev)
+        _launch(monkeypatch, MIC_IMAGE, meta)
+        udev.write_twin_json(meta)
+        assert len(alerts.sent) == 1
+        for _ in range(3):
+            startup.reconcile_sensor_pins()
+        assert relaunches == []
+        assert alerts.resolved == []
+        assert startup._SENSOR_PIN_WATCH[TWIN].alerted is True
+
+    def test_unusable_alert_does_not_claim_not_connected(self, udev, alerts, monkeypatch):
+        _launch(monkeypatch, MIC_IMAGE, self._ambiguous_mic(udev))
+        assert "not connected" not in alerts.sent[0]["title"].lower()
+
+    def test_unusable_pin_is_released_once_it_becomes_usable(
+        self, udev, alerts, relaunches, monkeypatch
+    ):
+        meta = self._ambiguous_mic(udev)
+        _launch(monkeypatch, MIC_IMAGE, meta)
+        udev.write_twin_json(meta)
+        os.unlink(f"{udev.mic_dir}/usb-other_UMA16v2_00026-00")
+        os.unlink(f"{udev.mic_dir}/usb-third_UMA16v2_00026-00")
+        startup.reconcile_sensor_pins()
+        assert len(relaunches) == 1
+        assert (TWIN, "sensor_device_missing") in alerts.resolved
+
+    def test_still_missing_twin_is_not_realerted_by_another_relaunch(
+        self, udev, alerts, monkeypatch
+    ):
+        _launch(monkeypatch, CAMERA_IMAGE, {"video_device": udev.cam_path})
+        _launch(monkeypatch, CAMERA_IMAGE, {"video_device": udev.cam_path})
+        assert len(alerts.sent) == 1
+
+    def test_unpinning_a_held_twin_resolves_its_alert(self, udev, alerts, monkeypatch):
+        _launch(monkeypatch, CAMERA_IMAGE, {"video_device": udev.cam_path})
+        out = _launch(monkeypatch, CAMERA_IMAGE, {"video_device": "/dev/video0"})
+        assert len(out.runs) == 1
+        assert (TWIN, "sensor_device_missing") in alerts.resolved
+        assert TWIN not in startup._SENSOR_PIN_WATCH
+
+    def test_unlinking_a_held_twin_resolves_its_alert(self, udev, alerts, monkeypatch):
+        _launch(monkeypatch, CAMERA_IMAGE, {"video_device": udev.cam_path})
+        startup._prune_sensor_pin_watch(set())
+        assert (TWIN, "sensor_device_missing") in alerts.resolved
+
+    def test_monitor_uses_the_pins_the_driver_was_launched_with(
+        self, udev, alerts, relaunches, monkeypatch
+    ):
+        # A stale twin JSON (deep-merge keeps removed keys) must not drive alerts.
+        udev.plug_camera()
+        _launch(monkeypatch, CAMERA_IMAGE, {"video_device": udev.cam_path})
+        udev.write_twin_json({"video_device": f"{sp.V4L_BY_ID_DIR}/usb-STALE-video-index0"})
+        startup.reconcile_sensor_pins()
+        assert alerts.sent == []
+
+    def test_conflicting_audio_pins_are_refused(self, udev, alerts, monkeypatch):
+        udev.plug_mic()
+        (udev.mic_dir.parent / "controlC4").write_text("")
+        os.symlink("../controlC4", f"{udev.mic_dir}/usb-Other_Mic_1-00")
+        out = _launch(
+            monkeypatch,
+            MIC_IMAGE,
+            {"audio_device": udev.mic_path, "serial_number": "usb-Other_Mic_1-00"},
+        )
+        assert out.runs == []
+        assert "conflicting" in alerts.sent[0]["description"]
+
+
+class TestNewKindNeedsOnlyARegistryEntry:
+    """A new pinnable sensor is a registry entry and an image rule, no new code paths."""
+
+    SERIAL_IMAGE = "cyberwaveos/serial-gadget-driver"
+
+    @pytest.fixture
+    def serial_kind(self, udev, monkeypatch, tmp_path):
+        tree = tmp_path / "serial" / "by-id"
+        tree.mkdir(parents=True)
+        (tmp_path / "serial" / "ttyACM7").write_text("")
+        real = sp.sensor_kinds
+        kinds = {
+            **real(),
+            "serial": sp.SensorKind(
+                name="serial",
+                link_dirs=(str(tree),),
+                fields=(sp.PinField("port", accepts_bare_name=True),),
+                node_prefix="ttyACM",
+            ),
+        }
+        monkeypatch.setattr(sp, "sensor_kinds", lambda: kinds)
+        monkeypatch.setattr(
+            startup,
+            "_SENSOR_IMAGE_RULES",
+            (
+                (lambda image: "serial-gadget" in image, "serial", None),
+                *startup._SENSOR_IMAGE_RULES,
+            ),
+        )
+        return tree
+
+    def test_resolves_pins_from_its_own_field_and_tree(self, serial_kind):
+        pins = sp.resolve_sensor_pins("serial", {"port": "usb-FTDI_Gadget_A1-if00-port0"})
+        assert [p.path for p in pins] == [f"{serial_kind}/usb-FTDI_Gadget_A1-if00-port0"]
+
+    def test_missing_device_holds_the_twin(self, serial_kind, alerts, monkeypatch):
+        out = _launch(monkeypatch, self.SERIAL_IMAGE, {"port": "usb-FTDI_Gadget_A1-if00-port0"})
+        assert out.runs == []
+        assert alerts.sent[0]["type"] == "sensor_device_missing"
+        assert "usb-FTDI_Gadget_A1-if00-port0" in alerts.sent[0]["description"]
+
+    def test_connected_device_starts_and_its_node_is_passed(self, serial_kind, alerts, monkeypatch):
+        os.symlink("../ttyACM7", serial_kind / "usb-FTDI_Gadget_A1-if00-port0")
+        out = _launch(monkeypatch, self.SERIAL_IMAGE, {"port": "usb-FTDI_Gadget_A1-if00-port0"})
+        node = os.path.realpath(serial_kind / "usb-FTDI_Gadget_A1-if00-port0")
+        assert out.runs[0]["params"][-2:] == ["--device", f"{node}:{node}"]
+        assert out.runs[0]["service_env"] is None

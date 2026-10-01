@@ -45,14 +45,16 @@ class TestCameraPins:
     def test_cameras_json_value_comes_first_and_is_deduplicated(self, udev):
         path = f"{sp.V4L_BY_ID_DIR}/{CAM_NAME}"
         pins = sp.resolve_sensor_pins(
-            sp.KIND_CAMERA, {"video_device": path}, selected_camera_device=path
+            sp.KIND_CAMERA, {"video_device": path}, extra_sources={"cameras.json": path}
         )
         assert [(p.path, p.source) for p in pins] == [(path, "cameras.json")]
 
     def test_two_different_sources_are_both_validated(self, udev):
         a = f"{sp.V4L_BY_ID_DIR}/usb-A-video-index0"
         b = f"{sp.V4L_BY_ID_DIR}/usb-B-video-index0"
-        pins = sp.resolve_sensor_pins(sp.KIND_CAMERA, {"video_device": b}, selected_camera_device=a)
+        pins = sp.resolve_sensor_pins(
+            sp.KIND_CAMERA, {"video_device": b}, extra_sources={"cameras.json": a}
+        )
         assert [p.path for p in pins] == [a, b]
 
     def test_by_path_is_a_pin(self, udev):
@@ -98,7 +100,9 @@ class TestCameraPins:
 
     def test_cameras_json_stream_value_is_ignored(self, udev):
         assert (
-            sp.resolve_sensor_pins(sp.KIND_CAMERA, {}, selected_camera_device="rtsp://10.0.0.2/avc")
+            sp.resolve_sensor_pins(
+                sp.KIND_CAMERA, {}, extra_sources={"cameras.json": "rtsp://10.0.0.2/avc"}
+            )
             == []
         )
 

@@ -3,9 +3,9 @@
 The installer writes the pin; edge-core only enforces it, so a pinned device
 that is missing holds the twin instead of letting its driver pick another one.
 
-Pin fields written by the CLI: cameras use ``video_device`` (and cameras.json
-``twin_to_device``), audio uses ``audio_device`` and ``serial_number`` with the
-by-id name. A raw hardware serial is not a link and is left to the driver.
+Which sensors can be pinned, where their links live and which metadata fields
+carry a pin is declared once in :func:`sensor_kinds`; everything else here is
+generic. A raw hardware serial is not a link and is left to the driver.
 
 The audio drivers do not understand a by-id name, so it is translated:
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 KIND_CAMERA = "camera"
 KIND_AUDIO = "audio"
@@ -93,50 +93,45 @@ def _metadata_dict(metadata: Any) -> dict[str, Any]:
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _starts_with_dir(value: Any, directory: str) -> bool:
+    return isinstance(value, str) and value.strip().startswith(directory.rstrip("/") + "/")
+
+
 def resolve_sensor_pins(
     kind: str,
     metadata: Any,
     *,
-    selected_camera_device: Optional[str] = None,
+    extra_sources: Optional[Mapping[str, Any]] = None,
 ) -> list[SensorPin]:
     """Deduplicated udev links the twin pins for *kind*.
 
-    *selected_camera_device* (from ``cameras.json``) outranks ``video_device``
-    inside the container, so it is validated too.
+    *extra_sources* maps a source label to a value that can override the
+    metadata inside the container (e.g. the ``cameras.json`` selection), so it
+    is validated too. Only full paths into the kind's link trees count there.
     """
-    meta = _metadata_dict(metadata)
+    spec = sensor_kinds()[kind]
+    meta = metadata if isinstance(metadata, dict) else {}
     pins: list[SensorPin] = []
 
     def add(path: Optional[str], source: str) -> None:
         if path and all(p.path != path for p in pins):
             pins.append(SensorPin(kind=kind, path=path, source=source))
 
-    if kind == KIND_CAMERA:
-        for value, source in (
-            (selected_camera_device, "cameras.json"),
-            (meta.get("video_device"), "metadata.video_device"),
-        ):
-            # Only full paths: indexes, /dev/videoN and URLs have no link to check.
-            for directory in (V4L_BY_ID_DIR, V4L_BY_PATH_DIR):
-                if _starts_with_dir(value, directory):
-                    add(_link_in_tree(value, directory), source)
-        serial = meta.get("serial_number")
-        if isinstance(serial, str) and looks_like_udev_name(serial):
-            add(_link_in_tree(serial, V4L_BY_ID_DIR), "metadata.serial_number")
-    elif kind == KIND_AUDIO:
-        audio_device = meta.get("audio_device")
-        if isinstance(audio_device, str) and (
-            _starts_with_dir(audio_device, ALSA_BY_ID_DIR) or looks_like_udev_name(audio_device)
-        ):
-            add(_link_in_tree(audio_device, ALSA_BY_ID_DIR), "metadata.audio_device")
-        serial = meta.get("serial_number")
-        if isinstance(serial, str) and looks_like_udev_name(serial):
-            add(_link_in_tree(serial, ALSA_BY_ID_DIR), "metadata.serial_number")
+    def add_path(value: Any, source: str) -> None:
+        for directory in spec.link_dirs:
+            if _starts_with_dir(value, directory):
+                add(_link_in_tree(value, directory), source)
+
+    for source, value in (extra_sources or {}).items():
+        add_path(value, source)
+    for field in spec.fields:
+        value = meta.get(field.name)
+        source = f"metadata.{field.name}"
+        add_path(value, source)
+        # A bare by-id name (not a hardware serial) resolves in the first tree.
+        if field.accepts_bare_name and isinstance(value, str) and looks_like_udev_name(value):
+            add(_link_in_tree(value, spec.link_dirs[0]), source)
     return pins
-
-
-def _starts_with_dir(value: Any, directory: str) -> bool:
-    return isinstance(value, str) and value.strip().startswith(directory.rstrip("/") + "/")
 
 
 def missing_pins(pins: Iterable[SensorPin]) -> list[SensorPin]:
@@ -184,9 +179,13 @@ def audio_serial_token(pin: SensorPin) -> str:
 
 def audio_launch_env(pins: Iterable[SensorPin], role: Optional[str] = None) -> dict[str, str]:
     """Env that points an audio driver at its pinned card (selector depends on *role*)."""
-    for pin in pins:
-        if pin.kind != KIND_AUDIO:
-            continue
+    audio_pins = [pin for pin in pins if pin.kind == KIND_AUDIO]
+    if len({pin_target(pin) for pin in audio_pins}) > 1:
+        raise SensorPinError(
+            "conflicting audio pins: "
+            + ", ".join(f"{pin.name} ({pin.source})" for pin in audio_pins)
+        )
+    for pin in audio_pins:
         index = audio_card_index(pin)
         if index is None:
             raise SensorPinError(f"{pin.name} does not resolve to an ALSA card ({pin_target(pin)})")
@@ -209,3 +208,43 @@ def audio_launch_env(pins: Iterable[SensorPin], role: Optional[str] = None) -> d
             env[AUDIO_DEVICE_ENV] = f"(hw:{index},"
         return env
     return {}
+
+
+@dataclass(frozen=True)
+class PinField:
+    name: str
+    # Whether a bare by-id name (not only a full path) in this field is a pin.
+    accepts_bare_name: bool = False
+
+
+@dataclass(frozen=True)
+class SensorKind:
+    name: str
+    # Link trees a pin may live in; bare names resolve in the first one.
+    link_dirs: tuple[str, ...]
+    fields: tuple[PinField, ...]
+    # Nodes with this basename prefix are passed to the container via --device.
+    node_prefix: Optional[str] = None
+    # Translates connected pins for the driver; raises SensorPinError if it cannot.
+    launch_env: Optional[Callable[[Iterable[SensorPin], Optional[str]], dict[str, str]]] = None
+
+
+def sensor_kinds() -> dict[str, SensorKind]:
+    """The pinnable sensor kinds. Add an entry here to support a new one."""
+    return {
+        KIND_CAMERA: SensorKind(
+            name=KIND_CAMERA,
+            link_dirs=(V4L_BY_ID_DIR, V4L_BY_PATH_DIR),
+            fields=(PinField("video_device"), PinField("serial_number", accepts_bare_name=True)),
+            node_prefix="video",
+        ),
+        KIND_AUDIO: SensorKind(
+            name=KIND_AUDIO,
+            link_dirs=(ALSA_BY_ID_DIR,),
+            fields=(
+                PinField("audio_device", accepts_bare_name=True),
+                PinField("serial_number", accepts_bare_name=True),
+            ),
+            launch_env=audio_launch_env,
+        ),
+    }
