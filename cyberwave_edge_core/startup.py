@@ -32,10 +32,10 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from cyberwave import Cyberwave
 from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
@@ -46,7 +46,7 @@ from rich.console import Console
 # reintroduce the cycle the bottom-of-file relative imports exist to break.
 # Re-exported because DRIVER_CONTAINER_PREFIX was defined here historically and
 # other modules still read it off ``startup``.
-from . import health_gating, sensor_pins
+from . import health_gating
 from .docker_helpers import DRIVER_CONTAINER_PREFIX as DRIVER_CONTAINER_PREFIX
 from .docker_helpers import driver_container_name
 
@@ -895,330 +895,6 @@ def _ensure_linux_camera_docker_params(image: str, params: list[str]) -> list[st
     if not _docker_params_include_v4l_volume(updated):
         updated.extend(["-v", "/dev/v4l:/dev/v4l:ro"])
     return updated
-
-
-# udev by-id pins (see ``sensor_pins``): the installer writes them, edge-core only
-# enforces them. A twin with a missing pinned device is held, never started on
-# a substitute.
-
-SENSOR_PIN_ALERT_TYPE = "sensor_device_missing"
-_PIN_MISSING = "missing"
-_PIN_UNUSABLE = "unusable"
-_SENSOR_PIN_RELAUNCH_BACKOFF_SECONDS = 60
-
-
-@dataclass
-class _SensorPinWatch:
-    kind: str
-    twin_name: str
-    # Launch-time pins; the cached twin JSON keeps keys removed upstream.
-    pins: tuple[sensor_pins.SensorPin, ...] = ()
-    role: Optional[str] = None
-    held: bool = False
-    alerted: bool = False
-    # "missing" (link gone) or "unusable" (present but ambiguous).
-    reason: str = _PIN_MISSING
-    # Node behind each link at launch; a change means the container has a stale one.
-    targets: dict[str, str] = field(default_factory=dict)
-    move_logged: bool = False
-
-
-_SENSOR_PIN_WATCH: dict[str, _SensorPinWatch] = {}
-_SENSOR_PIN_WATCH_LOCK = threading.Lock()
-_LAST_SENSOR_RELAUNCH_AT: Optional[float] = None
-
-
-# (image predicate, kind, role); first match wins.
-_SENSOR_IMAGE_RULES: tuple[tuple[Callable[[str], bool], str, Optional[str]], ...] = (
-    (lambda image: _is_camera_driver_image(image), sensor_pins.KIND_CAMERA, None),
-    (
-        lambda image: _is_generic_microphone_driver_image(image),
-        sensor_pins.KIND_AUDIO,
-        sensor_pins.ROLE_MICROPHONE,
-    ),
-    (
-        lambda image: _is_generic_speaker_driver_image(image),
-        sensor_pins.KIND_AUDIO,
-        sensor_pins.ROLE_SPEAKER,
-    ),
-)
-
-# Values beyond twin metadata that override a kind's device in the container.
-_SENSOR_EXTRA_SOURCES: dict[str, Callable[[str], dict[str, Any]]] = {
-    sensor_pins.KIND_CAMERA: lambda twin_uuid: {
-        "cameras.json": _load_selected_camera_device(twin_uuid)
-    },
-}
-
-
-def _sensor_pin_target(image: str) -> Optional[tuple[str, Optional[str]]]:
-    """``(kind, role)`` for images whose device can be pinned, else None."""
-    for matches, kind, role in _SENSOR_IMAGE_RULES:
-        if matches(image):
-            return kind, role
-    return None
-
-
-def _resolve_twin_sensor_pins(
-    twin_uuid: str, kind: str, metadata: Any
-) -> list[sensor_pins.SensorPin]:
-    extra = _SENSOR_EXTRA_SOURCES.get(kind)
-    return sensor_pins.resolve_sensor_pins(
-        kind, metadata, extra_sources=extra(twin_uuid) if extra else None
-    )
-
-
-def _send_sensor_missing_alert(
-    twin_uuid: str,
-    twin_name: str,
-    pins: Iterable[sensor_pins.SensorPin],
-    reason: str = _PIN_MISSING,
-    detail: Optional[str] = None,
-) -> None:
-    pins = list(pins)
-    named = sensor_pins.describe_missing(pins)
-    if reason == _PIN_UNUSABLE:
-        title = "Pinned sensor device cannot be used"
-        hint = f"{detail}. Its driver is not started."
-    else:
-        title = "Pinned sensor device not connected"
-        hint = (
-            f"{named} is not connected to this edge. Its driver is not started on "
-            "another device. Reconnect it, or re-run 'sudo cyberwave edge install' "
-            "to pick a different device."
-        )
-    try:
-        _send_alert_for_twin(
-            twin_uuid,
-            title,
-            f"Twin '{twin_name}' is pinned to {named}: {hint}",
-            SENSOR_PIN_ALERT_TYPE,
-            severity="error",
-            metadata={"devices": [pin.path for pin in pins], "reason": reason},
-        )
-    except Exception as exc:
-        logger.warning(
-            "Could not send %s alert for twin %s: %s", SENSOR_PIN_ALERT_TYPE, twin_uuid, exc
-        )
-
-
-def _resolve_sensor_missing_alerts(twin_uuid: str) -> None:
-    try:
-        resolve_active_alerts_for_twin(twin_uuid, SENSOR_PIN_ALERT_TYPE)
-    except Exception as exc:
-        logger.warning(
-            "Could not resolve %s alerts for twin %s: %s", SENSOR_PIN_ALERT_TYPE, twin_uuid, exc
-        )
-
-
-def _docker_params_pass_device(params: list[str], node: str) -> bool:
-    for idx, token in enumerate(params):
-        value = None
-        if token == "--device" and idx + 1 < len(params):
-            value = params[idx + 1]
-        elif token.startswith("--device="):
-            value = token.split("=", 1)[1]
-        if value is not None and value.split(":", 1)[0] == node:
-            return True
-    return False
-
-
-def _unusable_pin_reason(
-    kind: str, pins: Iterable[sensor_pins.SensorPin], role: Optional[str]
-) -> Optional[str]:
-    """Why connected pins still cannot be handed to the driver, else None."""
-    launch_env = sensor_pins.sensor_kinds()[kind].launch_env
-    if launch_env is None:
-        return None
-    try:
-        launch_env(pins, role)
-    except sensor_pins.SensorPinError as exc:
-        return str(exc)
-    return None
-
-
-def _hold_twin_for_sensor_pin(
-    spec: Any,
-    watch: _SensorPinWatch,
-    detail: str,
-    alert_ctx: Any,
-) -> None:
-    logger.error("Not starting driver for twin '%s': %s", watch.twin_name, detail)
-    if alert_ctx is not None:
-        alert_ctx.mark_failed_and_resolve(
-            f"Pinned device for twin '{watch.twin_name}' is not usable: {detail}.",
-            phase="sensor_device_missing",
-        )
-    watch.held = True
-    watch.alerted = True
-    with _SENSOR_PIN_WATCH_LOCK:
-        previous = _SENSOR_PIN_WATCH.get(spec.twin_uuid)
-        _SENSOR_PIN_WATCH[spec.twin_uuid] = watch
-    # Another twin's relaunch must not re-alert a twin that is still held.
-    if previous is None or not previous.alerted or previous.reason != watch.reason:
-        flagged = (
-            list(watch.pins[:1])
-            if watch.reason == _PIN_UNUSABLE
-            else sensor_pins.missing_pins(watch.pins)
-        )
-        _send_sensor_missing_alert(
-            spec.twin_uuid, watch.twin_name, flagged, watch.reason, detail
-        )
-
-
-def _gate_sensor_pins_before_launch(spec: Any, alert_ctx: Any) -> Optional[dict[str, str]]:
-    """Extra container env if the driver may start, ``None`` if the twin is held.
-
-    A connected camera's current node is also passed with ``--device``: the
-    asset's static ``/dev/videoN`` may no longer be that camera.
-    """
-    if platform.system() != "Linux":
-        return {}
-    target = _sensor_pin_target(spec.driver_image)
-    if target is None:
-        return {}
-    kind, role = target
-    kind_spec = sensor_pins.sensor_kinds()[kind]
-
-    twin_uuid = spec.twin_uuid
-    twin_name = str(getattr(spec.twin, "name", twin_uuid))
-    pins = _resolve_twin_sensor_pins(twin_uuid, kind, getattr(spec.twin, "metadata", None))
-    if not pins:
-        with _SENSOR_PIN_WATCH_LOCK:
-            old = _SENSOR_PIN_WATCH.pop(twin_uuid, None)
-        if old is not None and (old.alerted or old.held):
-            _resolve_sensor_missing_alerts(twin_uuid)
-        return {}
-
-    watch = _SensorPinWatch(kind=kind, twin_name=twin_name, pins=tuple(pins), role=role)
-
-    absent = sensor_pins.missing_pins(pins)
-    if absent:
-        detail = "pinned device not connected: " + sensor_pins.describe_missing(absent)
-        _hold_twin_for_sensor_pin(spec, watch, detail, alert_ctx)
-        return None
-
-    env: dict[str, str] = {}
-    if kind_spec.launch_env is not None:
-        try:
-            env = kind_spec.launch_env(pins, role)
-        except sensor_pins.SensorPinError as exc:
-            watch.reason = _PIN_UNUSABLE
-            _hold_twin_for_sensor_pin(spec, watch, str(exc), alert_ctx)
-            return None
-        explicit = _extract_docker_env_map(spec.driver_params)
-        env = {key: value for key, value in env.items() if key not in explicit}
-    if kind_spec.node_prefix:
-        for pin in pins:
-            node = sensor_pins.pin_target(pin)
-            if os.path.basename(node).startswith(kind_spec.node_prefix) and (
-                not _docker_params_pass_device(spec.driver_params, node)
-            ):
-                spec.driver_params = [*spec.driver_params, "--device", f"{node}:{node}"]
-
-    watch.targets = {pin.path: sensor_pins.pin_target(pin) for pin in pins}
-    with _SENSOR_PIN_WATCH_LOCK:
-        _SENSOR_PIN_WATCH[twin_uuid] = watch
-    return env
-
-
-def _note_sensor_driver_started(twin_uuid: str) -> None:
-    """Clear a stale ``sensor_device_missing`` alert once the driver is up."""
-    with _SENSOR_PIN_WATCH_LOCK:
-        watch = _SENSOR_PIN_WATCH.get(twin_uuid)
-    if watch is None:
-        return
-    _resolve_sensor_missing_alerts(twin_uuid)
-    watch.alerted = False
-    watch.held = False
-
-
-def _prune_sensor_pin_watch(linked_twin_uuids: set[str]) -> None:
-    with _SENSOR_PIN_WATCH_LOCK:
-        dropped = {
-            uuid: _SENSOR_PIN_WATCH.pop(uuid)
-            for uuid in set(_SENSOR_PIN_WATCH) - set(linked_twin_uuids)
-        }
-    for twin_uuid, old in dropped.items():
-        if old.alerted or old.held:
-            _resolve_sensor_missing_alerts(twin_uuid)
-
-
-def reconcile_sensor_pins() -> dict[str, int]:
-    """Alert once per outage; relaunch (60 s backoff, inline like revival) on recovery or move."""
-    global _LAST_SENSOR_RELAUNCH_AT
-    summary = {"watched": 0, "missing": 0, "alerted": 0, "recovered": 0, "relaunch_attempted": 0}
-    if platform.system() != "Linux":
-        return summary
-
-    with _SENSOR_PIN_WATCH_LOCK:
-        watches = list(_SENSOR_PIN_WATCH.items())
-    summary["watched"] = len(watches)
-
-    needs_relaunch = False
-    for twin_uuid, watch in watches:
-        absent = sensor_pins.missing_pins(watch.pins)
-        unusable = None if absent else _unusable_pin_reason(watch.kind, watch.pins, watch.role)
-        if absent or unusable:
-            summary["missing"] += 1
-            reason = _PIN_MISSING if absent else _PIN_UNUSABLE
-            if not watch.alerted or watch.reason != reason:
-                detail = sensor_pins.describe_missing(absent) if absent else unusable
-                logger.error(
-                    "Pinned device for twin '%s' is %s: %s",
-                    watch.twin_name,
-                    "no longer connected" if absent else "not usable",
-                    detail,
-                )
-                watch.alerted = True
-                watch.reason = reason
-                summary["alerted"] += 1
-                _send_sensor_missing_alert(
-                    twin_uuid, watch.twin_name, absent or watch.pins[:1], reason, unusable
-                )
-            continue
-        if watch.alerted:
-            logger.info("Pinned device for twin '%s' is back", watch.twin_name)
-            _resolve_sensor_missing_alerts(twin_uuid)
-            watch.alerted = False
-            summary["recovered"] += 1
-            needs_relaunch = True
-        elif watch.held:
-            needs_relaunch = True
-        elif any(
-            watch.targets.get(pin.path) not in (None, sensor_pins.pin_target(pin))
-            for pin in watch.pins
-        ):
-            if not watch.move_logged:
-                logger.warning(
-                    "Pinned device for twin '%s' moved; recreating its driver", watch.twin_name
-                )
-                watch.move_logged = True
-            needs_relaunch = True
-
-    if not needs_relaunch:
-        return summary
-
-    now = time.monotonic()
-    if (
-        _LAST_SENSOR_RELAUNCH_AT is not None
-        and (now - _LAST_SENSOR_RELAUNCH_AT) < _SENSOR_PIN_RELAUNCH_BACKOFF_SECONDS
-    ):
-        return summary
-    token = load_token()
-    fingerprint = load_saved_fingerprint()
-    environment_uuid = load_environment_uuid()
-    if not (token and fingerprint and environment_uuid):
-        return summary
-
-    _LAST_SENSOR_RELAUNCH_AT = now
-    summary["relaunch_attempted"] = 1
-    logger.info("Relaunching drivers: a pinned sensor device is available again")
-    try:
-        fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
-    except Exception:
-        logger.exception("Sensor pin relaunch failed")
-    return summary
 
 
 def _load_camera_stream_urls_for_twins(twin_uuids: list[str]) -> dict[str, str]:
@@ -3795,23 +3471,6 @@ def fetch_and_run_twin_drivers(
             results.append(fail_entry)
             continue
 
-        sensor_env = _gate_sensor_pins_before_launch(spec, alert_ctx)
-        if sensor_env is None:
-            held_entry: Dict[str, Any] = {
-                "twin_uuid": spec.twin_uuid,
-                "twin_name": spec.twin.name,
-                "driver_image": spec.driver_image,
-                "success": False,
-                "skipped_reason": SENSOR_PIN_ALERT_TYPE,
-            }
-            if spec.service_name:
-                held_entry["service_name"] = spec.service_name
-            results.append(held_entry)
-            continue
-        launch_service_env = (
-            {**(spec.service_env or {}), **sensor_env} if sensor_env else spec.service_env
-        )
-
         # `depends_on` ordering already put dependencies earlier in this list;
         # this is the second half of the contract, waiting for the health state
         # the dependency's own healthcheck reports.
@@ -3844,7 +3503,7 @@ def fetch_and_run_twin_drivers(
                 gpu_spec=spec.gpu_spec,
                 service_name=spec.service_name,
                 command=spec.command,
-                service_env=launch_service_env,
+                service_env=spec.service_env,
                 extra_networks=spec.extra_networks,
                 driver_alert_ctx=alert_ctx,
             )
@@ -3858,7 +3517,6 @@ def fetch_and_run_twin_drivers(
                 result_entry["service_name"] = spec.service_name
             results.append(result_entry)
             if success:
-                _note_sensor_driver_started(spec.twin_uuid)
                 # Clears a stale driver_start_failure alert now that the start succeeded.
                 try:
                     resolved = resolve_active_alerts_for_twin(
@@ -3919,8 +3577,6 @@ def fetch_and_run_twin_drivers(
                 spec.twin.name,
                 exc,
             )
-
-    _prune_sensor_pin_watch(linked_twin_uuids)
 
     # Worker start has been moved to ``run_startup_checks``. It now runs
     # *after* ``_sync_workers_for_twins`` so that the workers/ directory
@@ -6595,13 +6251,6 @@ def run_runtime_loop(
             reconcile_camera_config_drift()
         except Exception:
             logger.exception("Unexpected error in camera config drift reconciliation")
-
-        try:
-            sensor_pin_summary = reconcile_sensor_pins()
-            if sensor_pin_summary["missing"] or sensor_pin_summary["recovered"]:
-                logger.debug("Sensor pin reconcile: %s", sensor_pin_summary)
-        except Exception:
-            logger.exception("Unexpected error in sensor pin reconciliation")
 
         # Reconcile worker file changes and health probes each cycle.
         try:
