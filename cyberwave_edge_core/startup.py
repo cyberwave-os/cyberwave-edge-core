@@ -2443,9 +2443,8 @@ def reconcile_camera_config_drift() -> bool:
     # Fallback to the legacy global device when no per-twin mapping exists;
     # otherwise each container is compared against the device its twin is
     # bound to.
+    # A twin pinned only via ``twin_to_device`` has no global fallback.
     fallback_device = _load_selected_camera_device()
-    if fallback_device is None:
-        return False
 
     containers = _list_running_driver_containers()
     stale_containers: list[str] = []
@@ -2468,6 +2467,8 @@ def reconcile_camera_config_drift() -> bool:
             if container_twin_uuid
             else fallback_device
         ) or fallback_device
+        if desired_device is None:
+            continue
         if current_device != desired_device:
             logger.info(
                 "Camera config drift detected for %s (twin=%s): "
