@@ -1572,9 +1572,23 @@ def _docker_image_exists_locally(image: str) -> bool:
         return False
 
 
+def _split_image_tag(image: str) -> tuple[str, Optional[str]]:
+    """Split ``repo[:tag]`` into ``(repo, tag)``; *tag* is ``None`` when absent.
+
+    Docker's rule: the tag is what follows the last ``:``, but only if no
+    ``/`` comes after that colon. In ``registry:5000/repo`` the only colon
+    is the registry port, so there is no tag. Callers handle digest
+    references (``repo@sha256:…``) before calling this.
+    """
+    repo, colon, tag = image.rpartition(":")
+    if not colon or "/" in tag:
+        return image, None
+    return repo, tag
+
+
 def _resolve_driver_image_tag(image: str) -> str:
     """Append the environment tag to a driver image reference when missing."""
-    if ":" in image:
+    if "@" in image or _split_image_tag(image)[1] is not None:
         return image
     runtime_environment = (
         get_runtime_env_var("CYBERWAVE_ENVIRONMENT", DEFAULT_ENVIRONMENT) or DEFAULT_ENVIRONMENT
@@ -1592,13 +1606,25 @@ def _maybe_rewrite_jetson_tag(image: str, twin_name: str = "") -> str:
 
     If the tag already starts with ``jetson-`` or the platform is not Jetson,
     the image reference is returned unchanged.
+
+    Digest references (``repo@sha256:…``) and untagged ``registry:5000/repo``
+    (whose only colon is the port) are also returned unchanged.
     """
     from .driver_selection import is_jetson
 
     if not is_jetson():
         return image
 
-    if ":" not in image:
+    if "@" in image:
+        logger.info(
+            "[Jetson] Image %s for twin '%s' is pinned by digest — keeping as-is",
+            image,
+            twin_name,
+        )
+        return image
+
+    repo, tag = _split_image_tag(image)
+    if tag is None:
         logger.info(
             "[Jetson] Detected Jetson platform for twin '%s' but image "
             "%s has no explicit tag — keeping as-is",
@@ -1606,8 +1632,6 @@ def _maybe_rewrite_jetson_tag(image: str, twin_name: str = "") -> str:
             image,
         )
         return image
-
-    repo, tag = image.rsplit(":", 1)
 
     if tag.startswith("jetson-"):
         return image
@@ -2325,6 +2349,8 @@ def reconcile_driver_revival(
         return summary
 
     _LAST_REVIVAL_ATTEMPT_AT = now
+    # Containers handed to the scoped pass, not ones it launched: a down
+    # container whose service has left the topology matches no spec.
     summary["revived_attempted"] = len(down_names)
 
     logger.info(
@@ -2333,7 +2359,14 @@ def reconcile_driver_revival(
         ", ".join(down_names),
     )
     try:
-        fetch_and_run_twin_drivers(token, environment_uuid, fingerprint)
+        # Only the down containers: launching recreates its container, so an
+        # unscoped pass would restart every healthy sibling as well.
+        fetch_and_run_twin_drivers(
+            token,
+            environment_uuid,
+            fingerprint,
+            only_container_names=set(down_names),
+        )
     except Exception:
         logger.exception("Driver revival run failed")
 
@@ -3004,12 +3037,19 @@ def _clear_stale_driver_starting_alerts(
     return cleared
 
 
+def _container_is_twins(container_name: str, twin_uuid: str) -> bool:
+    """Whether *container_name* is one of the twin's driver containers (any service)."""
+    base = driver_container_name(twin_uuid)
+    return container_name == base or container_name.startswith(f"{base}-")
+
+
 def fetch_and_run_twin_drivers(
     token: str,
     environment_uuid: str,
     fingerprint: str,
     *,
     watchdog: Optional[Any] = None,
+    only_container_names: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch twins for the environment, match by edge fingerprint, and run drivers.
 
@@ -3021,6 +3061,9 @@ def fetch_and_run_twin_drivers(
     When *watchdog* is provided, it is forwarded to the parallel image pull
     so that ``EXTEND_TIMEOUT_USEC`` keeps the systemd start timeout alive
     during large downloads.
+
+    *only_container_names* limits the pull and launch passes to those
+    containers; revival passes only the down ones, since launching recreates.
 
     Returns a list of result dicts with twin info and whether the container
     started successfully.
@@ -3122,6 +3165,16 @@ def fetch_and_run_twin_drivers(
 
         twin_metadata = twin.metadata if isinstance(twin.metadata, dict) else {}
         if twin_metadata.get("edge_fingerprint") != fingerprint:
+            continue
+        # A twin attached to a revived one is kept too: this pass writes the
+        # child JSON the relaunched parent reads, and a child owns no container.
+        scope_twins = (twin_uuid, attach_to_by_twin_uuid.get(twin_uuid))
+        if only_container_names is not None and not any(
+            _container_is_twins(name, uuid)
+            for name in only_container_names
+            for uuid in scope_twins
+            if uuid
+        ):
             continue
 
         logger.info(
@@ -3437,6 +3490,13 @@ def fetch_and_run_twin_drivers(
     #         every alert to the wrong twin.
     # ------------------------------------------------------------------
     driver_specs = _defer_health_gated_twins(driver_specs)
+    # Before any position-keyed map below is built, for the same reason.
+    if only_container_names is not None:
+        driver_specs = [
+            spec
+            for spec in driver_specs
+            if driver_container_name(spec.twin_uuid, spec.service_name) in only_container_names
+        ]
 
     # ------------------------------------------------------------------
     # Pass 1a: Drop orphan ``driver_starting`` alerts left by interrupted
@@ -3509,9 +3569,9 @@ def fetch_and_run_twin_drivers(
     if _is_jetson_platform():
         fallback_needed: list[tuple[_DriverSpec, str]] = []
         for spec in driver_specs:
-            if not pull_results.get(spec.driver_image, False) and ":" in spec.driver_image:
-                repo, tag = spec.driver_image.rsplit(":", 1)
-                if tag.startswith("jetson-"):
+            if not pull_results.get(spec.driver_image, False):
+                repo, tag = _split_image_tag(spec.driver_image)
+                if tag is not None and tag.startswith("jetson-"):
                     original_tag = tag[len("jetson-"):]
                     original_image = f"{repo}:{original_tag}"
                     logger.warning(
@@ -3615,6 +3675,11 @@ def fetch_and_run_twin_drivers(
         # service that is skipped is never created, and `reconcile_driver_revival`
         # ignores a `removed` container by design, so nothing would revive it.
         # The gate spends each dependency's budget at most once per pass.
+        #
+        # A revival pass is scoped to the down containers and not closed over
+        # `depends_on`: a revived dependency leaves its running dependents alone
+        # (as Docker's own restart of it does), and a revived dependent whose
+        # dependency is `removed` waits out that budget here and starts anyway.
         for dependency, condition in (spec.depends_on or {}).items():
             if condition != "service_healthy":
                 continue
@@ -6375,7 +6440,7 @@ def run_runtime_loop(
             )
             if revival_summary["revived_attempted"]:
                 logger.info(
-                    "Driver revival reconcile (down=%d, revived_attempted=%d)",
+                    "Driver revival reconcile (down=%d, revival_requested=%d)",
                     revival_summary["down"],
                     revival_summary["revived_attempted"],
                 )

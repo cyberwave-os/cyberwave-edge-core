@@ -35,7 +35,7 @@ ZENOH_ROUTER_ENABLED
 
 ZENOH_ROUTER_IMAGE
     Docker image to use for the router container.
-    Defaults to ``"eclipse/zenoh:latest"``.
+    Defaults to ``"eclipse/zenoh:1.9.0"``.
 
 ZENOH_ROUTER_PORT
     Host port on which the Zenoh router listens.
@@ -80,6 +80,10 @@ from typing import NamedTuple
 from .docker_args import build_log_args
 
 logger = logging.getLogger(__name__)
+
+# Never ``:latest``: keep in step with the ``eclipse-zenoh`` pin of the drivers
+# and the simulator so a registry push cannot change the protocol.
+DEFAULT_ZENOH_ROUTER_IMAGE = "eclipse/zenoh:1.9.0"
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -153,7 +157,7 @@ class ZenohConfig:
 
         if not self.router_image:
             self.router_image = (
-                os.environ.get("ZENOH_ROUTER_IMAGE", "").strip() or "eclipse/zenoh:latest"
+                os.environ.get("ZENOH_ROUTER_IMAGE", "").strip() or DEFAULT_ZENOH_ROUTER_IMAGE
             )
 
         if not self.router_port:

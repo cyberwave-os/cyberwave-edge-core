@@ -655,14 +655,14 @@ All variables can be overridden per-driver with `-e KEY=VALUE` in driver params.
 
 **Peer-to-peer mode (default):** when `ZENOH_CONNECT` is empty, Zenoh uses multicast discovery. On Linux with `--network host` (the default), all driver containers on the same machine discover each other automatically.
 
-**Router mode (optional):** set `ZENOH_ROUTER_ENABLED=true` to have Edge Core start an `eclipse/zenoh:latest` router container before the driver containers. This is required for MQTT bridge or multi-hop topologies.
+**Router mode (optional):** set `ZENOH_ROUTER_ENABLED=true` to have Edge Core start an `eclipse/zenoh:1.9.0` router container before the driver containers. This is required for MQTT bridge or multi-hop topologies.
 
 Environment variables for Zenoh infrastructure:
 
 | Variable | Default | Description |
 |---|---|---|
 | `ZENOH_ROUTER_ENABLED` | `false` | Start a Zenoh router container before drivers |
-| `ZENOH_ROUTER_IMAGE` | `eclipse/zenoh:latest` | Docker image for the router |
+| `ZENOH_ROUTER_IMAGE` | `eclipse/zenoh:1.9.0` | Docker image for the router |
 | `ZENOH_ROUTER_PORT` | `7447` | Host port for the router |
 | `ZENOH_SHARED_MEMORY` | `false` | Opt-in shared-memory transport. Requires all Cyberwave containers to share an IPC namespace (`--ipc=host`); leave disabled unless validated end-to-end. |
 

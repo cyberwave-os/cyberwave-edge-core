@@ -41,7 +41,7 @@ def _config(**kwargs) -> ZenohConfig:
     cfg.connect_endpoints = kwargs.get("connect_endpoints", [])
     cfg.shared_memory = kwargs.get("shared_memory", False)
     cfg.router_enabled = kwargs.get("router_enabled", False)
-    cfg.router_image = kwargs.get("router_image", "eclipse/zenoh:latest")
+    cfg.router_image = kwargs.get("router_image", "eclipse/zenoh:1.9.0")
     cfg.router_port = kwargs.get("router_port", 7447)
     cfg.session_mode = kwargs.get("session_mode", "")
     return cfg
@@ -107,7 +107,7 @@ class TestZenohConfigEnvResolution:
     def test_router_image_default(self, monkeypatch):
         monkeypatch.delenv("ZENOH_ROUTER_IMAGE", raising=False)
         cfg = ZenohConfig()
-        assert cfg.router_image == "eclipse/zenoh:latest"
+        assert cfg.router_image == "eclipse/zenoh:1.9.0"
 
     def test_router_port_overridden_by_env(self, monkeypatch):
         monkeypatch.setenv("ZENOH_ROUTER_PORT", "17447")

@@ -641,7 +641,9 @@ class TestDriverRevivalReconciliation:
 
         summary = startup.reconcile_driver_revival()
 
-        fetch_mock.assert_called_once_with("tok", "env", "fp")
+        fetch_mock.assert_called_once_with(
+            "tok", "env", "fp", only_container_names={TWIN_A_CONTAINER}
+        )
         assert summary["down"] == 1
         assert summary["revived_attempted"] == 1
         assert summary["skipped_orphan"] == 0
