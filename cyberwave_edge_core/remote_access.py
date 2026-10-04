@@ -69,7 +69,8 @@ _SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
 _MIN_LOGIN_UID = 1000
 _MAX_LOGIN_UID = 65534
 DEFAULT_RELAY_HOST = "relay.edge.cyberwave.com"
-DEFAULT_RELAY_PORT = 7000
+# 443, not a port of our own: corporate allowlists permit 80/443 only.
+DEFAULT_RELAY_PORT = 443
 
 EDGE_KEY_HEADER = "X-Cyberwave-Edge-Key"
 EDGE_KEY_FILENAME = "remote_access_key"

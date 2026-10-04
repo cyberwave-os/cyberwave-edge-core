@@ -243,7 +243,7 @@ def test_frpc_config_defaults_and_escaping():
         trusted_ca_file=ra.CONTAINER_CA_PATH,
     )
     assert 'serverAddr = "relay.edge.cyberwave.com"' in config
-    assert "serverPort = 7000" in config
+    assert "serverPort = 443" in config
     assert 'metadatas.token = "a\\"b\\\\c"' in config
     assert 'transport.tls.trustedCaFile = "/etc/frp/relay-ca.pem"' in config
 
