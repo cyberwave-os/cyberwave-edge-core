@@ -19,6 +19,8 @@ from collections.abc import Collection
 from datetime import datetime
 from typing import Any, Optional
 
+from .container_spec import CLOUD_NODE_LABEL, WORKLOAD_LABEL
+
 logger = logging.getLogger(__name__)
 
 # Every driver container Edge Core creates is named from this prefix plus the
@@ -480,6 +482,75 @@ def docker_prune_stopped_cyberwave_containers(
 
     logger.info("Pruned %d/%d stopped cyberwave container(s)", removed, len(to_remove))
     return removed
+
+
+def docker_reap_workload_containers(
+    cloud_node_id: str, live_workloads: Collection[str], *, grace_s: int = 15
+) -> list[str]:
+    """Stop and remove *cloud_node_id*'s containers whose workload is not live.
+
+    Only containers carrying both :func:`container_spec.workload_labels` are
+    candidates. Returns the names removed; a Docker error is logged and leaves
+    the containers in place.
+    """
+    if not cloud_node_id or not docker_available():
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label={CLOUD_NODE_LABEL}={cloud_node_id}",
+                "--format",
+                f'{{{{.Names}}}}\t{{{{.Label "{WORKLOAD_LABEL}"}}}}',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to list workload containers of node %s: %s", cloud_node_id, exc)
+        return []
+
+    live = set(live_workloads)
+    orphans: list[str] = []
+    for line in result.stdout.splitlines():
+        name, _, workload = line.strip().partition("\t")
+        if name and workload and workload not in live:
+            orphans.append(name)
+    if not orphans:
+        return []
+
+    logger.warning("Reaping containers of finished workloads: %s", " ".join(orphans))
+    try:
+        subprocess.run(
+            ["docker", "stop", "--time", str(grace_s), *orphans],
+            capture_output=True,
+            text=True,
+            timeout=grace_s + 30,
+        )
+        # A --rm container is gone, or going, once stopped.
+        removed = subprocess.run(
+            ["docker", "rm", "-f", "-v", *orphans],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Failed to reap workload containers %s: %s", " ".join(orphans), exc)
+        return []
+    errors = [
+        line
+        for line in removed.stderr.splitlines()
+        if "No such container" not in line and "already in progress" not in line
+    ]
+    if removed.returncode != 0 and errors:
+        logger.warning("Failed to reap workload containers %s: %s", " ".join(orphans), errors)
+        return []
+    return orphans
 
 
 def docker_prune_unused_images() -> bool:

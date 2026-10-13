@@ -15,6 +15,7 @@ hash (built outside the spec, or dropped by the canonical form) fails here.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 from pathlib import Path
@@ -29,14 +30,21 @@ import cyberwave_edge_core.startup as startup
 import cyberwave_edge_core.worker_manager as wm_module
 from cyberwave_edge_core import __version__
 from cyberwave_edge_core.container_spec import (
+    CLOUD_NODE_ID_ENV,
+    CLOUD_NODE_LABEL,
     CREATED_BY_LABEL,
     EDGE_LABEL_PREFIX,
+    LIVE_WORKLOADS_ENV,
     SERVICE_LABEL,
     SPEC_HASH_LABEL,
     TWIN_LABEL,
     WORKER_SERVICE,
+    WORKLOAD_LABEL,
+    WORKLOAD_UUID_ENV,
     DockerRunSpec,
     _group_options,
+    live_workloads,
+    workload_labels,
 )
 from cyberwave_edge_core.docker_helpers import docker_image_id
 from cyberwave_edge_core.worker_manager import WorkerManager
@@ -298,6 +306,12 @@ class TestLabels:
         assert not any("super-secret-token" in (v or "") for v in label_values)
         assert not any("CYBERWAVE_API_KEY" in (v or "") for v in label_values)
 
+    def test_extra_labels_do_not_change_the_hash(self) -> None:
+        spec = _spec()
+        labels = spec.labels(extra={WORKLOAD_LABEL: "wl-1"})
+        assert labels[WORKLOAD_LABEL] == "wl-1"
+        assert labels[SPEC_HASH_LABEL] == spec.spec_hash()
+
     def test_run_argv_shape(self) -> None:
         spec = _spec()
         argv = spec.run_argv(twin_uuid="t", service="s")
@@ -308,6 +322,40 @@ class TestLabels:
         # Labels sit between the options and the image.
         assert argv[image_idx - 2] == "--label"
         assert _labels_from_argv(argv)[SPEC_HASH_LABEL] == spec.spec_hash()
+
+
+class TestWorkloadLabels:
+    def test_from_the_cloud_node_environment(self) -> None:
+        env = {CLOUD_NODE_ID_ENV: "node-a", WORKLOAD_UUID_ENV: "wl-env"}
+        assert workload_labels(env=env) == {CLOUD_NODE_LABEL: "node-a", WORKLOAD_LABEL: "wl-env"}
+        assert workload_labels("wl-1", env=env)[WORKLOAD_LABEL] == "wl-1"
+
+    def test_empty_outside_a_cloud_node_workload(self) -> None:
+        assert workload_labels("wl-1", env={}) == {}
+        assert workload_labels(env={CLOUD_NODE_ID_ENV: "node-a"}) == {}
+
+    def test_live_workloads(self) -> None:
+        assert live_workloads({LIVE_WORKLOADS_ENV: "a, b,,"}) == {"a", "b"}
+        assert live_workloads({}) == set()
+
+    def test_env_names_match_the_cloud_node(self) -> None:
+        """The cloud node sets these variables; it does not import edge-core."""
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "cyberwave-cloud-nodes/cyberwave-cloud-node/cyberwave_cloud_node/workload_cleanup.py"
+        )
+        if not source.exists():
+            pytest.skip("cloud node not checked out beside edge-core")
+        constants = {
+            node.targets[0].id: node.value.value
+            for node in ast.parse(source.read_text()).body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+        }
+        assert constants["CLOUD_NODE_ID_ENV"] == CLOUD_NODE_ID_ENV
+        assert constants["WORKLOAD_UUID_ENV"] == WORKLOAD_UUID_ENV
+        assert constants["LIVE_WORKLOADS_ENV"] == LIVE_WORKLOADS_ENV
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +480,7 @@ class TestWorkerLaunchLabels:
             environment_uuid="aabbccdd-eeff-0011-2233-445566778899",
             token="worker-secret-token-123",
             twin_uuids=["twin-uuid-1"],
+            labels={CLOUD_NODE_LABEL: "node-a", WORKLOAD_LABEL: "wl-1"},
         )
 
         run_calls: list[list[str]] = []
@@ -471,6 +520,8 @@ class TestWorkerLaunchLabels:
         assert TWIN_LABEL not in labels
         assert labels[SERVICE_LABEL] == WORKER_SERVICE
         assert labels[CREATED_BY_LABEL] == f"cyberwave-edge-core/{__version__}"
+        assert labels[CLOUD_NODE_LABEL] == "node-a"
+        assert labels[WORKLOAD_LABEL] == "wl-1"
         assert not any("worker-secret-token" in v for v in labels.values())
 
         rebuilt = _spec_from_run_argv(argv, image=image, image_id=_IMAGE_ID)

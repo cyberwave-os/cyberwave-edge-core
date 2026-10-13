@@ -14,6 +14,7 @@ Covers:
   include_stopped passes -a flag
 - docker_has_nvidia_runtime: nvidia present, absent, empty output, bad JSON, errors
 - docker_prune_stopped_cyberwave_containers: removes stopped containers, skips running
+- docker_reap_workload_containers: removes a node's containers whose workload is gone
 - docker_prune_unused_images: success, failure, docker unavailable
 - docker_prune_dangling_volumes: command shape, success, failure paths
 - docker_prune_navigation_bundle_volumes: labelled named-volume reclamation
@@ -1283,3 +1284,59 @@ class TestParseDockerTimestampNs:
     )
     def test_unparseable_input_is_unknown(self, raw):
         assert dh.parse_docker_timestamp_ns(raw) is None
+
+
+class TestDockerReapWorkloadContainers:
+    """Only this node's labelled containers of workloads that are not live go."""
+
+    def _docker(
+        self, monkeypatch, listing: str, *, fail: str | None = None, rm_stderr: str = ""
+    ) -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == fail:
+                raise subprocess.CalledProcessError(1, cmd)
+            done = _make_completed(listing if cmd[1] == "ps" else "", 1 if rm_stderr else 0)
+            done.stderr = rm_stderr if cmd[1] == "rm" else ""
+            return done
+
+        monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
+        monkeypatch.setattr(dh.subprocess, "run", run)
+        return calls
+
+    def test_removes_containers_of_gone_workloads(self, monkeypatch) -> None:
+        calls = self._docker(monkeypatch, "drv-a\twl-dead\ndrv-b\twl-live\nplant\twl-dead\n")
+        assert dh.docker_reap_workload_containers("node-a", {"wl-live"}) == ["drv-a", "plant"]
+        ps, stop, rm = calls
+        assert "label=io.cyberwave.edge.cloud-node=node-a" in ps
+        assert stop == ["docker", "stop", "--time", "15", "drv-a", "plant"]
+        assert rm == ["docker", "rm", "-f", "-v", "drv-a", "plant"]
+
+    def test_containers_without_a_workload_label_are_left(self, monkeypatch) -> None:
+        calls = self._docker(monkeypatch, "unlabelled\t\n")
+        assert dh.docker_reap_workload_containers("node-a", set()) == []
+        assert len(calls) == 1
+
+    def test_without_a_node_id_nothing_is_listed(self, monkeypatch) -> None:
+        calls = self._docker(monkeypatch, "drv-a\twl-dead\n")
+        assert dh.docker_reap_workload_containers("", set()) == []
+        assert calls == []
+
+    def test_a_docker_error_is_logged_not_raised(self, monkeypatch) -> None:
+        self._docker(monkeypatch, "", fail="ps")
+        assert dh.docker_reap_workload_containers("node-a", set()) == []
+        self._docker(monkeypatch, "drv-a\twl-dead\n", rm_stderr="Error: permission denied")
+        assert dh.docker_reap_workload_containers("node-a", set()) == []
+
+    @pytest.mark.parametrize(
+        "rm_stderr",
+        [
+            "Error response from daemon: No such container: plant",
+            "Error response from daemon: removal of container plant is already in progress",
+        ],
+    )
+    def test_a_container_removed_on_stop_counts_as_reaped(self, monkeypatch, rm_stderr) -> None:
+        self._docker(monkeypatch, "plant\twl-dead\n", rm_stderr=rm_stderr)
+        assert dh.docker_reap_workload_containers("node-a", set()) == ["plant"]

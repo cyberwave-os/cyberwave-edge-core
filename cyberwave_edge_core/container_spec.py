@@ -9,6 +9,10 @@ Every container edge-core creates for a driver or the ML worker carries:
   spec, see :meth:`DockerRunSpec.canonical`;
 - ``io.cyberwave.edge.created-by``: ``cyberwave-edge-core/<version>``.
 
+A container started by a cloud-node workload also carries
+``io.cyberwave.edge.cloud-node`` and ``io.cyberwave.edge.workload`` (see
+:func:`workload_labels`), so the node can reap it once the workload is gone.
+
 The spec hash exists so a later edge-core process can tell whether a running
 container still matches what it would create now, and keep it instead of
 recreating it (adoption, edge-core auto-update Phase D / EC6). It is therefore
@@ -40,8 +44,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from . import __version__
 
@@ -50,6 +55,13 @@ TWIN_LABEL = f"{EDGE_LABEL_PREFIX}twin"
 SERVICE_LABEL = f"{EDGE_LABEL_PREFIX}service"
 SPEC_HASH_LABEL = f"{EDGE_LABEL_PREFIX}spec-hash"
 CREATED_BY_LABEL = f"{EDGE_LABEL_PREFIX}created-by"
+CLOUD_NODE_LABEL = f"{EDGE_LABEL_PREFIX}cloud-node"
+WORKLOAD_LABEL = f"{EDGE_LABEL_PREFIX}workload"
+
+# Set by the cloud node on the workloads it spawns and on its cleanup command.
+CLOUD_NODE_ID_ENV = "CYBERWAVE_CLOUD_NODE_ID"
+WORKLOAD_UUID_ENV = "CYBERWAVE_WORKLOAD_UUID"
+LIVE_WORKLOADS_ENV = "CYBERWAVE_LIVE_WORKLOAD_UUIDS"
 
 WORKER_SERVICE = "worker"
 
@@ -111,6 +123,36 @@ _MAP_FLAGS = frozenset({"--env", "--label"})
 def created_by() -> str:
     """Value of the ``created-by`` label for this edge-core build."""
     return f"cyberwave-edge-core/{__version__}"
+
+
+def workload_labels(
+    workload_uuid: Optional[str] = None, *, env: Optional[Mapping[str, str]] = None
+) -> dict[str, str]:
+    """Labels tying a container to the cloud-node workload that started it.
+
+    Both values default to the environment the cloud node sets. Empty outside a
+    cloud-node workload, so the container is never reaped.
+    """
+    env = os.environ if env is None else env
+    node_id = (env.get(CLOUD_NODE_ID_ENV) or "").strip()
+    workload = (workload_uuid or env.get(WORKLOAD_UUID_ENV) or "").strip()
+    if not node_id or not workload:
+        return {}
+    return {CLOUD_NODE_LABEL: node_id, WORKLOAD_LABEL: workload}
+
+
+def live_workloads(env: Optional[Mapping[str, str]] = None) -> set[str]:
+    """Workload uuids the cloud node still runs, as passed to its cleanup command."""
+    env = os.environ if env is None else env
+    return {uuid.strip() for uuid in (env.get(LIVE_WORKLOADS_ENV) or "").split(",") if uuid.strip()}
+
+
+def label_args(labels: Mapping[str, str]) -> list[str]:
+    """``--label key=value`` arguments for *labels*."""
+    args: list[str] = []
+    for key, value in labels.items():
+        args += ["--label", f"{key}={value}"]
+    return args
 
 
 def _group_options(options: Sequence[str]) -> list[tuple[str, Optional[str]]]:
@@ -211,9 +253,13 @@ class DockerRunSpec:
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
 
     def labels(
-        self, *, twin_uuid: Optional[str] = None, service: Optional[str] = None
+        self,
+        *,
+        twin_uuid: Optional[str] = None,
+        service: Optional[str] = None,
+        extra: Optional[Mapping[str, str]] = None,
     ) -> dict[str, str]:
-        labels: dict[str, str] = {}
+        labels: dict[str, str] = dict(extra or {})
         if twin_uuid:
             labels[TWIN_LABEL] = twin_uuid
         if service:
@@ -223,10 +269,12 @@ class DockerRunSpec:
         return labels
 
     def run_argv(
-        self, *, twin_uuid: Optional[str] = None, service: Optional[str] = None
+        self,
+        *,
+        twin_uuid: Optional[str] = None,
+        service: Optional[str] = None,
+        extra_labels: Optional[Mapping[str, str]] = None,
     ) -> list[str]:
         """The ``docker run`` argv for this spec, edge labels included."""
-        label_args: list[str] = []
-        for key, value in self.labels(twin_uuid=twin_uuid, service=service).items():
-            label_args += ["--label", f"{key}={value}"]
-        return ["docker", "run", *self.options, *label_args, self.image, *self.command]
+        labels = self.labels(twin_uuid=twin_uuid, service=service, extra=extra_labels)
+        return ["docker", "run", *self.options, *label_args(labels), self.image, *self.command]

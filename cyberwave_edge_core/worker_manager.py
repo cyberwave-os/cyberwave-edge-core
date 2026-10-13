@@ -21,7 +21,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from ._clock import now_monotonic
 from .container_spec import WORKER_SERVICE, DockerRunSpec
@@ -659,6 +659,7 @@ class WorkerManager:
         image: str = DEFAULT_WORKER_IMAGE,
         resource_limits: Optional[ResourceLimits] = None,
         network: Optional[str] = None,
+        labels: Optional[Mapping[str, str]] = None,
     ) -> None:
         self._config_dir = config_dir
         self._environment_uuid = environment_uuid
@@ -676,6 +677,8 @@ class WorkerManager:
         self._image = image
         self._resource_limits = resource_limits
         self._network = (network or "").strip() or None
+        # Extra container labels, e.g. container_spec.workload_labels().
+        self._labels: dict[str, str] = dict(labels or {})
         self._container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
         self._health_monitor: Optional["WorkerHealthMonitor"] = None
         # Resolved once (mkdir/chown) and reused; derived from ``config_dir``.
@@ -1867,7 +1870,7 @@ class WorkerManager:
 
         cmd = DockerRunSpec(
             options=run_options, image=image, image_id=docker_image_id(image)
-        ).run_argv(service=WORKER_SERVICE)
+        ).run_argv(service=WORKER_SERVICE, extra_labels=self._labels)
 
         # A leftover ``ready`` from the previous container would resolve the
         # alert on the next readiness poll. Reset again here because the pull
