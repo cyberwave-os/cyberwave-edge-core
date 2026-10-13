@@ -742,6 +742,68 @@ Coverage per platform:
 
 The net effect before this existed: memory and temperature appeared while an edge sat idle and vanished the moment it started doing work — exactly backwards from when an operator wants them. Consumers that may see both copies should prefer whichever is *fresher*, which is the heartbeat's only while heartbeats are still arriving — a consumer holding the last-received payload in memory keeps those numbers indefinitely, so once the heartbeat stops they become a frozen snapshot and this copy is the live one. The dashboard treats a stale heartbeat as having no gauges at all and falls through to these. Treat a fallback reading as up to 30 s stale at the source, plus whatever polling interval the consumer adds on top.
 
+### Local pages and the edge local portal (opt-in)
+
+A driver that serves a page of its own on the edge's network (a download page
+for a ground-station browser, a camera preview, a status page) declares it in
+its `cw-driver.yml`:
+
+```yaml
+local_http:                 # shorthand for drivers.default.local_http
+  - name: plans             # slug, unique per driver
+    port: 8765              # the port the driver itself listens on
+    path: /                 # absolute path; no query string or fragment
+    service: gateway        # optional: which service of a multi-container driver serves it
+    audience: lan           # lan (default) is listed; host is declared but never listed
+    scheme: http            # http (default) or https
+    description: Plans for the ground station
+```
+
+The backend validates the block and stores it on the driver profile
+(`drivers.<profile>.local_http`); a twin can override it through its own
+`metadata.drivers`, with the same precedence Edge Core uses to pick the image.
+The driver still opens its own port: the declaration only makes it
+discoverable.
+
+With the portal switched on, Edge Core serves a small read-only index of those
+pages:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CYBERWAVE_EDGE_LOCAL_PORTAL` | off | `on` / `true` / `1` starts the portal. Anything else leaves Edge Core with no HTTP surface. |
+| `CYBERWAVE_EDGE_LOCAL_PORTAL_BIND` | `0.0.0.0:8700` | `host:port`, `[v6]:port`, `:port` or `port`. Use `127.0.0.1:8700` to keep it on the host. |
+| `CYBERWAVE_EDGE_LOCAL_PORTAL_HOST` | address the client reached | Host name or IP printed in links, e.g. a DNS name your LAN resolves. |
+| `CYBERWAVE_EDGE_LOCAL_PORTAL_REFRESH_SECONDS` | `10` | How often the listing is rebuilt from `docker ps` and the twin files. |
+
+Set them in the Edge Core service environment or under `envs` in
+`credentials.json`, then restart Edge Core.
+
+- `GET /` lists, per running driver, its twin name, registry id, health (from
+  the container healthcheck) and a link to `http://<edge-ip>:<port><path>` for
+  each declared page. A page whose `service` container is not running is shown
+  as `stopped`, without a link.
+- `GET /portal.json` is the same listing, machine-readable
+  (`schema: cyberwave.edge.local_portal.v1`).
+- `GET /healthz` reports the portal's own liveness.
+
+What it does not do, by design:
+
+- **No proxying.** Links point straight at the driver's port, so the portal
+  adds an index and nothing else to the edge's attack surface. Protecting a
+  page (if it needs it) is the driver's job.
+- **No secrets.** The output is built from a fixed set of fields. Tokens,
+  `shared_env`, image names and the rest of the twin metadata never reach it,
+  and declared paths cannot carry a query string. Entries are re-validated on
+  the edge, because twin metadata is editable after the catalog checked it.
+- **No mDNS.** Edge Core has no mDNS dependency and this does not add one;
+  reach the portal by IP or by a name your network already resolves.
+- **Never blocks the runtime loop.** Docker and the twin files are read by a
+  background refresher; requests are answered from that snapshot. A bad bind
+  value or a busy port is logged and Edge Core runs on without the portal.
+
+The links use the address the client connected to (or
+`CYBERWAVE_EDGE_LOCAL_PORTAL_HOST`), never the request's `Host` header.
+
 ### Driver failure handling
 
 Drivers must exit with a **non-zero** code when they cannot access required hardware (for example, missing `/dev/video*` or disconnected peripherals). This allows Edge Core to detect startup failures and trigger restart logic.

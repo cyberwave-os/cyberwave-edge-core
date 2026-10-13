@@ -15,6 +15,7 @@ from typing import Any, List, Optional
 
 # Module-level is safe: container_spec and docker_args are stdlib-only, so this
 # cannot reintroduce the cycle the lazy ``_startup()`` accessor below exists to break.
+from . import driver_credentials
 from .container_spec import DockerRunSpec
 from .docker_args import build_log_args
 from .docker_helpers import (
@@ -33,6 +34,43 @@ def _startup():
     from . import startup as _startup_mod
 
     return _startup_mod
+
+
+def _resolve_driver_credential(
+    *,
+    twin_uuid: str,
+    token: str,
+    child_camera_twin_uuids: Optional[list[str]],
+    image: str,
+) -> Optional[driver_credentials.DriverCredential]:
+    """The credential the driver container for *twin_uuid* runs with."""
+    s = _startup()
+    configured = driver_credentials.resolve_mode()
+    if configured == driver_credentials.MODE_LEGACY:
+        return driver_credentials.DriverCredential(api_key=token, scoped=False)
+    mode = driver_credentials.effective_mode(
+        mode=configured,
+        image_opts_in=configured == driver_credentials.MODE_AUTO
+        and _image_has_capability_label(image, driver_credentials.SCOPED_TOKEN_LABEL),
+    )
+    if mode == driver_credentials.MODE_LEGACY:
+        return driver_credentials.DriverCredential(api_key=token, scoped=False)
+    base_url = (
+        s.get_runtime_env_var("CYBERWAVE_BASE_URL", s.DEFAULT_API_URL) or s.DEFAULT_API_URL
+    )
+    try:
+        fingerprint = s.get_or_create_fingerprint()
+    except Exception:  # noqa: BLE001 -- the rotation key is best effort
+        fingerprint = None
+    return driver_credentials.resolve_driver_credential(
+        twin_uuid=twin_uuid,
+        edge_token=token,
+        base_url=base_url,
+        config_dir=s.CONFIG_DIR,
+        child_twin_uuids=child_camera_twin_uuids or (),
+        edge_fingerprint=fingerprint,
+        mode=mode,
+    )
 
 
 # Entrypoint flag that makes a driver image attach USB/IP devices into the
@@ -624,10 +662,25 @@ def _run_docker_image(
                 {"phase": "starting_container"}, force=True
             )
 
+    # Least privilege (CYB-4275 G5): the driver gets a token scoped to its own
+    # twin(s) rather than the edge's full credential; see driver_credentials.
+    driver_credential = _resolve_driver_credential(
+        twin_uuid=twin_uuid,
+        token=token,
+        child_camera_twin_uuids=child_camera_twin_uuids,
+        image=image,
+    )
+    if driver_credential is None:
+        return _refuse(
+            "driver_token_unavailable",
+            "Could not obtain a twin-scoped driver token and "
+            f"{driver_credentials.MODE_ENV}=strict forbids the edge token fallback.",
+        )
+
     # Build env vars for the container
     container_env: dict[str, str] = {
         "CYBERWAVE_TWIN_UUID": twin_uuid,
-        "CYBERWAVE_API_KEY": token,
+        "CYBERWAVE_API_KEY": driver_credential.api_key,
         "CYBERWAVE_EDGE_HOST_PLATFORM": platform.system().lower(),
     }
     normalized_child_uuids: list[str] = []
@@ -1019,6 +1072,10 @@ def _run_docker_image(
     if service_env:
         container_env.update(service_env)
 
+    # Last word on credentials: nothing merged above may carry the edge token
+    # into a container that runs on a scoped one.
+    driver_credentials.apply_to_container(container_env, driver_credential, token)
+
     # Control-plane routing is owned by Edge Core, not by asset metadata.  In
     # particular, old multi-service metadata can contain a production URL; it
     # must not redirect a staging/dev/local Edge Core back to production.  Keep
@@ -1037,6 +1094,20 @@ def _run_docker_image(
     # Mount the edge config directory read-only so driver containers cannot
     # tamper with credentials.json or other sensitive config files.
     env_vars += ["-v", f"{s.CONFIG_DIR}:/app/.cyberwave:ro"]
+    if driver_credential.scoped:
+        # The read-only mount above would otherwise still expose the edge
+        # token (credentials.json) and every twin's cached driver token.
+        try:
+            env_vars += driver_credentials.mask_mount_args(s.CONFIG_DIR)
+        except OSError as exc:
+            # Fail closed: this driver runs scoped (it opted in, or the operator
+            # asked for scoped tokens), and a scoped container that can still
+            # read the edge token is not least privilege. Legacy drivers never
+            # reach this branch.
+            return _refuse(
+                "driver_token_mask_failed",
+                f"Could not hide the edge credentials from the driver: {exc}",
+            )
     # SO101 drivers need write access to so101_lib/ for calibrations and URDF
     # downloads.  Mount that subdirectory read-write as an overlay.
     so101_lib_dir = s.CONFIG_DIR / "so101_lib"

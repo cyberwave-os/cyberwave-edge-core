@@ -418,6 +418,28 @@ class TestDockerPsByPrefix:
         filter_idx = cmd.index("--filter")
         assert "myprefix_" in cmd[filter_idx + 1]
 
+    def test_names_are_the_default_format(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
+        captured: list[list[str]] = []
+        monkeypatch.setattr(
+            dh.subprocess, "run", lambda cmd, **kw: captured.append(cmd) or _make_completed("")
+        )
+        dh.docker_ps_by_prefix("cw_")
+        assert captured[0][captured[0].index("--format") + 1] == "{{.Names}}"
+
+    def test_custom_format_returns_rendered_lines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(dh.shutil, "which", lambda name: "/usr/bin/docker")
+        captured: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kw: Any) -> MagicMock:
+            captured.append(cmd)
+            return _make_completed("cw_a\tUp 1 minute\ncw_b\tUp 2 hours\n")
+
+        monkeypatch.setattr(dh.subprocess, "run", fake_run)
+        result = dh.docker_ps_by_prefix("cw_", fmt="{{.Names}}\t{{.Status}}")
+        assert result == ["cw_a\tUp 1 minute", "cw_b\tUp 2 hours"]
+        assert captured[0][captured[0].index("--format") + 1] == "{{.Names}}\t{{.Status}}"
+
 
 # ---------------------------------------------------------------------------
 # docker_has_nvidia_runtime

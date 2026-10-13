@@ -445,13 +445,13 @@ class TestLoadEnvironmentUuid:
 class TestRemoveCachedTwinJsonFiles:
     def test_protected_files_are_never_deleted(self, tmp_path, monkeypatch):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
-        for protected_name in startup._PROTECTED_CONFIG_JSON_FILES:
+        for protected_name in startup.PROTECTED_CONFIG_JSON_FILES:
             (tmp_path / protected_name).write_text("{}")
 
         removed = startup._remove_cached_twin_json_files()
 
         assert removed == [], "No files should be removed when only protected files exist"
-        for protected_name in startup._PROTECTED_CONFIG_JSON_FILES:
+        for protected_name in startup.PROTECTED_CONFIG_JSON_FILES:
             assert (tmp_path / protected_name).exists(), f"{protected_name} must not be deleted"
 
     def test_uuid_named_files_are_removed(self, tmp_path, monkeypatch):

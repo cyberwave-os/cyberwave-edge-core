@@ -19,7 +19,6 @@ import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -34,6 +33,7 @@ from .docker_helpers import (
     docker_container_status,
     docker_rm,
 )
+from .utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +142,7 @@ def load_or_create_edge_key() -> str:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         key = secrets.token_urlsafe(32)
-        _atomic_write_private(path, key + "\n")
+        atomic_write_text(path, key + "\n")
         logger.info("Created remote access edge key at %s", path)
         return key
 
@@ -328,30 +328,12 @@ def render_frpc_config(
     return "\n".join(lines)
 
 
-def _atomic_write_private(path: Path, content: str) -> None:
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        if os.name != "nt":
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def _write_private(path: Path, content: str) -> None:
     directory = frpc_config_dir()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
         os.chmod(directory, 0o700)
-    _atomic_write_private(path, content)
+    atomic_write_text(path, content)
 
 
 def _unlink_quietly(path: Path) -> None:

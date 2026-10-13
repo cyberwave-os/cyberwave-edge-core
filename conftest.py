@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import types
@@ -28,6 +29,7 @@ def _ensure_real_or_stub_cyberwave_sdk() -> None:
         import cyberwave.edge.host_metrics  # noqa: F401
         import cyberwave.edge.platform  # noqa: F401
         import cyberwave.fingerprint  # noqa: F401
+        import cyberwave.mqtt_identity  # noqa: F401
     except ImportError:
         pass
     else:
@@ -58,11 +60,18 @@ def _ensure_real_or_stub_cyberwave_sdk() -> None:
 
     _fake_cw.edge = _fake_edge  # type: ignore[attr-defined]
 
+    _fake_mqtt_identity = types.ModuleType("cyberwave.mqtt_identity")
+    _fake_mqtt_identity.mqtt_username_for_token = (  # type: ignore[attr-defined]
+        lambda token: "cwh_" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+    )
+    _fake_cw.mqtt_identity = _fake_mqtt_identity  # type: ignore[attr-defined]
+
     sys.modules.setdefault("cyberwave", _fake_cw)
     sys.modules.setdefault("cyberwave.fingerprint", _fake_fp)
     sys.modules.setdefault("cyberwave.edge", _fake_edge)
     sys.modules.setdefault("cyberwave.edge.platform", _fake_edge_platform)
     sys.modules.setdefault("cyberwave.edge.host_metrics", _fake_host_metrics)
+    sys.modules.setdefault("cyberwave.mqtt_identity", _fake_mqtt_identity)
 
 
 _ensure_real_or_stub_cyberwave_sdk()

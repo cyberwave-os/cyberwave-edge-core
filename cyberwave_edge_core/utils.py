@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 from cyberwave import Cyberwave
@@ -19,6 +22,55 @@ DRIVER_STARTING_ALERT_METADATA_UPDATE_INTERVAL_SECONDS = max(
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config-directory files
+# ---------------------------------------------------------------------------
+
+#: Edge-owned JSON files in the config directory: never twin JSON objects, never
+#: removed or re-downloaded as one.
+PROTECTED_CONFIG_JSON_FILES: frozenset[str] = frozenset(
+    {"credentials.json", "fingerprint.json", "environment.json", "edge.json"}
+)
+
+
+def is_driver_twin_json_file(path: Path) -> bool:
+    """Return True when *path* is a managed twin JSON object file (``<twin_uuid>.json``)."""
+    if not path.is_file() or path.name in PROTECTED_CONFIG_JSON_FILES:
+        return False
+
+    try:
+        uuid.UUID(path.stem)
+        return True
+    except ValueError:
+        return False
+
+
+def atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
+    """Atomically replace *path* with *content*, with permissions *mode*.
+
+    Uses a sibling temp file, ``fsync`` and ``os.replace`` so readers never see
+    a half-written file. On POSIX the file is ``chmod``-ed to *mode* **before**
+    the rename, so it is never visible with looser permissions. The parent
+    directory is created when missing.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 
 # ---------------------------------------------------------------------------
 # Startup progress helpers

@@ -21,3 +21,15 @@ def _clean_worker_startup_cards() -> object:
     worker_manager._STARTUP_CARDS.clear()
     yield
     worker_manager._STARTUP_CARDS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _legacy_driver_tokens_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep launch tests offline: scoped driver tokens call the backend.
+
+    Tests of the scoped path (test_driver_credentials.py) set the mode back.
+    """
+    from cyberwave_edge_core import driver_credentials  # noqa: PLC0415
+
+    monkeypatch.delenv(driver_credentials.MODE_ENV, raising=False)
+    monkeypatch.setattr(driver_credentials, "DEFAULT_MODE", driver_credentials.MODE_LEGACY)

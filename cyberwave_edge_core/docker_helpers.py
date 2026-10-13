@@ -318,8 +318,16 @@ def parse_docker_timestamp_ns(raw: str) -> Optional[int]:
     return int(whole.timestamp()) * 1_000_000_000 + int(frac)
 
 
-def docker_ps_by_prefix(prefix: str, *, include_stopped: bool = False) -> list[str]:
-    """Return container names whose name starts with *prefix*."""
+def docker_ps_by_prefix(
+    prefix: str, *, include_stopped: bool = False, fmt: str = "{{.Names}}"
+) -> list[str]:
+    """Return one ``docker ps`` line per container whose name starts with *prefix*.
+
+    Each line is *fmt* rendered for that container (``--format``), stripped;
+    the default yields container names. Use tab-separated columns to read
+    more than one field, e.g. ``"{{.Names}}\t{{.Status}}"``; put a column that
+    is never empty first, since stripping drops empty columns at either end.
+    """
     if not docker_available():
         return []
 
@@ -329,7 +337,7 @@ def docker_ps_by_prefix(prefix: str, *, include_stopped: bool = False) -> list[s
     command.extend(
         [
             "--format",
-            "{{.Names}}",
+            fmt,
             "--filter",
             f"name=^{prefix}",
         ]

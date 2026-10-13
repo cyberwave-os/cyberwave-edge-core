@@ -25,7 +25,8 @@ dependencies = [
     "click>=8.1.0",
     "httpx>=0.25.0",
     "rich>=13.0.0",
-    "cyberwave>=0.6.0",
+    # 0.7.3 is the first SDK with ``cyberwave.mqtt_identity`` (driver_credentials).
+    "cyberwave>=0.7.3",
     # Engine HTTP API client. Required for byte-level docker pull progress
     # (the CLI suppresses byte deltas on a non-TTY pipe, so the subprocess
     # path can only ever surface coarse layer-count progress). driver_logs

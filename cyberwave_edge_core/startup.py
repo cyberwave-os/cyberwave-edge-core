@@ -73,9 +73,12 @@ from .utils import (
     EDGE_CORE_RESTART_PHASE_COMPLETED,
     EDGE_CORE_RESTART_PHASE_FAILED,
     EDGE_CORE_RESTART_PHASE_IN_PROGRESS,
+    PROTECTED_CONFIG_JSON_FILES,
     DriverStartingAlertContext,
     EdgeCoreRestartAlertContext,
     WorkerStartingAlertContext,
+    atomic_write_text,
+    is_driver_twin_json_file,
     resolve_active_alerts_for_twin,
 )
 from .zenoh_config import (
@@ -301,34 +304,6 @@ SD_CARD_CLEANUP_USAGE_PERCENT = float(
 )
 
 
-def _atomic_write_json(path: Path, data: Any, *, mode: int = 0o600) -> None:
-    """Atomically write *data* as JSON to *path* with restrictive permissions.
-
-    Uses a sibling temp file + ``os.replace`` so readers never see a
-    half-written file.  On POSIX the file is ``chmod``-ed to *mode*
-    **before** the rename.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        if os.name != "nt":
-            os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def resolve_config_owner_uid_gid(config_dir: "Path | None" = None) -> "tuple[int, int] | None":
     """Return the ``(uid, gid)`` that should own files inside *config_dir*.
 
@@ -376,12 +351,6 @@ DRIVER_TROUBLESHOOTING_URL = (
     os.getenv("CYBERWAVE_DRIVER_TROUBLESHOOTING_URL", DEFAULT_DRIVER_TROUBLESHOOTING_URL).strip()
     or DEFAULT_DRIVER_TROUBLESHOOTING_URL
 )
-_PROTECTED_CONFIG_JSON_FILES = {
-    "credentials.json",
-    "fingerprint.json",
-    "environment.json",
-    "edge.json",
-}
 _EDGE_COMMAND_SUBSCRIBED = False
 _EDGE_COMMAND_SUBSCRIPTION_LOCK = threading.Lock()
 _EDGE_RESTART_LOCK = threading.Lock()
@@ -647,7 +616,7 @@ def write_or_update_edge_json_file(edge_data: dict) -> bool:
     Returns True on success.
     """
     try:
-        _atomic_write_json(EDGE_JSON_FILE, edge_data, mode=0o644)
+        atomic_write_text(EDGE_JSON_FILE, json.dumps(edge_data, indent=2) + "\n", mode=0o644)
         return True
     except Exception as exc:
         logger.warning("Could not write edge.json: %s", exc)
@@ -1472,7 +1441,11 @@ def save_fingerprint(fingerprint: str) -> bool:
     desynchronising it from the one registered with the backend.
     """
     try:
-        _atomic_write_json(FINGERPRINT_FILE, {"fingerprint": fingerprint}, mode=0o644)
+        atomic_write_text(
+            FINGERPRINT_FILE,
+            json.dumps({"fingerprint": fingerprint}, indent=2) + "\n",
+            mode=0o644,
+        )
         return True
     except OSError as exc:
         logger.warning("Failed to save fingerprint file: %s", exc)
@@ -2697,7 +2670,7 @@ def _remove_cached_twin_json_files() -> list[str]:
     """Remove cached twin JSON objects so they can be re-downloaded."""
     removed: list[str] = []
     for json_file in CONFIG_DIR.glob("*.json"):
-        if json_file.name in _PROTECTED_CONFIG_JSON_FILES:
+        if json_file.name in PROTECTED_CONFIG_JSON_FILES:
             continue
 
         # Driver twin object files are UUID-based (<twin_uuid>.json). Skip any
@@ -5259,18 +5232,6 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
     return True
 
 
-def _is_driver_twin_json_file(path: Path) -> bool:
-    """Return True when *path* is a managed twin JSON object file."""
-    if not path.is_file() or path.name in _PROTECTED_CONFIG_JSON_FILES:
-        return False
-
-    try:
-        uuid.UUID(path.stem)
-        return True
-    except ValueError:
-        return False
-
-
 def _calculate_file_checksum(path: Path) -> Optional[str]:
     """Return SHA-256 checksum for *path* or None on read failures."""
     digest = hashlib.sha256()
@@ -5510,7 +5471,7 @@ def reconcile_twin_json_file_sync() -> dict[str, int]:
     active_twin_uuids: set[str] = set()
 
     for json_file in sorted(CONFIG_DIR.glob("*.json")):
-        if not _is_driver_twin_json_file(json_file):
+        if not is_driver_twin_json_file(json_file):
             continue
 
         twin_uuid = json_file.stem
@@ -6397,6 +6358,14 @@ def run_runtime_loop(
 
     worker_watcher: Optional[Any] = None
 
+    # -- Edge local portal (opt-in, CYBERWAVE_EDGE_LOCAL_PORTAL=on) ----------
+    # Read-only LAN index of the pages drivers declare under `local_http`.
+    # A no-op unless enabled; serves from its own daemon threads and never
+    # raises, so it cannot stall or break this loop.
+    from . import local_portal
+
+    local_portal.start_from_env(config_dir=CONFIG_DIR)
+
     while not shutdown_event.is_set():
         attached = reconcile_driver_log_streams()
         logger.debug(
@@ -6491,6 +6460,23 @@ def run_runtime_loop(
         except Exception:
             logger.exception("Unexpected error while ensuring twin command subscriptions")
 
+        # Keep the leases of running drivers' twin-scoped tokens alive
+        # (throttled internally; CYB-4275 G5).
+        try:
+            from . import driver_credentials as _driver_credentials
+
+            _driver_credentials.maybe_renew_driver_tokens(
+                twin_uuids=lambda: set(_CONTAINER_TWIN_MAP.values()),
+                edge_token=load_token,
+                base_url=lambda: (
+                    get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL)
+                    or DEFAULT_API_URL
+                ),
+                config_dir=CONFIG_DIR,
+            )
+        except Exception:
+            logger.exception("Unexpected error while renewing driver tokens")
+
         # Periodically refresh edge.json from the backend.
         _edge_json_sync_loop_counter += 1
         if _edge_json_sync_loop_counter >= _EDGE_JSON_SYNC_INTERVAL_LOOPS:
@@ -6563,6 +6549,11 @@ def _graceful_shutdown(worker_watcher: Optional[Any]) -> None:
         remote_access.shutdown()
     except Exception:
         logger.exception("Error stopping remote access tunnel during shutdown")
+
+    # Edge local portal: a no-op when it was never started.
+    from . import local_portal
+
+    local_portal.shutdown()
 
     # 1. Stop worker container via WorkerManager (sends SIGTERM to container).
     if worker_watcher is not None:
