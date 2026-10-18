@@ -287,6 +287,149 @@ def test_dependency_outside_the_variant_is_ignored(monkeypatch: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# graphs CI pinned to literal tags (x-cyberwave.pinned_from)
+# ---------------------------------------------------------------------------
+
+PINNED_DOC: dict[str, Any] = {
+    "x-cyberwave": {"schema": 1, "variant": "sim"},
+    "services": {
+        "driver": {
+            "image": "cyberwaveos/spot-ros2-driver:jazzy-dev-sha-0123456789ab",
+            "x-cyberwave": {"pinned_from": "CW_CHANNEL_TAG", "prefer_gpu": True},
+            "network_mode": "host",
+        },
+        "nav2": {
+            "image": "cyberwaveos/ros2-nav2:jazzy-dev-sha-067866cd1b0f",
+            "x-cyberwave": {"pinned_from": "CW_CHANNEL_TAG"},
+            "network_mode": "host",
+        },
+        "moveit": {
+            "image": "cyberwaveos/ros2-moveit:jazzy-dev-sha-def50a37fb66",
+            "x-cyberwave": {"pinned_from": "CW_MOVEIT_TAG"},
+            "network_mode": "host",
+        },
+        "plant": {
+            "image": "cyberwaveos/ros2-sim-proxy:sha-067866cd1b0fea569ad2c9a95550f73c41c5bfcf",
+            "x-cyberwave": {"pinned_from": "CW_SIM_PROXY_TAG"},
+            "network_mode": "host",
+        },
+        # Never a placeholder, so never marked and never repointed.
+        "redis": {"image": "redis:7", "network_mode": "host"},
+    },
+}
+
+_PINNED_DRIVER = "cyberwaveos/spot-ros2-driver:jazzy-dev-sha-0123456789ab"
+_PINNED_NAV2 = "cyberwaveos/ros2-nav2:jazzy-dev-sha-067866cd1b0f"
+_PINNED_MOVEIT = "cyberwaveos/ros2-moveit:jazzy-dev-sha-def50a37fb66"
+_PINNED_PROXY = "cyberwaveos/ros2-sim-proxy:sha-067866cd1b0fea569ad2c9a95550f73c41c5bfcf"
+
+
+def _pinned_images(monkeypatch: Any, **kwargs: Any) -> dict[str, str]:
+    _labels(monkeypatch, _label_set(PINNED_DOC, variant="sim"))
+    result = ds.get_image_declared_services("img:tag", variant="sim", **kwargs)
+    assert result is not None
+    return {spec.name: spec.image for spec in result[0]}
+
+
+def test_a_pinned_graph_runs_its_pinned_tags_without_an_override(monkeypatch: Any) -> None:
+    images = _pinned_images(monkeypatch)
+    assert images == {
+        "driver": _PINNED_DRIVER,
+        "nav2": _PINNED_NAV2,
+        "moveit": _PINNED_MOVEIT,
+        "plant": _PINNED_PROXY,
+        "redis": "redis:7",
+    }
+
+
+def test_the_image_label_and_environment_default_do_not_unpin_a_graph(monkeypatch: Any) -> None:
+    # The label says `jetson-humble-staging` and the environment says `staging`:
+    # neither is an explicit override, and a pinned graph must not move for them.
+    monkeypatch.setenv("CYBERWAVE_ENVIRONMENT", "staging")
+    images = _pinned_images(monkeypatch)
+    assert images["nav2"] == _PINNED_NAV2
+    assert images["plant"] == _PINNED_PROXY
+
+
+def test_the_channel_override_repoints_every_service_pinned_from_it(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ds.CHANNEL_TAG_ENV, "jazzy-pr-4755-sha-5481a4151f98")
+    images = _pinned_images(monkeypatch)
+    # The driver itself moves with its siblings, as it does for a placeholder graph.
+    assert images["driver"] == "cyberwaveos/spot-ros2-driver:jazzy-pr-4755-sha-5481a4151f98"
+    assert images["nav2"] == "cyberwaveos/ros2-nav2:jazzy-pr-4755-sha-5481a4151f98"
+    # A different placeholder, a different train: untouched.
+    assert images["moveit"] == _PINNED_MOVEIT
+    assert images["plant"] == _PINNED_PROXY
+    assert images["redis"] == "redis:7"
+
+
+def test_the_sim_proxy_override_repoints_only_the_proxy(monkeypatch: Any) -> None:
+    # What the sim E2E harness does to run the proxy it built from the checkout.
+    monkeypatch.setenv(ds.SIM_PROXY_TAG_ENV, "e2e")
+    images = _pinned_images(monkeypatch)
+    assert images["plant"] == "cyberwaveos/ros2-sim-proxy:e2e"
+    assert images["driver"] == _PINNED_DRIVER
+    assert images["nav2"] == _PINNED_NAV2
+
+
+def test_the_moveit_override_repoints_only_moveit(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ds.MOVEIT_TAG_ENV, "jazzy-pr-4755-sha-5481a4151f98")
+    images = _pinned_images(monkeypatch)
+    assert images["moveit"] == "cyberwaveos/ros2-moveit:jazzy-pr-4755-sha-5481a4151f98"
+    assert images["nav2"] == _PINNED_NAV2
+
+
+def test_an_explicit_argument_overrides_a_pinned_graph(monkeypatch: Any) -> None:
+    images = _pinned_images(monkeypatch, channel_tag="jazzy-ci-1", moveit_tag="jazzy-ci-2")
+    assert images["nav2"] == "cyberwaveos/ros2-nav2:jazzy-ci-1"
+    assert images["moveit"] == "cyberwaveos/ros2-moveit:jazzy-ci-2"
+    assert images["plant"] == _PINNED_PROXY
+
+
+def test_an_argument_wins_over_the_environment_for_a_pinned_graph(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ds.CHANNEL_TAG_ENV, "from-env")
+    images = _pinned_images(monkeypatch, channel_tag="from-argument")
+    assert images["nav2"] == "cyberwaveos/ros2-nav2:from-argument"
+
+
+def test_a_blank_override_is_not_an_override(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ds.SIM_PROXY_TAG_ENV, "   ")
+    assert _pinned_images(monkeypatch)["plant"] == _PINNED_PROXY
+
+
+def test_an_unknown_marker_value_is_ignored(monkeypatch: Any) -> None:
+    doc = json.loads(json.dumps(PINNED_DOC))
+    doc["services"]["nav2"]["x-cyberwave"]["pinned_from"] = "CW_FUTURE_TAG"
+    _labels(monkeypatch, _label_set(doc, variant="sim"))
+    monkeypatch.setenv(ds.CHANNEL_TAG_ENV, "anything")
+    result = ds.get_image_declared_services("img:tag", variant="sim")
+    assert result is not None
+    assert {spec.name: spec.image for spec in result[0]}["nav2"] == _PINNED_NAV2
+
+
+def test_the_marker_does_not_disturb_the_neighbouring_extension_keys(monkeypatch: Any) -> None:
+    _labels(monkeypatch, _label_set(PINNED_DOC, variant="sim"))
+    result = ds.get_image_declared_services("img:tag", variant="sim")
+    assert result is not None
+    driver = next(spec for spec in result[0] if spec.name == "driver")
+    assert driver.prefer_gpu is True
+
+
+@pytest.mark.parametrize(
+    ("image", "tag", "expected"),
+    [
+        ("cyberwaveos/ros2-nav2:humble-dev-sha-abc", "x", "cyberwaveos/ros2-nav2:x"),
+        ("redis:7", "8", "redis:8"),
+        ("registry:5000/team/repo:old", "new", "registry:5000/team/repo:new"),
+        ("registry:5000/repo", "new", "registry:5000/repo:new"),
+        ("cyberwaveos/ros2-nav2@sha256:" + "a" * 64, "x", "cyberwaveos/ros2-nav2@sha256:" + "a" * 64),
+    ],
+)
+def test_retag_replaces_only_the_tag(image: str, tag: str, expected: str) -> None:
+    assert ds._retag(image, tag) == expected
+
+
+# ---------------------------------------------------------------------------
 # substitution
 # ---------------------------------------------------------------------------
 
@@ -1801,7 +1944,22 @@ def test_an_unused_moveit_train_is_logged_as_unused(monkeypatch: Any, caplog: An
 
 
 @pytest.fixture
-def _declared_graph_on_disk(monkeypatch: Any) -> list[Any]:
+def pull_calls(monkeypatch: Any) -> list[tuple[str, ...]]:
+    """Record the images `_image_declared_services_for_twin` pulls ahead of the
+    graph read, and answer each as pulled. Without it a moving-tag image would run
+    a real `docker pull`."""
+    calls: list[tuple[str, ...]] = []
+
+    def _pull(images: list[str], **_kw: Any) -> dict[str, bool]:
+        calls.append(tuple(images))
+        return {image: True for image in images}
+
+    monkeypatch.setattr(startup, "_pull_driver_images_parallel", _pull)
+    return calls
+
+
+@pytest.fixture
+def _declared_graph_on_disk(monkeypatch: Any, pull_calls: list[tuple[str, ...]]) -> list[Any]:
     """Stub the image side of `_image_declared_services_for_twin`.
 
     Leaves profile matching real -- that is what decides WHICH shared_env is
@@ -1892,3 +2050,98 @@ def test_an_image_that_declares_nothing_still_falls_back_to_metadata(
     monkeypatch.setattr(startup, "get_image_declared_services", lambda _i, **_k: None)
     drivers = {"default": {"docker_image": "drv:x86", "shared_env": {"A": "1"}}}
     assert _declared_for(drivers) is None
+
+
+# ── the entry image is current before its label is read ───────────────────────
+#
+# The graph comes from the label of the image on disk, and the main pull phase only
+# pulls what the graph names. A graph CI pinned names the driver by an immutable
+# tag that is already on disk, so nothing refreshed the moving tag a twin points
+# at and the twin kept the build it first pulled.
+
+
+@pytest.mark.parametrize(
+    ("image", "can_move"),
+    [
+        ("cyberwaveos/spot-ros2-driver:humble-dev", True),
+        ("cyberwaveos/spot-ros2-driver", True),
+        ("cyberwaveos/spot-ros2-driver:humble-dev-sha-0123456789ab", False),
+        ("cyberwaveos/spot-ros2-driver:humble-0.1.3-sha-0123456789ab", False),
+        ("cyberwaveos/spot-ros2-driver@sha256:" + "a" * 64, False),
+    ],
+)
+def test_which_entry_images_can_move(image: str, can_move: bool) -> None:
+    assert startup._image_tag_can_move(image) is can_move
+
+
+def test_a_moving_entry_image_on_disk_is_pulled_again_before_its_label_is_read(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any], pull_calls: list[tuple[str, ...]]
+) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(
+        startup,
+        "_pull_driver_images_parallel",
+        lambda images, **_kw: order.append("pull") or {images[0]: True},
+    )
+    monkeypatch.setattr(
+        startup,
+        "get_image_declared_services",
+        lambda _image, **_kw: order.append("read") or ([ds._ServiceSpec(image="d:x", name="p")], {}, []),
+    )
+    assert _declared_for({"default": {"docker_image": "drv:humble-dev"}}) is not None
+    assert order == ["pull", "read"]
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "drv:humble-dev-sha-0123456789ab",
+        "drv@sha256:" + "a" * 64,
+    ],
+)
+def test_an_immutable_entry_image_on_disk_is_not_pulled(
+    image: str, _declared_graph_on_disk: list[Any], pull_calls: list[tuple[str, ...]]
+) -> None:
+    assert _declared_for({"default": {"docker_image": image}}) is not None
+    assert pull_calls == []
+
+
+def test_an_immutable_entry_image_missing_from_disk_is_pulled(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any], pull_calls: list[tuple[str, ...]]
+) -> None:
+    monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _image: False)
+    image = "drv:humble-dev-sha-0123456789ab"
+    assert _declared_for({"default": {"docker_image": image}}) is not None
+    assert pull_calls == [(image,)]
+
+
+def test_twins_sharing_a_moving_entry_image_pull_it_once(
+    _declared_graph_on_disk: list[Any], pull_calls: list[tuple[str, ...]]
+) -> None:
+    refreshed: set[str] = set()
+    for _ in range(3):
+        startup._image_declared_services_for_twin(
+            {"default": {"docker_image": "drv:humble-dev"}},
+            SimpleNamespace(name="go2-1"),
+            "abcd1234-0000-0000-0000-000000000000",
+            child_registry_ids=set(),
+            token=None,
+            refreshed_images=refreshed,
+        )
+    assert pull_calls == [("drv:humble-dev",)]
+
+
+def test_a_failed_pull_of_the_entry_image_reads_no_graph(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any]
+) -> None:
+    """`_pull_driver_images_parallel` reports success when a failed pull leaves a
+    copy on disk, so False here means there is nothing to read the label from."""
+    read: list[str] = []
+    monkeypatch.setattr(startup, "_pull_driver_images_parallel", lambda images, **_kw: {images[0]: False})
+    monkeypatch.setattr(
+        startup,
+        "get_image_declared_services",
+        lambda _image, **_kw: read.append("read") or None,
+    )
+    assert _declared_for({"default": {"docker_image": "drv:humble-dev"}}) is None
+    assert read == []

@@ -1622,6 +1622,27 @@ def _maybe_rewrite_jetson_tag(image: str, twin_name: str = "") -> str:
     return jetson_image
 
 
+# A tag CI mints for exactly one build (`humble-dev-sha-<sha12>`, `sha-<sha40>`):
+# nothing re-points it, so a copy on disk is current. Keep in sync with
+# `_IMMUTABLE_TAG` in .github/scripts/pin_driver_compose.py (a CI-only script that
+# cannot be imported from here).
+_IMMUTABLE_IMAGE_TAG = re.compile(r"(^|-)sha-[0-9a-f]{7,40}$")
+
+
+def _image_tag_can_move(image: str) -> bool:
+    """True when pulling *image* again can return a different build.
+
+    A digest reference and a per-build ``...-sha-<sha>`` tag cannot move. Anything
+    else (``humble-dev``, ``humble``, an untagged reference) can.
+    """
+    if "@" in image:
+        return False
+    _repo, tag = _split_image_tag(image)
+    if tag is None:
+        return True
+    return _IMMUTABLE_IMAGE_TAG.search(tag) is None
+
+
 def _image_declared_services_for_twin(
     drivers: Dict[str, Any],
     twin: Any,
@@ -1630,6 +1651,7 @@ def _image_declared_services_for_twin(
     child_registry_ids: set[str],
     token: Optional[str],
     watchdog: Optional[Any] = None,
+    refreshed_images: Optional[set[str]] = None,
 ) -> Optional[tuple[list[Any], dict[str, str], list[str]]]:
     """Service graph the twin's driver image declares, or None.
 
@@ -1659,7 +1681,14 @@ def _image_declared_services_for_twin(
 
     image = _maybe_rewrite_jetson_tag(_resolve_driver_image_tag(candidate), twin.name)
 
-    if not _docker_image_exists_locally(image):
+    # Refresh a moving tag before its label is read: once CI pins the driver in its
+    # own graph by an immutable tag, nothing later pulls the tag this twin points at.
+    # CI gates staging/production pinning on this (PIN_DRIVER_IMAGES_* in the driver
+    # workflows). `refreshed_images` lets twins sharing an image pull it once.
+    refreshed = refreshed_images if refreshed_images is not None else set()
+    if (
+        _image_tag_can_move(image) and image not in refreshed
+    ) or not _docker_image_exists_locally(image):
         logger.info(
             "Pulling %s ahead of the main pull phase to read its declared topology",
             image,
@@ -1675,6 +1704,7 @@ def _image_declared_services_for_twin(
                 twin.name,
             )
             return None
+        refreshed.add(image)
 
     declared = get_image_declared_services(image, twin_uuid=twin_uuid)
     if declared is None:
@@ -3130,6 +3160,8 @@ def fetch_and_run_twin_drivers(
         host_env_file: str | None = None
 
     driver_specs: list[_DriverSpec] = []
+    # Entry images already refreshed this boot: twins that share one pull it once.
+    refreshed_images: set[str] = set()
 
     for twin in twins:
         twin_uuid = str(getattr(twin, "uuid", ""))
@@ -3322,6 +3354,7 @@ def fetch_and_run_twin_drivers(
                     child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
                     token=token,
                     watchdog=watchdog,
+                    refreshed_images=refreshed_images,
                 )
         except (RuntimeError, ValueError) as exc:
             # A declared bundle must not degrade to intelligence defaults,

@@ -1465,9 +1465,65 @@ def _order_by_dependencies(
     return ordered
 
 
+# A driver image built by CI pins every sibling to an immutable tag and records,
+# per service, which placeholder that tag replaced: `x-cyberwave.pinned_from`.
+# The marker lives inside the per-service `x-cyberwave` mapping because Edge Core
+# refuses a graph that declares any other key it does not translate (see
+# `_TRANSLATED_SERVICE_KEYS`), so a new top-level service key would stop every
+# deployed Edge Core from starting a pinned image. Inside `x-cyberwave`, an Edge
+# Core that predates this reads only `prefer_gpu` / `gpu` and ignores the rest.
+_PINNED_FROM_KEY = "pinned_from"
+
+
+def _explicit_pin_overrides(
+    channel_tag: Optional[str],
+    moveit_tag: Optional[str],
+    sim_proxy_tag: Optional[str] = None,
+) -> Dict[str, str]:
+    """Placeholder values a caller or operator set EXPLICITLY, by placeholder name.
+
+    Only an argument or an environment variable counts. The image's own label,
+    the tag in its reference and the deployment-environment default do not: those
+    are what a pinned graph already replaces, and treating them as overrides would
+    un-pin every graph on every start.
+
+    This is the same argument-then-environment order `_resolve_channel_tag`,
+    `_resolve_moveit_tag` and `_resolve_sim_proxy_tag` use, so a graph pinned with
+    `CYBERWAVE_DRIVER_CHANNEL_TAG` or `CYBERWAVE_SIM_PROXY_TAG` (the sim E2E
+    harness does exactly that) is repointed the same way whether the image names
+    its siblings by placeholder or by pinned tag.
+    """
+    candidates = {
+        "CW_CHANNEL_TAG": (channel_tag, CHANNEL_TAG_ENV),
+        _MOVEIT_TAG_SUBSTITUTION: (moveit_tag, MOVEIT_TAG_ENV),
+        "CW_SIM_PROXY_TAG": (sim_proxy_tag, SIM_PROXY_TAG_ENV),
+    }
+    overrides: Dict[str, str] = {}
+    for placeholder, (argument, env_name) in candidates.items():
+        value = (argument or "").strip() or os.environ.get(env_name, "").strip()
+        if value:
+            overrides[placeholder] = value
+    return overrides
+
+
+def _retag(image: str, tag: str) -> str:
+    """*image* with its tag replaced by *tag*.
+
+    The tag is whatever follows the last ``:`` that comes after the last ``/``,
+    so a registry port (``registry:5000/repo``) is not mistaken for one. A digest
+    reference has no tag to replace and is returned unchanged.
+    """
+    if "@" in image:
+        return image
+    head, slash, tail = image.rpartition("/")
+    repo = tail.rsplit(":", 1)[0]
+    return f"{head}{slash}{repo}:{tag}"
+
+
 def _specs_from_compose(
     doc: Dict[str, Any],
     subs: Dict[str, str],
+    pin_overrides: Optional[Dict[str, str]] = None,
 ) -> tuple[list[_ServiceSpec], dict[str, str], list[str]] | None:
     """Map a rendered Compose document onto ``_ServiceSpec`` objects.
 
@@ -1476,6 +1532,12 @@ def _specs_from_compose(
     Compose document carries no shared env or params of its own — anchors are
     already expanded into each service by ``config`` — so both are empty and
     every value is per-service.
+
+    *pin_overrides* maps a placeholder name to an explicitly requested tag (see
+    :func:`_explicit_pin_overrides`). A service whose image CI pinned to an
+    immutable tag and marked ``x-cyberwave.pinned_from`` is retagged when its
+    placeholder has an override, so pinning a graph keeps working after CI has
+    replaced the placeholders with literal tags. Unmarked images are untouched.
     """
     raw_services = doc.get("services")
     if not isinstance(raw_services, dict) or not raw_services:
@@ -1523,9 +1585,24 @@ def _specs_from_compose(
             # service carried it; the log line has to say.
             raise ValueError(f"compose service {name!r}: {exc}") from exc
 
+        resolved_image = _substitute(image, subs)
+        pinned_from = extension.get(_PINNED_FROM_KEY)
+        if pin_overrides and isinstance(pinned_from, str) and pinned_from in pin_overrides:
+            overridden = _retag(resolved_image, pin_overrides[pinned_from])
+            if overridden != resolved_image:
+                logger.info(
+                    "compose service %r: %s pinned by the image, overridden to %s "
+                    "(explicit %s)",
+                    name,
+                    resolved_image,
+                    overridden,
+                    pinned_from,
+                )
+            resolved_image = overridden
+
         specs.append(
             _ServiceSpec(
-                image=_substitute(image, subs),
+                image=resolved_image,
                 name=name,
                 command=command,
                 env={
@@ -1836,6 +1913,13 @@ def get_image_declared_services(
     :data:`CHANNEL_TAG_ENV`) to pin a whole graph to one train, which a test that
     pins a single image must do or it silently tests one image out of four.
 
+    A graph CI has pinned names literal immutable tags instead of those
+    placeholders and marks each such service ``x-cyberwave.pinned_from``. An
+    explicit *channel_tag* / *moveit_tag* argument, or :data:`CHANNEL_TAG_ENV`,
+    :data:`MOVEIT_TAG_ENV` and :data:`SIM_PROXY_TAG_ENV`, still repoints the
+    services that placeholder stood for (see :func:`_explicit_pin_overrides`);
+    without one the pinned tags run as written.
+
     *moveit_tag* resolves ``${CW_MOVEIT_TAG}`` for the arm graphs, whose autonomy
     service (``ros2-moveit``) is on a third train -- see
     :func:`_resolve_moveit_tag`. A declaration that names it and cannot resolve
@@ -1932,6 +2016,9 @@ def get_image_declared_services(
         logger.error("Image %s compose label for %r is not an object", image, name)
         return None
 
+    # Taken before the arguments are rebound below: an explicit value is the only
+    # thing that may repoint a graph CI has already pinned to literal tags.
+    pin_overrides = _explicit_pin_overrides(channel_tag, moveit_tag)
     channel_tag, channel_source = _resolve_channel_tag(image, labels, channel_tag)
     proxy_tag, proxy_source = _resolve_sim_proxy_tag()
     moveit_tag, moveit_source = _resolve_moveit_tag(labels, channel_tag, moveit_tag)
@@ -1995,7 +2082,7 @@ def get_image_declared_services(
         navigation_profile=navigation_profile or None,
     )
     try:
-        resolved = _specs_from_compose(doc, preflight_substitutions)
+        resolved = _specs_from_compose(doc, preflight_substitutions, pin_overrides)
     except ValueError:
         logger.exception("Image %s declares an unusable compose graph for %r", image, name)
         return None
@@ -2030,7 +2117,7 @@ def get_image_declared_services(
         )
         # Preflight already proved the graph shape; this pass only replaces the
         # placeholder volume with the materialized one.
-        resolved = _specs_from_compose(doc, substitutions)
+        resolved = _specs_from_compose(doc, substitutions, pin_overrides)
 
     if resolved is not None:
         logger.info(
