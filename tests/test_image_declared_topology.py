@@ -552,7 +552,7 @@ def test_an_unusable_bundle_is_not_adopted(
     assert ds.navigation_bundle_cache_volumes() == {own}
 
 
-def _render_robot_graph(robot: str) -> dict[str, Any]:
+def _render_robot_graph(robot: str, family: str = "ros2/robots") -> dict[str, Any]:
     """Render a shipped ``compose.base.yaml`` + ``compose.robot.yaml`` pair.
 
     Rendered by the real `docker compose config`, the same render the driver
@@ -562,7 +562,8 @@ def _render_robot_graph(robot: str) -> dict[str, Any]:
     """
     root = (
         pathlib.Path(__file__).resolve().parents[2]
-        / "cyberwave-edge-runtime/runtime-services/drivers/ros2/robots"
+        / "cyberwave-edge-runtime/runtime-services/drivers"
+        / family
         / robot
     )
     if not (root / "compose.robot.yaml").exists():
@@ -591,6 +592,29 @@ def _render_robot_graph(robot: str) -> dict[str, Any]:
         pytest.skip("docker compose plugin not available")
     assert rendered.returncode == 0, rendered.stderr
     return json.loads(rendered.stdout)
+
+
+def test_compose_required_guard_is_left_literal_by_the_resolver() -> None:
+    """`${NAME:?msg}` is not a form edge-core expands: it reaches the container as is."""
+    subs = ds.compose_substitutions(channel_tag="humble")
+    guard = "${PX4_MAVLINK_ENDPOINT:?PX4_MAVLINK_ENDPOINT is required}"
+    assert ds._substitute(guard, subs) == guard
+
+
+def test_px4_robot_endpoint_comes_from_shared_env_not_a_literal_guard(
+    monkeypatch: Any,
+) -> None:
+    """A service's own env wins over the twin's shared_env (`{**shared_env, **svc.env}`
+    in startup), so a `:?` guard on PX4_MAVLINK_ENDPOINT used to replace the real
+    endpoint with the guard's own text on a robot."""
+    doc = _render_robot_graph("px4", family="native")
+    monkeypatch.delenv("PX4_MAVLINK_ENDPOINT", raising=False)
+    specs, _, _ = ds._specs_from_compose(doc, ds.compose_substitutions(channel_tag="dev"))
+    (gateway,) = specs
+    assert "PX4_MAVLINK_ENDPOINT" not in gateway.env
+    merged = {**{"PX4_MAVLINK_ENDPOINT": "udp://127.0.0.1:14540"}, **gateway.env}
+    assert merged["PX4_MAVLINK_ENDPOINT"] == "udp://127.0.0.1:14540"
+    assert not any("${" in value for value in gateway.env.values())
 
 
 def test_go2_spec_hashes_survive_an_edge_core_restart(monkeypatch: Any) -> None:
