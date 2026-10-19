@@ -753,7 +753,7 @@ def test_px4_robot_endpoint_comes_from_shared_env_not_a_literal_guard(
     doc = _render_robot_graph("px4", family="native")
     monkeypatch.delenv("PX4_MAVLINK_ENDPOINT", raising=False)
     specs, _, _ = ds._specs_from_compose(doc, ds.compose_substitutions(channel_tag="dev"))
-    (gateway,) = specs
+    gateway = next(s for s in specs if s.name == "gateway")
     assert "PX4_MAVLINK_ENDPOINT" not in gateway.env
     merged = {**{"PX4_MAVLINK_ENDPOINT": "udp://127.0.0.1:14540"}, **gateway.env}
     assert merged["PX4_MAVLINK_ENDPOINT"] == "udp://127.0.0.1:14540"
