@@ -2301,6 +2301,26 @@ class TestEnsureImagePulledForceRePullsMutableTags:
         monkeypatch.setattr(wm_module.subprocess, "run", raise_cpe)
         assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is False
 
+    def test_stale_host_login_retries_anonymously(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CYB-4348: a revoked ``docker login`` must not fail a public image pull."""
+        import subprocess as _sp
+
+        self._patch_inspect_absent(monkeypatch)
+        envs: list = []
+
+        def fake_run(cmd, **kwargs):
+            envs.append(kwargs.get("env"))
+            if kwargs.get("env") is None:
+                raise _sp.CalledProcessError(
+                    1, cmd, stderr="unauthorized: incorrect username or password"
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(wm_module.subprocess, "run", fake_run)
+        assert WorkerManager._ensure_image_pulled("cyberwaveos/edge-ml-worker:dev-gpu") is True
+        assert envs[0] is None
+        assert "DOCKER_CONFIG" in envs[1]
+
     def test_pull_timeout_with_local_copy_falls_back_to_local(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

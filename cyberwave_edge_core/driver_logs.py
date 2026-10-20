@@ -7,17 +7,19 @@ publishes them to the MQTT ``driverlog`` topic.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Optional, Union
+from typing import Any, Callable, Iterable, Iterator, Optional, Union
 
 from .utils import DriverStartingAlertContext, WorkerStartingAlertContext
 
@@ -1001,6 +1003,106 @@ def _apply_progress_to_alerts(
         ctx.driver_alert_ctx.update_metadata(patch, force=force)
 
 
+#: How a registry phrases a rejected login, whichever path reports it:
+#: docker-py's ``401 Client Error ... Unauthorized (...)``, the CLI's
+#: ``unauthorized: authentication required``, or an in-stream error event.
+_REGISTRY_AUTH_ERROR_RE = re.compile(r"unauthorized|incorrect username or password", re.IGNORECASE)
+
+
+def _is_registry_auth_error(message: Optional[str]) -> bool:
+    """True when the registry rejected the credentials the pull sent.
+
+    Docker attaches the host's stored ``docker login`` to every pull and never
+    falls back to anonymous when the registry rejects it, so a stale or revoked
+    login fails pulls of public images too (CYB-4348).
+    """
+    return message is not None and _REGISTRY_AUTH_ERROR_RE.search(message) is not None
+
+
+@contextlib.contextmanager
+def _docker_cli_env(*, anonymous: bool) -> Iterator[Optional[dict[str, str]]]:
+    """``env`` for a ``docker`` CLI call; *anonymous* hides the stored login.
+
+    Points ``DOCKER_CONFIG`` at an empty directory, so the CLI finds no
+    ``auths`` / ``credsStore`` and pulls unauthenticated. ``None`` (inherit
+    the environment unchanged) when not *anonymous*.
+    """
+    if not anonymous:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(prefix="cw-docker-anon-") as config_dir:
+        yield {**os.environ, "DOCKER_CONFIG": config_dir}
+
+
+def _pull_with_anonymous_retry(image: str, attempt: Callable[[bool], None]) -> None:
+    """Run ``attempt(False)``; if the registry rejects the stored login, ``attempt(True)``.
+
+    The anonymous retry succeeds for any public image, turning a stale host
+    ``docker login`` from an outage into a warning. If it fails too (private
+    image, registry down) the original credential error is re-raised: that's
+    the one the operator can act on.
+    """
+    try:
+        attempt(False)
+        return
+    except subprocess.CalledProcessError as exc:
+        if not _is_registry_auth_error(exc.stderr):
+            raise
+        auth_exc = exc
+
+    logger.warning(
+        "Registry refused the pull of %s as unauthorized; retrying without stored docker "
+        "credentials (%s)",
+        image,
+        auth_exc.stderr,
+    )
+    try:
+        attempt(True)
+    except subprocess.CalledProcessError as retry_exc:
+        logger.info("Anonymous retry of %s failed too: %s", image, retry_exc.stderr)
+        raise auth_exc
+    logger.warning(
+        "Pulled %s anonymously: the host's stored docker login is stale or revoked. "
+        "Run `docker logout` as the user running edge-core to clear it.",
+        image,
+    )
+
+
+def _drive_pull(
+    image: str,
+    *,
+    tracker: _DockerPullTracker,
+    contexts_list: list[_PullDeliveryContext],
+    timeout: int,
+    on_progress: Optional[Callable[[_DockerPullProgress], None]],
+    anonymous: bool = False,
+) -> None:
+    """Engine API first; ``docker`` CLI subprocess when the SDK or socket is unavailable."""
+    try:
+        _drive_pull_via_engine_api(
+            image,
+            tracker=tracker,
+            contexts_list=contexts_list,
+            timeout=timeout,
+            on_progress=on_progress,
+            anonymous=anonymous,
+        )
+    except _EngineAPIUnavailableError as exc:
+        logger.info(
+            "Falling back to docker CLI subprocess for pull of %s (%s)",
+            image,
+            exc,
+        )
+        _drive_pull_via_subprocess(
+            image,
+            tracker=tracker,
+            contexts_list=contexts_list,
+            timeout=timeout,
+            on_progress=on_progress,
+            anonymous=anonymous,
+        )
+
+
 def _pull_docker_image_with_progress_multi(
     image: str,
     *,
@@ -1030,28 +1132,29 @@ def _pull_docker_image_with_progress_multi(
         image=image,
     )
 
+    def _attempt(anonymous: bool) -> None:
+        nonlocal tracker
+        if anonymous:
+            # A fresh pull: the rejected attempt's error line must not linger
+            # as ``last_docker_pull_line``.
+            tracker = _DockerPullTracker(image)
+            _broadcast_pull_event(
+                contexts_list,
+                f"docker pull: registry refused {image} as unauthorized; "
+                "retrying without stored credentials",
+                image=image,
+            )
+        _drive_pull(
+            image,
+            tracker=tracker,
+            contexts_list=contexts_list,
+            timeout=timeout,
+            on_progress=on_progress,
+            anonymous=anonymous,
+        )
+
     try:
-        try:
-            _drive_pull_via_engine_api(
-                image,
-                tracker=tracker,
-                contexts_list=contexts_list,
-                timeout=timeout,
-                on_progress=on_progress,
-            )
-        except _EngineAPIUnavailableError as exc:
-            logger.info(
-                "Falling back to docker CLI subprocess for pull of %s (%s)",
-                image,
-                exc,
-            )
-            _drive_pull_via_subprocess(
-                image,
-                tracker=tracker,
-                contexts_list=contexts_list,
-                timeout=timeout,
-                on_progress=on_progress,
-            )
+        _pull_with_anonymous_retry(image, _attempt)
     except subprocess.TimeoutExpired:
         for ctx in contexts_list:
             if ctx.driver_alert_ctx:
@@ -1138,6 +1241,7 @@ def _drive_pull_via_engine_api(
     contexts_list: list[_PullDeliveryContext],
     timeout: int,
     on_progress: Optional[Callable[[_DockerPullProgress], None]],
+    anonymous: bool = False,
 ) -> None:
     """Stream the pull via the Docker Engine HTTP API.
 
@@ -1163,7 +1267,15 @@ def _drive_pull_via_engine_api(
     repo, tag = parse_repository_tag(image)
 
     try:
-        stream = client.api.pull(repo, tag=tag, stream=True, decode=True)
+        stream = client.api.pull(
+            repo,
+            tag=tag,
+            stream=True,
+            decode=True,
+            # ``None`` lets docker-py attach the stored login from the caller's
+            # config.json; ``{}`` sends an empty X-Registry-Auth (anonymous).
+            auth_config={} if anonymous else None,
+        )
     except APIError as exc:
         raise subprocess.CalledProcessError(
             returncode=1,
@@ -1236,51 +1348,55 @@ def _drive_pull_via_subprocess(
     contexts_list: list[_PullDeliveryContext],
     timeout: int,
     on_progress: Optional[Callable[[_DockerPullProgress], None]],
+    anonymous: bool = False,
 ) -> None:
     """Fallback: ``docker pull`` subprocess + stdout parser.
 
     Docker's CLI suppresses byte progress on a non-TTY pipe, so this
     path only surfaces layer-count progress via ``layers_active``.
     """
-    process = subprocess.Popen(
-        ["docker", "pull", image],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    # The temp DOCKER_CONFIG must outlive the process: the CLI reads it after exec.
+    with _docker_cli_env(anonymous=anonymous) as env:
+        process = subprocess.Popen(
+            ["docker", "pull", image],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
 
-    last_message: Optional[str] = None
-    try:
-        if process.stdout:
-            for message in _iter_stream_messages(process.stdout):
-                if message == last_message:
-                    continue
-                last_message = message
-                _publish_pull_line_to_mqtt(
-                    contexts_list,
-                    f"docker pull: {message}",
-                    image=image,
-                )
-                if tracker.feed(message):
-                    _apply_progress_to_alerts(contexts_list, tracker.progress)
-                    if on_progress is not None:
-                        try:
-                            on_progress(tracker.progress)
-                        except Exception:
-                            logger.debug(
-                                "on_progress callback raised for image %s",
-                                image,
-                                exc_info=True,
-                            )
-
-        return_code = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
+        last_message: Optional[str] = None
         try:
-            process.wait(timeout=2)
+            if process.stdout:
+                for message in _iter_stream_messages(process.stdout):
+                    if message == last_message:
+                        continue
+                    last_message = message
+                    _publish_pull_line_to_mqtt(
+                        contexts_list,
+                        f"docker pull: {message}",
+                        image=image,
+                    )
+                    if tracker.feed(message):
+                        _apply_progress_to_alerts(contexts_list, tracker.progress)
+                        if on_progress is not None:
+                            try:
+                                on_progress(tracker.progress)
+                            except Exception:
+                                logger.debug(
+                                    "on_progress callback raised for image %s",
+                                    image,
+                                    exc_info=True,
+                                )
+
+            return_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            pass
-        raise
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
 
     if return_code != 0:
         error_output = tracker.progress.last_line or f"docker pull exited with code {return_code}"
@@ -1289,6 +1405,23 @@ def _drive_pull_via_subprocess(
             ["docker", "pull", image],
             stderr=error_output,
         )
+
+
+def _run_docker_pull(image: str, *, timeout: int) -> None:
+    """``docker pull`` *image* without progress fan-out, with the anonymous retry."""
+
+    def _attempt(anonymous: bool) -> None:
+        with _docker_cli_env(anonymous=anonymous) as env:
+            subprocess.run(
+                ["docker", "pull", image],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+
+    _pull_with_anonymous_retry(image, _attempt)
 
 
 def _pull_docker_image_with_progress(

@@ -851,15 +851,26 @@ class TestPullDriverImagesParallelHeartbeat:
         assert any(s.startswith("Pulling: ") for s in captured_status), (captured_status,)
 
 
-def _install_fake_docker_sdk(monkeypatch, events):
-    """Wire a fake ``docker`` SDK that yields *events* and re-enable the real driver."""
+def _install_fake_docker_sdk(monkeypatch, events, *, reject=lambda auth_config: None):
+    """Wire a fake ``docker`` SDK that yields *events* and re-enable the real driver.
+
+    *reject* maps the ``auth_config`` a pull sent to an ``APIError`` message
+    (``None`` lets it through). Returns the ``auth_config`` of every pull.
+    """
     import sys
     import types
 
+    pull_auth_configs: list = []
+
     class _FakeAPI:
-        def pull(self, repository, tag=None, stream=False, decode=False):
+        def pull(self, repository, tag=None, stream=False, decode=False, auth_config=None):
             assert stream is True and decode is True
-            yield from events
+            pull_auth_configs.append(auth_config)
+            # Like docker-py: a rejected /images/create raises before streaming.
+            error = reject(auth_config)
+            if error is not None:
+                raise _APIError(error)
+            return iter(events)
 
     class _FakeDockerClient:
         api = _FakeAPI()
@@ -887,6 +898,7 @@ def _install_fake_docker_sdk(monkeypatch, events):
     monkeypatch.setitem(sys.modules, "docker.errors", fake_errors)
     monkeypatch.setitem(sys.modules, "docker.utils", fake_utils)
     monkeypatch.setattr(driver_logs, "_drive_pull_via_engine_api", _REAL_ENGINE_API_DRIVER)
+    return pull_auth_configs
 
 
 class TestPullDockerImageViaEngineAPI:
@@ -974,7 +986,9 @@ class TestPullDockerImageViaEngineAPI:
         """SDK missing: dispatcher must complete via the subprocess driver."""
         called: dict[str, bool] = {"subprocess": False}
 
-        def _fake_subprocess_driver(image, *, tracker, contexts_list, timeout, on_progress):
+        def _fake_subprocess_driver(
+            image, *, tracker, contexts_list, timeout, on_progress, anonymous=False
+        ):
             called["subprocess"] = True
             tracker.feed("abc: Pulling fs layer")
             tracker.feed("abc: Pull complete")
@@ -1149,3 +1163,170 @@ class TestPullDockerImageViaEngineAPI:
         assert any(
             patch.get("phase") == "pull_exit_error" for patch, _ in alert_ctx.metadata_history
         )
+
+
+# The exact 401 a stale host ``docker login`` produced on a Kinova rig (CYB-4348).
+_STALE_LOGIN_401 = (
+    "401 Client Error for http+docker://localhost/v1.52/images/create"
+    "?tag=jazzy-staging&fromImage=cyberwaveos%2Fkinova-ros2-driver: "
+    'Unauthorized ("authentication required - incorrect username or password")'
+)
+_PRIVATE_IMAGE_404 = (
+    "404 Client Error for http+docker://localhost/v1.52/images/create: Not Found "
+    '("pull access denied for cyberwaveos/private, repository does not exist or '
+    "may require 'docker login': denied: requested access to the resource is denied\")"
+)
+_STALE_LOGIN_CLI = (
+    'Error response from daemon: Head "https://registry-1.docker.io/v2/'
+    'cyberwaveos/kinova-ros2-driver/manifests/jazzy-staging": '
+    "unauthorized: incorrect username or password"
+)
+_KINOVA_IMAGE = "cyberwaveos/kinova-ros2-driver:jazzy-staging"
+
+
+class TestStaleCredentialAnonymousRetry:
+    """A rejected host ``docker login`` must not break pulls of public images."""
+
+    _FakeClient = TestPullDockerImageViaEngineAPI._FakeClient
+    _FakeAlertCtx = TestPullDockerImageViaEngineAPI._FakeAlertCtx
+    _FakeProcess = TestPullDockerImageWithProgress._FakeProcess
+
+    def _pull(self, monkeypatch, alert_ctx=None):  # type: ignore[no-untyped-def]
+        fake_client = self._FakeClient()
+        monkeypatch.setattr(startup, "_get_shared_mqtt_client", lambda token: fake_client)
+        final = driver_logs._pull_docker_image_with_progress_multi(
+            _KINOVA_IMAGE,
+            contexts=[
+                _PullDeliveryContext(
+                    twin_uuid="twin-1",
+                    container_name="cyberwave-driver-twin1",
+                    driver_alert_ctx=alert_ctx or self._FakeAlertCtx(),
+                ),
+            ],
+            token="test-token",
+            timeout=30,
+        )
+        return final, fake_client
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            (_STALE_LOGIN_401, True),
+            (_STALE_LOGIN_CLI, True),
+            ("unauthorized: authentication required", True),
+            (_PRIVATE_IMAGE_404, False),
+            ("manifest unknown for foo:latest", False),
+            ("network unreachable", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_is_registry_auth_error(self, message, expected):  # type: ignore[no-untyped-def]
+        assert driver_logs._is_registry_auth_error(message) is expected
+
+    def test_engine_api_retries_anonymously_when_stored_login_is_rejected(self, monkeypatch):
+        auth_configs = _install_fake_docker_sdk(
+            monkeypatch,
+            [
+                {"status": "Pull complete", "progressDetail": {}, "id": "44cf07"},
+                {"status": f"Status: Downloaded newer image for {_KINOVA_IMAGE}"},
+            ],
+            reject=lambda auth: _STALE_LOGIN_401 if auth is None else None,
+        )
+
+        final, fake_client = self._pull(monkeypatch)
+
+        assert final.phase == _PULL_PHASE_COMPLETE
+        # Stored login first, then an explicitly empty one.
+        assert auth_configs == [None, {}]
+        messages = [str(p.get("message", "")) for _, p in fake_client.mqtt.published]
+        assert any("retrying without stored credentials" in m for m in messages), messages
+
+    def test_engine_api_reraises_the_credential_error_when_anonymous_fails_too(self, monkeypatch):
+        """Private image: the stale-login 401 is the error the operator can act on."""
+        auth_configs = _install_fake_docker_sdk(
+            monkeypatch,
+            [],
+            reject=lambda auth: _STALE_LOGIN_401 if auth is None else _PRIVATE_IMAGE_404,
+        )
+
+        alert_ctx = self._FakeAlertCtx()
+        with pytest.raises(subprocess.CalledProcessError) as excinfo:
+            self._pull(monkeypatch, alert_ctx)
+
+        assert auth_configs == [None, {}]
+        assert "incorrect username or password" in str(excinfo.value.stderr)
+        assert any(
+            patch.get("phase") == "pull_exit_error"
+            and "incorrect username or password" in patch.get("last_error", "")
+            for patch, _ in alert_ctx.metadata_history
+        )
+
+    def test_engine_api_does_not_retry_non_auth_failures(self, monkeypatch):
+        auth_configs = _install_fake_docker_sdk(
+            monkeypatch, [], reject=lambda auth: "500 Server Error: network unreachable"
+        )
+
+        with pytest.raises(subprocess.CalledProcessError):
+            self._pull(monkeypatch)
+
+        assert auth_configs == [None]
+
+    def test_cli_retry_hides_the_stored_login_behind_an_empty_docker_config(self, monkeypatch):
+        """Subprocess fallback: retry with ``DOCKER_CONFIG`` on an empty dir."""
+        import os
+
+        envs: list = []
+        config_dirs_at_spawn: list = []
+
+        def _fake_popen(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            env = kwargs.get("env")
+            envs.append(env)
+            if env is None:
+                return self._FakeProcess(_STALE_LOGIN_CLI + "\n", returncode=1)
+            config_dir = env["DOCKER_CONFIG"]
+            config_dirs_at_spawn.append((config_dir, os.listdir(config_dir)))
+            return self._FakeProcess(
+                f"abc: Pull complete\nStatus: Downloaded newer image for {_KINOVA_IMAGE}\n"
+            )
+
+        monkeypatch.setattr(driver_logs.subprocess, "Popen", _fake_popen)
+
+        final, _ = self._pull(monkeypatch)
+
+        assert final.phase == _PULL_PHASE_COMPLETE
+        assert envs[0] is None  # first attempt inherits the environment untouched
+        assert len(envs) == 2
+        [(config_dir, contents)] = config_dirs_at_spawn
+        assert contents == []  # no auths / credsStore for the CLI to find
+        assert not os.path.exists(config_dir)  # cleaned up after the pull
+
+    def test_run_docker_pull_retries_anonymously(self, monkeypatch):
+        """The no-progress path (``WorkerManager._ensure_image_pulled``)."""
+        envs: list = []
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            envs.append(kwargs.get("env"))
+            if kwargs.get("env") is None:
+                raise subprocess.CalledProcessError(1, cmd, stderr=_STALE_LOGIN_CLI)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(driver_logs.subprocess, "run", _fake_run)
+
+        driver_logs._run_docker_pull(_KINOVA_IMAGE, timeout=30)
+
+        assert envs[0] is None
+        assert "DOCKER_CONFIG" in envs[1]
+
+    def test_run_docker_pull_does_not_retry_non_auth_failures(self, monkeypatch):
+        calls: list = []
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(cmd)
+            raise subprocess.CalledProcessError(1, cmd, stderr="network unreachable")
+
+        monkeypatch.setattr(driver_logs.subprocess, "run", _fake_run)
+
+        with pytest.raises(subprocess.CalledProcessError):
+            driver_logs._run_docker_pull(_KINOVA_IMAGE, timeout=30)
+        assert len(calls) == 1

@@ -1179,14 +1179,10 @@ class WorkerManager:
             mutable,
             has_local,
         )
+        from .driver_logs import _run_docker_pull  # noqa: PLC0415
+
         try:
-            subprocess.run(
-                ["docker", "pull", image],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            _run_docker_pull(image, timeout=timeout)
             logger.info("Successfully pulled %s", image)
             return True
         except subprocess.CalledProcessError as exc:
