@@ -602,7 +602,11 @@ class ModelManager:
                 return cached_path
             raise
 
-    def ensure_models(self, model_ids: list[str]) -> dict[str, Path]:
+    def ensure_models(
+        self,
+        model_ids: list[str],
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, Path]:
         """Batch version of :meth:`ensure_model`.
 
         Returns a mapping of ``model_id → local_path`` for every model that
@@ -619,10 +623,17 @@ class ModelManager:
         it on first inference. Such models are omitted from both the
         result and ``last_ensure_failures`` so they do not trigger a
         misleading ``model_download_failure`` alert (CYB-2103).
+
+        When *should_stop* returns True, the remaining models are skipped
+        (a download already in progress still completes) so that a shutdown
+        request does not wait out the whole batch (CYB-4369).
         """
         results: dict[str, Path] = {}
         failures: dict[str, str] = {}
         for model_id in model_ids:
+            if should_stop is not None and should_stop():
+                logger.info("Stop requested; skipping remaining model downloads")
+                break
             try:
                 results[model_id] = self.ensure_model(model_id)
             except _RuntimeManagedDeferred as exc:

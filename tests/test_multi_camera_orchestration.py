@@ -384,7 +384,7 @@ class TestStartWorkerAfterDrivers:
             def scan_worker_model_ids(workers_dir):
                 return real_scan(workers_dir)
 
-            def ensure_models(self, model_ids):
+            def ensure_models(self, model_ids, should_stop=None):
                 ensure_calls.append(list(model_ids))
 
         monkeypatch.setattr("cyberwave_edge_core.model_manager.ModelManager", FakeModelManager)
@@ -453,7 +453,7 @@ class TestStartWorkerAfterDrivers:
             def scan_worker_model_ids(workers_dir):
                 return real_scan(workers_dir)
 
-            def ensure_models(self, model_ids):
+            def ensure_models(self, model_ids, should_stop=None):
                 ensure_calls.append(list(model_ids))
 
         monkeypatch.setattr("cyberwave_edge_core.model_manager.ModelManager", FakeModelManager)

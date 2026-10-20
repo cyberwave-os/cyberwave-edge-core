@@ -660,7 +660,9 @@ class WorkerManager:
         resource_limits: Optional[ResourceLimits] = None,
         network: Optional[str] = None,
         labels: Optional[Mapping[str, str]] = None,
+        shutdown_event: Optional[threading.Event] = None,
     ) -> None:
+        self._shutdown_event = shutdown_event
         self._config_dir = config_dir
         self._environment_uuid = environment_uuid
         self._token = token
@@ -684,6 +686,9 @@ class WorkerManager:
         # Resolved once (mkdir/chown) and reused; derived from ``config_dir``.
         self._status_dir_cache: Optional[Path] = None
         self._status_dir_resolved = False
+
+    def _shutdown_requested(self) -> bool:
+        return self._shutdown_event is not None and self._shutdown_event.is_set()
 
     @property
     def _card(self) -> _StartupCard:
@@ -1339,6 +1344,8 @@ class WorkerManager:
         semantics for a failed pull with a local copy present are identical to
         those of :meth:`_ensure_image_pulled`.
         """
+        if self._shutdown_requested():
+            return False
         if not _begin_worker_image_pull(image):
             waited = _wait_for_worker_image_pull(image, timeout=float(timeout) + 30.0)
             if waited is True or _docker_image_present(image):
@@ -1372,6 +1379,8 @@ class WorkerManager:
                 alert_ctxs.append(ctx)
         try:
             for attempt in range(1, max_attempts + 1):
+                if self._shutdown_requested():
+                    return False
                 if attempt > 1:
                     backoff = min(30.0, 2.0 ** (attempt - 1))
                     logger.info(
@@ -1381,7 +1390,11 @@ class WorkerManager:
                         max_attempts,
                         backoff,
                     )
-                    time.sleep(backoff)
+                    if self._shutdown_event is not None:
+                        if self._shutdown_event.wait(backoff):
+                            return False
+                    else:
+                        time.sleep(backoff)
                 if self._pull_worker_image_with_progress_once(
                     image,
                     timeout=timeout,
@@ -1821,6 +1834,9 @@ class WorkerManager:
         self._open_starting_alerts(image)
 
         if not self._pull_worker_image_with_progress(image):
+            if self._shutdown_requested():
+                self._close_starting_alerts()
+                return False
             if non_gpu_image:
                 # Covers both the ``-gpu`` (discrete NVIDIA) and ``-jetson``
                 # (Tegra) rewrites: same fallback shape — drop the accelerator
@@ -1861,6 +1877,10 @@ class WorkerManager:
                     f"image {image} unavailable and no local copy", phase="pull_failed"
                 )
                 return False
+
+        if self._shutdown_requested():
+            self._close_starting_alerts()
+            return False
 
         self._update_starting_alerts({"phase": "starting_container", "image": image})
 

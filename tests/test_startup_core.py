@@ -3718,7 +3718,7 @@ class TestWorkerStartupModelGate:
             def __init__(self, *args, **kwargs):
                 self.last_ensure_failures: dict[str, str] = {}
 
-            def ensure_models(self, _ids):
+            def ensure_models(self, _ids, should_stop=None):
                 self.last_ensure_failures = dict(failures)
                 return {}
 
@@ -3759,6 +3759,37 @@ class TestWorkerStartupModelGate:
             # relied on to dismiss the alert — pin its absence.
             assert "will start without" not in str(alert["description"])
             assert "will not be started" in str(alert["description"])
+
+    def test_stop_during_model_download_skips_alerts_and_worker(self, tmp_path, monkeypatch):
+        """SIGTERM mid-download: no failure alerts, no worker launch (CYB-4369)."""
+        from cyberwave_edge_core import model_manager as mm_mod
+
+        spy = self._patch_runtime(
+            monkeypatch, tmp_path, failures={"yoloe-26n-pf": "download failed"}
+        )
+        alerts = self._capture_alerts(monkeypatch)
+        event = threading.Event()
+        monkeypatch.setattr(startup, "shutdown_event", event)
+        stub_cls = mm_mod.ModelManager
+        seen: dict[str, object] = {}
+
+        def _ensure_then_stop(self, ids, should_stop=None):
+            seen["should_stop"] = should_stop
+            event.set()
+            self.last_ensure_failures = {"yoloe-26n-pf": "download failed"}
+            return {}
+
+        monkeypatch.setattr(stub_cls, "ensure_models", _ensure_then_stop)
+
+        startup._start_worker_after_drivers(
+            token="tok",
+            environment_uuid="env-abc-def-12345678",
+            twin_uuids=["twin-aaa"],
+        )
+
+        assert seen["should_stop"] == event.is_set
+        assert spy == {"init": 0, "start": 0}
+        assert alerts == []
 
     def test_no_failure_starts_worker(self, tmp_path, monkeypatch):
         spy = self._patch_runtime(monkeypatch, tmp_path, failures={})

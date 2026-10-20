@@ -1885,6 +1885,9 @@ def _pull_driver_images_parallel(
     progress_by_image: dict[str, _DockerPullProgress] = {}
 
     def _pull_one(image: str) -> tuple[str, bool]:
+        if shutdown_event.is_set():
+            return image, False
+
         def _record(progress: _DockerPullProgress) -> None:
             snapshot = replace(progress)
             with progress_lock:
@@ -1950,7 +1953,7 @@ def _pull_driver_images_parallel(
                     ]
                 status_line = "; ".join(summaries)
                 logger.info("Still pulling: %s", status_line)
-                if watchdog is not None:
+                if watchdog is not None and not shutdown_event.is_set():
                     watchdog.extend_timeout(heartbeat_extend_seconds)
                     watchdog.notify_status(f"Pulling: {status_line}")
                 time.sleep(heartbeat_interval_seconds)
@@ -3805,6 +3808,9 @@ def fetch_and_run_twin_drivers(
     else:
         pull_results = {}
 
+    if shutdown_event.is_set():
+        return []
+
     # Update alert metadata now that the pull phase has finished so the
     # dashboard shows "pull_complete" while the container is being created.
     for idx, spec in enumerate(driver_specs):
@@ -3878,6 +3884,8 @@ def fetch_and_run_twin_drivers(
         configure_jetson_nvpmodel(requested_nvpmodel)
 
     for idx, spec in enumerate(driver_specs):
+        if shutdown_event.is_set():
+            return results
         alert_ctx = alert_by_spec_index.get(idx)
 
         if not pull_results.get(spec.driver_image, False):
@@ -3935,6 +3943,9 @@ def fetch_and_run_twin_drivers(
             if condition != "service_healthy":
                 continue
             health_gate.wait_once(driver_container_name(spec.twin_uuid, dependency))
+
+        if shutdown_event.is_set():
+            return results
 
         logger.info(
             "Starting driver container %s%s for twin '%s'",
@@ -4151,6 +4162,7 @@ def _start_worker_after_drivers(
     token: str,
     environment_uuid: str,
     twin_uuids: list[str],
+    watchdog: Optional[Any] = None,
 ) -> None:
     """Start the worker container after verifying driver readiness.
 
@@ -4164,105 +4176,121 @@ def _start_worker_after_drivers(
     ``wf_*.py`` files and can correctly skip the image pull when no active
     workflows exist (CYB-1766).
     """
-    try:
-        logger.info(
-            "Preparing worker startup with %d twin(s): %s",
-            len(twin_uuids),
-            ", ".join(tu[:8] + "..." for tu in twin_uuids) if twin_uuids else "(none)",
-        )
+    if shutdown_event.is_set():
+        return
+    from .watchdog import startup_heartbeat
 
-        driver_statuses = _wait_for_driver_readiness(twin_uuids)
-        unhealthy = {n: s for n, s in driver_statuses.items() if s != "running"}
-        if unhealthy:
-            logger.warning(
-                "Starting worker despite %d unhealthy driver(s): %s",
-                len(unhealthy),
-                ", ".join(f"{n}={s}" for n, s in unhealthy.items()),
+    with startup_heartbeat(
+        watchdog,
+        shutdown_event=shutdown_event,
+        status="Preparing ML worker (models, image pull, container start)",
+    ):
+        try:
+            logger.info(
+                "Preparing worker startup with %d twin(s): %s",
+                len(twin_uuids),
+                ", ".join(tu[:8] + "..." for tu in twin_uuids) if twin_uuids else "(none)",
             )
 
-        from .docker_helpers import docker_container_status  # noqa: PLC0415
-        from .model_manager import ModelManager  # noqa: PLC0415
-        from .worker_manager import (  # noqa: PLC0415
-            WORKER_CONTAINER_PREFIX,
-            WorkerManager,
-            resolve_worker_image,
-        )
-
-        workers_dir = CONFIG_DIR / "workers"
-        models_dir = CONFIG_DIR / "models"
-
-        container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
-        worker_already_running = docker_container_status(container_name) == "running"
-
-        model_ensure_failures: dict[str, str] = {}
-        if workers_dir.is_dir():
-            model_ids = ModelManager.scan_worker_model_ids(workers_dir)
-            if model_ids and not worker_already_running:
-                logger.info("Pre-downloading %d model(s) before worker startup: %s", len(model_ids), model_ids)
-                base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-                mm = ModelManager(
-                    cache_dir=models_dir,
-                    api_token=token,
-                    base_url=base_url,
-                    # Keep new cache entries readable from the worker container
-                    # when edge-core itself runs as root (systemd). Without this,
-                    # root-owned per-model directories crash ``cw.models.load``
-                    # with ``PermissionError`` on ``iterdir`` inside the worker.
-                    owner_uid_gid=resolve_config_owner_uid_gid(),
-                )
-                mm.ensure_models(model_ids)
-                model_ensure_failures = dict(mm.last_ensure_failures)
-                _send_model_failure_alerts(
-                    twin_uuids=twin_uuids,
-                    failures=model_ensure_failures,
-                )
-            elif model_ids and worker_already_running:
-                logger.debug(
-                    "Worker container %s already running; skipping model pre-download "
-                    "(worker resolves models on first inference — CYB-2182).",
-                    container_name,
-                )
-
-        # Refuse to start the worker when ensure_models reports genuine
-        # failures (runtime-deferred downloads are pruned upstream).
-        if model_ensure_failures:
-            logger.error(
-                "Refusing to start worker for env %s: %d model(s) failed: %s",
-                environment_uuid,
-                len(model_ensure_failures),
-                ", ".join(sorted(model_ensure_failures)),
-            )
-            return
-
-        worker_manager = WorkerManager(
-            config_dir=CONFIG_DIR,
-            environment_uuid=environment_uuid,
-            token=token,
-            twin_uuids=twin_uuids,
-            image=resolve_worker_image(),
-            resource_limits=load_worker_resource_limits(),
-        )
-        worker_manager.start()
-        # Clears stale worker_start_failure alerts now that the start succeeded.
-        for twin_uuid in twin_uuids:
-            try:
-                resolved = resolve_active_alerts_for_twin(twin_uuid, "worker_start_failure")
-                if resolved:
-                    logger.info(
-                        "Resolved %d worker_start_failure alert(s) for twin %s "
-                        "after successful worker start",
-                        resolved,
-                        twin_uuid,
-                    )
-            except Exception as alert_exc:
+            driver_statuses = _wait_for_driver_readiness(twin_uuids)
+            if shutdown_event.is_set():
+                return
+            unhealthy = {n: s for n, s in driver_statuses.items() if s != "running"}
+            if unhealthy:
                 logger.warning(
-                    "Could not resolve worker_start_failure alerts for twin %s: %s",
-                    twin_uuid,
-                    alert_exc,
+                    "Starting worker despite %d unhealthy driver(s): %s",
+                    len(unhealthy),
+                    ", ".join(f"{n}={s}" for n, s in unhealthy.items()),
                 )
-    except Exception as exc:
-        logger.warning("Failed to start worker container after driver startup: %s", exc)
-        _send_worker_start_failure_alerts(twin_uuids=twin_uuids, error=str(exc))
+
+            from .docker_helpers import docker_container_status  # noqa: PLC0415
+            from .model_manager import ModelManager  # noqa: PLC0415
+            from .worker_manager import (  # noqa: PLC0415
+                WORKER_CONTAINER_PREFIX,
+                WorkerManager,
+                resolve_worker_image,
+            )
+
+            workers_dir = CONFIG_DIR / "workers"
+            models_dir = CONFIG_DIR / "models"
+
+            container_name = f"{WORKER_CONTAINER_PREFIX}{environment_uuid[:8]}"
+            worker_already_running = docker_container_status(container_name) == "running"
+
+            model_ensure_failures: dict[str, str] = {}
+            if workers_dir.is_dir():
+                model_ids = ModelManager.scan_worker_model_ids(workers_dir)
+                if model_ids and not worker_already_running:
+                    logger.info("Pre-downloading %d model(s) before worker startup: %s", len(model_ids), model_ids)
+                    base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+                    mm = ModelManager(
+                        cache_dir=models_dir,
+                        api_token=token,
+                        base_url=base_url,
+                        # Keep new cache entries readable from the worker container
+                        # when edge-core itself runs as root (systemd). Without this,
+                        # root-owned per-model directories crash ``cw.models.load``
+                        # with ``PermissionError`` on ``iterdir`` inside the worker.
+                        owner_uid_gid=resolve_config_owner_uid_gid(),
+                    )
+                    mm.ensure_models(model_ids, should_stop=shutdown_event.is_set)
+                    if shutdown_event.is_set():
+                        return
+                    model_ensure_failures = dict(mm.last_ensure_failures)
+                    _send_model_failure_alerts(
+                        twin_uuids=twin_uuids,
+                        failures=model_ensure_failures,
+                    )
+                elif model_ids and worker_already_running:
+                    logger.debug(
+                        "Worker container %s already running; skipping model pre-download "
+                        "(worker resolves models on first inference — CYB-2182).",
+                        container_name,
+                    )
+
+            # Refuse to start the worker when ensure_models reports genuine
+            # failures (runtime-deferred downloads are pruned upstream).
+            if model_ensure_failures:
+                logger.error(
+                    "Refusing to start worker for env %s: %d model(s) failed: %s",
+                    environment_uuid,
+                    len(model_ensure_failures),
+                    ", ".join(sorted(model_ensure_failures)),
+                )
+                return
+
+            worker_manager = WorkerManager(
+                config_dir=CONFIG_DIR,
+                environment_uuid=environment_uuid,
+                token=token,
+                twin_uuids=twin_uuids,
+                image=resolve_worker_image(),
+                resource_limits=load_worker_resource_limits(),
+                shutdown_event=shutdown_event,
+            )
+            if shutdown_event.is_set():
+                return
+            worker_manager.start()
+            # Clears stale worker_start_failure alerts now that the start succeeded.
+            for twin_uuid in twin_uuids:
+                try:
+                    resolved = resolve_active_alerts_for_twin(twin_uuid, "worker_start_failure")
+                    if resolved:
+                        logger.info(
+                            "Resolved %d worker_start_failure alert(s) for twin %s "
+                            "after successful worker start",
+                            resolved,
+                            twin_uuid,
+                        )
+                except Exception as alert_exc:
+                    logger.warning(
+                        "Could not resolve worker_start_failure alerts for twin %s: %s",
+                        twin_uuid,
+                        alert_exc,
+                    )
+        except Exception as exc:
+            logger.warning("Failed to start worker container after driver startup: %s", exc)
+            _send_worker_start_failure_alerts(twin_uuids=twin_uuids, error=str(exc))
 
 
 def _send_alert_for_twin(
@@ -6381,6 +6409,8 @@ def run_startup_checks(
                     f"  [yellow]Driver startup failed: {exc}[/yellow]"
                 )
                 results = []
+            if shutdown_event.is_set():
+                return False
             _elapsed = time.perf_counter() - _t0
             if not results:
                 had_warnings = True
@@ -6457,6 +6487,7 @@ def run_startup_checks(
                         token=token,
                         environment_uuid=environment_uuid,
                         twin_uuids=sync_twin_uuids,
+                        watchdog=watchdog,
                     )
                 elif total_errors:
                     had_warnings = True

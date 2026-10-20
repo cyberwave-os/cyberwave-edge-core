@@ -32,13 +32,57 @@ import os
 import platform
 import socket
 import struct
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterator, Optional
 
 from .systemd_unit import resolve_startup_timeout_minutes
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def startup_heartbeat(
+    watchdog: Optional[Any],
+    *,
+    shutdown_event: threading.Event,
+    status: str,
+    interval_seconds: float = 5.0,
+    extend_seconds: float = 30.0,
+) -> Iterator[None]:
+    """Keep a blocking startup phase alive, without extending a requested stop.
+
+    A separate thread is necessary while Docker is extracting a layer or a
+    model download is waiting for data: progress callbacks may be silent then.
+    The operation retains its own timeout and retry policy.
+    """
+    if watchdog is None or shutdown_event.is_set():
+        yield
+        return
+
+    done = threading.Event()
+
+    def heartbeat() -> None:
+        if not shutdown_event.is_set():
+            watchdog.extend_timeout(extend_seconds)
+            watchdog.notify_status(status)
+
+    def run() -> None:
+        while not done.wait(interval_seconds):
+            if shutdown_event.is_set():
+                return
+            heartbeat()
+
+    heartbeat()
+    thread = threading.Thread(target=run, name="worker-startup-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join()
 
 # ---------------------------------------------------------------------------
 # Systemd watchdog (sd_notify protocol)

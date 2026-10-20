@@ -340,6 +340,25 @@ def test_ensure_models_tracks_failures(tmp_path: Path) -> None:
     assert "yolov8n" not in manager.last_ensure_failures
 
 
+def test_ensure_models_stops_between_models_when_requested(tmp_path: Path) -> None:
+    """A stop request skips the models not yet started (CYB-4369)."""
+    manager = _make_manager(tmp_path)
+    downloaded: list[str] = []
+    stop = {"requested": False}
+
+    def _download(model_id: str) -> Path:
+        downloaded.append(model_id)
+        stop["requested"] = True
+        raise RuntimeError("network error")
+
+    with patch.object(manager, "_download_model", side_effect=_download):
+        result = manager.ensure_models(["a", "b", "c"], should_stop=lambda: stop["requested"])
+
+    assert downloaded == ["a"]
+    assert result == {}
+    assert set(manager.last_ensure_failures) == {"a"}
+
+
 def test_ensure_models_clears_previous_failures(tmp_path: Path) -> None:
     """Each ensure_models call should reset last_ensure_failures."""
     _write_fake_model(tmp_path, "yolov8n", b"good")

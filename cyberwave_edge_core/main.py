@@ -125,7 +125,18 @@ def cli(ctx: click.Context) -> None:
         # first heartbeat instead of "metric absent" for ~30 s.
         resource_monitor.check()
 
-        if not run_startup_checks(resource_monitor=resource_monitor, watchdog=watchdog):
+        startup_ok = run_startup_checks(resource_monitor=resource_monitor, watchdog=watchdog)
+        if shutdown_event.is_set():
+            from .startup import _graceful_shutdown, _stop_worker_container_for_restart
+
+            try:
+                _stop_worker_container_for_restart()
+                _graceful_shutdown(None)
+            finally:
+                watchdog.stop()
+            return
+        if not startup_ok:
+            watchdog.stop()
             sys.exit(1)
 
         if shutdown_event.is_set():
