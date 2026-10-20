@@ -723,12 +723,13 @@ def _is_not_found_error(exc: BaseException) -> bool:
     return False
 
 
-def resolve_active_alerts_for_twin(twin_uuid: str, alert_type: str) -> int:
+def resolve_active_alerts_for_twin(twin_uuid: str, alert_type: str, *, strict: bool = False) -> int:
     """Resolve active *alert_type* alerts for *twin_uuid*; best-effort, returns count resolved.
 
     Shared by the alert-context classes and by callers clearing a persistent
     failure alert (e.g. ``driver_start_failure``) once a later pull/start
     attempt succeeds, since the retry/revival loops never do so themselves.
+    With *strict*, a failed list or resolve raises so the caller can retry.
     """
     from .startup import DEFAULT_API_URL, get_runtime_env_var, load_token
 
@@ -739,6 +740,7 @@ def resolve_active_alerts_for_twin(twin_uuid: str, alert_type: str) -> int:
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
 
     resolved = 0
+    failed = False
     try:
         client = Cyberwave(base_url=base_url, api_key=token)
         twin = client.twin(twin_id=twin_uuid)
@@ -752,6 +754,7 @@ def resolve_active_alerts_for_twin(twin_uuid: str, alert_type: str) -> int:
                 if _is_not_found_error(exc):
                     # Alert was concurrently deleted/resolved; nothing to do.
                     continue
+                failed = True
                 logger.warning(
                     "Could not resolve stale %s alert %s for twin %s: %s",
                     alert_type,
@@ -768,6 +771,7 @@ def resolve_active_alerts_for_twin(twin_uuid: str, alert_type: str) -> int:
                 twin_uuid,
             )
             return 0
+        failed = True
         logger.debug(
             "Could not list %s alerts for twin %s: %s",
             alert_type,
@@ -775,6 +779,8 @@ def resolve_active_alerts_for_twin(twin_uuid: str, alert_type: str) -> int:
             exc,
             exc_info=True,
         )
+    if strict and failed:
+        raise RuntimeError(f"Could not resolve {alert_type} alerts for twin {twin_uuid}")
     return resolved
 
 

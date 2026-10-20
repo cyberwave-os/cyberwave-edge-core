@@ -36,6 +36,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .systemd_unit import resolve_startup_timeout_minutes
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -346,6 +348,8 @@ class ProcessWatchdog:
         self.hardware = HardwareWatchdog(timeout_seconds=hardware_watchdog_timeout)
         self._ready_signalled = False
         self._pinging_started = False
+        self._startup_deadline = time.monotonic() + resolve_startup_timeout_minutes() * 60
+        self._stopping = False
 
     @property
     def any_enabled(self) -> bool:
@@ -408,7 +412,7 @@ class ProcessWatchdog:
         to make this process the ``WATCHDOG_PID`` when running under
         PyInstaller ``--onefile``).
         """
-        if self._ready_signalled:
+        if self._ready_signalled or self._stopping:
             return
         self.systemd.notify_ready()
         self._ready_signalled = True
@@ -433,7 +437,7 @@ class ProcessWatchdog:
 
         Idempotent.
         """
-        if self._pinging_started:
+        if self._pinging_started or self._stopping:
             return
         self.hardware.open()
         layers = self.active_layers()
@@ -473,10 +477,13 @@ class ProcessWatchdog:
     def extend_timeout(self, seconds: float) -> None:
         """Ask systemd to extend the current timeout by *seconds*.
 
-        Safe to call during startup (extends ``TimeoutStartSec``) and
-        during runtime (extends ``WatchdogSec``).  No-op when there is
-        no notify socket.
+        Capped by the startup budget (``CYBERWAVE_STARTUP_TIMEOUT_MINUTES``, default 30);
+        a no-op once shutdown has begun.
         """
+        if self._stopping:
+            return
+        if not self._ready_signalled:
+            seconds = min(seconds, self._startup_deadline - time.monotonic())
         usec = int(seconds * 1_000_000)
         self.systemd.notify_extend_timeout(usec)
 
@@ -489,9 +496,13 @@ class ProcessWatchdog:
         self.systemd.ping()
         self.hardware.ping()
 
+    def begin_shutdown(self) -> None:
+        self._stopping = True
+        self.systemd.notify_stopping()
+
     def stop(self) -> None:
         """Gracefully shut down watchdog layers."""
-        self.systemd.notify_stopping()
+        self.begin_shutdown()
         self.hardware.close()
 
 

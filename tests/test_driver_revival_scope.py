@@ -108,6 +108,20 @@ def test_scoped_run_launches_only_the_named_service(edge: SimpleNamespace) -> No
     assert len(results) == 1
 
 
+@pytest.mark.parametrize(("on_disk", "pulled"), [(True, []), (False, ["cyberwaveos/arm-driver:humble"])])
+def test_a_run_without_pulling_relaunches_the_image_on_disk(
+    edge: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, on_disk: bool, pulled: list[str]
+) -> None:
+    monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _image: on_disk)
+
+    startup.fetch_and_run_twin_drivers(
+        "tok", "env", "edge-fp", only_container_names={ARM_DRIVER}, pull_images=False
+    )
+
+    assert edge.launched == [ARM_DRIVER]
+    assert edge.pulled == pulled, "only a missing image is pulled"
+
+
 def test_scoped_run_leaves_other_twins_alone(edge: SimpleNamespace) -> None:
     startup.fetch_and_run_twin_drivers("tok", "env", "edge-fp", only_container_names={ARM_DRIVER})
 
@@ -184,6 +198,7 @@ def test_repairing_to_another_environment(
     monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: "edge-fp")
     monkeypatch.setattr(startup, "load_environment_uuid", lambda: environment["uuid"])
     monkeypatch.setattr(startup, "_DRIVER_HEALTH_PREVIOUS", {})
+    monkeypatch.setattr(startup, "_DRIVER_HEALTH_STALE", False)
     monkeypatch.setattr(startup, "_CONTAINER_TWIN_MAP", {})
     monkeypatch.setattr(startup, "_LAST_REVIVAL_ATTEMPT_AT", None)
 

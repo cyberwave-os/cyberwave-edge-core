@@ -1320,6 +1320,104 @@ class TestRunDockerImagePullFallback:
         assert len(bridge_calls) == 1, "only non-video device should trigger bridge"
         assert "/dev/ttyACM0" in bridge_calls[0]
 
+    @pytest.mark.parametrize(
+        ("image", "gets_device"),
+        [
+            ("cyberwaveos/microphone-driver:dev", False),
+            ("cyberwaveos/speaker-driver:dev", False),
+            ("cyberwaveos/camera-driver:dev", True),
+        ],
+    )
+    def test_selected_camera_device_reaches_only_non_audio_drivers(
+        self, tmp_path, monkeypatch, image, gets_device
+    ):
+        selected = "/dev/v4l/by-id/any-selected-camera"
+        commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup, "_load_selected_camera_device", lambda _twin: selected)
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        assert startup._run_docker_image(image, [], twin_uuid=self._TWIN_UUID, token="t")
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        env_map = self._extract_env_map(docker_create_cmd)
+        assert env_map.get("CYBERWAVE_METADATA_VIDEO_DEVICE") == (selected if gets_device else None)
+
+    @pytest.mark.parametrize(
+        ("params", "mounted"),
+        [
+            ([], True),
+            (["-e", "CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/v4l/by-path/pci-video-index0"], True),
+            (["-e", "CYBERWAVE_METADATA_VIDEO_DEVICE=/dev/video2"], False),
+            (["-v", "/dev/v4l:/dev/v4l"], True),
+        ],
+    )
+    def test_v4l_pin_mounts_host_v4l_tree_whatever_the_image(
+        self, tmp_path, monkeypatch, params, mounted
+    ):
+        commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        real_isdir = os.path.isdir
+        monkeypatch.setattr(
+            startup.os.path, "isdir", lambda path: path == "/dev/v4l" or real_isdir(path)
+        )
+        monkeypatch.setattr(
+            startup,
+            "_load_selected_camera_device",
+            lambda _twin: "/dev/v4l/by-id/usb-cam-video-index0",
+        )
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        assert startup._run_docker_image(
+            "cyberwaveos/ros-ugv-driver:dev", params, twin_uuid=self._TWIN_UUID, token="t"
+        )
+        docker_create_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+        v4l_mounts = [arg for arg in docker_create_cmd if arg.startswith("/dev/v4l:")]
+        assert len(v4l_mounts) == (1 if mounted else 0)
+
+    def test_camera_driver_command_is_the_same_as_with_the_mount_added_up_front(
+        self, tmp_path, monkeypatch
+    ):
+        commands: list[list[str]] = []
+        self._patch_common(tmp_path, monkeypatch, commands=commands)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        real_isdir = os.path.isdir
+        monkeypatch.setattr(
+            startup.os.path, "isdir", lambda path: path == "/dev/v4l" or real_isdir(path)
+        )
+        monkeypatch.setattr(
+            startup, "_load_selected_camera_device", lambda _twin: "/dev/v4l/by-id/usb-cam-video-index0"
+        )
+
+        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(startup.subprocess, "run", _fake_run)
+
+        def _create_command(params: list[str]) -> list[str]:
+            commands.clear()
+            assert startup._run_docker_image(
+                "cyberwaveos/camera-driver:dev", params, twin_uuid=self._TWIN_UUID, token="t"
+            )
+            return next(cmd for cmd in commands if cmd[:2] == ["docker", "create"])
+
+        now = _create_command(["--privileged"])
+        monkeypatch.setattr(startup, "_ensure_linux_camera_docker_params", lambda _i, p, _d=None: p)
+        before = _create_command(["--privileged", "-v", "/dev/v4l:/dev/v4l:ro"])
+        assert now == before
+
 
 class TestDriverStartingAlertLifecycle:
     """Regression: the ``driver_starting`` alert must be resolved on the
@@ -2754,6 +2852,77 @@ class TestReconcileCameraConfigDrift:
 
         assert startup.reconcile_camera_config_drift() is False
 
+    def _drift_without_global_device(
+        self, tmp_path, monkeypatch, twin_to_device: dict, containers: dict
+    ) -> tuple[bool, list[str]]:
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+
+        cameras_file = tmp_path / "cameras.json"
+        cameras_file.write_text(json.dumps({"twin_to_device": twin_to_device}))
+        monkeypatch.setattr(startup, "_cameras_json_mtime", cameras_file.stat().st_mtime - 10)
+        monkeypatch.setattr(
+            startup, "_list_running_driver_containers", lambda: list(containers)
+        )
+        monkeypatch.setattr(
+            startup,
+            "_inspect_driver_container",
+            lambda name: {
+                "Config": {
+                    "Env": [
+                        f"CYBERWAVE_TWIN_UUID={containers[name][0]}",
+                        f"CYBERWAVE_METADATA_VIDEO_DEVICE={containers[name][1]}",
+                    ],
+                },
+            },
+        )
+        restart_calls: list[str] = []
+        monkeypatch.setattr(
+            startup,
+            "_start_camera_config_drift_restart",
+            lambda token: restart_calls.append(token),
+        )
+        monkeypatch.setattr(startup, "load_token", lambda: "test-token")
+        return startup.reconcile_camera_config_drift(), restart_calls
+
+    def test_per_twin_pin_change_restarts_without_global_device(self, tmp_path, monkeypatch):
+        new_pin = "/dev/v4l/by-path/platform-xhci-hcd.0-usb-0:2:1.0-video-index0"
+        old_pin = "/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:2:1.0-video-index0"
+
+        restarted, restart_calls = self._drift_without_global_device(
+            tmp_path,
+            monkeypatch,
+            twin_to_device={"twin-a": new_pin},
+            containers={"cyberwave-driver-a": ("twin-a", old_pin)},
+        )
+
+        assert restarted is True
+        assert restart_calls == ["test-token"]
+
+    def test_per_twin_pin_unchanged_without_global_device(self, tmp_path, monkeypatch):
+        pin = "/dev/v4l/by-path/platform-xhci-hcd.0-usb-0:2:1.0-video-index0"
+
+        restarted, restart_calls = self._drift_without_global_device(
+            tmp_path,
+            monkeypatch,
+            twin_to_device={"twin-a": pin},
+            containers={"cyberwave-driver-a": ("twin-a", pin)},
+        )
+
+        assert restarted is False
+        assert restart_calls == []
+
+    def test_unmapped_twin_is_left_alone_without_global_device(self, tmp_path, monkeypatch):
+        restarted, restart_calls = self._drift_without_global_device(
+            tmp_path,
+            monkeypatch,
+            twin_to_device={"twin-b": "/dev/v4l/by-id/usb-Cam-video-index0"},
+            containers={"cyberwave-driver-a": ("twin-a", "/dev/video2")},
+        )
+
+        assert restarted is False
+        assert restart_calls == []
+
     def test_drift_restart_runs_in_background_worker(self, tmp_path, monkeypatch):
         monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
@@ -3127,6 +3296,68 @@ class TestEnsureLinuxCameraDockerParams:
                 "cyberwaveos/so101-driver:latest", params
             )
             == params
+        )
+
+    @pytest.mark.parametrize(
+        ("video_device", "mounted"),
+        [
+            ("/dev/v4l/by-id/usb-cam-video-index0", True),
+            ("/dev/v4l/by-path/platform-xhci-hcd.0-usb-0:2:1.0-video-index0", True),
+            ("/dev/video0", False),
+            ("rtsp://10.0.0.2/stream", False),
+            (None, False),
+        ],
+    )
+    def test_mounts_v4l_tree_for_any_image_given_a_v4l_link(
+        self, monkeypatch, video_device, mounted
+    ):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda path: path == "/dev/v4l")
+        params = startup._ensure_linux_camera_docker_params(
+            "cyberwaveos/ros-ugv-driver:latest", [], video_device
+        )
+        assert params == (["-v", "/dev/v4l:/dev/v4l:ro"] if mounted else [])
+
+    def test_a_mount_of_another_v4l_subtree_does_not_hide_the_pinned_link(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda path: path == "/dev/v4l")
+        pin = "/dev/v4l/by-id/usb-cam-video-index0"
+        for other in (
+            ["-v", "/dev/v4l/by-path:/dev/v4l/by-path:ro"],
+            ["-v", "/tmp/empty:/dev/v4l:ro"],
+        ):
+            assert startup._ensure_linux_camera_docker_params(
+                "cyberwaveos/ros-ugv-driver:latest", other, pin
+            ) == [*other, "-v", "/dev/v4l:/dev/v4l:ro"]
+        by_id = ["-v", "/dev/v4l/by-id:/dev/v4l/by-id:ro"]
+        assert startup._ensure_linux_camera_docker_params(
+            "cyberwaveos/ros-ugv-driver:latest", by_id, pin
+        ) == by_id
+
+    @pytest.mark.parametrize(
+        "params",
+        [[], ["-v", "/dev/v4l:/dev/v4l:ro"], ["-v", "/dev/v4l/by-path:/dev/v4l/by-path:ro"]],
+    )
+    @pytest.mark.parametrize("video_device", [None, "/dev/v4l/by-id/usb-cam-video-index0", "/dev/video0"])
+    def test_camera_images_keep_the_params_they_had_before(self, monkeypatch, params, video_device):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda path: path == "/dev/v4l")
+        before = params if params else ["-v", "/dev/v4l:/dev/v4l:ro"]
+        assert (
+            startup._ensure_linux_camera_docker_params(
+                "cyberwaveos/camera-driver:latest", params, video_device
+            )
+            == before
+        )
+
+    def test_v4l_link_does_not_mount_off_linux(self, monkeypatch):
+        monkeypatch.setattr(startup.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(startup.os.path, "isdir", lambda path: path == "/dev/v4l")
+        assert (
+            startup._ensure_linux_camera_docker_params(
+                "cyberwaveos/ros-ugv-driver:latest", [], "/dev/v4l/by-id/usb-cam-video-index0"
+            )
+            == []
         )
 
 
@@ -3624,6 +3855,58 @@ class TestReadCamerasConfig:
         monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
 
         assert startup._read_cameras_config() is None
+
+    def test_a_twin_only_in_cameras_json_keeps_its_entry(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
+        usb, ip_cam = "11111111-0000-0000-0000-000000000000", "22222222-0000-0000-0000-000000000000"
+        by_id = "/dev/v4l/by-id/usb-cam-video-index0"
+        url = "rtsp://169.254.10.20/stream"
+        (tmp_path / "edge.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "cameras": {
+                            "selected_device": 0,
+                            "devices": [],
+                            "twin_to_device": {usb: by_id},
+                        }
+                    }
+                }
+            )
+        )
+        (tmp_path / "cameras.json").write_text(
+            json.dumps(
+                {
+                    "selected_device": 7,
+                    "twin_to_device": {usb: "/dev/v4l/by-id/stale-video-index0", ip_cam: url},
+                }
+            )
+        )
+
+        config = startup._read_cameras_config()
+
+        assert config == {
+            "selected_device": 0,
+            "devices": [],
+            "twin_to_device": {usb: by_id, ip_cam: url},
+        }
+        assert startup._load_selected_camera_device(ip_cam) == url
+        assert startup._load_selected_camera_device(usb) == by_id
+
+    def test_edge_json_without_a_mapping_takes_cameras_json_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "EDGE_JSON_FILE", tmp_path / "edge.json")
+        url = "rtsp://169.254.10.20/stream"
+        (tmp_path / "edge.json").write_text(
+            json.dumps({"metadata": {"cameras": {"selected_device": 0}}})
+        )
+        (tmp_path / "cameras.json").write_text(json.dumps({"twin_to_device": {"cam": url}}))
+
+        assert startup._read_cameras_config() == {
+            "selected_device": 0,
+            "twin_to_device": {"cam": url},
+        }
 
 
 class TestWriteOrUpdateEdgeJsonFile:

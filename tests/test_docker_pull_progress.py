@@ -1165,6 +1165,44 @@ class TestPullDockerImageViaEngineAPI:
         )
 
 
+@pytest.mark.parametrize(
+    ("image", "present", "expected"),
+    [
+        ("cyberwaveos/microphone-driver:local", True, True),
+        ("cyberwaveos/microphone-driver:local-uma16", True, True),
+        ("cyberwaveos/microphone-driver:uma16-local", True, True),
+        ("cyberwaveos/microphone-driver:local", False, False),
+        ("cyberwaveos/microphone-driver:dev", True, False),
+        ("cyberwaveos/microphone-driver", True, False),
+        ("registry:5000/microphone-driver", True, False),
+        ("cyberwaveos/microphone-driver@sha256:abc", True, False),
+    ],
+)
+def test_use_local_build(monkeypatch, image, present, expected):
+    monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _img: present)
+    assert startup._use_local_build(image) is expected
+
+
+def test_parallel_pull_keeps_a_local_build_and_pulls_the_rest(monkeypatch):
+    pulled: list[str] = []
+
+    def _fake_pull(image, **_kwargs):
+        pulled.append(image)
+
+    monkeypatch.setattr(startup, "_pull_docker_image_with_progress_multi", _fake_pull)
+    monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _img: True)
+
+    results = startup._pull_driver_images_parallel(
+        ["cyberwaveos/microphone-driver:local", "cyberwaveos/camera-driver:dev"]
+    )
+
+    assert pulled == ["cyberwaveos/camera-driver:dev"]
+    assert results == {
+        "cyberwaveos/microphone-driver:local": True,
+        "cyberwaveos/camera-driver:dev": True,
+    }
+
+
 # The exact 401 a stale host ``docker login`` produced on a Kinova rig (CYB-4348).
 _STALE_LOGIN_401 = (
     "401 Client Error for http+docker://localhost/v1.52/images/create"

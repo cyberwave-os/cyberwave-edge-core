@@ -7,8 +7,8 @@ Covers:
   3. The fields that change the argv (restart, stop timeout, privileged,
      restart-floor label, host env file)
   4. ``_restart_floor_decision`` and the launcher's refuse/adopt branches
-  5. Revival skips ``restart: "no"`` and restart-floor containers, but brings
-     back a ``restart: "no"`` one whose relaunch the floor refused
+  5. Revival skips ``restart: "no"`` and restart-floor containers, removed or
+     not, but brings back a ``restart: "no"`` one whose relaunch the floor refused
   6. Restart teardown stops restart-floor containers gracefully, and the
      periodic prune keeps them
 
@@ -497,7 +497,9 @@ class TestRevival:
     @pytest.fixture(autouse=True)
     def _state(self, monkeypatch: pytest.MonkeyPatch) -> Any:
         startup._DRIVER_HEALTH_PREVIOUS.clear()
+        monkeypatch.setattr(startup, "_DRIVER_HEALTH_STALE", False)
         startup._CONTAINER_TWIN_MAP.clear()
+        startup._CONTAINER_RESTART_POLICY.clear()
         startup._RESTART_FLOOR_DEFERRED.clear()
         startup._LAST_REVIVAL_ATTEMPT_AT = None
         self.fetch_calls = 0
@@ -515,6 +517,7 @@ class TestRevival:
         yield
         startup._DRIVER_HEALTH_PREVIOUS.clear()
         startup._CONTAINER_TWIN_MAP.clear()
+        startup._CONTAINER_RESTART_POLICY.clear()
         startup._RESTART_FLOOR_DEFERRED.clear()
         startup._LAST_REVIVAL_ATTEMPT_AT = None
 
@@ -566,6 +569,29 @@ class TestRevival:
         summary = startup.reconcile_driver_revival()
         assert self.fetch_calls == 0
         assert summary["skipped_restart_no"] == 1
+
+    @pytest.mark.parametrize("restart", ["no", "unless-stopped"])
+    def test_the_launch_records_its_restart_policy(
+        self, monkeypatch: pytest.MonkeyPatch, restart: str
+    ) -> None:
+        monkeypatch.setattr(startup, "_CONTAINER_RESTART_POLICY", {})
+        _patch_driver_container_launch(monkeypatch, [])
+        assert _run(restart=restart)
+        assert startup._CONTAINER_RESTART_POLICY == {DRIVER_CONTAINER: restart}
+
+    @pytest.mark.parametrize(("deferred", "revived"), [(False, 0), (True, 1)])
+    def test_removed_restart_no_container_comes_back_only_if_its_floor_deferred_it(
+        self, monkeypatch: pytest.MonkeyPatch, deferred: bool, revived: int
+    ) -> None:
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda name, default=None: default)
+        monkeypatch.setattr(startup, "_CONTAINER_RESTART_POLICY", {DRIVER_CONTAINER: "no"})
+        monkeypatch.setattr(startup, "_REMOVED_SINCE", {DRIVER_CONTAINER: time.monotonic() - 301})
+        startup._DRIVER_HEALTH_PREVIOUS[DRIVER_CONTAINER] = "removed"
+        startup._CONTAINER_TWIN_MAP[DRIVER_CONTAINER] = TWIN_UUID
+        if deferred:
+            startup._RESTART_FLOOR_DEFERRED.add(DRIVER_CONTAINER)
+        startup.reconcile_driver_revival()
+        assert self.fetch_calls == revived
 
     def test_floor_container_waits_out_its_floor(self) -> None:
         self._down(

@@ -1,31 +1,7 @@
 #!/usr/bin/env bash
-# Upgrade a running edge-core service to PACKAGE_FILE under a real systemd
-# (plan B1), which test_emulated_binary_package.sh cannot do: without systemd
-# the deb's postinst always takes its "nothing to manage" branch.
-#
-# Starting from the unit an older `cyberwave edge install` wrote, with a custom
-# config dir and a drop-in, it checks that `dpkg -i`:
-#   - rewrites the unit with the ExecStartPre update-guard hook, keeping
-#     ExecStart, the config dir and the drop-in;
-#   - runs daemon-reload and does not restart the running service;
-#   - is a no-op when the postinst or the install runs again.
-# It then restarts the service with the guard missing, succeeding and failing,
-# and checks that the service starts every time.
-#
-# Last, it runs `cyberwave edge update` (the CLI from this checkout) against a
-# local apt repository holding the same deb repacked as stable 1.0.0 and 1.0.1:
-# --check, an update, an update with nothing new, a rollback with --version,
-# and a held package without and with --force. Each step checks the installed
-# version, whether the service restarted, and that the unit is left unchanged.
-#
-# The service's main process is a sleep stub (a drop-in replaces ExecStart),
-# because the real orchestrator needs credentials and a backend.
-#
-# On the runner: PACKAGE_FILE=path/to/cyberwave-edge-core*.deb ./test_deb_upgrade_under_systemd.sh
-# It boots a privileged, systemd-enabled Ubuntu 22.04 container and runs this
-# same script inside it with --in-container. The container is removed on exit.
-# Only the deb and the CLI and SDK sources are mounted, read-only, so nothing
-# root-owned is left in the runner's workspace. Installing the CLI needs PyPI.
+# Test Debian upgrades and lifecycle limits in an isolated Linux systemd container.
+# PACKAGE_FILE=path/to/package.deb bash scripts/test_deb_upgrade_under_systemd.sh
+# LIFECYCLE_ONLY=1 skips Debian packaging checks and tests the checkout directly.
 
 set -euo pipefail
 
@@ -37,6 +13,7 @@ GUARD=/usr/lib/cyberwave-edge-core/update-guard
 DEB_IN_CONTAINER=/tmp/cyberwave-edge-core.deb
 CLI_SRC_IN_CONTAINER=/src/cyberwave-python-cli
 SDK_SRC_IN_CONTAINER=/src/cyberwave-python
+CORE_SRC_IN_CONTAINER=/src/cyberwave-edge-core
 STABLE_PACKAGE=cyberwave-edge-core
 REPO_DIR=/srv/cyberwave-ci-apt
 CLI=/opt/cli-venv/bin/cyberwave
@@ -339,9 +316,34 @@ print(*core._resolve_deb_registry_paths(core.EDGE_CORE_SPEC, "stable"))')
     echo "✅ cyberwave edge update works against a local apt repository"
 }
 
+run_lifecycle_checks() {
+    [ -x /opt/cli-venv/bin/python ] || python3 -m venv /opt/cli-venv
+    /opt/cli-venv/bin/pip install --quiet --disable-pip-version-check \
+        "${CLI_SRC_IN_CONTAINER}[dev]" "${CORE_SRC_IN_CONTAINER}[dev]"
+    (
+        cd "${CLI_SRC_IN_CONTAINER}"
+        /opt/cli-venv/bin/python -m pytest -q -p no:cacheprovider \
+            tests/test_systemd_lifecycle.py tests/test_service_spec.py \
+            tests/test_edge_uninstall.py tests/test_edge_update.py \
+            tests/test_edge_process_mode.py tests/test_edge_install_non_linux.py \
+            tests/test_create_systemd_service_delegation.py
+    )
+    (
+        cd "${CORE_SRC_IN_CONTAINER}"
+        CYBERWAVE_TEST_SYSTEMD_SYSTEM=1 CYBERWAVE_REQUIRE_SYSTEMD_TESTS=1 \
+        /opt/cli-venv/bin/python -m pytest -q -p no:cacheprovider \
+            tests/test_watchdog.py tests/test_systemd_unit.py \
+            tests/test_systemd_notify_integration.py tests/test_worker_pull_watchdog_gap.py \
+            tests/test_dependency_health_gating.py tests/test_docker_pull_progress.py
+    )
+}
+
 if [ "${1:-}" = "--in-container" ]; then
-    run_checks
-    run_update_checks
+    if [ "${LIFECYCLE_ONLY:-0}" != "1" ]; then
+        run_checks
+        run_update_checks
+    fi
+    run_lifecycle_checks
     exit 0
 fi
 
@@ -350,9 +352,13 @@ fi
 # ---------------------------------------------------------------------------
 
 PACKAGE_FILE="${PACKAGE_FILE:-}"
-[ -n "${PACKAGE_FILE}" ] || { echo "ERROR: PACKAGE_FILE is required." >&2; exit 1; }
-[ -f "${PACKAGE_FILE}" ] || { echo "ERROR: package file not found: ${PACKAGE_FILE}" >&2; exit 1; }
-PACKAGE_FILE="$(realpath "${PACKAGE_FILE}")"
+package_mount=()
+if [ "${LIFECYCLE_ONLY:-0}" != "1" ]; then
+    [ -n "${PACKAGE_FILE}" ] || { echo "ERROR: PACKAGE_FILE is required." >&2; exit 1; }
+    [ -f "${PACKAGE_FILE}" ] || { echo "ERROR: package file not found: ${PACKAGE_FILE}" >&2; exit 1; }
+    PACKAGE_FILE="$(realpath "${PACKAGE_FILE}")"
+    package_mount=(-v "${PACKAGE_FILE}:${DEB_IN_CONTAINER}:ro")
+fi
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CLI_SRC="${REPO_ROOT}/cyberwave-clis/cyberwave-python-cli"
 SDK_SRC="${REPO_ROOT}/cyberwave-sdks/cyberwave-python"
@@ -366,7 +372,7 @@ CONTAINER="cw-edge-core-systemd-${RUN_LABEL}-$$"
 cleanup() {
     docker rm -f -v "${CONTAINER}" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+trap 'test_status=$?; cleanup; exit "$test_status"' EXIT
 
 echo "=== Building ${IMAGE} ==="
 # No build context: the image is only systemd on top of ubuntu:22.04, cached
@@ -404,9 +410,11 @@ docker run -d \
     "${cgroup_args[@]}" \
     --tmpfs /run \
     --tmpfs /run/lock \
-    -v "${PACKAGE_FILE}:${DEB_IN_CONTAINER}:ro" \
+    -e "LIFECYCLE_ONLY=${LIFECYCLE_ONLY:-0}" \
+    ${package_mount[@]+"${package_mount[@]}"} \
     -v "${CLI_SRC}:${CLI_SRC_IN_CONTAINER}:ro" \
     -v "${SDK_SRC}:${SDK_SRC_IN_CONTAINER}:ro" \
+    -v "${REPO_ROOT}/cyberwave-edge-core:${CORE_SRC_IN_CONTAINER}:ro" \
     "${IMAGE}" >/dev/null
 
 state=""

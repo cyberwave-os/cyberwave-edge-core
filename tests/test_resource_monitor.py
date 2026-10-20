@@ -283,6 +283,12 @@ class TestReadCpuTemperature:
 
 
 class TestSystemResourceMonitor:
+    @pytest.fixture(autouse=True)
+    def _no_docker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.resource_monitor as rm_mod
+
+        monkeypatch.setattr(rm_mod, "read_disk_percent", lambda: None)
+
     def test_check_returns_cached_snapshot_on_throttle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -364,3 +370,116 @@ class TestSystemResourceMonitor:
 
         monitor.check()
         assert monitor.consecutive_critical_count == 0
+
+    def test_check_reports_cpu_and_disk_percent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.resource_monitor as rm_mod
+
+        monkeypatch.setattr(rm_mod, "MONITOR_CHECK_INTERVAL_SECONDS", 0.0)
+        monkeypatch.setattr(rm_mod, "read_memory_info", lambda: None)
+        monkeypatch.setattr(rm_mod, "read_cpu_temperature", lambda: None)
+        monkeypatch.setattr(rm_mod, "read_disk_percent", lambda: 96.5)
+        times = iter([(100, 1000), (150, 2000), (150, 2000)])
+        monkeypatch.setattr(rm_mod, "read_cpu_times", lambda: next(times))
+
+        monitor = SystemResourceMonitor()
+        first = monitor.check()
+        assert first is not None and first.cpu_percent is None
+        assert first.disk_percent == 96.5
+
+        second = monitor.check()
+        assert second is not None and second.cpu_percent == pytest.approx(95.0)
+        assert second.to_publish_dict() == {"host_cpu_percent": 95.0, "host_disk_percent": 96.5}
+
+        third = monitor.check()
+        assert third is not None and third.cpu_percent is None
+
+
+class TestHostGauges:
+    def test_read_cpu_times_parses_the_aggregate_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import io
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/stat":
+                return io.StringIO("cpu  10 2 30 400 50 6 7 8 9 10\ncpu0 1 1 1 1 1 1 1 1\n")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        from cyberwave_edge_core.resource_monitor import read_cpu_times
+
+        assert read_cpu_times() == (450, 513)
+
+    def test_read_cpu_times_is_none_without_proc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_open(*_args, **_kwargs):
+            raise FileNotFoundError("/proc/stat")
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        from cyberwave_edge_core.resource_monitor import read_cpu_times
+
+        assert read_cpu_times() is None
+
+    def test_read_disk_percent_measures_the_docker_data_root(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import shutil
+        from collections import namedtuple
+
+        import cyberwave_edge_core.docker_helpers as dh
+        from cyberwave_edge_core.resource_monitor import read_disk_percent
+
+        usage = namedtuple("usage", "total used free")
+        seen: list[str] = []
+        monkeypatch.setattr(dh, "docker_data_root", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            shutil, "disk_usage", lambda path: seen.append(path) or usage(200, 190, 10)
+        )
+
+        assert read_disk_percent() == pytest.approx(95.0)
+        assert seen == [str(tmp_path)]
+
+
+class TestSaturationThreshold:
+    @pytest.mark.parametrize(
+        ("raw", "expected", "warned"),
+        [
+            (None, 95.0, False),
+            ("80", 80.0, False),
+            ("100", 100.0, False),
+            ("high", 95.0, True),
+            ("150", 95.0, True),
+            ("0", 95.0, True),
+            ("nan", 95.0, True),
+        ],
+    )
+    def test_env_threshold(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        raw: str | None,
+        expected: float,
+        warned: bool,
+    ) -> None:
+        from cyberwave_edge_core.resource_monitor import (
+            RESOURCE_SATURATION_PERCENT_ENV,
+            resource_saturation_percent,
+        )
+
+        if raw is None:
+            monkeypatch.delenv(RESOURCE_SATURATION_PERCENT_ENV, raising=False)
+        else:
+            monkeypatch.setenv(RESOURCE_SATURATION_PERCENT_ENV, raw)
+
+        with caplog.at_level("WARNING"):
+            assert resource_saturation_percent() == expected
+        assert (RESOURCE_SATURATION_PERCENT_ENV in caplog.text) is warned
+
+    def test_monitor_clears_five_points_below(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cyberwave_edge_core.resource_monitor import RESOURCE_SATURATION_PERCENT_ENV
+
+        monkeypatch.setenv(RESOURCE_SATURATION_PERCENT_ENV, "85")
+        monitor = SystemResourceMonitor()
+
+        assert (monitor.saturation_percent, monitor.saturation_clear_percent) == (85.0, 80.0)

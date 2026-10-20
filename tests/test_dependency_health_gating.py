@@ -11,10 +11,9 @@ worse than not gating at all:
 
 * **The wait can delay a start but never prevent one.** The return value says
   whether the dependency reached healthy; the launch loop does not branch on it.
-  A skipped service is never created, so its health snapshot reads `removed`, and
-  `reconcile_driver_revival` deliberately ignores `removed` containers — removal
-  is an operator signal there. Skipping would strand the service until edge-core
-  restarts, with nothing to revive it. Docker's `unhealthy` is not terminal
+  A skipped service is never created, and `reconcile_driver_revival` acts only on
+  containers this process created. Skipping would strand the service until
+  edge-core restarts, with nothing to revive it. Docker's `unhealthy` is not terminal
   either: the healthcheck keeps running and a later probe can flip it back.
 
 * **At most one wait per (twin, dependency) per pass.** Four Go2 services declare
@@ -146,8 +145,8 @@ def test_the_launch_loop_never_branches_on_the_result() -> None:
     """The regression test for a stranded service.
 
     An earlier version returned False for an unhealthy dependency and the launch
-    loop skipped the service. Never created means a `removed` health snapshot,
-    which `reconcile_driver_revival` ignores by design — so the service stayed
+    loop skipped the service. Never created means nothing for
+    `reconcile_driver_revival` to bring back — so the service stayed
     down until edge-core restarted. The wait must be called for its side effect
     (the delay) and nothing else.
     """

@@ -486,21 +486,20 @@ class TestStartWorkerAfterDrivers:
 
 
 class TestDriverHealthReconciliation:
+    @staticmethod
+    def _docker_ps(monkeypatch: pytest.MonkeyPatch, *, running: list, all_: list) -> None:
+        monkeypatch.setattr(
+            startup,
+            "_list_driver_containers_or_none",
+            lambda *, include_stopped: all_ if include_stopped else running,
+        )
+
     def test_detects_driver_going_down(self, monkeypatch: pytest.MonkeyPatch) -> None:
         startup._DRIVER_HEALTH_PREVIOUS.clear()
         startup._DRIVER_HEALTH_PREVIOUS[TWIN_A_CONTAINER] = "running"
         startup._CONTAINER_TWIN_MAP[TWIN_A_CONTAINER] = TWIN_A
 
-        monkeypatch.setattr(
-            startup,
-            "_list_running_driver_containers",
-            lambda: [],
-        )
-        monkeypatch.setattr(
-            startup,
-            "_list_driver_containers",
-            lambda include_stopped: [TWIN_A_CONTAINER],
-        )
+        self._docker_ps(monkeypatch, running=[], all_=[TWIN_A_CONTAINER])
         monkeypatch.setattr(
             startup, "_send_alert_for_twin", MagicMock()
         )
@@ -517,16 +516,7 @@ class TestDriverHealthReconciliation:
         startup._DRIVER_HEALTH_PREVIOUS.clear()
         startup._DRIVER_HEALTH_PREVIOUS[TWIN_A_CONTAINER] = "running"
 
-        monkeypatch.setattr(
-            startup,
-            "_list_running_driver_containers",
-            lambda: [TWIN_A_CONTAINER],
-        )
-        monkeypatch.setattr(
-            startup,
-            "_list_driver_containers",
-            lambda include_stopped: [TWIN_A_CONTAINER],
-        )
+        self._docker_ps(monkeypatch, running=[TWIN_A_CONTAINER], all_=[TWIN_A_CONTAINER])
         alert_mock = MagicMock()
         monkeypatch.setattr(startup, "_send_alert_for_twin", alert_mock)
 
@@ -539,16 +529,7 @@ class TestDriverHealthReconciliation:
         """On the first reconcile cycle there is no previous state so no alerts."""
         startup._DRIVER_HEALTH_PREVIOUS.clear()
 
-        monkeypatch.setattr(
-            startup,
-            "_list_running_driver_containers",
-            lambda: [TWIN_A_CONTAINER],
-        )
-        monkeypatch.setattr(
-            startup,
-            "_list_driver_containers",
-            lambda include_stopped: [TWIN_A_CONTAINER],
-        )
+        self._docker_ps(monkeypatch, running=[TWIN_A_CONTAINER], all_=[TWIN_A_CONTAINER])
         alert_mock = MagicMock()
         monkeypatch.setattr(startup, "_send_alert_for_twin", alert_mock)
 
@@ -563,10 +544,7 @@ class TestDriverHealthReconciliation:
         startup._DRIVER_HEALTH_PREVIOUS[TWIN_A_CONTAINER] = "running"
         startup._CONTAINER_TWIN_MAP[TWIN_A_CONTAINER] = TWIN_A
 
-        monkeypatch.setattr(startup, "_list_running_driver_containers", lambda: [])
-        monkeypatch.setattr(
-            startup, "_list_driver_containers", lambda include_stopped: []
-        )
+        self._docker_ps(monkeypatch, running=[], all_=[])
         monkeypatch.setattr(startup, "_send_alert_for_twin", MagicMock())
 
         result = startup.reconcile_driver_health_for_worker()
@@ -599,8 +577,48 @@ class TestDriverRevivalReconciliation:
 
     def _reset_revival_state(self) -> None:
         startup._DRIVER_HEALTH_PREVIOUS.clear()
+        startup._DRIVER_HEALTH_STALE = False
         startup._CONTAINER_TWIN_MAP.clear()
+        startup._CONTAINER_RESTART_POLICY.clear()
         startup._LAST_REVIVAL_ATTEMPT_AT = None
+        startup._REMOVED_SINCE.clear()
+
+    @pytest.mark.parametrize(("grace_env", "revived"), [(None, True), ("0", False)])
+    def test_removed_managed_driver_is_relaunched_after_the_grace_period(
+        self, monkeypatch: pytest.MonkeyPatch, grace_env: str | None, revived: bool
+    ) -> None:
+        self._reset_revival_state()
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_A_CONTAINER] = "removed"
+        startup._DRIVER_HEALTH_PREVIOUS[TWIN_B_CONTAINER] = "removed"
+        startup._CONTAINER_TWIN_MAP[TWIN_A_CONTAINER] = TWIN_A
+        clock = [1000.0]
+        monkeypatch.setattr(startup.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(
+            startup,
+            "get_runtime_env_var",
+            lambda name, default=None: grace_env
+            if name == "CYBERWAVE_DRIVER_REMOVED_REVIVAL_SECONDS"
+            else default,
+        )
+        fetch_mock = MagicMock()
+        monkeypatch.setattr(startup, "fetch_and_run_twin_drivers", fetch_mock)
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: "fp")
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env")
+
+        startup.reconcile_driver_revival()
+        clock[0] += startup._REMOVED_REVIVAL_GRACE_SECONDS - 1
+        startup.reconcile_driver_revival()
+        fetch_mock.assert_not_called()
+
+        clock[0] += 2
+        startup.reconcile_driver_revival()
+        if revived:
+            fetch_mock.assert_called_once_with(
+                "tok", "env", "fp", only_container_names={TWIN_A_CONTAINER}
+            )
+        else:
+            fetch_mock.assert_not_called()
 
     def test_orphan_container_does_not_trigger_revival(
         self, monkeypatch: pytest.MonkeyPatch
@@ -690,6 +708,211 @@ class TestDriverRevivalReconciliation:
         assert summary["skipped_orphan"] == 1
         assert summary["down"] == 0
         assert startup._LAST_REVIVAL_ATTEMPT_AT is None
+
+
+class _Host:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.now = 1000.0
+        self.running: set[str] = set()
+        self.stopped: set[str] = set()
+        self.docker_policy: dict[str, str] = {}
+        self.failing: set[str] = set()
+        self.linked = True
+        self.revivals: list[set[str]] = []
+        self.alerts: list[str] = []
+        for name, value in {
+            "_CONTAINER_TWIN_MAP": {},
+            "_CONTAINER_RESTART_POLICY": {},
+            "_DRIVER_HEALTH_PREVIOUS": {},
+            "_DRIVER_HEALTH_STALE": False,
+            "_REMOVED_SINCE": {},
+            "_REMOVED_MISSES": {},
+            "_RESTART_FLOOR_DEFERRED": set(),
+            "_LAST_REVIVAL_ATTEMPT_AT": None,
+        }.items():
+            monkeypatch.setattr(startup, name, value)
+        monkeypatch.setattr(startup.shutil, "which", lambda _n: "/usr/bin/docker")
+        monkeypatch.setattr(startup.subprocess, "run", self._docker)
+        monkeypatch.setattr(startup.time, "monotonic", lambda: self.now)
+        monkeypatch.setattr("cyberwave_edge_core.docker_helpers.docker_inspect", self._inspect)
+        monkeypatch.setattr(startup, "fetch_and_run_twin_drivers", self._fetch)
+        monkeypatch.setattr(
+            startup, "_send_alert_for_twin", lambda twin, title, *a, **kw: self.alerts.append(title)
+        )
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda name, default=None: default)
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "load_saved_fingerprint", lambda: "fp")
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env")
+
+    def _docker(self, cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        verb = cmd[1]
+        if verb == "ps":
+            key = "ps -a" if "-a" in cmd else "ps"
+            if key in self.failing:
+                raise subprocess.TimeoutExpired(cmd, 10)
+            names = self.running | self.stopped if key == "ps -a" else self.running
+            return subprocess.CompletedProcess(cmd, 0, "".join(f"{n}\n" for n in names), "")
+        if verb == "update":
+            self.docker_policy[cmd[-1]] = "no"
+        elif verb == "stop":
+            self.running.discard(cmd[-1])
+            self.stopped.add(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def _inspect(self, name: str) -> dict | None:
+        if "inspect" in self.failing or name not in self.running | self.stopped:
+            return None
+        return {
+            "State": {"Status": "running" if name in self.running else "exited"},
+            "HostConfig": {"RestartPolicy": {"Name": self.docker_policy[name]}},
+            "Config": {"Labels": {}},
+        }
+
+    def launch(self, policy: str) -> None:
+        """What a successful ``_run_docker_image(..., restart=policy)`` leaves behind."""
+        startup._CONTAINER_TWIN_MAP[TWIN_A_CONTAINER] = TWIN_A
+        startup._CONTAINER_RESTART_POLICY[TWIN_A_CONTAINER] = policy
+        self.docker_policy[TWIN_A_CONTAINER] = policy
+        self.stopped.discard(TWIN_A_CONTAINER)
+        self.running.add(TWIN_A_CONTAINER)
+
+    def _fetch(self, *_a: object, only_container_names: set[str]) -> list[dict]:
+        self.revivals.append(set(only_container_names))
+        if not self.linked:
+            return []
+        self.launch(self.docker_policy[TWIN_A_CONTAINER])
+        return [{"twin_uuid": TWIN_A, "twin_name": "a", "driver_image": "i", "success": True}]
+
+    def stop(self) -> None:
+        self.running.discard(TWIN_A_CONTAINER)
+        self.stopped.add(TWIN_A_CONTAINER)
+
+    def remove(self) -> None:
+        self.running.discard(TWIN_A_CONTAINER)
+        self.stopped.discard(TWIN_A_CONTAINER)
+
+    def tick(self, seconds: float = 15.0) -> None:
+        self.now += seconds
+        startup.reconcile_driver_health_for_worker()
+        startup.reconcile_driver_revival()
+
+    def run_for(self, seconds: float) -> None:
+        for _ in range(int(seconds // 15)):
+            self.tick()
+
+
+class TestRemovedDriverRevival:
+    @pytest.fixture
+    def host(self, monkeypatch: pytest.MonkeyPatch) -> _Host:
+        return _Host(monkeypatch)
+
+    @pytest.mark.parametrize(("policy", "revived"), [("no", False), ("unless-stopped", True)])
+    def test_a_pruned_driver_comes_back_only_if_its_restart_policy_allows(
+        self, host: _Host, policy: str, revived: bool
+    ) -> None:
+        host.launch(policy)
+        host.tick()
+        host.remove()
+        host.tick()
+        host.run_for(startup._REMOVED_REVIVAL_GRACE_SECONDS - 15)
+        assert host.revivals == []
+
+        host.tick(2)
+        host.run_for(20 * 60)
+        assert host.revivals == ([{TWIN_A_CONTAINER}] if revived else [])
+
+    def test_a_driver_the_flap_detector_stopped_stays_down_once_pruned(self, host: _Host) -> None:
+        host.launch("unless-stopped")
+        host.tick()
+        assert startup._stop_driver_container(TWIN_A_CONTAINER)
+        host.run_for(5 * 60)
+        host.remove()
+        host.run_for(20 * 60)
+        assert host.revivals == []
+
+    @pytest.mark.parametrize("failing", [{"ps", "ps -a"}, {"ps -a"}])
+    def test_a_failed_docker_ps_changes_nothing(self, host: _Host, failing: set[str]) -> None:
+        host.launch("unless-stopped")
+        host.tick()
+        host.failing |= failing
+        host.tick()
+        assert startup._DRIVER_HEALTH_PREVIOUS == {TWIN_A_CONTAINER: "running"}
+        host.run_for(startup._REMOVED_REVIVAL_GRACE_SECONDS + 15)
+        assert host.alerts == []
+        assert host.revivals == []
+
+    def test_a_failed_running_list_recreates_nothing(self, host: _Host) -> None:
+        host.launch("unless-stopped")
+        host.tick()
+        host.failing.add("ps")
+        host.run_for(5 * 60)
+        assert host.alerts == []
+        assert host.revivals == []
+
+    @pytest.mark.parametrize("gone", ["exited", "removed"])
+    def test_revival_sits_out_the_ticks_whose_docker_ps_failed(
+        self, host: _Host, gone: str
+    ) -> None:
+        host.launch("unless-stopped")
+        host.tick()
+        host.linked = False
+        if gone == "exited":
+            host.stop()
+        else:
+            host.remove()
+        host.run_for(startup._REMOVED_REVIVAL_GRACE_SECONDS + 15)
+        attempts, alerts = len(host.revivals), list(host.alerts)
+        assert attempts >= 1
+
+        host.failing |= {"ps", "ps -a", "inspect"}
+        host.run_for(5 * 60)
+        assert len(host.revivals) == attempts
+        assert host.alerts == alerts
+
+        host.failing.clear()
+        host.linked = True
+        host.run_for(60)
+        assert TWIN_A_CONTAINER in host.running
+
+    @pytest.mark.parametrize(("policy", "revived"), [("no", False), ("unless-stopped", True)])
+    def test_an_uninspectable_exited_driver_keeps_its_recorded_restart_policy(
+        self, host: _Host, policy: str, revived: bool
+    ) -> None:
+        host.launch(policy)
+        host.tick()
+        host.failing.add("inspect")
+        host.stop()
+        host.run_for(5 * 60)
+        assert host.revivals == ([{TWIN_A_CONTAINER}] if revived else [])
+
+    def test_a_removed_driver_of_an_unlinked_twin_is_forgotten_after_repeated_misses(
+        self, host: _Host
+    ) -> None:
+        host.launch("unless-stopped")
+        host.tick()
+        host.linked = False
+        host.remove()
+        host.run_for(20 * 60)
+        assert host.revivals == [{TWIN_A_CONTAINER}] * startup._REMOVED_FORGET_AFTER_MISSES
+        assert TWIN_A_CONTAINER not in startup._CONTAINER_TWIN_MAP
+        assert TWIN_A_CONTAINER not in startup._DRIVER_HEALTH_PREVIOUS
+        assert TWIN_A_CONTAINER not in startup._REMOVED_SINCE
+        assert TWIN_A_CONTAINER not in startup._REMOVED_MISSES
+
+    def test_one_pass_without_a_spec_does_not_cancel_the_revival(self, host: _Host) -> None:
+        host.launch("unless-stopped")
+        host.tick()
+        host.linked = False
+        host.remove()
+        host.run_for(startup._REMOVED_REVIVAL_GRACE_SECONDS + 30)
+        assert host.revivals == [{TWIN_A_CONTAINER}]
+
+        host.linked = True
+        host.run_for(5 * 60)
+
+        assert host.revivals == [{TWIN_A_CONTAINER}, {TWIN_A_CONTAINER}]
+        assert TWIN_A_CONTAINER in host.running
+        assert TWIN_A_CONTAINER not in startup._REMOVED_MISSES
 
 
 # ---------------------------------------------------------------------------

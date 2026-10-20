@@ -25,8 +25,19 @@ _DEFAULT_DRIVER_CREATE_TIMEOUT_SECONDS = 30
 _DEFAULT_DRIVER_STARTUP_PROBE_SECONDS = 120
 _DEFAULT_DRIVER_START_RECOVERY_SECONDS = 30
 _DEFAULT_DRIVER_REMOVE_TIMEOUT_SECONDS = 60
+_CREATE_TIMEOUT_GRACE_SECONDS = 10.0
 
 GetRuntimeEnvVar = Callable[[str, Any], Any]
+
+
+def _wait_for_container(container_name: str, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if docker_helpers.docker_inspect(container_name) is not None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(1.0)
 
 
 def driver_startup_probe_seconds(get_runtime_env_var: GetRuntimeEnvVar) -> int:
@@ -300,12 +311,17 @@ def launch_detached_container(
         on_failure(f"Failed to create container {container_name}.", "docker_create_failed")
         return False
     except subprocess.TimeoutExpired:
-        logger.error("Docker create timed out for container %s", container_name)
-        on_failure(
-            f"Docker create timed out for container {container_name}.",
-            "docker_create_timeout",
+        if not _wait_for_container(container_name, _CREATE_TIMEOUT_GRACE_SECONDS):
+            logger.error("Docker create timed out for container %s", container_name)
+            on_failure(
+                f"Docker create timed out for container {container_name}.",
+                "docker_create_timeout",
+            )
+            return False
+        logger.warning(
+            "Docker create timed out for container %s, but the daemon created it; starting it",
+            container_name,
         )
-        return False
 
     for network in extra_networks:
         try:

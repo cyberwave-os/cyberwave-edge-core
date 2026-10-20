@@ -1,35 +1,4 @@
-"""End-to-end-ish regression test for the systemd ``Type=notify`` boot path.
-
-This test catches the 0.1.4.1459 → 0.1.4.1463 regression in which
-``ProcessWatchdog.start()`` silently dropped ``READY=1`` whenever it
-ran in a process whose PID did not equal ``$WATCHDOG_PID`` — the
-canonical case being the PyInstaller ``--onefile`` bootloader (holds
-``MainPID``) forking the actual Python app into a child (whose PID
-differs).  Under ``Type=notify`` the unit then timed out at
-``TimeoutStartSec``.
-
-Two layers of coverage:
-
-1. :func:`test_mark_ready_from_subprocess_with_pid_mismatch` is a
-   fully portable, no-systemd-required regression test that runs on
-   any POSIX host (Linux + macOS).  The parent test process binds a
-   real ``AF_UNIX`` ``SOCK_DGRAM`` socket as a fake ``$NOTIFY_SOCKET``,
-   sets ``$WATCHDOG_PID`` to a deliberately wrong PID (so the child's
-   ``os.getpid()`` cannot match), spawns a Python subprocess that
-   imports the watchdog module and calls
-   :meth:`ProcessWatchdog.mark_ready`, and asserts the parent receives
-   a ``READY=1`` datagram.  Subprocess (rather than ``os.fork``) is
-   used so the test is safe in a multi-threaded pytest worker on
-   macOS, where fork from a threaded process is unsupported.
-
-2. :func:`test_service_reaches_active_under_systemd_run` is the full
-   systemd integration check.  Skipped automatically on macOS / when
-   no user systemd is reachable; on a Linux host with
-   ``systemctl --user`` it runs ``systemd-run --service-type=notify``
-   against a tiny script that mirrors the production handoff
-   (``mark_ready`` → ``start_pinging`` → sleep) and polls
-   ``systemctl --user is-active`` for ``active`` within 30 s.
-"""
+"""Readiness and bounded lifecycle checks with portable and real-systemd coverage."""
 
 from __future__ import annotations
 
@@ -71,11 +40,6 @@ def _short_unix_socket_path() -> Iterator[Path]:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Layer 1 — portable subprocess-based regression (runs on macOS + Linux)
-# ---------------------------------------------------------------------------
-
-
 _CHILD_SCRIPT = textwrap.dedent(
     """
     import sys
@@ -88,24 +52,12 @@ _CHILD_SCRIPT = textwrap.dedent(
 
 
 def test_mark_ready_from_subprocess_with_pid_mismatch() -> None:
-    """Regression for 0.1.4.1459 → 0.1.4.1463.
-
-    Simulates the PyInstaller ``--onefile`` shape: a parent process
-    (the bootloader, in production) holds the systemd-designated
-    ``WATCHDOG_PID``, while the actual app runs in a child whose PID
-    differs.  Pre-fix the child's ``READY=1`` was silently dropped by
-    the ``WATCHDOG_PID`` guard inside
-    :func:`cyberwave_edge_core.watchdog._sd_notify` and the unit timed
-    out at ``TimeoutStartSec``.  Post-fix it reaches the notify socket.
-    """
+    """A PyInstaller child must notify readiness despite a different WATCHDOG_PID."""
     with _short_unix_socket_path() as sock_path:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         server.bind(str(sock_path))
         server.settimeout(10.0)
         try:
-            # Pick a PID the child cannot possibly own.  ``os.getpid()`` of
-            # this test process is fine because the child gets a different
-            # PID by definition.
             fake_watchdog_pid = os.getpid()
 
             env = os.environ.copy()
@@ -125,14 +77,6 @@ def test_mark_ready_from_subprocess_with_pid_mismatch() -> None:
             assert child.returncode == 0, (
                 f"child failed: stdout={child.stdout!r} stderr={child.stderr!r}"
             )
-            assert os.getpid() != fake_watchdog_pid or True  # documentation
-            # Sanity: the child's PID differs from the recorded
-            # ``WATCHDOG_PID``; otherwise the test does not actually
-            # exercise the regression.  We can't read the child's PID
-            # after the fact, but ``Popen`` always allocates a new PID
-            # different from the parent's, and we set ``WATCHDOG_PID``
-            # to the parent's PID.
-
             try:
                 data, _addr = server.recvfrom(256)
             except socket.timeout:
@@ -147,48 +91,30 @@ def test_mark_ready_from_subprocess_with_pid_mismatch() -> None:
             server.close()
 
 
-# ---------------------------------------------------------------------------
-# Layer 2 — full systemd-run integration (Linux + systemctl --user only)
-# ---------------------------------------------------------------------------
+def _systemd_scope() -> list[str]:
+    return [] if os.environ.get("CYBERWAVE_TEST_SYSTEMD_SYSTEM") == "1" else ["--user"]
 
 
-def _have_user_systemd() -> bool:
-    """Best-effort detection of a reachable per-user systemd instance."""
-    if sys.platform != "linux":
-        return False
-    if not shutil.which("systemd-run") or not shutil.which("systemctl"):
-        return False
-    if os.environ.get("XDG_RUNTIME_DIR") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "is-system-running"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return False
-    # 0 (running) / 1 (degraded) / 5 (offline) — anything other than
-    # "couldn't talk to dbus" is good enough.  ``is-system-running``
-    # returns non-zero when the bus is missing, which we reject.
-    return result.returncode in (0, 1, 5)
+@pytest.fixture
+def live_systemd():
+    available = False
+    if sys.platform == "linux" and shutil.which("systemd-run") and shutil.which("systemctl"):
+        try:
+            result = subprocess.run(
+                ["systemctl", *_systemd_scope(), "is-system-running"],
+                capture_output=True, text=True, timeout=3,
+            )
+            available = result.stdout.strip() in {"running", "degraded"}
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not available:
+        message = "A running Linux systemd manager is required"
+        if os.environ.get("CYBERWAVE_REQUIRE_SYSTEMD_TESTS") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
 
 
-@pytest.mark.skipif(
-    not _have_user_systemd(),
-    reason="systemctl --user not reachable; integration test requires Linux + user systemd",
-)
-def test_service_reaches_active_under_systemd_run(tmp_path: Path) -> None:
-    """A ``Type=notify`` unit running our two-phase handoff must reach ``active``.
-
-    Mirrors the production boot path in miniature: ``mark_ready`` (the
-    PID-unrestricted ``READY=1``) followed by ``start_pinging`` (the
-    PID-restricted ``WATCHDOG=1`` loop) followed by a sleep, all
-    inside a transient ``systemd-run --user --service-type=notify``
-    unit.  A failure here means a future change reintroduced the
-    silent-drop bug.
-    """
+def test_service_reaches_active_under_systemd_run(tmp_path: Path, live_systemd) -> None:
     unit_name = f"cw-edgecore-notify-regression-{uuid.uuid4().hex[:8]}"
 
     script_path = tmp_path / "edge_core_notify_simulator.py"
@@ -211,7 +137,7 @@ def test_service_reaches_active_under_systemd_run(tmp_path: Path) -> None:
     systemd_run = subprocess.run(
         [
             "systemd-run",
-            "--user",
+            *_systemd_scope(),
             f"--unit={unit_name}",
             "--service-type=notify",
             "--property=TimeoutStartSec=30s",
@@ -232,7 +158,7 @@ def test_service_reaches_active_under_systemd_run(tmp_path: Path) -> None:
         state = ""
         while time.monotonic() < deadline:
             result = subprocess.run(
-                ["systemctl", "--user", "is-active", unit_name],
+                ["systemctl", *_systemd_scope(), "is-active", unit_name],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -243,7 +169,7 @@ def test_service_reaches_active_under_systemd_run(tmp_path: Path) -> None:
             if state in {"failed", "inactive"}:
                 # Capture the unit journal for the failure message.
                 journal = subprocess.run(
-                    ["journalctl", "--user", "-u", unit_name, "--no-pager"],
+                    ["journalctl", *_systemd_scope(), "-u", unit_name, "--no-pager"],
                     capture_output=True,
                     text=True,
                     timeout=5,
@@ -259,14 +185,110 @@ def test_service_reaches_active_under_systemd_run(tmp_path: Path) -> None:
         )
     finally:
         subprocess.run(
-            ["systemctl", "--user", "stop", unit_name],
+            ["systemctl", *_systemd_scope(), "stop", unit_name],
             capture_output=True,
             text=True,
             timeout=5,
         )
         subprocess.run(
-            ["systemctl", "--user", "reset-failed", unit_name],
+            ["systemctl", *_systemd_scope(), "reset-failed", unit_name],
             capture_output=True,
             text=True,
             timeout=5,
         )
+
+
+@pytest.mark.parametrize("action", ["startup_timeout", "restart", "stop"])
+def test_stalled_service_lifecycle(tmp_path, live_systemd, action):
+    unit = f"cw-edgecore-lifecycle-{uuid.uuid4().hex[:8]}.service"
+    script = tmp_path / "stalled_boot.py"
+    script.write_text(textwrap.dedent(f"""
+        import signal, sys, time
+        from pathlib import Path
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
+        from cyberwave_edge_core.watchdog import ProcessWatchdog
+        watchdog = ProcessWatchdog()
+        watchdog._startup_deadline = time.monotonic() + 3
+        signal.signal(signal.SIGTERM, lambda *_: watchdog.begin_shutdown())
+        watchdog.extend_timeout(30)
+        Path({str(tmp_path / 'booting')!r}).touch()
+        while True:
+            watchdog.extend_timeout(30)
+            time.sleep(0.05)
+    """))
+
+    def control(*args):
+        return subprocess.run(
+            ["systemctl", *_systemd_scope(), *args],
+            capture_output=True, text=True, timeout=5,
+        )
+
+    def state():
+        result = control("show", unit, "--all", "--property=ActiveState,MainPID,Job,Result")
+        assert result.returncode == 0, result.stderr
+        return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            fields = state()
+            if predicate(fields):
+                return fields
+            time.sleep(0.1)
+        pytest.fail(f"Service lifecycle did not complete: {fields}")
+
+    try:
+        result = subprocess.run(
+            ["systemd-run", *_systemd_scope(), f"--unit={unit}", "--no-block",
+             "--service-type=notify", "--property=TimeoutStartSec=2s",
+             "--property=TimeoutStopSec=1s", "--property=KillMode=control-group",
+             "--property=SendSIGKILL=yes", "--property=Restart=no",
+             sys.executable, str(script)],
+            capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+        initial = wait_for(lambda f: f["ActiveState"] == "activating" and f["MainPID"] != "0")
+        wait_for(lambda f: (tmp_path / "booting").exists())
+        if action != "startup_timeout":
+            result = control(action, "--no-block", unit)
+            assert result.returncode == 0, result.stderr
+            if action == "restart":
+                wait_for(lambda f: f["MainPID"] not in {"0", initial["MainPID"]})
+                result = control("stop", "--no-block", unit)
+                assert result.returncode == 0, result.stderr
+        final = wait_for(lambda f: f["ActiveState"] in {"inactive", "failed"}
+                         and f["MainPID"] == "0" and f["Job"] in {"", "0"})
+        if action in {"startup_timeout", "stop"}:
+            assert final["Result"] == "timeout"
+    finally:
+        control("stop", "--no-block", unit)
+        control("kill", "--signal=SIGKILL", unit)
+        control("reset-failed", unit)
+
+
+def test_sigterm_during_startup_never_announces_ready(monkeypatch):
+    import signal
+    import threading
+    from click.testing import CliRunner
+    from cyberwave_edge_core import main, watchdog, startup, resource_monitor
+
+    event = threading.Event()
+    monkeypatch.setattr(main, "shutdown_event", event)
+    handlers, notifications, cleaned = {}, [], []
+    monkeypatch.setattr(main.signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler))
+    monkeypatch.setattr(watchdog, "protect_edge_core_oom", lambda: None)
+    monkeypatch.setattr(watchdog, "_NOTIFY_SOCKET", "/run/systemd/notify")
+    monkeypatch.setattr(watchdog, "_sd_notify", notifications.append)
+    monkeypatch.setattr(resource_monitor.SystemResourceMonitor, "check", lambda self: None)
+    monkeypatch.setattr(startup, "_graceful_shutdown", lambda worker: cleaned.append(worker))
+    def boot(**kwargs):
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        kwargs["watchdog"].extend_timeout(30)
+        return True
+    monkeypatch.setattr(main, "run_startup_checks", boot)
+    result = CliRunner().invoke(main.cli, [])
+    assert result.exit_code == 0, result.output
+    assert cleaned == [None]
+    assert "STOPPING=1" in notifications
+    assert "READY=1" not in notifications
+    assert not any(s.startswith("EXTEND_TIMEOUT") for s in notifications)

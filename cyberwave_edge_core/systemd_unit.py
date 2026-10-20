@@ -30,6 +30,8 @@ hidden command beyond starting the ``cyberwave-edge-core`` binary itself.
 from __future__ import annotations
 
 import enum
+import json
+import logging
 import os
 import re
 import subprocess
@@ -46,6 +48,11 @@ DEFAULT_BINARY_PATH = "/usr/bin/cyberwave-edge-core"
 UPDATE_GUARD_PATH = "/usr/lib/cyberwave-edge-core/update-guard"
 CONFIG_DIR_ENV_VAR = "CYBERWAVE_EDGE_CONFIG_DIR"
 SYSTEMD_RUNTIME_DIR = Path("/run/systemd/system")
+STARTUP_TIMEOUT_ENV_VAR = "CYBERWAVE_STARTUP_TIMEOUT_MINUTES"
+DEFAULT_STARTUP_TIMEOUT_MINUTES = 30
+JOB_TIMEOUT_MARGIN_MINUTES = 5
+
+logger = logging.getLogger(__name__)
 
 # The update guard (plan B2) is shipped by a later package version. Until it
 # lands the file does not exist, and even afterwards a manually installed
@@ -63,13 +70,12 @@ UPDATE_GUARD_EXEC_START_PRE = (
     f"-/bin/sh -c 'if [ -x {UPDATE_GUARD_PATH} ]; then exec {UPDATE_GUARD_PATH}; fi'"
 )
 
-# Keep functionally identical to the template the CLI wrote before B1
-# (``cyberwave_cli/core.py``), apart from the ``ExecStartPre=`` line.
 UNIT_TEMPLATE = textwrap.dedent("""\
     [Unit]
     Description=Cyberwave Edge Core Orchestrator
     After=network-online.target docker.service
     Wants=network-online.target docker.service
+    JobTimeoutSec={job_timeout_minutes}min
 
     [Service]
     Type=notify
@@ -80,6 +86,9 @@ UNIT_TEMPLATE = textwrap.dedent("""\
     RestartSec=5
     WatchdogSec=60
     TimeoutStartSec=900
+    TimeoutStopSec=90
+    KillMode=control-group
+    SendSIGKILL=yes
     Environment=CYBERWAVE_EDGE_CONFIG_DIR={config_dir}
     OOMScoreAdjust=-800
     StandardOutput=journal
@@ -114,13 +123,57 @@ class EnsureResult:
     daemon_reload_error: Optional[str] = None
 
 
-def render_unit(*, binary_path: str, config_dir: str) -> str:
+def render_unit(
+    *,
+    binary_path: str,
+    config_dir: str,
+    startup_timeout_minutes: int = DEFAULT_STARTUP_TIMEOUT_MINUTES,
+) -> str:
     """Render the unit file for ``binary_path`` and ``config_dir``."""
     return UNIT_TEMPLATE.format(
         exec_start_pre=UPDATE_GUARD_EXEC_START_PRE,
         binary_path=binary_path,
         config_dir=config_dir,
+        job_timeout_minutes=startup_timeout_minutes + JOB_TIMEOUT_MARGIN_MINUTES,
     )
+
+
+def resolve_startup_timeout_minutes(
+    config_dir: Optional[str] = None, *, include_process_env: bool = True
+) -> int:
+    """Startup budget in minutes: process env, else ``credentials.json`` in *config_dir*, else 30.
+
+    Drives both the watchdog's extension cap and the unit's ``JobTimeoutSec``.
+    """
+    from_env = os.getenv(STARTUP_TIMEOUT_ENV_VAR, "").strip() if include_process_env else ""
+    raw = from_env or _credentials_env(
+        Path(config_dir or default_config_dir()), STARTUP_TIMEOUT_ENV_VAR
+    )
+    if not raw:
+        return DEFAULT_STARTUP_TIMEOUT_MINUTES
+    try:
+        minutes = int(raw)
+    except ValueError:
+        minutes = 0
+    if minutes <= 0:
+        logger.warning(
+            "Ignoring %s=%r: expected a positive number of minutes; using %d",
+            STARTUP_TIMEOUT_ENV_VAR,
+            raw,
+            DEFAULT_STARTUP_TIMEOUT_MINUTES,
+        )
+        return DEFAULT_STARTUP_TIMEOUT_MINUTES
+    return minutes
+
+
+def _credentials_env(config_dir: Path, name: str) -> str:
+    try:
+        data = json.loads((config_dir / "credentials.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    envs = data.get("envs") if isinstance(data, dict) else None
+    value = envs.get(name) if isinstance(envs, dict) else None
+    return value.strip() if isinstance(value, str) else ""
 
 
 def parse_existing_settings(unit_text: str) -> tuple[Optional[str], Optional[str]]:
@@ -235,9 +288,12 @@ def ensure_systemd_unit(
         return EnsureResult(EnsureOutcome.SKIPPED_NO_UNIT, unit_path)
 
     existing_exec, existing_config_dir = parse_existing_settings(existing or "")
+    config_dir = config_dir or existing_config_dir or default_config_dir()
     rendered = render_unit(
         binary_path=binary_path or existing_exec or DEFAULT_BINARY_PATH,
-        config_dir=config_dir or existing_config_dir or default_config_dir(),
+        config_dir=config_dir,
+        # The installer's shell is not the service's environment: read what the service reads.
+        startup_timeout_minutes=resolve_startup_timeout_minutes(config_dir, include_process_env=False),
     )
 
     if existing == rendered:

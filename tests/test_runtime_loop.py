@@ -309,6 +309,55 @@ class TestRuntimeLoopSyncCadence:
 
         assert ping_count[0] == 2
 
+    def test_pulled_metadata_changes_reach_the_restart_reconciler(self, monkeypatch):
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        changes = {"twin-a": frozenset({"audio_gain_db"})}
+        monkeypatch.setattr(
+            startup,
+            "reconcile_twin_json_file_sync",
+            lambda: {"tracked": 1, "changed": 0, "synced": 0, "metadata_changes": changes},
+        )
+        seen = []
+
+        class LoopWatchdog:
+            def ping(self):
+                pass
+
+        loop_watchdog = LoopWatchdog()
+
+        def failing_reconcile(arg, *, watchdog=None):
+            seen.append((arg, watchdog))
+            raise RuntimeError("restart boom")
+
+        monkeypatch.setattr(startup, "reconcile_driver_metadata_restarts", failing_reconcile)
+        self._stop_after(2, monkeypatch)
+
+        startup.run_runtime_loop(watchdog=loop_watchdog)
+
+        # The relaunch runs inside the loop, so it gets the loop's watchdog to ping.
+        assert seen == [(changes, loop_watchdog), (changes, loop_watchdog)]
+
+    def test_resource_saturation_follows_each_check(self, monkeypatch):
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        order = []
+
+        class FakeResourceMonitor:
+            def check(self):
+                order.append("check")
+
+        def failing_reconcile(monitor):
+            order.append("saturation")
+            raise RuntimeError("saturation boom")
+
+        monkeypatch.setattr(startup, "reconcile_resource_saturation", failing_reconcile)
+        self._stop_after(2, monkeypatch)
+
+        startup.run_runtime_loop(resource_monitor=FakeResourceMonitor())
+
+        assert order == ["check", "saturation", "check", "saturation"]
+
     def test_periodic_docker_cleanup_called(self, monkeypatch):
         """Verify _run_periodic_docker_cleanup is called each cycle."""
         self._patch_loop_deps(monkeypatch)

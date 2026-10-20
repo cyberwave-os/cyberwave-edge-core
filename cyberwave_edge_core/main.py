@@ -13,6 +13,7 @@ from . import __version__
 from .startup import (
     CONFIG_DIR,
     DEFAULT_API_URL,
+    bound_sdk_request_timeouts,
     check_mqtt_connection,
     get_runtime_env_var,
     load_environment_uuid,
@@ -91,10 +92,14 @@ def cli(ctx: click.Context) -> None:
         from .startup import LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS
         from .watchdog import ProcessWatchdog, protect_edge_core_oom
 
-        signal.signal(signal.SIGTERM, _sigterm_handler)
-
         protect_edge_core_oom()
         watchdog = ProcessWatchdog()
+
+        def request_shutdown(signum: int, frame: object) -> None:
+            _sigterm_handler(signum, frame)
+            watchdog.begin_shutdown()
+
+        signal.signal(signal.SIGTERM, request_shutdown)
         # Rebind systemd's ``MainPID`` to this process *before any other
         # notify-socket traffic*. Under PyInstaller ``--onefile`` the
         # bootloader holds the original ``MainPID`` / ``$WATCHDOG_PID``
@@ -123,6 +128,13 @@ def cli(ctx: click.Context) -> None:
         if not run_startup_checks(resource_monitor=resource_monitor, watchdog=watchdog):
             sys.exit(1)
 
+        if shutdown_event.is_set():
+            from .startup import _graceful_shutdown
+
+            _graceful_shutdown(None)
+            watchdog.stop()
+            return
+
         # Send READY=1 immediately after the blocking boot work (driver
         # images pulled, MQTT connected, twin sync reconciled) so
         # systemd transitions the unit to ``active`` well within
@@ -131,6 +143,7 @@ def cli(ctx: click.Context) -> None:
         # reconcile cycle thereafter.
         watchdog.mark_ready()
         watchdog.start_pinging(ping_interval_seconds=LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
+        bound_sdk_request_timeouts()
         try:
             run_runtime_loop(
                 watchdog=watchdog,

@@ -35,7 +35,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from cyberwave import Cyberwave
 from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
@@ -257,6 +257,8 @@ _CONTAINER_TWIN_MAP: dict[str, str] = {}
 # revival brings them back even when they are declared ``restart: "no"``.
 _RESTART_FLOOR_DEFERRED: set[str] = set()
 
+_CONTAINER_RESTART_POLICY: dict[str, str] = {}
+
 # Shared MQTT client for publishing driver log telemetry.
 _shared_mqtt_client: Optional[Any] = None
 _shared_mqtt_lock = threading.Lock()
@@ -434,6 +436,8 @@ _HANDLED_TWIN_COMMAND_REQUEST_IDS: deque[str] = deque(maxlen=1024)
 # path separators and traversal implicitly.
 _REMOVE_WORKER_FILENAME_RE = re.compile(r"^wf_[a-f0-9]{1,32}\.py$")
 _TWIN_FILE_CHECKSUMS: dict[str, str] = {}
+_TWIN_JSON_LAST_GOOD: dict[str, str] = {}
+_TWIN_JSON_REPAIR_WARNED: set[str] = set()
 _CONTAINER_LAST_RESTART_COUNT: dict[str, int] = {}
 _CONTAINER_RESTART_HISTORY: dict[str, deque[float]] = {}
 _EDGE_HEALTH_CHECK: Optional[Any] = None
@@ -636,13 +640,29 @@ def _read_edge_json() -> Optional[dict]:
 
 
 def _read_cameras_config() -> Optional[dict]:
-    """Return the camera config dict, preferring ``edge.json`` over ``cameras.json``."""
+    """Return the camera config dict, preferring ``edge.json`` over ``cameras.json``.
+
+    A twin only in ``cameras.json``'s ``twin_to_device`` keeps that entry; otherwise a network
+    camera whose URL never reached the backend falls back to the global USB ``selected_device``.
+    """
+    local = _read_cameras_json()
     edge_data = _read_edge_json()
     if edge_data:
         cameras = (edge_data.get("metadata") or {}).get("cameras")
         if isinstance(cameras, dict) and cameras:
+            local_map = local.get("twin_to_device") if isinstance(local, dict) else None
+            edge_map = cameras.get("twin_to_device")
+            edge_map = edge_map if isinstance(edge_map, dict) else {}
+            if isinstance(local_map, dict):
+                missing = {k: v for k, v in local_map.items() if k not in edge_map}
+                if missing:
+                    return {**cameras, "twin_to_device": {**edge_map, **missing}}
             return cameras
+    return local
 
+
+def _read_cameras_json() -> Optional[dict]:
+    """Return the CLI's local ``cameras.json``, or ``None``."""
     cameras_file = CONFIG_DIR / "cameras.json"
     if not cameras_file.exists():
         return None
@@ -807,6 +827,18 @@ def _is_linux_alsa_audio_driver_image(image: str) -> bool:
     )
 
 
+def _is_generic_webcam_driver_image(image: str) -> bool:
+    return "webcam" in image.lower()
+
+
+def _is_sensor_driver_image(image: str) -> bool:
+    return (
+        _is_camera_driver_image(image)
+        or _is_linux_alsa_audio_driver_image(image)
+        or _is_generic_webcam_driver_image(image)
+    )
+
+
 def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> list[str]:
     """Append ALSA passthrough for generic audio drivers on Linux.
 
@@ -848,26 +880,29 @@ def _ensure_linux_microphone_docker_params(image: str, params: list[str]) -> lis
     return updated
 
 
-def _ensure_linux_camera_docker_params(image: str, params: list[str]) -> list[str]:
-    """Expose host V4L stable-name symlinks to Linux camera containers.
+def _ensure_linux_camera_docker_params(
+    image: str, params: list[str], video_device: Optional[str] = None
+) -> list[str]:
+    """Mount the host's ``/dev/v4l`` read-only for camera images and for a *video_device* under it."""
+    from .docker_args import (
+        _docker_params_include_v4l_volume,
+        _extract_docker_volume_mappings,
+        _is_v4l_device_path,
+    )
 
-    ``--device /dev/videoN`` exposes only that device node. Serial selection
-    resolves through udev's separate ``/dev/v4l/by-id`` tree, whose relative
-    symlinks then target the already-passed-through ``/dev/videoN`` node.
-    """
-    if (
-        platform.system() != "Linux"
-        or not _is_camera_driver_image(image)
-        or not os.path.isdir("/dev/v4l")
-    ):
+    if platform.system() != "Linux" or not os.path.isdir("/dev/v4l"):
         return params
-
-    from .docker_args import _docker_params_include_v4l_volume
-
-    updated = list(params)
-    if not _docker_params_include_v4l_volume(updated):
-        updated.extend(["-v", "/dev/v4l:/dev/v4l:ro"])
-    return updated
+    if _is_camera_driver_image(image):
+        mounted = _docker_params_include_v4l_volume(params)
+    elif video_device and _is_v4l_device_path(video_device):
+        mounted = any(
+            host.rstrip("/") == container.rstrip("/")
+            and video_device.startswith(container.rstrip("/") + "/")
+            for host, container in _extract_docker_volume_mappings(params)
+        )
+    else:
+        return params
+    return params if mounted else [*params, "-v", "/dev/v4l:/dev/v4l:ro"]
 
 
 def _load_camera_stream_urls_for_twins(twin_uuids: list[str]) -> dict[str, str]:
@@ -1087,6 +1122,40 @@ def _resolve_mqtt_kwargs() -> dict[str, Any]:
     if mqtt_host:
         return {"mqtt_host": mqtt_host}
     return {}
+
+
+SDK_REQUEST_TIMEOUT_SECONDS = 10.0
+
+
+def bound_sdk_request_timeouts(seconds: float = SDK_REQUEST_TIMEOUT_SECONDS) -> None:
+    """Give SDK requests without a timeout a per-attempt one (idempotent; no-op if unpatchable).
+
+    Not a loop bound: urllib3's ``Retry(3)`` can stretch one GET to ~40 s, and calls add up.
+    """
+    import inspect
+
+    try:
+        from cyberwave.rest import rest
+    except ImportError:
+        return
+    original = rest.RESTClientObject.request
+    if getattr(original, "_cw_bounded", False):
+        return
+    parameters = list(inspect.signature(original).parameters)
+    if "_request_timeout" not in parameters:
+        return
+    position = parameters.index("_request_timeout") - 1  # among the arguments after self
+
+    def request(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if len(args) > position:
+            if args[position] is None:
+                args = (*args[:position], seconds, *args[position + 1 :])
+        elif kwargs.get("_request_timeout") is None:
+            kwargs["_request_timeout"] = seconds
+        return original(self, *args, **kwargs)
+
+    request._cw_bounded = True  # type: ignore[attr-defined]
+    rest.RESTClientObject.request = request
 
 
 def _get_shared_mqtt_client(token: str) -> Any:
@@ -1493,8 +1562,12 @@ from .driver_launcher import _run_docker_image, _run_macos_device_bridge_command
 
 def _list_driver_containers(*, include_stopped: bool) -> list[str]:
     """Return edge-core managed driver container names."""
+    return _list_driver_containers_or_none(include_stopped=include_stopped) or []
+
+
+def _list_driver_containers_or_none(*, include_stopped: bool) -> Optional[list[str]]:
     if not shutil.which("docker"):
-        return []
+        return None
 
     command = ["docker", "ps"]
     if include_stopped:
@@ -1518,7 +1591,7 @@ def _list_driver_containers(*, include_stopped: bool) -> list[str]:
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         logger.warning("Failed to list running driver containers: %s", exc)
-        return []
+        return None
 
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
@@ -1557,6 +1630,16 @@ def _split_image_tag(image: str) -> tuple[str, Optional[str]]:
     if not colon or "/" in tag:
         return image, None
     return repo, tag
+
+
+def _use_local_build(image: str) -> bool:
+    """True for a ``local``/``local-*``/``*-local`` tag on this host, which a pull would replace."""
+    if "@" in image:
+        return False
+    tag = _split_image_tag(image)[1]
+    if tag is None or not (tag == "local" or tag.startswith("local-") or tag.endswith("-local")):
+        return False
+    return _docker_image_exists_locally(image)
 
 
 def _resolve_driver_image_tag(image: str) -> str:
@@ -1652,8 +1735,11 @@ def _image_declared_services_for_twin(
     token: Optional[str],
     watchdog: Optional[Any] = None,
     refreshed_images: Optional[set[str]] = None,
+    refresh: bool = True,
 ) -> Optional[tuple[list[Any], dict[str, str], list[str]]]:
     """Service graph the twin's driver image declares, or None.
+
+    With *refresh* False an image on disk is read as it is; only a missing one is pulled.
 
     Consulted only when twin metadata carries no ``services`` array, so metadata
     stays authoritative and this path is dormant until a twin is trimmed.
@@ -1687,7 +1773,7 @@ def _image_declared_services_for_twin(
     # workflows). `refreshed_images` lets twins sharing an image pull it once.
     refreshed = refreshed_images if refreshed_images is not None else set()
     if (
-        _image_tag_can_move(image) and image not in refreshed
+        refresh and _image_tag_can_move(image) and image not in refreshed
     ) or not _docker_image_exists_locally(image):
         logger.info(
             "Pulling %s ahead of the main pull phase to read its declared topology",
@@ -1762,7 +1848,8 @@ def _pull_driver_images_parallel(
 
     Returns ``image -> success``.  Images already present locally are
     still re-pulled to pick up newer tags, but a failure with a local
-    copy on disk is treated as success.
+    copy on disk is treated as success. A local build already on the host
+    (a ``local`` tag, see ``_use_local_build``) is never pulled.
 
     When *pull_contexts_by_image* is provided, byte-level progress
     is fanned out to every twin sharing the image (alert metadata +
@@ -1782,6 +1869,12 @@ def _pull_driver_images_parallel(
         return {}
 
     results: dict[str, bool] = {}
+    for image in [img for img in unique_images if _use_local_build(img)]:
+        logger.info("Using the local build of %s; local-only tags are not pulled", image)
+        results[image] = True
+        unique_images.remove(image)
+    if not unique_images:
+        return results
     contexts_map = pull_contexts_by_image or {}
 
     # Worker threads write a *snapshot* (not the live tracker dataclass)
@@ -2067,6 +2160,7 @@ def _stop_driver_container(container_name: str) -> bool:
         )
         _CONTAINER_LOG_THREADS.pop(container_name, None)
         _CONTAINER_LOG_LAST_SEEN.pop(container_name, None)
+        _CONTAINER_RESTART_POLICY[container_name] = "no"
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         logger.warning("Failed to stop flapping driver container %s: %s", container_name, exc)
@@ -2170,6 +2264,7 @@ def reconcile_driver_restart_failures() -> dict[str, int]:
 
 
 _DRIVER_HEALTH_PREVIOUS: dict[str, str] = {}
+_DRIVER_HEALTH_STALE = False
 
 
 def reconcile_driver_health_for_worker() -> dict[str, str]:
@@ -2187,12 +2282,16 @@ def reconcile_driver_health_for_worker() -> dict[str, str]:
     alerts.  The alert types differ (``driver_health`` vs
     ``driver_restart_loop``), so this is informative rather than redundant.
     """
-    running = set(_list_running_driver_containers())
-    all_containers = set(_list_driver_containers(include_stopped=True))
+    global _DRIVER_HEALTH_STALE
+    running = _list_driver_containers_or_none(include_stopped=False)
+    all_containers = _list_driver_containers_or_none(include_stopped=True)
+    _DRIVER_HEALTH_STALE = running is None or all_containers is None
+    if _DRIVER_HEALTH_STALE:
+        return dict(_DRIVER_HEALTH_PREVIOUS)
     known = set(_DRIVER_HEALTH_PREVIOUS.keys())
 
     statuses: dict[str, str] = {}
-    for name in all_containers | known:
+    for name in set(all_containers) | known:
         if name in running:
             statuses[name] = "running"
         elif name in all_containers:
@@ -2234,6 +2333,35 @@ def reconcile_driver_health_for_worker() -> dict[str, str]:
 # debounce.
 _LAST_REVIVAL_ATTEMPT_AT: Optional[float] = None
 _REVIVAL_BACKOFF_SECONDS = 60
+_REMOVED_REVIVAL_GRACE_SECONDS = 300.0
+_REMOVED_SINCE: dict[str, float] = {}
+# Consecutive revival passes without a spec for a removed container: one miss may be a
+# swallowed backend error, not an unlinked twin.
+_REMOVED_MISSES: dict[str, int] = {}
+_REMOVED_FORGET_AFTER_MISSES = 3
+
+
+def _removed_containers_due(now: float) -> list[str]:
+    raw = get_runtime_env_var("CYBERWAVE_DRIVER_REMOVED_REVIVAL_SECONDS", None)
+    try:
+        grace = float(raw) if raw not in (None, "") else _REMOVED_REVIVAL_GRACE_SECONDS
+    except (TypeError, ValueError):
+        grace = _REMOVED_REVIVAL_GRACE_SECONDS
+    removed = {
+        name
+        for name, status in _DRIVER_HEALTH_PREVIOUS.items()
+        if status == "removed"
+        and name in _CONTAINER_TWIN_MAP
+        and (_CONTAINER_RESTART_POLICY.get(name) != "no" or name in _RESTART_FLOOR_DEFERRED)
+    }
+    for name in [n for n in _REMOVED_SINCE if n not in removed]:
+        del _REMOVED_SINCE[name]
+        _REMOVED_MISSES.pop(name, None)
+    for name in removed:
+        _REMOVED_SINCE.setdefault(name, now)
+    if grace <= 0:
+        return []
+    return sorted(name for name in removed if now - _REMOVED_SINCE[name] >= grace)
 
 
 def reconcile_driver_revival(
@@ -2250,21 +2378,13 @@ def reconcile_driver_revival(
     :func:`fetch_and_run_twin_drivers` to bring the missing container
     back up.
 
-    **Fully removed containers are intentionally not revived.**  When a
-    driver is gone from Docker entirely (``docker rm -f``,
-    ``docker system prune``, manual cleanup) the health snapshot
-    reports status ``removed`` and this reconciler leaves it alone.
-    Removal is treated as an explicit operator signal — auto-respawning
-    would fight the operator on planned takedowns, image swaps, and
-    debug sessions.  To bring such a container back, restart edge-core
-    or re-link the twin.
+    Fully removed containers are revived after :data:`_REMOVED_REVIVAL_GRACE_SECONDS`.
 
-    Only containers that this edge-core process is managing (tracked in
-    ``_CONTAINER_TWIN_MAP``) are eligible for revival.  Stopped driver
-    containers belonging to twins that are no longer linked to this edge
-    are treated as orphans and skipped, otherwise every revival cycle
-    would re-run :func:`fetch_and_run_twin_drivers` — which forcibly
-    recreates the *currently healthy* drivers as a side effect of
+    Only containers that this edge-core process started (tracked in
+    ``_CONTAINER_TWIN_MAP``) are eligible for revival.  Any other stopped
+    driver container is treated as an orphan and skipped, otherwise every
+    revival cycle would re-run :func:`fetch_and_run_twin_drivers` — which
+    forcibly recreates the *currently healthy* drivers as a side effect of
     iterating linked twins (CYB-2231).
 
     This complements:
@@ -2283,9 +2403,9 @@ def reconcile_driver_revival(
     tick — used when the flap detector just stopped a driver, so we
     don't immediately undo its decision.
 
-    An exited ``restart: "no"`` service stays down, unless its relaunch was
-    refused on its floor, and one with a ``min_restart_interval_s`` floor
-    waits until the floor has passed.
+    A ``restart: "no"`` service, or one the flap detector stopped, stays down
+    even once pruned, unless its relaunch was refused on its floor; one with
+    a ``min_restart_interval_s`` floor waits until the floor has passed.
 
     Returns a summary dict.  All values default to 0 so callers can log
     a single line regardless of which branch fired.
@@ -2301,8 +2421,12 @@ def reconcile_driver_revival(
         "skipped_no_credentials": 0,
         "revived_attempted": 0,
     }
+    if _DRIVER_HEALTH_STALE:
+        return summary
 
+    now = time.monotonic()
     all_down_names = [n for n, s in _DRIVER_HEALTH_PREVIOUS.items() if s == "down"]
+    all_down_names += _removed_containers_due(now)
     if not all_down_names:
         return summary
 
@@ -2331,7 +2455,6 @@ def reconcile_driver_revival(
         summary["skipped_flap_protection"] = len(down_names)
         return summary
 
-    now = time.monotonic()
     if (
         _LAST_REVIVAL_ATTEMPT_AT is not None
         and (now - _LAST_REVIVAL_ATTEMPT_AT) < _REVIVAL_BACKOFF_SECONDS
@@ -2364,7 +2487,7 @@ def reconcile_driver_revival(
     try:
         # Only the down containers: launching recreates its container, so an
         # unscoped pass would restart every healthy sibling as well.
-        fetch_and_run_twin_drivers(
+        results = fetch_and_run_twin_drivers(
             token,
             environment_uuid,
             fingerprint,
@@ -2372,43 +2495,83 @@ def reconcile_driver_revival(
         )
     except Exception:
         logger.exception("Driver revival run failed")
+        return summary
+
+    launched = {
+        driver_container_name(result["twin_uuid"], result.get("service_name"))
+        for result in results or []
+    }
+    for name in down_names:
+        if _DRIVER_HEALTH_PREVIOUS.get(name) != "removed":
+            continue
+        if name in launched:
+            _REMOVED_MISSES.pop(name, None)
+            continue
+        misses = _REMOVED_MISSES.get(name, 0) + 1
+        if misses < _REMOVED_FORGET_AFTER_MISSES:
+            _REMOVED_MISSES[name] = misses
+            logger.info(
+                "Removed driver container %s got no spec (%d/%d); retrying before forgetting it",
+                name,
+                misses,
+                _REMOVED_FORGET_AFTER_MISSES,
+            )
+            continue
+        logger.info("Forgetting removed driver container %s: no linked twin declares it", name)
+        _forget_driver_container(name)
 
     return summary
+
+
+def _forget_driver_container(name: str) -> None:
+    _CONTAINER_TWIN_MAP.pop(name, None)
+    _CONTAINER_RESTART_POLICY.pop(name, None)
+    _DRIVER_HEALTH_PREVIOUS.pop(name, None)
+    _REMOVED_SINCE.pop(name, None)
+    _REMOVED_MISSES.pop(name, None)
+
+
+def _restart_floor_seconds(inspect: dict[str, Any]) -> int:
+    from .docker_helpers import MIN_RESTART_INTERVAL_LABEL
+
+    config = inspect.get("Config") if isinstance(inspect.get("Config"), dict) else {}
+    labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+    try:
+        return int(labels.get(MIN_RESTART_INTERVAL_LABEL) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _revivable_driver_containers(down_names: list[str], summary: dict[str, int]) -> list[str]:
     """The down containers revival may recreate now, counting the rest in *summary*.
 
-    An uninspectable container is revived as before.
+    An uninspectable container is judged on the restart policy it was launched with.
     """
-    from .docker_helpers import MIN_RESTART_INTERVAL_LABEL, docker_inspect
+    from .docker_helpers import docker_inspect
     from .driver_launcher import _restart_floor_decision
 
     eligible: list[str] = []
     for name in down_names:
         inspect = docker_inspect(name)
-        if not isinstance(inspect, dict):
-            eligible.append(name)
-            continue
-        host_config = inspect.get("HostConfig")
-        host_config = host_config if isinstance(host_config, dict) else {}
-        policy = host_config.get("RestartPolicy")
-        policy = policy if isinstance(policy, dict) else {}
+        if isinstance(inspect, dict):
+            host_config = inspect.get("HostConfig")
+            host_config = host_config if isinstance(host_config, dict) else {}
+            policy = host_config.get("RestartPolicy")
+            policy = policy if isinstance(policy, dict) else {}
+            restart = str(policy.get("Name") or "")
+        else:
+            inspect = {}
+            restart = _CONTAINER_RESTART_POLICY.get(name, "")
         # restart=no is about the driver exiting on its own, not about the
         # stop-then-refuse edge-core did itself (a restart inside the floor).
-        if str(policy.get("Name") or "") == "no" and name not in _RESTART_FLOOR_DEFERRED:
+        if restart == "no" and name not in _RESTART_FLOOR_DEFERRED:
             summary["skipped_restart_no"] += 1
             logger.debug(
                 "Driver container %s exited and is declared restart=no; leaving it stopped",
                 name,
             )
             continue
-        config = inspect.get("Config") if isinstance(inspect.get("Config"), dict) else {}
-        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
-        try:
-            floor_s = int(labels.get(MIN_RESTART_INTERVAL_LABEL) or 0)
-        except (TypeError, ValueError):
-            floor_s = 0
+        floor_s = _restart_floor_seconds(inspect)
         if floor_s > 0:
             decision, detail = _restart_floor_decision(inspect, min_restart_interval_s=floor_s)
             if decision == "refuse":
@@ -2499,13 +2662,83 @@ def _start_camera_config_drift_restart(token: str) -> None:
     worker.start()
 
 
+SENSOR_DEVICE_MISSING_ALERT = "sensor_device_missing"
+_SENSOR_DEVICE_CHECKS_TO_FLIP = 2
+_MISSING_SENSOR_DEVICES: dict[str, str] = {}
+_SENSOR_DEVICE_STREAKS: dict[str, int] = {}
+_SENSOR_DEVICE_ALERTS_CLEARED: set[str] = set()
+
+
+def _resolve_sensor_device_alert(twin_uuid: str) -> bool:
+    try:
+        resolve_active_alerts_for_twin(twin_uuid, SENSOR_DEVICE_MISSING_ALERT, strict=True)
+    except Exception:
+        logger.warning(
+            "Could not resolve %s for twin %s; retrying", SENSOR_DEVICE_MISSING_ALERT, twin_uuid
+        )
+        return False
+    _SENSOR_DEVICE_ALERTS_CLEARED.add(twin_uuid)
+    return True
+
+
+def reconcile_sensor_device_presence(exists: Callable[[str], bool] = os.path.exists) -> None:
+    """Alert while a managed camera twin's pinned ``/dev`` node is missing."""
+    data = _read_cameras_config() or {}
+    mapping = data.get("twin_to_device") if isinstance(data.get("twin_to_device"), dict) else {}
+    managed_twins = set(_CONTAINER_TWIN_MAP.values())
+    checked: set[str] = set()
+    for twin_uuid in mapping:
+        if twin_uuid not in managed_twins:
+            continue
+        device = _load_selected_camera_device(twin_uuid)
+        if not device or not device.startswith("/dev/"):
+            continue
+        checked.add(twin_uuid)
+        missing = not exists(device)
+        if missing == (twin_uuid in _MISSING_SENSOR_DEVICES):
+            _SENSOR_DEVICE_STREAKS.pop(twin_uuid, None)
+            if not missing and twin_uuid not in _SENSOR_DEVICE_ALERTS_CLEARED:
+                _resolve_sensor_device_alert(twin_uuid)
+            continue
+        streak = _SENSOR_DEVICE_STREAKS.get(twin_uuid, 0) + 1
+        if streak < _SENSOR_DEVICE_CHECKS_TO_FLIP:
+            _SENSOR_DEVICE_STREAKS[twin_uuid] = streak
+            continue
+        _SENSOR_DEVICE_STREAKS.pop(twin_uuid, None)
+        if missing:
+            _MISSING_SENSOR_DEVICES[twin_uuid] = device
+            logger.warning("Pinned sensor device %s of twin %s is missing", device, twin_uuid)
+            try:
+                _send_alert_for_twin(
+                    twin_uuid,
+                    "Sensor device missing",
+                    f"The pinned device {device} is not present on the edge host.",
+                    SENSOR_DEVICE_MISSING_ALERT,
+                    severity="error",
+                    metadata={"device": device},
+                )
+            except Exception:
+                logger.warning(
+                    "Could not raise %s for twin %s", SENSOR_DEVICE_MISSING_ALERT, twin_uuid
+                )
+        else:
+            logger.info("Pinned sensor device %s of twin %s is back", device, twin_uuid)
+            if _resolve_sensor_device_alert(twin_uuid):
+                del _MISSING_SENSOR_DEVICES[twin_uuid]
+
+    for twin_uuid in [t for t in _SENSOR_DEVICE_STREAKS if t not in checked]:
+        del _SENSOR_DEVICE_STREAKS[twin_uuid]
+    for twin_uuid in [t for t in _MISSING_SENSOR_DEVICES if t not in checked]:
+        if _resolve_sensor_device_alert(twin_uuid):
+            del _MISSING_SENSOR_DEVICES[twin_uuid]
+
+
 def reconcile_camera_config_drift() -> bool:
-    """Detect ``cameras.json`` changes and trigger a targeted driver restart.
+    """Detect ``cameras.json`` changes and restart the edge when a driver's device drifted.
 
     Compares the video device in ``cameras.json`` against what each running
-    driver container was launched with.  When they diverge, the stale
-    container is removed and edge-core re-runs driver startup so the new
-    device is picked up — no full service restart required.
+    driver container was launched with.  When they diverge, the whole edge is
+    restarted (``_perform_edge_core_restart``), not just the drifted driver.
 
     NOTE (CYB-2004): this function reads ``edge.json`` and ``cameras.json``
     mtimes alongside ``docker inspect`` env vars.  It does not inspect any
@@ -2558,8 +2791,6 @@ def reconcile_camera_config_drift() -> bool:
     # otherwise each container is compared against the device its twin is
     # bound to.
     fallback_device = _load_selected_camera_device()
-    if fallback_device is None:
-        return False
 
     containers = _list_running_driver_containers()
     stale_containers: list[str] = []
@@ -2582,6 +2813,8 @@ def reconcile_camera_config_drift() -> bool:
             if container_twin_uuid
             else fallback_device
         ) or fallback_device
+        if desired_device is None:
+            continue
         if current_device != desired_device:
             logger.info(
                 "Camera config drift detected for %s (twin=%s): "
@@ -3053,6 +3286,7 @@ def fetch_and_run_twin_drivers(
     *,
     watchdog: Optional[Any] = None,
     only_container_names: Optional[set[str]] = None,
+    pull_images: bool = True,
 ) -> List[Dict[str, Any]]:
     """Fetch twins for the environment, match by edge fingerprint, and run drivers.
 
@@ -3067,6 +3301,10 @@ def fetch_and_run_twin_drivers(
 
     *only_container_names* limits the pull and launch passes to those
     containers; revival passes only the down ones, since launching recreates.
+
+    With *pull_images* False a driver relaunches on the image already on disk and only a
+    missing image is pulled: a settings restart applies settings, it does not upgrade the
+    driver, and it runs inside the runtime loop, whose watchdog a long pull would outlast.
 
     Returns a list of result dicts with twin info and whether the container
     started successfully.
@@ -3355,6 +3593,7 @@ def fetch_and_run_twin_drivers(
                     token=token,
                     watchdog=watchdog,
                     refreshed_images=refreshed_images,
+                    refresh=pull_images,
                 )
         except (RuntimeError, ValueError) as exc:
             # A declared bundle must not degrade to intelligence defaults,
@@ -3539,6 +3778,12 @@ def fetch_and_run_twin_drivers(
 
     if driver_specs:
         images_to_pull = [spec.driver_image for spec in driver_specs]
+        on_disk = (
+            set()
+            if pull_images
+            else {image for image in set(images_to_pull) if _docker_image_exists_locally(image)}
+        )
+        images_to_pull = [image for image in images_to_pull if image not in on_disk]
         # Fan-out map so progress on a shared image lands on every twin's
         # alert + ``driverlog`` topic, not just the first to claim it.
         pull_contexts_by_image: dict[str, list[_PullDeliveryContext]] = {}
@@ -3556,6 +3801,7 @@ def fetch_and_run_twin_drivers(
             pull_contexts_by_image=pull_contexts_by_image,
             token=token,
         )
+        pull_results.update(dict.fromkeys(on_disk, True))
     else:
         pull_results = {}
 
@@ -3677,10 +3923,9 @@ def fetch_and_run_twin_drivers(
         # this is the second half of the contract, waiting for the health state
         # the dependency's own healthcheck reports.
         #
-        # Called for its side effect -- the delay -- and never branched on: a
-        # service that is skipped is never created, and `reconcile_driver_revival`
-        # ignores a `removed` container by design, so nothing would revive it.
-        # The gate spends each dependency's budget at most once per pass.
+        # Called for its side effect -- the delay -- and never branched on: the
+        # service starts once the budget is spent, whatever the dependency's
+        # state. The gate spends each dependency's budget at most once per pass.
         #
         # A revival pass is scoped to the down containers and not closed over
         # `depends_on`: a revived dependency leaves its running dependents alone
@@ -3697,6 +3942,15 @@ def fetch_and_run_twin_drivers(
             f" (service={spec.service_name})" if spec.service_name else "",
             spec.twin.name,
         )
+        result_entry: Dict[str, Any] = {
+            "twin_uuid": spec.twin_uuid,
+            "twin_name": spec.twin.name,
+            "driver_image": spec.driver_image,
+            "success": False,
+        }
+        if spec.service_name:
+            result_entry["service_name"] = spec.service_name
+        results.append(result_entry)
         try:
             success = _run_docker_image(
                 spec.driver_image,
@@ -3715,15 +3969,7 @@ def fetch_and_run_twin_drivers(
                 driver_alert_ctx=alert_ctx,
                 **_driver_spec_lifecycle_kwargs(spec),
             )
-            result_entry: Dict[str, Any] = {
-                "twin_uuid": spec.twin_uuid,
-                "twin_name": spec.twin.name,
-                "driver_image": spec.driver_image,
-                "success": success,
-            }
-            if spec.service_name:
-                result_entry["service_name"] = spec.service_name
-            results.append(result_entry)
+            result_entry["success"] = success
             if success:
                 # Clears a stale driver_start_failure alert now that the start succeeded.
                 try:
@@ -5217,17 +5463,7 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if twin_json_file.exists():
-        with open(twin_json_file, "r+", encoding="utf-8") as file_handle:
-            file_handle.seek(0)
-            file_handle.write(rendered_json)
-            file_handle.truncate()
-            file_handle.flush()
-            os.fsync(file_handle.fileno())
-        if os.name != "nt":
-            try:
-                os.chmod(twin_json_file, 0o644)
-            except OSError:
-                pass
+        _rewrite_twin_json_in_place(twin_json_file, rendered_json)
     else:
         temp_path: str | None = None
         try:
@@ -5262,7 +5498,35 @@ def write_or_update_twin_json_file(twin_uuid: str, twin_data: dict, asset_data: 
         _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
     else:
         _TWIN_FILE_CHECKSUMS.pop(twin_uuid, None)
+    _TWIN_JSON_LAST_GOOD[twin_uuid] = rendered_json
+    _reset_driver_metadata_baseline(twin_uuid, twin_data.get("metadata"))
     return True
+
+
+def _rewrite_twin_json_in_place(twin_json_file: Path, rendered: str) -> None:
+    """Overwrite *twin_json_file* keeping its inode, which single-file bind mounts follow."""
+    data = rendered.encode("utf-8")
+    with tempfile.NamedTemporaryFile(
+        dir=twin_json_file.parent, prefix=f"{twin_json_file.stem}.", suffix=".tmp"
+    ) as probe:
+        probe.write(data)
+        probe.flush()
+        os.fsync(probe.fileno())
+        # No O_TRUNC, so the file is never empty; a shorter document is padded with spaces, which JSON ignores.
+    fd = os.open(twin_json_file, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    try:
+        view = memoryview(data.ljust(os.fstat(fd).st_size, b" "))
+        while view:
+            view = view[os.write(fd, view) :]
+        os.ftruncate(fd, len(data))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if os.name != "nt":
+        try:
+            os.chmod(twin_json_file, 0o644)
+        except OSError:
+            pass
 
 
 def _calculate_file_checksum(path: Path) -> Optional[str]:
@@ -5363,89 +5627,71 @@ def _coerce_twin_to_dict(twin: Any) -> dict[str, Any] | None:
     return None
 
 
-def _atomic_write_twin_json(twin_json_file: Path, rendered: str) -> bool:
-    """Write *rendered* into *twin_json_file* atomically via a same-dir temp."""
-    twin_json_file.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=twin_json_file.parent,
-            prefix=f"{twin_json_file.stem}.",
-            suffix=".tmp",
-            delete=False,
-            encoding="utf-8",
-        ) as temp_file:
-            temp_file.write(rendered)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-            temp_path = temp_file.name
-        if os.name != "nt":
-            try:
-                os.chmod(temp_path, 0o644)
-            except OSError:
-                pass
-        os.replace(temp_path, twin_json_file)
-        return True
-    except OSError as exc:
-        logger.warning("Failed to write twin JSON %s: %s", twin_json_file, exc)
-        return False
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                logger.debug("Could not remove temp twin JSON %s", temp_path, exc_info=True)
+def _changed_top_level_keys(old: Any, new: Any) -> frozenset[str]:
+    old_dict = old if isinstance(old, dict) else {}
+    new_dict = new if isinstance(new, dict) else {}
+    return frozenset(
+        key
+        for key in old_dict.keys() | new_dict.keys()
+        if key not in old_dict or key not in new_dict or old_dict[key] != new_dict[key]
+    )
 
 
 def _pull_twin_json_file_from_backend(
     client: Cyberwave, twin_uuid: str, twin_json_file: Path
-) -> bool:
-    """Apply backend-managed twin fields to the local JSON file.
+) -> Optional[frozenset[str]]:
+    """Apply backend-managed twin fields to the local JSON file, rewriting it in place.
 
-    Returns True when the local file was actually modified. Backend fields
-    listed in :data:`_TWIN_PULL_ALLOWED_FIELDS` win over the local value;
-    everything else (asset, environment, edge-owned positions, kinematics,
-    capabilities, ...) is left untouched.
-
-    Errors (network, JSON, missing twin) are logged at debug and treated as
-    no-op so the reconcile loop keeps running.
+    An unreadable local file is rebuilt from the last copy edge-core wrote or read intact. Returns
+    the top-level ``metadata`` keys that changed, or None when the file was not rewritten.
     """
     if not twin_json_file.exists():
-        return False
+        return None
 
     try:
-        with open(twin_json_file) as file_handle:
-            local_data = json.load(file_handle)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Twin pull skipped for %s: invalid local JSON (%s)", twin_uuid, exc)
-        return False
-    if not isinstance(local_data, dict):
-        logger.warning("Twin pull skipped for %s: expected object root in local JSON", twin_uuid)
-        return False
+        with open(twin_json_file, encoding="utf-8") as file_handle:
+            text = file_handle.read()
+        local_data = json.loads(text)
+    except (OSError, ValueError):
+        local_data = None
+    repair = not isinstance(local_data, dict)
+    if not repair:
+        _TWIN_JSON_LAST_GOOD[twin_uuid] = text
+        _TWIN_JSON_REPAIR_WARNED.discard(twin_uuid)
+    elif twin_uuid not in _TWIN_JSON_LAST_GOOD:
+        if twin_uuid not in _TWIN_JSON_REPAIR_WARNED:
+            _TWIN_JSON_REPAIR_WARNED.add(twin_uuid)
+            logger.warning(
+                "Twin JSON for %s is unreadable and edge-core holds no intact copy; "
+                "the next driver launch rewrites it",
+                twin_uuid,
+            )
+        return None
+    else:
+        logger.warning("Twin JSON for %s is unreadable; repairing it", twin_uuid)
+        local_data = json.loads(_TWIN_JSON_LAST_GOOD[twin_uuid])
 
     try:
         twin = client.twins.get_raw(twin_uuid)
     except Exception as exc:
         logger.debug("Twin pull skipped for %s: backend fetch failed (%s)", twin_uuid, exc)
-        return False
+        return None
 
     backend_data = _coerce_twin_to_dict(twin)
     if backend_data is None:
         logger.debug("Twin pull skipped for %s: cannot serialize backend twin", twin_uuid)
-        return False
+        return None
 
-    changed_fields: list[str] = []
-    for field in _TWIN_PULL_ALLOWED_FIELDS:
-        if field not in backend_data:
-            continue
-        if local_data.get(field) == backend_data[field]:
-            continue
+    changed_fields = sorted(
+        field
+        for field in _TWIN_PULL_ALLOWED_FIELDS
+        if field in backend_data and (repair or local_data.get(field) != backend_data[field])
+    )
+    if not changed_fields and not repair:
+        return None
+    old_metadata = local_data.get("metadata")
+    for field in changed_fields:
         local_data[field] = backend_data[field]
-        changed_fields.append(field)
-
-    if not changed_fields:
-        return False
 
     def _json_default(obj: Any) -> Any:
         if isinstance(obj, (datetime, date)):
@@ -5453,15 +5699,21 @@ def _pull_twin_json_file_from_backend(
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
     rendered = json.dumps(local_data, indent=2, default=_json_default) + "\n"
-    if not _atomic_write_twin_json(twin_json_file, rendered):
-        return False
+    try:
+        _rewrite_twin_json_in_place(twin_json_file, rendered)
+    except OSError as exc:
+        logger.warning("Failed to write twin JSON %s: %s", twin_json_file, exc)
+        return None
+    _TWIN_JSON_LAST_GOOD[twin_uuid] = rendered
 
+    changed_keys = _changed_top_level_keys(old_metadata, local_data.get("metadata"))
     logger.info(
-        "Pulled twin JSON updates for %s from backend (fields=%s)",
+        "Pulled twin JSON updates for %s from backend (fields=%s, metadata keys=%s)",
         twin_uuid,
-        sorted(changed_fields),
+        changed_fields,
+        sorted(changed_keys),
     )
-    return True
+    return changed_keys
 
 
 def _build_twin_sync_client() -> Optional[Cyberwave]:
@@ -5479,26 +5731,10 @@ def _build_twin_sync_client() -> Optional[Cyberwave]:
         return None
 
 
-def reconcile_twin_json_file_sync() -> dict[str, int]:
-    """Reconcile local twin JSON files with the backend in both directions.
+def reconcile_twin_json_file_sync() -> dict[str, Any]:
+    """Push locally changed twin JSON files to the backend and pull backend metadata into the rest.
 
-    The reconcile is bidirectional:
-
-    * **Push** (legacy behaviour): a local file whose checksum changed since
-      the last cycle is pushed to the backend via the twin REST update
-      endpoint. The set of fields the edge is allowed to push is constrained
-      by :data:`_TWIN_UPDATE_ALLOWED_FIELDS`.
-
-    * **Pull** (new behaviour): for every tracked twin file that did *not*
-      change locally this cycle, the latest twin is fetched from the backend
-      and the fields in :data:`_TWIN_PULL_ALLOWED_FIELDS` (currently just
-      ``metadata``) are merged in. This closes the gap that previously
-      forced an edge-core restart for UI-driven metadata edits to reach the
-      driver container's environment via ``entrypoint.sh``.
-
-    Push wins for the current cycle; the next cycle's pull will reflect any
-    backend-side reconciliation. The summary dict is the only return value
-    and is used by the runtime loop for log output.
+    Returns counters plus ``metadata_changes``, the top-level metadata keys each pull changed.
     """
     changed_candidates: list[tuple[str, Path, str]] = []
     active_twin_uuids: set[str] = set()
@@ -5524,12 +5760,15 @@ def reconcile_twin_json_file_sync() -> dict[str, int]:
 
     for stale_twin_uuid in set(_TWIN_FILE_CHECKSUMS) - active_twin_uuids:
         _TWIN_FILE_CHECKSUMS.pop(stale_twin_uuid, None)
+        _TWIN_JSON_LAST_GOOD.pop(stale_twin_uuid, None)
 
-    summary = {
+    metadata_changes: dict[str, frozenset[str]] = {}
+    summary: dict[str, Any] = {
         "tracked": len(active_twin_uuids),
         "changed": len(changed_candidates),
         "synced": 0,
         "pulled": 0,
+        "metadata_changes": metadata_changes,
     }
     if not active_twin_uuids:
         return summary
@@ -5544,6 +5783,7 @@ def reconcile_twin_json_file_sync() -> dict[str, int]:
             _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
             summary["synced"] += 1
             pushed_uuids.add(twin_uuid)
+            _rebaseline_driver_metadata(twin_uuid)
 
     for twin_uuid in sorted(active_twin_uuids):
         if twin_uuid in pushed_uuids:
@@ -5551,13 +5791,305 @@ def reconcile_twin_json_file_sync() -> dict[str, int]:
             # any concurrent backend edits.
             continue
         twin_json_file = CONFIG_DIR / f"{twin_uuid}.json"
-        if _pull_twin_json_file_from_backend(client, twin_uuid, twin_json_file):
+        changed_keys = _pull_twin_json_file_from_backend(client, twin_uuid, twin_json_file)
+        if changed_keys is not None:
             new_checksum = _calculate_file_checksum(twin_json_file)
             if new_checksum:
                 _TWIN_FILE_CHECKSUMS[twin_uuid] = new_checksum
             summary["pulled"] += 1
+            metadata_changes[twin_uuid] = changed_keys
 
     return summary
+
+
+DRIVER_RESTART_NEEDED_ALERT = "driver_restart_needed"
+DRIVER_METADATA_RESTART_SUPPRESSED_ALERT = "driver_metadata_restart_suppressed"
+_RUNTIME_METADATA_KEYS = frozenset(
+    {
+        "status",
+        "power",
+        "motor_temps",
+        "performance",
+        "active_map_uuid",
+        "active_map_type",
+        "active_map_resolution",
+        "finalize_active_map_request",
+        "last_finalized_map_uuid",
+        "last_finalized_map_name",
+        "navigation_lifecycle",
+        "localization",
+        "speaker_device",
+        "audio_routing",
+        "robot_dump",
+        "edge_fingerprint",
+    }
+)
+_METADATA_RESTART_DEBOUNCE_SECONDS = 10.0
+_METADATA_RESTART_STARTUP_GRACE_SECONDS = 90.0
+_METADATA_RESTART_MIN_GAP_SECONDS = 120.0
+_METADATA_RESTART_WINDOW_SECONDS = 1800.0
+_METADATA_RESTART_MAX_IN_WINDOW = 3
+
+
+@dataclass
+class _DriverMetadataState:
+    applied: str
+    pending: Optional[str] = None
+    changed_at: float = 0.0
+    changed_wall: float = 0.0
+    keys: frozenset[str] = frozenset()
+
+    def apply(self, digest: str) -> None:
+        self.applied, self.pending, self.keys = digest, None, frozenset()
+
+
+_DRIVER_METADATA_STATE: dict[str, _DriverMetadataState] = {}
+_UNREAD_METADATA = "unread"
+_METADATA_RESTART_TIMES: dict[str, deque[float]] = {}
+_METADATA_RESTART_SUPPRESSED: set[str] = set()
+
+
+def _driver_config_digest(metadata: Any) -> str:
+    config = {
+        key: value
+        for key, value in (metadata if isinstance(metadata, dict) else {}).items()
+        if key not in _RUNTIME_METADATA_KEYS
+        and not (key == "audio_device" and isinstance(value, dict))
+    }
+    if isinstance(config.get("sensors"), list):
+        sensors = [
+            sensor
+            for sensor in config.pop("sensors")
+            if not isinstance(sensor, dict) or sensor.get("parameters")
+        ]
+        if sensors:
+            config["sensors"] = sensors
+    return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _read_twin_json(twin_uuid: str) -> Optional[dict[str, Any]]:
+    try:
+        with open(CONFIG_DIR / f"{twin_uuid}.json") as file_handle:
+            data = json.load(file_handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _reset_driver_metadata_baseline(twin_uuid: str, metadata: Any) -> None:
+    digest = _driver_config_digest(metadata)
+    state = _DRIVER_METADATA_STATE.get(twin_uuid)
+    if state is None:
+        _DRIVER_METADATA_STATE[twin_uuid] = _DriverMetadataState(applied=digest)
+    else:
+        state.apply(digest)
+
+
+def _rebaseline_driver_metadata(twin_uuid: str) -> None:
+    state = _DRIVER_METADATA_STATE.get(twin_uuid)
+    data = _read_twin_json(twin_uuid) if state else None
+    if state is None or data is None:
+        return
+    digest = _driver_config_digest(data.get("metadata"))
+    if state.pending is None:
+        state.applied = digest
+    elif state.pending != _UNREAD_METADATA:
+        state.pending = digest
+
+
+def _metadata_restart_target(twin_uuid: str, data: dict[str, Any]) -> str:
+    if twin_uuid in _CONTAINER_TWIN_MAP.values():
+        return twin_uuid
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    parent = data.get("attach_to_twin_uuid") or metadata.get("attach_to_twin_uuid")
+    return str(parent) if parent else twin_uuid
+
+
+def _send_metadata_restart_alert(
+    twin_uuid: str, name: str, description: str, alert_type: str, state: _DriverMetadataState
+) -> bool:
+    try:
+        _send_alert_for_twin(
+            twin_uuid,
+            name,
+            description,
+            alert_type,
+            severity="warning",
+            metadata={"keys": sorted(state.keys)},
+        )
+    except Exception:
+        logger.warning("Could not raise %s for twin %s; retrying", alert_type, twin_uuid)
+        return False
+    return True
+
+
+def reconcile_driver_metadata_restarts(
+    changes: dict[str, frozenset[str]], *, watchdog: Optional[Any] = None
+) -> None:
+    """Restart a twin's sensor drivers once a configuration change in its metadata has settled.
+
+    *changes* maps twins to the metadata keys this tick's pull changed. Other drivers get a
+    ``driver_restart_needed`` alert instead of a restart. *watchdog* is the runtime loop's:
+    a relaunch runs inside the loop, so its waits must ping it.
+    """
+    pending = {twin for twin, state in _DRIVER_METADATA_STATE.items() if state.pending}
+    for twin_uuid in sorted(set(changes) | pending):
+        state = _DRIVER_METADATA_STATE.get(twin_uuid)
+        if state is None:
+            continue
+        data = _read_twin_json(twin_uuid)
+        keys = changes.get(twin_uuid, frozenset())
+        if data is None:
+            if not (CONFIG_DIR / f"{twin_uuid}.json").exists():
+                del _DRIVER_METADATA_STATE[twin_uuid]
+                continue
+            state.pending = state.pending or _UNREAD_METADATA
+            state.keys |= keys - _RUNTIME_METADATA_KEYS
+            continue
+        digest = _driver_config_digest(data.get("metadata"))
+        if digest == state.applied or "edge_fingerprint" in keys:
+            state.apply(digest)
+            continue
+        if digest != state.pending:
+            state.pending, state.changed_at, state.changed_wall = (
+                digest,
+                time.monotonic(),
+                time.time(),
+            )
+        state.keys |= keys - _RUNTIME_METADATA_KEYS
+        _settle_driver_metadata_change(twin_uuid, data, state, digest, watchdog)
+
+
+def _container_metadata_change_state(
+    inspect: dict[str, Any], changed_wall: float, now_wall: float
+) -> str:
+    from .docker_helpers import container_status_of, parse_docker_timestamp_ns
+
+    if container_status_of(inspect) != "running":
+        return "taken"
+    state = inspect.get("State") if isinstance(inspect.get("State"), dict) else {}
+    started_ns = parse_docker_timestamp_ns(str(state.get("StartedAt") or ""))
+    if started_ns is None:
+        return "stale"
+    if started_ns / 1e9 > changed_wall:
+        return "taken"
+    if now_wall < started_ns / 1e9 + _METADATA_RESTART_STARTUP_GRACE_SECONDS:
+        return "grace"
+    return "stale"
+
+
+def _settle_driver_metadata_change(
+    twin_uuid: str,
+    data: dict[str, Any],
+    state: _DriverMetadataState,
+    digest: str,
+    watchdog: Optional[Any] = None,
+) -> None:
+    now = time.monotonic()
+    if now - state.changed_at < _METADATA_RESTART_DEBOUNCE_SECONDS:
+        return
+    with _CAMERA_DRIFT_RESTART_LOCK:
+        drift_restart = _CAMERA_DRIFT_RESTART_IN_PROGRESS
+    if drift_restart or _edge_core_restart_in_progress():
+        return
+
+    target = _metadata_restart_target(twin_uuid, data)
+    containers = sorted(name for name, owner in _CONTAINER_TWIN_MAP.items() if owner == target)
+    inspected = [_inspect_driver_container(name) for name in containers]
+    inspects = [i for i in inspected if i]
+    if len(inspects) < len(containers):
+        return
+    change_states = {
+        _container_metadata_change_state(i, state.changed_wall, time.time()) for i in inspects
+    }
+    if "grace" in change_states:
+        return
+    if change_states <= {"taken"}:
+        state.apply(digest)
+        return
+
+    keys = ", ".join(sorted(state.keys)) or "metadata"
+    images = [_resolve_container_driver_image(i) or "" for i in inspects]
+    if not all(map(_is_sensor_driver_image, images)) or any(map(_restart_floor_seconds, inspects)):
+        logger.info(
+            "Twin %s settings changed (%s); %s needs a manual restart",
+            twin_uuid,
+            keys,
+            ", ".join(containers),
+        )
+        if _send_metadata_restart_alert(
+            twin_uuid,
+            "Driver restart needed",
+            "Settings changed; restart the driver to apply them.",
+            DRIVER_RESTART_NEEDED_ALERT,
+            state,
+        ):
+            state.apply(digest)
+        return
+
+    times = _METADATA_RESTART_TIMES.setdefault(target, deque())
+    while times and now - times[0] >= _METADATA_RESTART_WINDOW_SECONDS:
+        times.popleft()
+    if len(times) >= _METADATA_RESTART_MAX_IN_WINDOW:
+        if target not in _METADATA_RESTART_SUPPRESSED:
+            logger.warning(
+                "Not restarting %s for twin %s settings (%s): %d restarts in the last %d min",
+                ", ".join(containers),
+                twin_uuid,
+                keys,
+                len(times),
+                int(_METADATA_RESTART_WINDOW_SECONDS // 60),
+            )
+            if not _send_metadata_restart_alert(
+                twin_uuid,
+                "Driver restarts suppressed",
+                "Settings changed too often to restart the driver each time; restart it to "
+                "apply them.",
+                DRIVER_METADATA_RESTART_SUPPRESSED_ALERT,
+                state,
+            ):
+                return
+            _METADATA_RESTART_SUPPRESSED.add(target)
+        state.apply(digest)
+        return
+    if times and now - times[-1] < _METADATA_RESTART_MIN_GAP_SECONDS:
+        return
+
+    token = load_token()
+    fingerprint = load_saved_fingerprint()
+    environment_uuid = load_environment_uuid()
+    if not (token and fingerprint and environment_uuid):
+        return
+    times.append(now)
+    _METADATA_RESTART_SUPPRESSED.discard(target)
+    logger.info(
+        "Restarting %s to apply twin %s settings (%s)", ", ".join(containers), twin_uuid, keys
+    )
+    applied, pending_keys = state.applied, state.keys
+    try:
+        results = fetch_and_run_twin_drivers(
+            token,
+            environment_uuid,
+            fingerprint,
+            watchdog=watchdog,
+            only_container_names=set(containers),
+            pull_images=False,
+        )
+    except Exception:
+        logger.exception("Restart of %s for twin %s settings failed", target, twin_uuid)
+        results = []
+    outcomes = [
+        bool(result.get("success"))
+        for result in results or []
+        if driver_container_name(result.get("twin_uuid", ""), result.get("service_name"))
+        in containers
+    ]
+    if outcomes and all(outcomes):
+        if state.pending == digest:
+            state.apply(digest)
+        return
+    logger.warning("Restart of %s for twin %s settings will be retried", target, twin_uuid)
+    state.applied, state.pending, state.keys = applied, digest, pending_keys
 
 
 def _fix_config_dir_ownership() -> None:
@@ -6241,15 +6773,9 @@ def reconcile_edge_json_file_sync() -> bool:
 
 def _docker_disk_usage_percent() -> float | None:
     """Percent used of the filesystem holding Docker's data root, or None."""
-    from .docker_helpers import docker_data_root
+    from .resource_monitor import read_disk_percent
 
-    try:
-        usage = shutil.disk_usage(docker_data_root())
-    except OSError:
-        return None
-    if usage.total <= 0:
-        return None
-    return (usage.used / usage.total) * 100.0
+    return read_disk_percent()
 
 
 def _is_periodic_docker_cleanup_disabled() -> bool:
@@ -6364,6 +6890,191 @@ def _run_periodic_docker_cleanup() -> None:
         _last_volume_prune_time = now
 
 
+_SATURATION_SNAPSHOTS_TO_FLIP = 2
+_SATURATION_LOG_INTERVAL_SECONDS = 60.0
+_SATURATION_LABELS = {"cpu": "CPU", "memory": "memory", "disk": "disk"}
+
+
+@dataclass
+class _Saturation:
+    onset: float
+    logged_at: float
+    top: str
+    twins: set[str]
+    # Fixed at the crossing so retried alerts stay identical for the backend's dedupe.
+    name: str
+    description: str
+    metadata: dict[str, Any]
+    undelivered: set[str]
+
+
+_SATURATED: dict[str, _Saturation] = {}
+_SATURATION_STREAKS: dict[str, tuple[int, float]] = {}
+_SATURATION_UNRESOLVED: dict[str, set[str]] = {}
+_SATURATION_LEFT_OPEN: set[str] = set()
+_LAST_SATURATION_SNAPSHOT: Optional[Any] = None
+
+
+def adopt_saturation_alerts_left_open() -> None:
+    """Treat every resource as alerted by an earlier Edge Core process, which this one cannot see.
+
+    Its alerts are resolved on the resource's first reading below the clear level; a resource that
+    saturates first raises again, which the backend folds into the alert still active.
+    """
+    _SATURATION_LEFT_OPEN.update(_SATURATION_LABELS)
+
+
+def _top_containers(resource: str) -> str:
+    column = {"cpu": 1, "memory": 2}.get(resource)
+    if column is None or not shutil.which("docker"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemPerc}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    usage: list[tuple[float, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        try:
+            usage.append((float(fields[column].strip().rstrip("%")), fields[0]))
+        except (IndexError, ValueError):
+            continue
+    usage.sort(reverse=True)
+    return ", ".join(f"{name} {percent:.0f}%" for percent, name in usage[:3])
+
+
+def _log_saturation(resource: str, percent: float, threshold: float, now: float) -> None:
+    saturation = _SATURATED[resource]
+    saturation.logged_at = now
+    logger.warning(
+        "Edge %s saturated: %.0f%% (threshold %.0f%%) for %.0f s%s",
+        _SATURATION_LABELS[resource],
+        percent,
+        threshold,
+        now - saturation.onset,
+        f"; top: {saturation.top}" if saturation.top else "",
+    )
+
+
+def _raise_saturation(
+    resource: str, percent: float, threshold: float, onset: float, now: float
+) -> None:
+    label = _SATURATION_LABELS[resource]
+    top = _top_containers(resource)
+    twins = set(_CONTAINER_TWIN_MAP.values())
+    description = (
+        f"{label[:1].upper()}{label[1:]} usage on edge {socket.gethostname()} is "
+        f"{percent:.0f}% (threshold {threshold:.0f}%)."
+    )
+    if top:
+        description += f" Top containers: {top}."
+    _SATURATED[resource] = _Saturation(
+        onset=onset,
+        logged_at=now,
+        top=top,
+        twins=twins,
+        name=f"Edge {label} saturated",
+        description=description,
+        metadata={"resource": resource, "percent": round(percent, 1), "threshold": threshold},
+        undelivered=set(twins),
+    )
+    _log_saturation(resource, percent, threshold, now)
+    _deliver_saturation_alerts(resource)
+
+
+def _deliver_saturation_alerts(resource: str) -> None:
+    saturation = _SATURATED[resource]
+    for twin_uuid in sorted(saturation.undelivered):
+        try:
+            _send_alert_for_twin(
+                twin_uuid,
+                saturation.name,
+                saturation.description,
+                f"edge_{resource}_saturation",
+                severity="warning",
+                metadata=saturation.metadata,
+            )
+        except Exception:
+            logger.warning(
+                "Could not raise edge_%s_saturation for twin %s; retrying", resource, twin_uuid
+            )
+            continue
+        saturation.undelivered.discard(twin_uuid)
+
+
+def _resolve_saturation_alerts(resource: str) -> None:
+    twins = _SATURATION_UNRESOLVED.get(resource, set())
+    alerted = _SATURATED[resource].twins if resource in _SATURATED else set()
+    for twin_uuid in sorted(twins - alerted):
+        try:
+            resolve_active_alerts_for_twin(twin_uuid, f"edge_{resource}_saturation", strict=True)
+        except Exception:
+            logger.warning(
+                "Could not resolve edge_%s_saturation for twin %s; retrying", resource, twin_uuid
+            )
+            continue
+        twins.discard(twin_uuid)
+    if not twins:
+        _SATURATION_UNRESOLVED.pop(resource, None)
+
+
+def reconcile_resource_saturation(resource_monitor: Any) -> None:
+    """Alert every managed twin while host CPU, memory or disk usage stays saturated.
+
+    Two new snapshots in a row at the threshold raise; two below the clear level resolve.
+    """
+    global _LAST_SATURATION_SNAPSHOT
+    snapshot = getattr(resource_monitor, "last_snapshot", None)
+    if snapshot is None or snapshot is _LAST_SATURATION_SNAPSHOT:
+        return
+    _LAST_SATURATION_SNAPSHOT = snapshot
+    threshold = resource_monitor.saturation_percent
+    clear = resource_monitor.saturation_clear_percent
+    now = snapshot.timestamp
+    readings = {
+        "cpu": snapshot.cpu_percent,
+        "memory": snapshot.memory.used_percent if snapshot.memory else None,
+        "disk": snapshot.disk_percent,
+    }
+    for resource, percent in readings.items():
+        if resource in _SATURATION_LEFT_OPEN and percent is not None and percent < clear:
+            _SATURATION_LEFT_OPEN.discard(resource)
+            _SATURATION_UNRESOLVED.setdefault(resource, set()).update(_CONTAINER_TWIN_MAP.values())
+        _resolve_saturation_alerts(resource)
+        saturated = resource in _SATURATED
+        if percent is None or (percent >= clear if saturated else percent < threshold):
+            _SATURATION_STREAKS.pop(resource, None)
+            if saturated:
+                _deliver_saturation_alerts(resource)
+            if saturated and percent is not None:
+                if now - _SATURATED[resource].logged_at >= _SATURATION_LOG_INTERVAL_SECONDS:
+                    _log_saturation(resource, percent, threshold, now)
+            continue
+        count, since = _SATURATION_STREAKS.get(resource, (0, now))
+        if count + 1 < _SATURATION_SNAPSHOTS_TO_FLIP:
+            _SATURATION_STREAKS[resource] = (count + 1, since)
+            if saturated:
+                _deliver_saturation_alerts(resource)
+            continue
+        _SATURATION_STREAKS.pop(resource, None)
+        if saturated:
+            label = _SATURATION_LABELS[resource]
+            logger.info("Edge %s no longer saturated: %.0f%%", label, percent)
+            _SATURATION_UNRESOLVED.setdefault(resource, set()).update(
+                _SATURATED.pop(resource).twins
+            )
+            _resolve_saturation_alerts(resource)
+        else:
+            _SATURATION_LEFT_OPEN.discard(resource)
+            _raise_saturation(resource, percent, threshold, since, now)
+
+
 def run_runtime_loop(
     *,
     watchdog: Optional[Any] = None,
@@ -6379,8 +7090,8 @@ def run_runtime_loop(
         watchdog know the process is alive.
     resource_monitor:
         Optional :class:`~cyberwave_edge_core.resource_monitor.SystemResourceMonitor`
-        to check host memory/temperature each cycle and log warnings
-        when resources are critically low.
+        to check host resources each cycle, log warnings when they are
+        critically low and alert managed twins when they saturate.
     """
     global _worker_sync_loop_counter, _edge_json_sync_loop_counter
 
@@ -6398,6 +7109,9 @@ def run_runtime_loop(
     from . import local_portal
 
     local_portal.start_from_env(config_dir=CONFIG_DIR)
+
+    if resource_monitor is not None:
+        adopt_saturation_alerts_left_open()
 
     while not shutdown_event.is_set():
         attached = reconcile_driver_log_streams()
@@ -6473,9 +7187,21 @@ def run_runtime_loop(
         )
 
         try:
+            reconcile_driver_metadata_restarts(
+                twin_sync_summary.get("metadata_changes", {}), watchdog=watchdog
+            )
+        except Exception:
+            logger.exception("Unexpected error in driver metadata restart reconciliation")
+
+        try:
             reconcile_camera_config_drift()
         except Exception:
             logger.exception("Unexpected error in camera config drift reconciliation")
+
+        try:
+            reconcile_sensor_device_presence()
+        except Exception:
+            logger.exception("Unexpected error in sensor device presence reconciliation")
 
         # Reconcile worker file changes and health probes each cycle.
         try:
@@ -6567,6 +7293,10 @@ def run_runtime_loop(
                 resource_monitor.check()
             except Exception:
                 logger.debug("Resource monitor check failed", exc_info=True)
+            try:
+                reconcile_resource_saturation(resource_monitor)
+            except Exception:
+                logger.exception("Unexpected error in resource saturation reconciliation")
 
         shutdown_event.wait(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
 

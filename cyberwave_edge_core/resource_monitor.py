@@ -1,6 +1,6 @@
 """System resource monitoring for Cyberwave Edge Core.
 
-Scope: monitors **host-level** memory and CPU temperature so the operator
+Scope: monitors **host-level** memory, CPU load, disk usage and CPU temperature so the operator
 can correlate OOM kills / thermal throttling with edge-core or worker
 restarts.  This is independent of:
 
@@ -9,7 +9,7 @@ restarts.  This is independent of:
   diagnostic readers in the CLI).
 
 Provides lightweight, non-blocking monitoring of host system resources
-(memory, CPU temperature) to detect conditions that could cause edge-core
+(memory, CPU load, disk usage, CPU temperature) to detect conditions that could cause edge-core
 or its managed containers to be killed by the OS.
 
 Designed for resource-constrained devices (Raspberry Pi 4 with 1–4 GB RAM)
@@ -26,6 +26,8 @@ container, not the host.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -66,6 +68,10 @@ CPU_TEMP_WARNING_C = 75.0
 CPU_TEMP_CRITICAL_C = 82.0
 
 MONITOR_CHECK_INTERVAL_SECONDS = 30.0
+
+RESOURCE_SATURATION_PERCENT_ENV = "CYBERWAVE_RESOURCE_SATURATION_PERCENT"
+DEFAULT_RESOURCE_SATURATION_PERCENT = 95.0
+RESOURCE_SATURATION_CLEAR_MARGIN = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +119,8 @@ class ResourceSnapshot:
     timestamp: float
     memory: Optional[MemoryInfo]
     cpu_temp: Optional[CpuTemperature]
+    cpu_percent: Optional[float] = None
+    disk_percent: Optional[float] = None
 
     @property
     def is_healthy(self) -> bool:
@@ -149,6 +157,10 @@ class ResourceSnapshot:
             out["host_memory_available_mb"] = self.memory.available_mb
         if self.cpu_temp is not None:
             out["cpu_temp_c"] = self.cpu_temp.celsius
+        if self.cpu_percent is not None:
+            out["host_cpu_percent"] = self.cpu_percent
+        if self.disk_percent is not None:
+            out["host_disk_percent"] = self.disk_percent
         return out
 
 
@@ -194,6 +206,55 @@ def read_cpu_temperature() -> Optional[CpuTemperature]:
     return CpuTemperature(celsius=raw.celsius, source=raw.source)
 
 
+def read_cpu_times() -> Optional[tuple[int, int]]:
+    """Return ``(idle, total)`` jiffies from the aggregate ``/proc/stat`` line, or ``None``."""
+    try:
+        with open("/proc/stat", encoding="ascii") as stat_file:
+            fields = stat_file.readline().split()
+    except OSError:
+        return None
+    if len(fields) < 6 or fields[0] != "cpu":
+        return None
+    try:
+        values = [int(value) for value in fields[1:9]]
+    except ValueError:
+        return None
+    return values[3] + values[4], sum(values)
+
+
+def read_disk_percent() -> Optional[float]:
+    """Return the percent used of the filesystem holding Docker's data root, or ``None``."""
+    from .docker_helpers import docker_data_root
+
+    try:
+        usage = shutil.disk_usage(docker_data_root())
+    except OSError:
+        return None
+    if usage.total <= 0:
+        return None
+    return (usage.used / usage.total) * 100.0
+
+
+def resource_saturation_percent() -> float:
+    """Return the threshold from ``CYBERWAVE_RESOURCE_SATURATION_PERCENT`` (default 95)."""
+    raw = os.getenv(RESOURCE_SATURATION_PERCENT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_RESOURCE_SATURATION_PERCENT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not RESOURCE_SATURATION_CLEAR_MARGIN < value <= 100.0:
+        logger.warning(
+            "Ignoring invalid %s=%r; using %.0f%%",
+            RESOURCE_SATURATION_PERCENT_ENV,
+            raw,
+            DEFAULT_RESOURCE_SATURATION_PERCENT,
+        )
+        return DEFAULT_RESOURCE_SATURATION_PERCENT
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Resource monitor
 # ---------------------------------------------------------------------------
@@ -210,6 +271,9 @@ class SystemResourceMonitor:
         self._last_check: float = 0.0
         self._last_snapshot: Optional[ResourceSnapshot] = None
         self._consecutive_critical: int = 0
+        self._cpu_times: Optional[tuple[int, int]] = None
+        self.saturation_percent = resource_saturation_percent()
+        self.saturation_clear_percent = self.saturation_percent - RESOURCE_SATURATION_CLEAR_MARGIN
 
         self._warning_logged_at: float = 0.0
         self._critical_logged_at: float = 0.0
@@ -230,6 +294,8 @@ class SystemResourceMonitor:
             timestamp=time.time(),
             memory=read_memory_info(),
             cpu_temp=read_cpu_temperature(),
+            cpu_percent=self._cpu_percent(),
+            disk_percent=read_disk_percent(),
         )
         self._last_snapshot = snapshot
         self._log_resource_state(snapshot, now)
@@ -238,6 +304,18 @@ class SystemResourceMonitor:
     @property
     def last_snapshot(self) -> Optional[ResourceSnapshot]:
         return self._last_snapshot
+
+    def _cpu_percent(self) -> Optional[float]:
+        """Busy share of all CPUs since the previous check; ``None`` on the first."""
+        times = read_cpu_times()
+        previous, self._cpu_times = self._cpu_times, times
+        if times is None or previous is None:
+            return None
+        total = times[1] - previous[1]
+        if total <= 0:
+            return None
+        busy = 1.0 - (times[0] - previous[0]) / total
+        return max(0.0, min(100.0, busy * 100.0))
 
     @property
     def consecutive_critical_count(self) -> int:

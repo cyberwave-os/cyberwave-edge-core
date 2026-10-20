@@ -52,7 +52,7 @@ The installer and Edge Core create these files in the config directory:
 | `{twin-uuid}.json` | Cached twin + asset record (one per twin)   |
 | `cameras.json`     | **Deprecated.** Legacy camera device config; superseded by `edge.json` `metadata.cameras` |
 
-Edge Core requires `credentials.json` to operate. `fingerprint.json` is produced by Edge Core; `environment.json` is written by the CLI during setup. `edge.json` is written automatically on first registration and refreshed every ~5 minutes; it stores the full edge device record including `metadata.cameras` (device list and twin-to-device mapping).
+Edge Core requires `credentials.json` to operate. `fingerprint.json` is produced by Edge Core; `environment.json` is written by the CLI during setup. `edge.json` is written on registration and stores the full edge device record, including `metadata.cameras` (the device list and the twin-to-device mapping). Every ~5 minutes `reconcile_edge_json_file_sync` fetches the record again, but it rewrites the file only when `metadata.cameras` changed, because a rewrite is what the camera drift check reacts to (see *Camera pins: drift and missing devices*).
 
 ## How Edge Core works
 
@@ -102,7 +102,7 @@ When Edge Core receives this command it performs a graceful restart consisting o
 5. Re-downloading the selected environment and restarting drivers.
 6. Restarting the worker container (if worker files exist).
 
-The restart is intended to preserve durable state where possible. If connectivity is available before shutdown, Edge Core will attempt to sync any twin JSON changes back to the backend.
+The restart deletes the cached twin JSON files without a final push, so an edit a driver made to its twin file after the last runtime tick (see *Twin JSON file*) is lost; everything else is downloaded again from the backend.
 
 Each driver startup attempt creates a `driver_starting` twin alert that tracks the in-flight startup (image pull, container launch, post-launch health probe). The alert is automatically resolved once the driver container is observed `running`; if the attempt fails, it's annotated with the failure phase (e.g. `pull_failed` / `pull_timeout` / `pull_oserror`), escalated to `critical` severity, and resolved. The same lifecycle applies to the ML worker via the `worker_starting` alert, which is raised *before* the image pull and held until the worker container is observed `running` — so a worker whose image is already on disk still reports that it is starting, rather than coming up silently. The alert is therefore guaranteed to clear when the driver has restarted; longer-lived failure conditions are surfaced through separate `driver_start_failure` alerts created by the orchestrator.
 
@@ -111,6 +111,14 @@ While `docker pull` is running, edge-core writes pull progress directly onto the
 Startup is reported as three distinct stages. `overall_progress_percent` — the number a progress bar should read — spans all three as a single 0–100 that only moves forward (download 0–45, install 45–80, container 80–100), because the card renders one bar and a stage restarting its own count reads as the bar rewinding. `stage_progress_percent` carries the same startup as a per-stage 0–100, for a stage-aware bar to use; the alert's text names the stage on screen, so a stage that reads 100 % is one you can check against what you are being told. The bands are sized by how long each stage takes rather than by how many steps it has, so install — the stage that outlasts the download — gets a comparable share of the bar.
 
 **Downloading** is driven by layers fetched rather than by bytes: docker only declares a layer's size when it starts fetching it, so a byte ratio has an unknown denominator for most of the pull and reads 100 % every time the in-flight batch drains. The layer currently downloading counts as its byte fraction, so the number still moves between layers. 100 % is reserved for a pull docker has confirmed finished. **Installing** — verifying and decompressing, which on a multi-GB image outlasts the download — tracks layer completion (`layers_complete` / `layers_total`). **Starting** covers container create → run → probe.
+
+#### Local driver builds are never pulled
+
+A driver image whose tag is `local`, starts with `local-` or ends with `-local` is treated as a developer build. When such an image already exists on the host, Edge Core uses it as it is: `_use_local_build` takes it out of the parallel pull, the startup alert records `phase: "pull_skipped"`, and the log says `Using the local build of <image>; local-only tags are not pulled`. Before this rule a restart pulled the tag like any other, and because Docker Hub can carry an image with the same tag, the pull quietly replaced the build you were testing. A local-only tag that is not on the host is still pulled, and digests (`@sha256:…`) never count as local. The worker has its own, broader rule; see *Worker image refresh policy*.
+
+#### When `docker create` times out
+
+`docker create` runs with a timeout (`CYBERWAVE_DRIVER_CREATE_TIMEOUT_SECONDS`, 30 s by default), but the timeout only kills the CLI. A busy Docker daemon usually goes on to finish the create, which used to leave a container in `Created` that Edge Core had never registered and therefore never retried. Edge Core now waits up to 10 more seconds for the container to appear (`_wait_for_container` in `docker_launch.py`). If it does, the launch carries on as normal, with a warning in the log; only if it does not is the attempt failed with `docker_create_timeout`.
 
 ## Model Manager (ML model cache)
 
@@ -315,6 +323,8 @@ This avoids the previous failure mode where a stale `cyberwaveos/edge-ml-worker:
 
 `local` counts as immutable because nothing publishes it: a `:local` image is whatever the last local `docker build` produced, so a pull can only fail — a wasted round-trip, or a connect timeout on an offline machine. A `:local` tag with no local copy is still pulled, like any other missing image.
 
+Driver images follow a narrower rule. They are pulled on every start unless the tag is `local`, `local-*` or `*-local` and the image is already on the host (see *Local driver builds are never pulled*). The reason is the same: a local build must survive a restart.
+
 ### Pinning a custom worker image (`CYBERWAVE_WORKER_IMAGE`)
 
 `resolve_worker_image()` consults `CYBERWAVE_WORKER_IMAGE` before falling back to the `CYBERWAVE_ENVIRONMENT`-derived tag. This is the worker-side counterpart to the `driver_overrides` field in `credentials.json` for camera/asset drivers, and is the recommended way to run a locally-built or hot-patched worker image without re-pushing to the registry.
@@ -429,7 +439,7 @@ There are **four** independent watchdog/supervision layers, each covering a diff
 | Hardware watchdog | Kernel hang, total board lockup | `/dev/watchdog` ping | SoC resets the board |
 | Systemd watchdog | Orchestrator process hang/exit | `Type=notify` + `WatchdogSec` | systemd restarts the service |
 | Worker container | ML worker container health | `WorkerHealthMonitor` + circuit breaker | Docker restart / circuit-break |
-| Driver containers | Flapping per-driver containers | `reconcile_driver_*` in `startup.py` | restart suppression on flap |
+| Driver containers | Per-driver containers that flap, exit or disappear | `reconcile_driver_*` in `startup.py` | restart suppression on flap; revival of clean exits, and of removed containers after a grace period |
 
 Note: these are *infrastructure* watchdogs. They are **distinct** from the in-process command/teleop watchdogs in `cyberwave-edge-nodes` and `cyberwave-edge-runtime`, which stop driver motion if no commands arrive within a window — the term "watchdog" is overloaded.
 
@@ -439,7 +449,17 @@ The systemd unit generated by `cyberwave edge install` configures `WatchdogSec=6
 
 Startup readiness uses a two-phase handoff (`ProcessWatchdog.mark_ready()` → `ProcessWatchdog.start_pinging()`): `READY=1` is sent unconditionally as soon as the blocking boot work (driver images pulled, MQTT connected, twin sync reconciled) is done, while the periodic `WATCHDOG=1` pings — which `sd_notify(3)` restricts to the `$WATCHDOG_PID` process — are driven from the runtime loop in the same process. The split is what makes the standalone PyInstaller binary work under `Type=notify`: the `--onefile` bootloader holds `MainPID` (and therefore `$WATCHDOG_PID`) while the actual Python app runs in a forked child whose PID differs.
 
-During long-running startup operations (e.g. pulling large driver images that can exceed the base `TimeoutStartSec`), Edge Core sends `EXTEND_TIMEOUT_USEC` notifications via `sd_notify` every 5 seconds. This dynamically extends the systemd start timeout while genuine progress is being made, preventing `TimeoutStartSec` from killing the service during slow image downloads. A `STATUS=` notification is also sent so that `systemctl status` shows which images are being pulled.
+During long-running startup operations (e.g. pulling large driver images that can exceed the base `TimeoutStartSec`), Edge Core sends `EXTEND_TIMEOUT_USEC` notifications via `sd_notify` every 5 seconds. This extends the systemd start timeout while the pull makes progress, so `TimeoutStartSec` does not kill the service during a slow download, but not without limit: extensions stop when the startup budget (30 minutes by default) has passed since the watchdog was created, and they stop at once on SIGTERM (see *Bounded startup and shutdown* below). A `STATUS=` notification is also sent so that `systemctl status` shows which images are being pulled.
+
+Because the watchdog pings come from the runtime loop, anything that blocks the loop for a minute gets the service killed, and an SDK REST call made without a timeout could do exactly that when the backend never answered. Before the runtime loop starts, `main.py` therefore calls `bound_sdk_request_timeouts()`, which patches the generated SDK client so that every request without its own timeout gets one of 10 s (`SDK_REQUEST_TIMEOUT_SECONDS`). Requests that already pass a timeout keep it, the patch is applied once however often it is called, and boot-time calls made before it are not affected. The bound applies to each attempt, not to the call: urllib3's default policy retries a timed-out GET three times, so one GET can still take about 40 s. Nor does it bound a sequence of calls: a driver revival pass makes one GET for the twin list and up to two per linked twin, one after another. The trade-off is deliberate: a legitimately slow REST call from the runtime loop now fails and is retried on a later cycle, instead of taking the whole service down with it.
+
+#### Bounded startup and shutdown
+
+Startup keeps `Type=notify` readiness and a base `TimeoutStartSec=900`. The pull heartbeat above can extend it, but only up to the startup budget, counted from the watchdog's creation, so a startup that never succeeds cannot stay "activating" forever. The budget is 30 minutes; an edge whose first start pulls several gigabytes over a slow link can raise it with `CYBERWAVE_STARTUP_TIMEOUT_MINUTES`, a positive whole number of minutes (any other value is ignored with a warning). Set it in the `envs` of `credentials.json`: the service reads it from there, and so does the unit generator, which derives `JobTimeoutSec` from it and deliberately ignores the shell it runs in, since the service never sees that shell. After changing it, run `sudo cyberwave edge install` again, or let the next package upgrade regenerate the unit, before restarting the service. SIGTERM calls `ProcessWatchdog.begin_shutdown()`: it sends `STOPPING=1` and refuses every later extension, `READY=1` and watchdog ping, even when the signal arrives in the middle of the startup checks, which then exit through the normal shutdown path without announcing readiness. A consequence worth knowing: `/dev/watchdog` is never opened after SIGTERM, so a stop can never arm the hardware reset.
+
+The generated unit also bounds the other end. `TimeoutStopSec=90` gives the orchestrator 90 seconds to stop before systemd kills what is left in the service's control group (`KillMode=control-group`, `SendSIGKILL=yes`), and `JobTimeoutSec` in the `[Unit]` section bounds the start job as a whole, including time spent waiting behind its dependencies, five minutes beyond the startup budget (`35min` by default). Killing the orchestrator does not stop Docker containers by itself, so CLI uninstall checks separately that the service stopped and removes the containers before deleting configuration.
+
+The CLI side matches: on Linux, `cyberwave edge start`, `restart` and `install` submit the systemd job without waiting for readiness and print the commands to follow it, while `stop` and `uninstall` wait up to 120 seconds for the service to stop and, if they cannot confirm it, report the failure and keep the configuration. Deploy both packages to get both halves. The [media and lifecycle investigation](../cyberwave-clis/cyberwave-python-cli/docs/media-device-troubleshooting.md) has recovery steps, limits and verification commands.
 
 #### Hardware watchdog (Raspberry Pi)
 
@@ -457,9 +477,11 @@ On devices with ≤4 GB total RAM, Edge Core automatically applies a memory limi
 
 #### Resource monitoring
 
-Edge Core monitors host memory usage and CPU temperature every ~30 seconds. When memory usage exceeds 85% (warning) or 92% (critical), or CPU temperature exceeds 75°C (warning) or 82°C (critical), structured log messages are emitted so operators can investigate via `journalctl`.
+`SystemResourceMonitor` (`resource_monitor.py`) watches four host gauges: memory in use, from `/proc/meminfo`; CPU load, the busy share of all cores between two readings of `/proc/stat`; disk usage of the filesystem that holds Docker's data root; and the temperature of the hottest CPU thermal zone. The runtime loop calls `check()` on every tick, but the monitor reads the host at most every 30 s (`MONITOR_CHECK_INTERVAL_SECONDS`) and otherwise hands back its last snapshot, so the CPU figure is a 30 s average and is absent from the first snapshot. Memory at 85 % or a temperature of 75 °C logs `Resource pressure elevated` at INFO. Memory at 92 % or 82 °C logs `CRITICAL resource pressure` as a warning and increments `consecutive_critical`, which drops back to zero on the first reading below both critical thresholds. Each message is rate-limited to one a minute.
 
-Every heartbeat also samples instantaneous board power draw from sysfs (Jetson INA3221 `in_power0_input`, generic `hwmon/power1_input`, or `power_supply/BAT*/power_now` in that order) and publishes it as `power_mw` on the `edge_health` MQTT payload. This surfaces as the `pwr X.XW` pill in the Edge details panel of the dashboard. Power is read fresh on every 5 s heartbeat (not throttled by the 30 s monitor cache) because draw can change several-fold between idle and motion in under a second.
+CPU, memory and disk also raise an alert when they saturate. `reconcile_resource_saturation` runs after `check()` and looks at each new snapshot once: two snapshots in a row at or above `CYBERWAVE_RESOURCE_SATURATION_PERCENT` (95 % by default; an invalid value logs a warning and falls back to 95) mark the resource saturated, and two in a row below a level five points lower (90 % by default) clear it, so a single spike or dip changes nothing. On the way up Edge Core runs `docker stats --no-stream` once to name the busiest containers, logs `Edge CPU saturated: 97% (threshold 95%) for 30 s; top: cyberwave-driver-658d581b 61%, …`, repeats that line every minute while the resource stays saturated, and sends an `edge_cpu_saturation`, `edge_memory_saturation` or `edge_disk_saturation` warning to every twin whose driver it manages. The alert is raised once per crossing, so the percentage in its description does not defeat the backend's dedupe; its `metadata` carries `resource`, `percent` and `threshold`. A twin the alert could not reach is retried on each later snapshot with the same content until it is delivered or the saturation clears. On the way down the alerts are resolved, and a resolve that fails is retried on the next snapshot. The saturation state lives in memory, so a new process cannot know what the last one raised: when the runtime loop starts it treats every resource as possibly alerted, resolves those alerts on every managed twin at the resource's first snapshot below the clear level, and lets a resource that saturates first raise again, which the backend folds into the alert still active. An edge that manages no driver only logs. Temperature keeps its own thresholds and raises nothing.
+
+Board power draw is sampled separately, from sysfs (Jetson INA3221 `in_power0_input`, generic `hwmon/power1_input`, or `power_supply/BAT*/power_now`, in that order), and fresh on every reading rather than from the 30 s snapshot, because draw can change several-fold between idle and motion in under a second. It is published as `power_mw` by the same two transports as the other gauges and shows up as the `pwr X.XW` pill in the Edge details panel of the dashboard.
 
 Set `CYBERWAVE_BATTERY_WH` to your battery pack's watt-hour capacity to enable a rough runtime estimate on the dashboard (e.g. `36.0` for a 36 Wh pack). The estimate is a simple linear model (`battery_wh / current_watts` hours); it ignores discharge curves and temperature effects and is only meant to answer "will this run another 30 minutes?".
 
@@ -471,6 +493,7 @@ Set `CYBERWAVE_BATTERY_WH` to your battery pack's watt-hour capacity to enable a
 | `CYBERWAVE_WORKER_READY_TIMEOUT_SECONDS` | `900` | Seconds to wait for the worker *process* to finish starting (load and warm up its models) once its container is running |
 | `CYBERWAVE_WORKER_STATUS_PATH` | `/run/cyberwave/worker-status.json` | Where the worker writes its startup milestones. Set by Edge Core on the worker container to match the directory it mounts; override only if `/run` is unavailable |
 | `CYBERWAVE_BATTERY_WH` | _(unset)_ | Battery pack capacity in watt-hours. Enables the battery uptime estimate in the Edge details panel of the dashboard. |
+| `CYBERWAVE_RESOURCE_SATURATION_PERCENT` | `95` | CPU, memory and disk usage at which Edge Core raises the `edge_*_saturation` alerts; they clear five points lower. See *Resource monitoring*. |
 | `CYBERWAVE_JETSON_ALLOW_UNSUPPORTED_L4T` | _(unset)_ | Set to `1` to use the `-jetson` worker image and NVIDIA runtime on a Jetson below L4T r38 (JetPack 7). See the accelerator precedence list below. |
 
 ### GPU support
@@ -535,9 +558,24 @@ When multiple cameras are connected to the same edge device (each represented as
 2. **One shared worker:** A single `cyberwave-worker-{env[:8]}` container receives frames from all cameras. The worker container receives `CYBERWAVE_TWIN_UUIDS` as a comma-separated list of all linked twins.
 3. **Readiness probes:** Edge Core waits for all driver containers to reach a `running` state before starting the worker. If some drivers fail, the worker starts anyway so healthy cameras can be utilized.
 4. **Model pre-download:** Before the worker starts, Edge Core scans worker scripts and pre-downloads all referenced ML models.
-5. **Driver health monitoring:** If a driver goes down while the worker is running, Edge Core sends an alert to the affected twin.
+5. **Driver health monitoring:** when a driver container that was running is found stopped or removed, `reconcile_driver_health_for_worker` raises a `driver_health` warning on its twin, whether or not the worker is running.
+6. **One device per camera:** `cyberwave edge install` binds each camera twin to its own camera and records the binding under `twin_to_device` in the camera config. For a USB camera the CLI pins a `/dev/v4l/by-id` link, or a `/dev/v4l/by-path` link when two identical units are attached and a by-id name could match either; the value can also be an index (a camera that cannot be pinned), `serial:<serial>` (a depth camera that the driver resolves by serial) or a stream URL. On Linux, Edge Core passes it to the driver as `CYBERWAVE_METADATA_VIDEO_DEVICE` (`_load_selected_camera_device`: an index becomes `/dev/video<N>`, a link or URL goes through verbatim, a `serial:` value injects nothing), and a twin missing from the map gets the global `selected_device` instead. That fallback is why the installer records every pinned twin, even one whose camera the operator chose not to rebind, and every network camera with its stream URL. The injected `/dev` node is also watched, as described below.
+
+   A by-id link resolves inside the container only if the container can see `/dev/v4l`. `_ensure_linux_camera_docker_params` therefore bind-mounts the host's `/dev/v4l` read-only into every image whose name contains `camera-driver` (or `camera_driver`), and into any other image whose final `CYBERWAVE_METADATA_VIDEO_DEVICE`, injected or set in its own params, lies under `/dev/v4l/`, unless the params already mount it.
+
+   Three precedence rules decide what the driver actually receives. `_read_cameras_config` prefers `edge.json`: a non-empty `metadata.cameras` there wins over the legacy `cameras.json` for every key and every twin it lists, and a twin listed only in `cameras.json`'s `twin_to_device` is merged in, so it keeps that entry instead of falling back to `selected_device`. An explicit `-e CYBERWAVE_METADATA_VIDEO_DEVICE=...` in the driver's params wins over the mapping, and Edge Core then injects nothing. And the ALSA audio images, those whose name contains `generic-microphone`, `microphone-driver`, `generic-speaker` or `speaker-driver`, never receive the variable at all.
+
+7. **Network cameras:** a camera on the Ethernet port (a FLIR AX8, an IP camera) has no `/dev` node. `cyberwave edge install` finds it on the wire, identifies it by MAC and writes its stream URL into the twin's metadata (`video_device`, plus `mac_address`) and into `twin_to_device`, so Edge Core hands it to the camera driver like any other source; a URL has no node, so it is not watched for presence. When a driver param still names a source, that param wins as above, which is why the installer removes a placeholder or superseded param from the twin's drivers once it binds the device. How the device is found, matched and pinned, and how to describe a new kind of IP device in asset metadata, is in the CLI's [wired network devices](../cyberwave-clis/cyberwave-python-cli/docs/wired-network-devices.md) guide.
 
 Use `cyberwave edge status` to see all driver and worker containers with their twin mappings.
+
+### Camera pins: drift and missing devices
+
+Two reconcilers in the runtime loop (every ~15 s) keep camera drivers honest about the device they were given.
+
+**Pin drift.** On Linux, `reconcile_camera_config_drift` notices a camera config change by a new modification time on `edge.json` or `cameras.json`. It then compares the `CYBERWAVE_METADATA_VIDEO_DEVICE` each running driver container was started with against the device its twin resolves to now: the twin's own `twin_to_device` entry, or the global `selected_device` when the twin has no entry or its entry resolves to no device (a `serial:` pin, for example). A container started without the variable is skipped, and so is a twin for which neither names a device. When the two differ, for example after `cyberwave edge install --reconfigure-camera`, Edge Core restarts the whole edge on a background thread through `_perform_edge_core_restart`: every driver, the worker and the Zenoh router are stopped and started again, not just the drifted driver. Microphone and speaker containers are never started with `CYBERWAVE_METADATA_VIDEO_DEVICE`, so they cannot trigger that restart, but it recreates them along with everything else.
+
+**Missing devices.** `reconcile_sensor_device_presence` watches each twin that has a `twin_to_device` entry and a driver container started by this Edge Core, and it checks the device the launcher injects for that twin: the entry is resolved by `_load_selected_camera_device`, exactly as at launch, so an index becomes `/dev/video<N>`, a stable link is kept and a `serial:` pin resolves to nothing. Only a result under `/dev/` is checked; serial pins and stream URLs have no node to look for. A node missing on two consecutive checks (about 30 s) raises one `sensor_device_missing` alert on the twin (`error`, `source_type: "edge"`, `metadata.device` naming the path), and two consecutive checks that find it again resolve the alert, so a single glitch neither raises nor resolves one. The alert is also resolved as soon as the twin is no longer checked, because its entry was removed, it was re-pinned to a value with no `/dev` node, or no driver container is mapped to it any more. Camera drivers react to an unplugged device by reconnecting quietly, so without this check nothing told the operator why a camera had gone dark. Microphones are left out on purpose, because the CLI stores their pin in the twin's `audio_device` rather than in `twin_to_device`, and the microphone driver already raises its own sensor-failure alert while its pinned unit is absent. The "already alerted" state lives in memory, so after an Edge Core restart the first check that finds a twin's device present also resolves any alert left from before the restart, once per twin. A resolve that fails, for example while the backend is unreachable, is retried until it succeeds; an alert that fails to send is not retried.
 
 ## Multi-container drivers
 
@@ -633,11 +671,14 @@ A Cyberwave driver is a Docker image that interacts with device hardware and the
 
 - `CYBERWAVE_TWIN_UUID`
 - `CYBERWAVE_API_KEY`
-- `CYBERWAVE_TWIN_JSON_FILE` (writable file path)
+- `CYBERWAVE_TWIN_JSON_FILE` (writable file path; set when the twin file exists at launch, see *Twin JSON file*)
 - `CYBERWAVE_CHILD_TWIN_UUIDS` (optional, comma-separated)
 - `CYBERWAVE_DATA_BACKEND` — data transport backend (`zenoh` by default)
 - `ZENOH_SHARED_MEMORY` — `true`/`false`; enables zero-copy Zenoh SHM transport
 - `ZENOH_CONNECT` — (optional) comma-separated Zenoh router endpoint URLs
+- `CYBERWAVE_METADATA_VIDEO_DEVICE` — (Linux, optional) the camera device this twin is pinned to, from `twin_to_device` or the global `selected_device`. It is never set for microphone or speaker images, and it is left alone when the driver's own params already set it. When it names a `/dev/v4l/` link, the container also gets the host's `/dev/v4l` mounted read-only so the link resolves, whatever the image (see *Multi-camera orchestration*).
+
+Any other `-e CYBERWAVE_METADATA_<KEY>=...` in a driver's params reaches the container as written and, by the convention the Cyberwave camera and microphone drivers follow, outranks the twin's `metadata.<key>`. That makes such a param the strongest way to fix a source, and also the easiest way to leave a stale one behind: a binding written to the twin's metadata is ignored while the param is there. Hardware found on the network is bound through the twin's metadata (the keys its asset's `network_discovery.bind` names, plus `mac_address`), so a driver for a new kind of IP device should read those keys from the twin JSON file below.
 
 `CYBERWAVE_CHILD_TWIN_UUIDS` is present when child camera twins are attached to the driver twin; drivers can use this to coordinate cameras without additional prompts.
 
@@ -668,16 +709,20 @@ Environment variables for Zenoh infrastructure:
 
 ### Host telemetry
 
-Edge Core augments every `cyberwave/twin/{uuid}/edge_health` heartbeat with the host's dynamic resource pressure and exposes static hardware facts via REST. The split mirrors the existing convention: state that changes at the publish cadence (~5 s) rides MQTT, identity that effectively never changes rides REST.
+Edge Core reports the host's resource pressure over two transports. The bootstrap publisher folds the gauges into every `cyberwave/twin/{uuid}/edge_health` heartbeat it sends (~5 s), but Edge Core stops that publisher once driver startup has brought up at least one driver, because drivers publish their own health on the same topics from then on. After that the gauges travel only on the REST host-facts keepalive, which uploads them every ~30 s together with the static hardware facts. In practice, then, MQTT carries host metrics while the edge boots (and beyond that only on an edge whose startup brought up no driver), and REST carries them the rest of the time.
 
-**Dynamic (MQTT `edge_health` payload, every ~5 s):**
+**Dynamic (MQTT `edge_health` payload, every ~5 s while the bootstrap publisher runs):**
 
 | Field | Source | Notes |
 | --- | --- | --- |
-| `host_memory_percent` | `/proc/meminfo` | Absent on non-Linux hosts. |
-| `host_memory_available_mb` | `/proc/meminfo` | Free + buffers/cache. |
-| `cpu_temp_c` | `/sys/class/thermal/thermal_zone*` | Hottest CPU-typed zone. |
-| `consecutive_critical` | `resource_monitor` | Reconcile cycles where memory or CPU was over the critical threshold. Resets when pressure clears. |
+| `host_memory_percent` | `/proc/meminfo` | Absent on non-Linux hosts. From the monitor's 30 s snapshot. |
+| `host_memory_available_mb` | `/proc/meminfo` | Free + buffers/cache. From the monitor's 30 s snapshot. |
+| `cpu_temp_c` | `/sys/class/thermal/thermal_zone*` | Hottest CPU-typed zone. From the monitor's 30 s snapshot. |
+| `host_cpu_percent` | `/proc/stat` | Busy share of all cores between the monitor's last two snapshots. Absent on non-Linux hosts and before the second snapshot. |
+| `host_disk_percent` | `shutil.disk_usage` | Usage of the filesystem holding Docker's data root. From the monitor's 30 s snapshot. |
+| `consecutive_critical` | `SystemResourceMonitor` | Consecutive 30 s readings over a critical threshold (memory 92 %, CPU 82 °C). Resets on the first reading below both. |
+| `power_mw` | sysfs power rails | Read fresh on every heartbeat; see *Resource monitoring*. |
+| `battery_wh` | `CYBERWAVE_BATTERY_WH` | Only when set. |
 | `watchdog_layers` | `ProcessWatchdog.active_layers()` | E.g. `["systemd"]` or `["systemd", "hardware"]`. Also on `host_facts`, which is where the dashboard reads it — see below. Still published here so a dashboard can keep showing layers for an edge whose binary predates that upload. |
 
 Only the bootstrap publisher on the edge host injects these fields. Driver containers see their container's `/proc`, not the host's, so they intentionally omit the host block and publish only stream-level health.
@@ -686,7 +731,7 @@ Only the bootstrap publisher on the edge host injects these fields. Driver conta
 
 Each entry under `streams[id]` may carry an optional `stream_config` block — a discriminated union keyed by `kind` (`camera` / `audio` / `lidar` / `imu`) describing the runtime-negotiated config for that stream. Drivers attach a block once at startup via `EdgeHealthCheck.register_stream_config(stream_id, config)` in the Python SDK; the publisher merges it into every heartbeat thereafter. The legacy top-level `camera_config` slot stays populated for one deprecation release for out-of-tree consumers and mirrors the lexicographically-first camera-kind `stream_config`. New consumers must read `streams[id].stream_config` instead — the legacy slot only ever describes one camera and is silent for audio / lidar / IMU streams.
 
-`reconcile_camera_config_drift` watches `edge.json` and `cameras.json` mtimes alongside `docker inspect` env vars. It does not inspect any `edge_health` payload, so schema changes here are behaviourally invisible to it. Camera config is now read from `edge.json` `metadata.cameras` first, with `cameras.json` as a legacy fallback.
+`reconcile_camera_config_drift` works from file modification times and `docker inspect` output and never reads an `edge_health` payload, so changes to this schema cannot affect it (see *Camera pins: drift and missing devices*).
 
 **Static (REST `POST /api/v1/edges/discover`, every ~30 s):**
 
@@ -806,52 +851,78 @@ The links use the address the client connected to (or
 
 ### Driver failure handling
 
-Drivers must exit with a **non-zero** code when they cannot access required hardware (for example, missing `/dev/video*` or disconnected peripherals). This allows Edge Core to detect startup failures and trigger restart logic.
+Drivers should exit with a **non-zero** code when they cannot access required hardware at startup (for example, missing `/dev/video*` or disconnected peripherals). This allows Edge Core to detect startup failures and trigger restart logic. Not every driver does: the camera driver keeps running and reconnects when its device is unplugged, which is why Edge Core watches camera pins itself (`sensor_device_missing` below).
 
-Edge Core alerts and behavior:
+Edge Core raises these twin alerts, all with `source_type: "edge"`:
 
-- `driver_start_failure`: raised if a driver container cannot reach a stable running state.
-- `driver_restart_loop`: raised when a driver restarts more than the configured threshold (default 4 restarts within 60 seconds). The container is stopped and marked as flapping.
-- `model_download_failure` (`error`): raised when a required ML model cannot be downloaded. The worker container is **not** started — any workflow that depends on this model is held off rather than allowed to run with empty inference results. Models that the worker container can resolve on its own (e.g. an ultralytics auto-download on a frozen PyInstaller binary) are deferred via `_RuntimeManagedDeferred` and never trip this alert.
-- `worker_start_failure` (`error`): raised when the edge ML worker container cannot be started. No workflow on this edge will run until the issue is resolved.
+| Alert type | Severity | Raised when | Cleared by Edge Core |
+|---|---|---|---|
+| `driver_starting` | `info` | A driver start attempt begins; carries pull and startup progress (see *Remote restart*). | Resolved once the container runs. A failed attempt is annotated with its phase, escalated to `critical` and resolved. |
+| `worker_starting` | `info` | The same for the ML worker, held until the worker reports ready (see *Worker readiness*). | As above. |
+| `driver_start_failure` | `error` | The twin has no asset, the driver image cannot be pulled, or the container does not reach a running state. A launch refused only by its restart floor raises nothing. | Resolved by the next successful start of that twin's driver. |
+| `driver_restart_loop` | `error` | The driver restarted more than `CYBERWAVE_DRIVER_RESTART_LOOP_THRESHOLD` times within `CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS`. The container is switched to `--restart=no` and stopped. | No. |
+| `driver_health` | `warning` | A driver container that was running is found stopped or removed. | No. |
+| `sensor_device_missing` | `error` | The `/dev` node a managed camera twin is pinned to is missing on two consecutive checks (see *Camera pins: drift and missing devices*). | Resolved when two consecutive checks find it again, or when the twin is no longer checked. |
+| `driver_restart_needed` | `warning` | A configuration key in the metadata of a twin whose driver is not a sensor driver, or declares a restart floor, changed (see *Bidirectional twin sync*). Edge Core restarts nothing. | No. |
+| `driver_metadata_restart_suppressed` | `warning` | A sensor driver has already been restarted three times in 30 minutes for metadata changes; the change is left for a manual restart. | No. |
+| `edge_cpu_saturation`, `edge_memory_saturation`, `edge_disk_saturation` | `warning` | Raised on every managed twin when CPU, memory or disk usage is at or above `CYBERWAVE_RESOURCE_SATURATION_PERCENT` on two consecutive 30 s snapshots (see *Resource monitoring*). | Resolved after two consecutive snapshots five points below the threshold. |
+| `model_download_failure` | `error` | A required ML model cannot be downloaded. | No. |
+| `worker_start_failure` | `error` | The ML worker container cannot be started, or its startup probe gives up (see *Worker startup probe*). | Resolved by the next successful worker start. |
+| `workflow_sync_failure` | `error` | Downloading a twin's workflow workers from the backend failed. | No. |
+| `macos_camera_not_configured`, `macos_microphone_not_configured`, `macos_speaker_not_configured` | `warning` | On macOS, a camera, microphone or speaker twin has no host stream or bridge URL configured. | No. |
+
+When a model fails to download, the worker container is **not** started: a workflow that depends on the model is held off rather than allowed to run with empty inference results. Models that the worker container can resolve on its own (an Ultralytics auto-download on a frozen PyInstaller binary, for example) are deferred via `_RuntimeManagedDeferred` and never trip the alert.
+
+`docker_create_timeout` is a failure phase, not an alert type. When `docker create` times out and the container has still not appeared 10 s later (see *When `docker create` times out*), the `driver_starting` alert is closed with `phase: "docker_create_timeout"` and the twin gets a `driver_start_failure`. Nor does Edge Core create the `edge_core_restart` alert: the backend creates it when a restart is requested through `POST /api/v1/edges/{uuid}/restart-core` and ships its UUID in the MQTT command, and Edge Core only moves its `metadata.phase` from `in_progress` to `completed` or `failed` (`EdgeCoreRestartAlertContext` in `utils.py`).
 
 Optional environment variables to tune restart behavior:
 
 - `CYBERWAVE_DRIVER_RESTART_LOOP_THRESHOLD` (default: `4`)
 - `CYBERWAVE_DRIVER_RESTART_LOOP_WINDOW_SECONDS` (default: `60`)
+- `CYBERWAVE_DRIVER_CREATE_TIMEOUT_SECONDS` (default: `30`)
+- `CYBERWAVE_DRIVER_REMOVED_REVIVAL_SECONDS` (default: `300`; `0` keeps removed drivers down)
 - `CYBERWAVE_DRIVER_TROUBLESHOOTING_URL` (default: `https://docs.cyberwave.com`)
 
 #### Periodic Docker cleanup
 
-Edge Core periodically prunes stopped `cyberwave-*` containers (every 30 min) and unused Docker images (every 3 h) to reclaim disk space. The intervals are configurable:
-
-- `CYBERWAVE_CONTAINER_PRUNE_INTERVAL_SECONDS` (default: `1800`)
-- `CYBERWAVE_IMAGE_PRUNE_INTERVAL_SECONDS` (default: `10800`)
-
-**SD card protection:** when the root filesystem is on an SD card (`/dev/mmcblk*`), periodic Docker cleanup is automatically disabled to avoid accelerating flash wear from repeated prune/pull cycles. You can also disable it explicitly by setting `CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP=1`.
+Edge Core prunes stopped `cyberwave-*` containers every 30 minutes, and unused images and anonymous volumes every 3 hours, from the runtime loop (`_run_periodic_docker_cleanup`). When Docker's data root is on an SD card the pruning is deferred to spare the flash, but only until that filesystem is 80 % full; `CYBERWAVE_SKIP_PERIODIC_DOCKER_CLEANUP=1` turns it off altogether. The intervals, the threshold and the reasoning are under *Disk usage: container logs and cleanup*.
 
 #### Driver revival and orphan containers
 
-When a managed driver exits cleanly (Docker's `--restart unless-stopped` policy does not auto-revive clean exits), Edge Core's revival reconciler re-runs driver startup so the missing container is recreated. Revival is restricted to driver containers this Edge Core process is currently managing — i.e. whose twin is still linked to this edge's fingerprint.
+When a managed driver exits cleanly (Docker's `--restart unless-stopped` policy does not auto-revive clean exits), Edge Core's revival reconciler re-runs driver startup for that container so it is recreated. Revival is restricted to driver containers this Edge Core process launched. A service declared `restart: "no"`, or one the flap detector stopped, is left down, unless its relaunch was refused only on its restart floor. If `docker ps` fails or times out, the health snapshot from the previous cycle is kept and nothing is classified, alerted or revived on the strength of the failed listing.
 
-Stopped `cyberwave-driver-*` containers belonging to twins that have since been unlinked are treated as **orphans** and ignored by revival. They remain on the host harmlessly until the user removes them with `docker rm` or `docker container prune`. Without this guard, an orphan would re-trigger driver startup every revival cycle and force-recreate the currently healthy drivers as a side effect of the idempotent `docker rm -f` step.
+A managed container that has been **removed** altogether, by `docker rm` or by the periodic prune, is revived too, but only after a grace period: 300 s by default, set with `CYBERWAVE_DRIVER_REMOVED_REVIVAL_SECONDS`, where `0` disables it. The grace leaves an operator time for a deliberate takedown, an image swap or a debugging session before Edge Core brings the driver back. `_removed_containers_due` notes when each container was first seen removed and hands the overdue ones to the same revival pass as clean exits, so the orphan filter, the flap detector's opt-out and the 60 s revival debounce all apply. A removed container cannot be inspected, so Edge Core records the restart policy it launched each container with, and marks the ones the flap detector stopped as `no`: a removed `restart: "no"` or flap-stopped driver is not revived, unless its relaunch was refused on its restart floor. If a revival pass finds no linked twin that still declares a removed container, the container is not forgotten at once: that takes three passes in a row without a declaring twin (`_REMOVED_FORGET_AFTER_MISSES`), each at least a minute apart, so a twin list that comes back short while the backend is flaky does not cost a driver, and a twin that is really gone costs three passes rather than one a minute. Containers removed by an edge restart are dropped from Edge Core's bookkeeping and never come back this way; the restart relaunches what it still needs.
+
+Stopped `cyberwave-driver-*` containers that this process did not start, such as those of twins unlinked before Edge Core last started, are treated as **orphans** and ignored by revival. The periodic prune removes them with every other stopped `cyberwave-*` container, except those that carry a restart-floor label, or when periodic cleanup is disabled. Without this guard, an orphan would send a revival pass to the backend every minute for a container that no linked twin declares.
 
 ### Twin JSON file
 
-`CYBERWAVE_TWIN_JSON_FILE` is an absolute path to a JSON file provided to the driver. The file contains the digital twin instance object (including its `metadata`) and the associated catalog twin data, matching the API schema: TwinSchema and AssetSchema.
+`CYBERWAVE_TWIN_JSON_FILE` points the driver at `/app/<twin_uuid>.json`, a JSON copy of its twin: the twin instance as the API returns it (TwinSchema, including `metadata`), with the catalog asset (AssetSchema) under `asset`. Edge Core sets the variable only when the host file exists at launch.
 
-Drivers may modify this file; Edge Core will sync changes back to the backend when connectivity is available.
+On the host the file is `<config_dir>/<twin_uuid>.json`, and the container sees it twice: as a writable single-file bind mount at `/app/<twin_uuid>.json`, and inside the read-only mount of the whole config directory at `/app/.cyberwave/<twin_uuid>.json`. The difference matters because a single-file bind mount follows the file's inode, not its path. That is why `write_or_update_twin_json_file`, which runs before every driver launch, deep-merges the backend twin into an existing file and rewrites it in place rather than replacing it: the inode a running container holds stays the one the host sees.
+
+Drivers read the file when they start. The Cyberwave camera driver's `entrypoint.sh`, for example, exports the twin's metadata as `CYBERWAVE_METADATA_*` variables once, before the driver process runs, so a change to the file while the driver runs does not reach the driver until it is started again.
 
 #### Bidirectional twin sync
 
-`reconcile_twin_json_file_sync()` runs on every reconcile cycle (~15 s) and now operates in **both directions**:
+`reconcile_twin_json_file_sync` runs on every runtime tick (~15 s) and keeps the host files and the backend in step in both directions.
 
-- **Push** (legacy): a local file whose checksum changed since the last cycle is pushed to `PUT /api/v1/twins/{uuid}`. The set of fields the edge is allowed to push is constrained by `_TWIN_UPDATE_ALLOWED_FIELDS` (no `asset_uuid`, `environment_uuid`, etc.).
-- **Pull** (new): for every tracked twin file that did *not* change locally this cycle, the latest twin is fetched via `client.twins.get_raw(uuid)` and the fields in `_TWIN_PULL_ALLOWED_FIELDS` (currently just `metadata`) are merged into the local file.
+The push leg looks for files whose SHA-256 changed since the previous tick and sends each one with `PUT /api/v1/twins/{uuid}`. The payload is every field of `_TWIN_UPDATE_ALLOWED_FIELDS` present in the file: the whole `metadata` object along with the name, pose, attachment and calibration fields, but never asset or environment assignments. This is how a driver's own edits to its twin file reach the backend. A file seen for the first time only has its checksum recorded, and the writes Edge Core makes itself, at launch and on a pull, record the new checksum too, so they are never pushed back.
 
-The pull leg closes the gap that previously forced an `edge-core` restart for UI-driven metadata edits (e.g. flipping the privacy frame filter on/off in the sensor settings dialog) to reach the driver container's environment via `entrypoint.sh`. Push wins for the cycle in which the local file changed; the next cycle's pull surfaces any concurrent backend edits.
+The pull leg covers every file the push leg did not send in that tick. `_pull_twin_json_file_from_backend` fetches the twin with `client.twins.get_raw` and, for each field in `_TWIN_PULL_ALLOWED_FIELDS` (only `metadata`), compares the backend value with the local one as a whole; if they differ at all, the backend value replaces the local one outright, with no key-by-key merge. A push that failed therefore does not protect a local edit, because the same tick's pull can overwrite it with the backend's metadata. For the same reason a field the edge legitimately writes must never be added to `_TWIN_PULL_ALLOWED_FIELDS`.
 
-The pull set is intentionally narrow: any field the edge legitimately writes locally **must not** be added to `_TWIN_PULL_ALLOWED_FIELDS`, otherwise the next cycle would silently clobber the local edit.
+Like the launch path, the pull rewrites the host file in place, so the inode a running container holds stays the one the host sees: `/app/<twin_uuid>.json` shows the pulled content at once, and what the driver writes there still reaches the push leg. The new content is first written to a temporary file, so a full disk fails before the original is touched, and the original is then overwritten without being emptied first, a shorter document padded with spaces until the old tail is cut, so a reader always finds valid JSON. A host file that cannot be read is rebuilt from the last copy Edge Core wrote or read intact, with the backend metadata applied; with no such copy in memory it is left, with one warning, for the next launch to rewrite. The pull reports which top-level metadata keys changed, and `reconcile_twin_json_file_sync` returns them per twin.
+
+Drivers read the file only when they start, so a metadata edit made in the UI, such as a new microphone gain, reaches a driver only through a restart. `reconcile_driver_metadata_restarts`, which runs right after the sync, makes that restart for sensor drivers: the camera, microphone, speaker and webcam drivers, recognised by their image names.
+
+- **Configuration only.** Runtime state is left out of the comparison: telemetry (`status`, `power`, `motor_temps`, `performance`), the backend's navigation keys (`active_map_*`, `finalize_active_map_request`, `last_finalized_map_*`, `navigation_lifecycle`, `localization`), the drivers' own reports (`speaker_device`, `audio_routing`, `robot_dump`, and `audio_device` when it is the webcam's dict rather than a pinned device string) and `edge_fingerprint`; a change of `edge_fingerprint`, a link or unlink, never restarts anything. In `sensors`, entries without `parameters` are left out too, because a driver registers a missing sensor on its own as a bare id and type, and a list left empty counts as no `sensors` at all. Every other key is configuration, compared as a digest of the filtered metadata.
+- **Debounced.** The restart happens once the filtered metadata has been unchanged for at least 10 s, that is on a later tick, so several saves in a row cost one restart.
+- **The driver's own writes do not count.** The digest written at launch is the baseline, and whatever Edge Core pushes from the file becomes the new one; the writes a driver is known to make through the backend are filtered out of the digest (see above). Each of the twin's containers is judged on its own: one that started after the change, or is not running, has it or reads it when it starts. A change seen during a container's first 90 s waits for those 90 s to pass, so nothing restarts while a driver is starting; if the filtered metadata still differs from what the containers started with, the twin is then restarted. A real edit made right after a restart therefore still reaches the driver, and a startup write Edge Core does not recognise costs at most the restarts the rate limit allows. A container that cannot be inspected holds the decision until a later tick.
+- **Relaunch.** The twin's containers go through `fetch_and_run_twin_drivers(..., only_container_names=..., pull_images=False)`, the revival path, which re-fetches the twin, rewrites the file and shows `driver_starting`. A child camera twin restarts the containers of the twin it is attached to. The relaunch uses the image already on disk and pulls only a missing one: a settings change applies settings and does not upgrade the driver. It also runs inside the runtime loop, whose only `WATCHDOG=1` comes at the end of each cycle, so a pull of a newly published tag could outlast `WatchdogSec=60` and get Edge Core aborted. For the same reason the relaunch gets the loop's watchdog, which the dependency health wait pings. The change counts as applied only when every relaunched container started; otherwise it stays pending and is retried under the rate limit below.
+- **Rate limit.** At least 120 s between two metadata restarts of a twin and at most three in 30 minutes; beyond that the change is left for a manual restart and the twin gets one `driver_metadata_restart_suppressed` alert.
+- **Never during another restart.** The step waits while an Edge Core or camera-drift restart is in progress.
+
+Any other driver, a robot or a drone, and any service with a restart floor, is not restarted for a metadata change: the change raises one `driver_restart_needed` alert ("Settings changed; restart the driver to apply them") on the twin whose settings changed. Until that alert, or a `driver_metadata_restart_suppressed` one, reaches the backend, the change stays pending and the alert is retried on later ticks.
 
 ### Twin metadata
 
@@ -1187,6 +1258,21 @@ export CYBERWAVE_ENVIRONMENT=local
 | CLI        | `../cyberwave-clis/cyberwave-python-cli`   |
 
 Edit code in any of those directories; the editable installs pick up changes (no reinstall needed for Python changes).
+
+## Testing
+
+CI (`.github/workflows/edge-core-test-and-push.yml`) runs the whole unit suite, `pytest tests/ --ignore=tests/integration`, and then the Docker integration tests separately. Run the same thing locally from this folder:
+
+```bash
+pytest tests/ --ignore=tests/integration -q
+```
+
+The systemd behaviour (readiness, the watchdog, bounded start and stop, upgrades of the Debian package) can only be checked under a real systemd. `scripts/test_deb_upgrade_under_systemd.sh` boots one in a container, installs the package given by `PACKAGE_FILE` and checks install, upgrade, hold and update. It then runs the lifecycle test files of the CLI and of Edge Core inside that systemd, with `CYBERWAVE_TEST_SYSTEMD_SYSTEM=1` and `CYBERWAVE_REQUIRE_SYSTEMD_TESTS=1` so that tests needing systemd fail instead of skipping. The Edge Core checkout is mounted read-only. `LIFECYCLE_ONLY=1` skips the Debian checks and needs no package, which is the quick way to check a lifecycle change:
+
+```bash
+LIFECYCLE_ONLY=1 bash scripts/test_deb_upgrade_under_systemd.sh
+PACKAGE_FILE=path/to/package.deb bash scripts/test_deb_upgrade_under_systemd.sh
+```
 
 ## Contributing
 

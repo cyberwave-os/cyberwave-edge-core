@@ -22,8 +22,8 @@ THE INVARIANT, which is load-bearing
 ------------------------------------
 **The wait may delay a start. It may never prevent one.** The return value is a
 report; no caller branches on it. Skipping a service is unrecoverable: it is
-never created, so its health snapshot reads `removed`, which
-`reconcile_driver_revival` ignores by design and nothing else retries. Docker's
+never created, and `reconcile_driver_revival` acts only on containers this
+process created, so nothing retries it. Docker's
 `unhealthy` is not terminal either -- the healthcheck keeps running and a later
 pass can flip the container back -- so treating it as fatal reads a transient
 state as permanent.

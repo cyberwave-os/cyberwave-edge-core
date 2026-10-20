@@ -2115,6 +2115,21 @@ def test_an_immutable_entry_image_missing_from_disk_is_pulled(
     assert pull_calls == [(image,)]
 
 
+def test_without_refresh_a_moving_entry_image_on_disk_is_read_as_it_is(
+    _declared_graph_on_disk: list[Any], pull_calls: list[tuple[str, ...]]
+) -> None:
+    assert _declared_for({"default": {"docker_image": "drv:humble-dev"}}, refresh=False) is not None
+    assert pull_calls == []
+
+
+def test_without_refresh_a_missing_entry_image_is_still_pulled(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any], pull_calls: list[tuple[str, ...]]
+) -> None:
+    monkeypatch.setattr(startup, "_docker_image_exists_locally", lambda _image: False)
+    assert _declared_for({"default": {"docker_image": "drv:humble-dev"}}, refresh=False) is not None
+    assert pull_calls == [("drv:humble-dev",)]
+
+
 def test_twins_sharing_a_moving_entry_image_pull_it_once(
     _declared_graph_on_disk: list[Any], pull_calls: list[tuple[str, ...]]
 ) -> None:

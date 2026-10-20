@@ -585,3 +585,46 @@ class TestProtectEdgeCoreOom:
 
         protect_edge_core_oom(score_adj=-5000)
         assert oom_file.read_text() == "-1000"
+
+
+def test_startup_extensions_have_absolute_deadline(monkeypatch):
+    import cyberwave_edge_core.watchdog as wd_mod
+    now = [100.0]
+    sent = []
+    monkeypatch.setattr(wd_mod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+    monkeypatch.setattr(wd_mod, "_sd_notify", sent.append)
+    watchdog = wd_mod.ProcessWatchdog()
+    watchdog.extend_timeout(30)
+    assert sent[-1] == "EXTEND_TIMEOUT_USEC=30000000"
+    now[0] = 1898
+    watchdog.extend_timeout(30)
+    assert sent[-1] == "EXTEND_TIMEOUT_USEC=2000000"
+    before = list(sent)
+    now[0] = 1901
+    watchdog.extend_timeout(30)
+    assert sent == before
+
+
+def test_startup_deadline_follows_startup_timeout_setting(monkeypatch):
+    import cyberwave_edge_core.watchdog as wd_mod
+    monkeypatch.setenv("CYBERWAVE_STARTUP_TIMEOUT_MINUTES", "90")
+    monkeypatch.setattr(wd_mod.time, "monotonic", lambda: 100.0)
+    assert wd_mod.ProcessWatchdog()._startup_deadline == 100.0 + 90 * 60
+
+
+def test_shutdown_disables_extensions_and_readiness(monkeypatch):
+    import cyberwave_edge_core.watchdog as wd_mod
+    sent = []
+    monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
+    monkeypatch.setattr(wd_mod, "_sd_notify", sent.append)
+    watchdog = wd_mod.ProcessWatchdog()
+    opened = []
+    monkeypatch.setattr(watchdog.hardware, "open", lambda: opened.append(True))
+    watchdog.begin_shutdown()
+    watchdog.extend_timeout(30)
+    watchdog.mark_ready()
+    watchdog.start_pinging()
+    assert sent == ["STOPPING=1"]
+    assert not watchdog._ready_signalled
+    assert not opened

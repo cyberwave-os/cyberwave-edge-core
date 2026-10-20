@@ -352,6 +352,65 @@ class TestLaunchDetachedContainer:
         assert ok is False
         assert failures[0][0] == "docker_create_failed"
 
+    def test_create_timeout_starts_the_container_the_daemon_created(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess
+
+        events: list[str] = []
+
+        def _fake_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+            if cmd[:2] == ["docker", "create"]:
+                raise subprocess.TimeoutExpired(cmd, 30)
+            return MagicMock()
+
+        monkeypatch.setattr(dl.subprocess, "run", _fake_run)
+        monkeypatch.setattr(dl.subprocess, "Popen", _finished_popen)
+        monkeypatch.setattr(dl.time, "sleep", lambda _: None)
+        inspect_results = [
+            None,
+            {"State": {"Status": "created"}},
+            {"State": {"Status": "created"}},
+            {"State": {"Status": "running"}},
+        ]
+        with patch.object(docker_helpers, "docker_inspect", side_effect=inspect_results):
+            ok = dl.launch_detached_container(
+                container_name="cyberwave-driver-deadbeef",
+                run_argv=self._RUN_ARGV,
+                get_runtime_env_var=self._noop_env,
+                on_container_created=lambda: events.append("created"),
+                on_running=lambda: events.append("running"),
+                on_failure=lambda _m, phase: events.append(phase),
+            )
+
+        assert ok is True
+        assert events == ["created", "running"]
+
+    def test_create_timeout_without_a_container_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess
+
+        failures: list[str] = []
+
+        def _timeout(cmd: list[str], **kwargs: Any) -> None:
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(dl.subprocess, "run", _timeout)
+        monkeypatch.setattr(dl, "_CREATE_TIMEOUT_GRACE_SECONDS", 0.0)
+        with patch.object(docker_helpers, "docker_inspect", return_value=None):
+            ok = dl.launch_detached_container(
+                container_name="cyberwave-driver-deadbeef",
+                run_argv=self._RUN_ARGV,
+                get_runtime_env_var=self._noop_env,
+                on_container_created=lambda: failures.append("created"),
+                on_running=lambda: failures.append("running"),
+                on_failure=lambda _m, phase: failures.append(phase),
+            )
+
+        assert ok is False
+        assert failures == ["docker_create_timeout"]
+
     def test_recovery_start_when_stuck_in_created(self, monkeypatch: pytest.MonkeyPatch) -> None:
         run_cmds: list[list[str]] = []
         popen_calls = 0

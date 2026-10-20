@@ -460,9 +460,9 @@ def _run_docker_image(
         return False
 
     container_name = driver_container_name(twin_uuid, service_name)
+    s._CONTAINER_RESTART_POLICY[container_name] = restart
     image = s._resolve_driver_image_tag(image)
     params = s._ensure_linux_microphone_docker_params(image, params)
-    params = s._ensure_linux_camera_docker_params(image, params)
     runtime_environment = (
         s.get_runtime_env_var("CYBERWAVE_ENVIRONMENT", s.DEFAULT_ENVIRONMENT) or s.DEFAULT_ENVIRONMENT
     ).lower()
@@ -580,6 +580,9 @@ def _run_docker_image(
             )
             return False
         driver_alert_ctx.update_metadata({"phase": "pull_skipped"}, force=True)
+    elif s._use_local_build(image):
+        logger.info("Using the local build of %s; local-only tags are not pulled", image)
+        driver_alert_ctx.update_metadata({"phase": "pull_skipped"}, force=True)
     else:
         try:
             s._pull_docker_image_with_progress(
@@ -695,7 +698,11 @@ def _run_docker_image(
 
     # On Linux, read the selected camera device from cameras.json so camera
     # drivers open the correct /dev/video* instead of defaulting to index 0.
-    if platform.system() == "Linux" and "CYBERWAVE_METADATA_VIDEO_DEVICE" not in explicit_params_env:
+    if (
+        platform.system() == "Linux"
+        and "CYBERWAVE_METADATA_VIDEO_DEVICE" not in explicit_params_env
+        and not s._is_linux_alsa_audio_driver_image(image)
+    ):
         selected_video_device = s._load_selected_camera_device(twin_uuid)
         if selected_video_device is not None:
             container_env.setdefault("CYBERWAVE_METADATA_VIDEO_DEVICE", selected_video_device)
@@ -1082,6 +1089,14 @@ def _run_docker_image(
     # the legacy alias in sync for services that have not migrated to BASE_URL.
     container_env["CYBERWAVE_BASE_URL"] = control_plane_url
     container_env["CYBERWAVE_API_URL"] = control_plane_url
+
+    params = s._ensure_linux_camera_docker_params(
+        image,
+        params,
+        {**host_env, **explicit_params_env, **container_env}.get(
+            "CYBERWAVE_METADATA_VIDEO_DEVICE"
+        ),
+    )
 
     env_vars: List[str] = []
     for key, value in container_env.items():

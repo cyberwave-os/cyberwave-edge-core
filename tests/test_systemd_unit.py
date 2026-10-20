@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import shutil
 import subprocess
@@ -24,6 +26,7 @@ EXPECTED_UNIT = """\
 Description=Cyberwave Edge Core Orchestrator
 After=network-online.target docker.service
 Wants=network-online.target docker.service
+JobTimeoutSec=35min
 
 [Service]
 Type=notify
@@ -34,6 +37,9 @@ Restart=always
 RestartSec=5
 WatchdogSec=60
 TimeoutStartSec=900
+TimeoutStopSec=90
+KillMode=control-group
+SendSIGKILL=yes
 Environment=CYBERWAVE_EDGE_CONFIG_DIR=/home/pi/.cyberwave
 OOMScoreAdjust=-800
 StandardOutput=journal
@@ -47,6 +53,8 @@ WantedBy=multi-user.target
 # What ``cyberwave edge install`` wrote before B1 (cyberwave_cli/core.py).
 LEGACY_CLI_UNIT = EXPECTED_UNIT.replace(
     "ExecStartPre=" + systemd_unit.UPDATE_GUARD_EXEC_START_PRE + "\n", ""
+).replace("JobTimeoutSec=35min\n", "").replace(
+    "TimeoutStopSec=90\nKillMode=control-group\nSendSIGKILL=yes\n", ""
 )
 
 
@@ -60,6 +68,11 @@ class RecordingRunner:
         if self.fail_stderr is not None:
             raise subprocess.CalledProcessError(1, list(cmd), output="", stderr=self.fail_stderr)
         return subprocess.CompletedProcess(list(cmd), 0, "", "")
+
+
+@pytest.fixture(autouse=True)
+def _no_startup_timeout_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(systemd_unit.STARTUP_TIMEOUT_ENV_VAR, raising=False)
 
 
 @pytest.fixture
@@ -256,6 +269,77 @@ def test_daemon_reload_failure_is_reported_not_raised(tmp_path: Path, systemd_di
     assert unit_path.exists()
 
 
+
+
+def _write_credentials_envs(config_dir: Path, envs: dict[str, str]) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "credentials.json").write_text(json.dumps({"token": "t", "envs": envs}))
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        ("90", 90, False),
+        (" 45 ", 45, False),
+        ("0", 30, True),
+        ("-5", 30, True),
+        ("ninety", 30, True),
+        ("1.5", 30, True),
+    ],
+)
+def test_startup_timeout_from_process_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, raw, expected, warns
+) -> None:
+    monkeypatch.setenv(systemd_unit.STARTUP_TIMEOUT_ENV_VAR, raw)
+
+    with caplog.at_level(logging.WARNING, logger=systemd_unit.__name__):
+        assert systemd_unit.resolve_startup_timeout_minutes(str(tmp_path)) == expected
+
+    assert bool(caplog.records) is warns
+
+
+def test_startup_timeout_defaults_to_30_when_unset(tmp_path: Path) -> None:
+    assert systemd_unit.resolve_startup_timeout_minutes(str(tmp_path)) == 30
+    assert systemd_unit.resolve_startup_timeout_minutes(str(tmp_path / "missing")) == 30
+
+
+def test_startup_timeout_falls_back_to_credentials_envs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_credentials_envs(tmp_path, {systemd_unit.STARTUP_TIMEOUT_ENV_VAR: "120"})
+    assert systemd_unit.resolve_startup_timeout_minutes(str(tmp_path)) == 120
+
+    monkeypatch.setenv(systemd_unit.STARTUP_TIMEOUT_ENV_VAR, "60")
+    assert systemd_unit.resolve_startup_timeout_minutes(str(tmp_path)) == 60
+
+
+def test_unit_job_timeout_follows_startup_budget_of_the_unit_config_dir(
+    tmp_path: Path, systemd_dir: Path
+) -> None:
+    config_dir = tmp_path / "cw"
+    _write_credentials_envs(config_dir, {systemd_unit.STARTUP_TIMEOUT_ENV_VAR: "120"})
+    unit_path = tmp_path / "cyberwave-edge-core.service"
+    unit_path.write_text(LEGACY_CLI_UNIT.replace("/home/pi/.cyberwave\n", f"{config_dir}\n"))
+
+    _ensure(unit_path, systemd_dir, RecordingRunner())
+
+    assert "JobTimeoutSec=125min\n" in unit_path.read_text()
+
+
+def test_unit_job_timeout_ignores_the_installer_shell(
+    tmp_path: Path, systemd_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = tmp_path / "cw"
+    _write_credentials_envs(config_dir, {})
+    unit_path = tmp_path / "cyberwave-edge-core.service"
+    unit_path.write_text(LEGACY_CLI_UNIT.replace("/home/pi/.cyberwave\n", f"{config_dir}\n"))
+    monkeypatch.setenv(systemd_unit.STARTUP_TIMEOUT_ENV_VAR, "90")
+
+    _ensure(unit_path, systemd_dir, RecordingRunner())
+
+    assert "JobTimeoutSec=35min\n" in unit_path.read_text()
+
+
 def test_never_restarts_across_all_paths(tmp_path: Path, systemd_dir: Path) -> None:
     unit_path = tmp_path / "cyberwave-edge-core.service"
     runner = RecordingRunner()
@@ -368,6 +452,8 @@ def test_postinst_is_executable_posix_sh() -> None:
 
 def _run_postinst(tmp_path: Path, *, systemd: bool, unit: bool, binary_rc: int, arg="configure"):
     """Run the postinst with its absolute paths redirected into ``tmp_path``."""
+    if shutil.which("timeout") is None:
+        pytest.skip("Debian postinst requires GNU timeout")
     root = tmp_path / "root"
     (root / "run/systemd/system").mkdir(parents=True) if systemd else root.mkdir()
     unit_path = root / "etc/systemd/system/cyberwave-edge-core.service"
