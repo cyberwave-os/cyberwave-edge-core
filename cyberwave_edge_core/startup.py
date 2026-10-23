@@ -1797,6 +1797,26 @@ def _image_declared_services_for_twin(
         return None
     specs, _translator_shared_env, shared_params = declared
 
+    image_overrides = select_driver_service_image_overrides(
+        drivers, child_registry_ids=child_registry_ids
+    )
+    if image_overrides:
+        unknown = set(image_overrides) - {spec.name for spec in specs}
+        if unknown:
+            raise ValueError(
+                "service_image_overrides names unknown service(s): "
+                + ", ".join(sorted(unknown))
+            )
+        for spec in specs:
+            if spec.name in image_overrides:
+                logger.info(
+                    "Pinning image-declared service %s for twin %s to %s",
+                    spec.name,
+                    twin.name,
+                    image_overrides[spec.name],
+                )
+                spec.image = image_overrides[spec.name]
+
     # The twin's `shared_env`, in place of the translator's empty one.
     #
     # `get_image_declared_services` returns `(specs, {}, [])` BY CONSTRUCTION: a
@@ -4398,6 +4418,9 @@ from .driver_selection import (  # noqa: E402
 )
 from .driver_selection import (  # noqa: E402
     select_driver_shared_env as select_driver_shared_env,
+)
+from .driver_selection import (  # noqa: E402
+    select_driver_service_image_overrides as select_driver_service_image_overrides,
 )
 
 

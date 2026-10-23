@@ -2011,6 +2011,47 @@ def test_the_twin_shared_env_replaces_the_translators_empty_one(
     assert shared_params == []
 
 
+def test_service_image_override_preserves_declared_topology(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any]
+) -> None:
+    mapper = ds._ServiceSpec(
+        image="cyberwaveos/ros2-slam:jetson-humble",
+        name="map-stream-bridge",
+        depends_on={"plant": "service_healthy"},
+        command=["map_stream_bridge"],
+    )
+    _declared_graph_on_disk.append(mapper)
+    monkeypatch.setattr(ds, "_platform_driver_keys", lambda: ["linux-aarch64-jetson"])
+    drivers = {
+        "default": {"docker_image": "drv:x86"},
+        "linux-aarch64-jetson": {
+            "docker_image": "drv:jetson",
+            "service_image_overrides": {
+                "map-stream-bridge": "cyberwaveos/ros2-slam:jetson-humble-mapalign-895e91bbb2"
+            },
+        },
+    }
+    specs, _, _ = _declared_for(drivers)
+    assert specs[0].image == "drv:x86"
+    assert mapper.image == "cyberwaveos/ros2-slam:jetson-humble-mapalign-895e91bbb2"
+    assert mapper.depends_on == {"plant": "service_healthy"}
+    assert mapper.command == ["map_stream_bridge"]
+
+
+def test_service_image_override_rejects_unknown_service(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    with pytest.raises(ValueError, match="unknown service"):
+        _declared_for(
+            {
+                "default": {
+                    "docker_image": "drv:x86",
+                    "service_image_overrides": {"typo-mapper": "image:tag"},
+                }
+            }
+        )
+
+
 def test_the_substituted_env_comes_from_the_profile_the_image_came_from(
     monkeypatch: Any, _declared_graph_on_disk: list[Any]
 ) -> None:

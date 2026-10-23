@@ -222,6 +222,37 @@ def select_driver_shared_env(
     }
 
 
+def select_driver_service_image_overrides(
+    drivers: Dict[str, Dict[str, Any]],
+    *,
+    child_registry_ids: Optional[set[str]] = None,
+) -> Dict[str, str]:
+    """Select explicit per-service image pins from the matched driver profile.
+
+    This overlays only image references on an image-declared graph. In particular,
+    the graph still supplies its commands, networks, volumes and dependencies.
+    A temporary robot-specific mapper build can therefore be tested without
+    replacing the complete topology with inline ``services`` metadata.
+    """
+    if not isinstance(drivers, dict) or not drivers:
+        return {}
+    _name, config = _matched_driver_profile(drivers, child_registry_ids)
+    if not isinstance(config, dict):
+        return {}
+    raw = config.get("service_image_overrides")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or any(
+        not isinstance(name, str)
+        or not name.strip()
+        or not isinstance(image, str)
+        or not image.strip()
+        for name, image in raw.items()
+    ):
+        raise ValueError("service_image_overrides must map service names to image references")
+    return {name: image for name, image in raw.items()}
+
+
 def _get_best_driver_image_and_params(
     drivers: Dict[str, Dict[str, Any]],
     child_registry_ids: Optional[set[str]] = None,
