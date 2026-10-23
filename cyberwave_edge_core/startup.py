@@ -1779,9 +1779,32 @@ def _image_declared_services_for_twin(
             "Pulling %s ahead of the main pull phase to read its declared topology",
             image,
         )
-        if not _pull_driver_images_parallel(
-            [image], watchdog=watchdog, token=token
-        ).get(image, False):
+        # Topology discovery precedes the per-service startup cards. A cold
+        # image can take minutes here, so give this phase its own twin alert
+        # and log delivery target rather than leaving the dashboard silent.
+        _clear_stale_driver_starting_alerts([twin_uuid], log_context="topology discovery")
+        alert = DriverStartingAlertContext(twin_uuid=twin_uuid, image=image)
+        alert.create()
+        try:
+            pulled = _pull_driver_images_parallel(
+                [image],
+                watchdog=watchdog,
+                token=token,
+                pull_contexts_by_image={
+                    image: [
+                        _PullDeliveryContext(
+                            twin_uuid=twin_uuid,
+                            container_name=driver_container_name(twin_uuid),
+                            driver_alert_ctx=alert,
+                        )
+                    ],
+                },
+            ).get(image, False)
+        finally:
+            # The main pass owns subsequent per-service alerts, including
+            # failures. Do not leave a topology card active on cancellation.
+            alert.resolve()
+        if not pulled:
             # Not fatal here: the main pull phase reports the failure for this
             # twin with the alerting the operator already expects.
             logger.warning(
@@ -3806,6 +3829,9 @@ def fetch_and_run_twin_drivers(
             if pull_images
             else {image for image in set(images_to_pull) if _docker_image_exists_locally(image)}
         )
+        # Discovery already refreshed these exact references during this
+        # startup. This also covers images with no topology label (cameras).
+        on_disk.update(refreshed_images)
         images_to_pull = [image for image in images_to_pull if image not in on_disk]
         # Fan-out map so progress on a shared image lands on every twin's
         # alert + ``driverlog`` topic, not just the first to claim it.

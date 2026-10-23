@@ -24,6 +24,7 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1948,6 +1949,8 @@ def pull_calls(monkeypatch: Any) -> list[tuple[str, ...]]:
     """Record the images `_image_declared_services_for_twin` pulls ahead of the
     graph read, and answer each as pulled. Without it a moving-tag image would run
     a real `docker pull`."""
+    monkeypatch.setattr(startup, "DriverStartingAlertContext", MagicMock())
+    monkeypatch.setattr(startup, "_clear_stale_driver_starting_alerts", lambda *a, **kw: 0)
     calls: list[tuple[str, ...]] = []
 
     def _pull(images: list[str], **_kw: Any) -> dict[str, bool]:
@@ -2201,3 +2204,93 @@ def test_a_failed_pull_of_the_entry_image_reads_no_graph(
     )
     assert _declared_for({"default": {"docker_image": "drv:humble-dev"}}) is None
     assert read == []
+
+
+@pytest.mark.parametrize("outcome", [True, False, "cancelled"])
+def test_topology_pull_publishes_progress_and_closes_alert(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any], outcome: Any
+) -> None:
+    image = "drv:staging"
+    refreshed: set[str] = set()
+    alert = startup.DriverStartingAlertContext.return_value
+
+    def pull(images: list[str], **kwargs: Any) -> dict[str, bool]:
+        alert.create.assert_called_once()
+        alert.resolve.assert_not_called()
+        (context,) = kwargs["pull_contexts_by_image"][image]
+        assert context.twin_uuid == "abcd1234-0000-0000-0000-000000000000"
+        assert context.container_name == startup.driver_container_name(context.twin_uuid)
+        assert context.driver_alert_ctx is alert
+        if outcome == "cancelled":
+            raise RuntimeError("cancelled")
+        return {image: outcome}
+
+    monkeypatch.setattr(startup, "_pull_driver_images_parallel", pull)
+    if outcome == "cancelled":
+        with pytest.raises(RuntimeError, match="cancelled"):
+            _declared_for({"default": {"docker_image": image}}, refreshed_images=refreshed)
+    else:
+        _declared_for({"default": {"docker_image": image}}, refreshed_images=refreshed)
+    alert.resolve.assert_called_once()
+    assert refreshed == ({image} if outcome is True else set())
+
+
+@pytest.mark.parametrize("first_pull_succeeds", [True, False])
+@pytest.mark.parametrize("declares_services", [True, False])
+def test_startup_reuses_discovery_pull_but_retries_failures(
+    monkeypatch: Any,
+    _declared_graph_on_disk: list[Any],
+    first_pull_succeeds: bool,
+    declares_services: bool,
+) -> None:
+    image = "drv:staging"
+    twin = SimpleNamespace(
+        uuid="abcd1234-0000-0000-0000-000000000000",
+        name="camera",
+        asset_uuid="asset-camera",
+        metadata={
+            "edge_fingerprint": "edge-fp",
+            "drivers": {"default": {"docker_image": image}},
+        },
+    )
+    client = SimpleNamespace(
+        twins=SimpleNamespace(list=lambda **kw: [twin], get_raw=lambda *a: {}),
+        assets=SimpleNamespace(get=lambda *a: SimpleNamespace(metadata={})),
+    )
+    monkeypatch.setattr(startup, "Cyberwave", lambda **kw: client)
+    monkeypatch.setattr(startup, "_check_and_alert_sensors_devices", lambda *a, **kw: None)
+    monkeypatch.setattr(startup, "write_or_update_twin_json_file", lambda *a, **kw: True)
+    monkeypatch.setattr(startup, "_run_docker_image", lambda *a, **kw: True)
+    monkeypatch.setattr(startup.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        startup,
+        "get_image_declared_services",
+        lambda *a, **kw: (
+            (
+                [
+                    ds._ServiceSpec(image=image, name="camera"),
+                    ds._ServiceSpec(image="helper:staging", name="helper"),
+                ],
+                {},
+                [],
+            )
+            if declares_services
+            else None
+        ),
+    )
+    calls: list[list[str]] = []
+
+    def pull(images: list[str], **kw: Any) -> dict[str, bool]:
+        calls.append(list(images))
+        return {img: first_pull_succeeds if len(calls) == 1 else True for img in images}
+
+    monkeypatch.setattr(startup, "_pull_driver_images_parallel", pull)
+    results = startup.fetch_and_run_twin_drivers("test-token", "env-uuid", "edge-fp")
+    assert calls[0] == [image]
+    if not first_pull_succeeds:
+        # Discovery cannot read a graph; the single-image fallback retries.
+        assert calls[1] == [image]
+    else:
+        assert calls[1] == (["helper:staging"] if declares_services else [])
+    assert len(calls) == 2
+    assert results and all(result["success"] for result in results)
