@@ -649,6 +649,13 @@ Some robots require multiple cooperating containers (e.g. a driver, bridge nodes
 
 - `shared_env`: Environment variables applied to every service. Per-service `env` overrides shared values.
 - `shared_params`: Docker params applied to every service (e.g. `--network host`, volume mounts).
+- `service_image_overrides`: for a driver whose image declares its own service graph (no inline `services`), maps service names to image references. Only those services' images change; the declared graph still supplies commands, env, networks, volumes and dependencies. Use it to try one service's build (a mapper, say) on a robot without restating the whole topology. A name the graph does not declare, or a value that is not a non-empty string, stops the driver from starting.
+
+  ```json
+  "service_image_overrides": {
+    "slam": "cyberwaveos/ros2-slam:jetson-humble-<tag>"
+  }
+  ```
 
 ### Environment layering
 
