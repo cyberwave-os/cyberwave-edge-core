@@ -3,9 +3,10 @@
 The backend sends ``open_tunnel`` / ``close_tunnel`` with a session id only.
 Edge-core fetches the relay token over REST with its per-edge key, runs frpc
 in the ``cyberwave-remote-access`` container and polls the session state as a
-watchdog. The relay address comes from local config, never from the payload,
-and the relay itself re-checks every login, proxy and connection. The running
-session id is kept on disk so a restarted edge-core resumes a still-live session.
+watchdog. The relay address comes from local config or that REST credential,
+never from the MQTT payload, and the relay itself re-checks every login, proxy
+and connection. The running session id is kept on disk so a restarted
+edge-core resumes a still-live session.
 """
 
 from __future__ import annotations
@@ -69,6 +70,8 @@ _SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
 _MIN_LOGIN_UID = 1000
 _MAX_LOGIN_UID = 65534
 DEFAULT_RELAY_HOST = "relay.edge.cyberwave.com"
+# A DNS name; IP literals are checked separately.
+_RELAY_HOST_RE = re.compile(r"(?=.{1,253}\Z)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*")
 # 443, not a port of our own: corporate allowlists permit 80/443 only.
 DEFAULT_RELAY_PORT = 443
 
@@ -147,16 +150,36 @@ def load_or_create_edge_key() -> str:
         return key
 
 
-def relay_address() -> tuple[str, int]:
+def _offered_relay(credential: Optional[dict[str, Any]]) -> tuple[Optional[str], Any]:
+    """The relay the backend names in the credential; older backends name none."""
+    host = (credential or {}).get("relay_host")
+    if not isinstance(host, str) or not host:
+        return None, None
+    if not _RELAY_HOST_RE.fullmatch(host) and not _is_ip_literal(host):
+        logger.warning("Remote access: ignoring invalid relay_host %r from the backend", host)
+        return None, None
+    return host, (credential or {}).get("relay_port")
+
+
+def relay_address(credential: Optional[dict[str, Any]] = None) -> tuple[str, int]:
+    """Where frpc dials: the edge's own setting, else the backend's relay, else production's.
+
+    Each backend accepts tunnels only through its own relay, so an edge paired
+    with dev or staging would otherwise fail on production's.
+    """
     get = _startup().get_runtime_env_var
-    host = get(RELAY_HOST_ENV, DEFAULT_RELAY_HOST) or DEFAULT_RELAY_HOST
-    raw_port = get(RELAY_PORT_ENV, str(DEFAULT_RELAY_PORT))
+    host = get(RELAY_HOST_ENV) or None
+    offered_port: Any = None
+    if host is None:
+        host, offered_port = _offered_relay(credential)
+    host = host or DEFAULT_RELAY_HOST
+    raw_port = get(RELAY_PORT_ENV) or offered_port or DEFAULT_RELAY_PORT
     try:
         port = int(str(raw_port))
         if not 0 < port < 65536:
             raise ValueError
     except ValueError:
-        logger.warning("Invalid %s=%r; using %d", RELAY_PORT_ENV, raw_port, DEFAULT_RELAY_PORT)
+        logger.warning("Invalid relay port %r; using %d", raw_port, DEFAULT_RELAY_PORT)
         port = DEFAULT_RELAY_PORT
     return host, port
 
@@ -172,6 +195,14 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
 
 
 def _container_relay_host(relay_host: str) -> str:
@@ -730,7 +761,7 @@ class RemoteAccessManager:
         ca_file = relay_ca_file()
         if ca_file and not os.path.isfile(ca_file):
             return f"relay CA file {ca_file} not found"
-        relay_host, relay_port = relay_address()
+        relay_host, relay_port = relay_address(credential)
         trusted_ca = _relay_tls_ca(relay_host, ca_file)
         try:
             content = render_frpc_config(

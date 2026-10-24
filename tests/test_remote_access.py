@@ -41,6 +41,7 @@ class FakeClient:
         self.credential_errors: list[ra.RemoteAccessHTTPError] = []
         self.host_keys: list | None = None
         self.ssh_user: str | None = None
+        self.credential_extra: dict = {}
 
     def claim_key(self) -> dict:
         self.calls.append(("claim", None))
@@ -54,7 +55,7 @@ class FakeClient:
         self.ssh_user = ssh_user
         if self.credential_errors:
             raise self.credential_errors.pop(0)
-        return _credential(session_id)
+        return {**_credential(session_id), **self.credential_extra}
 
     def session_state(self, session_id: str) -> dict:
         self.calls.append(("state", session_id))
@@ -290,6 +291,69 @@ def test_docker_desktop_reaches_host_via_gateway(env, monkeypatch, host):
     assert 'localIP = "host.docker.internal"' in config
     assert "trustedCaFile" not in config
     assert "--network" not in env.docker.run_args[0]
+
+
+def test_relay_named_by_backend_is_used_and_verified(env):
+    env.client.credential_extra = {"relay_host": "relay.staging.example", "relay_port": 8443}
+    env.manager.open_tunnel(SESSION_A)
+    config = env.docker.config_at_run
+    assert 'serverAddr = "relay.staging.example"' in config
+    assert "serverPort = 8443" in config
+    assert 'transport.tls.serverName = "relay.staging.example"' in config
+    assert f'transport.tls.trustedCaFile = "{ra.CONTAINER_SYSTEM_CA_BUNDLE}"' in config
+
+
+def test_edge_setting_wins_over_backend_relay(env, monkeypatch):
+    env.client.credential_extra = {"relay_host": "relay.staging.example", "relay_port": 8443}
+    monkeypatch.setenv(ra.RELAY_HOST_ENV, "localhost")
+    env.manager.open_tunnel(SESSION_A)
+    config = env.docker.config_at_run
+    assert 'serverAddr = "localhost"' in config
+    # The backend's port belongs to the backend's relay, not to this one.
+    assert f"serverPort = {ra.DEFAULT_RELAY_PORT}" in config
+    assert "relay.staging.example" not in config
+
+
+def test_edge_port_applies_to_backend_relay(env, monkeypatch):
+    env.client.credential_extra = {"relay_host": "relay.staging.example", "relay_port": 8443}
+    monkeypatch.setenv(ra.RELAY_PORT_ENV, "7443")
+    assert ra.relay_address(env.client.fetch_credential(SESSION_A, [])) == (
+        "relay.staging.example",
+        7443,
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"relay_host": None, "relay_port": None},
+        {"relay_host": ""},
+        {"relay_host": "evil.example\nserverAddr = x"},
+        {"relay_host": "relay example"},
+        {"relay_host": "relay.example\n"},
+        {"relay_host": 42},
+    ],
+)
+def test_missing_or_invalid_backend_relay_falls_back_to_default(env, extra):
+    env.client.credential_extra = extra
+    env.manager.open_tunnel(SESSION_A)
+    config = env.docker.config_at_run
+    assert f'serverAddr = "{ra.DEFAULT_RELAY_HOST}"' in config
+    assert f"serverPort = {ra.DEFAULT_RELAY_PORT}" in config
+
+
+@pytest.mark.parametrize("port", [0, 70000, "abc", None])
+def test_invalid_backend_relay_port_falls_back_to_443(env, port):
+    env.client.credential_extra = {"relay_host": "relay.staging.example", "relay_port": port}
+    assert ra.relay_address(env.client.fetch_credential(SESSION_A, [])) == (
+        "relay.staging.example",
+        ra.DEFAULT_RELAY_PORT,
+    )
+
+
+def test_backend_relay_may_be_an_ip_literal(env):
+    env.client.credential_extra = {"relay_host": "2001:db8::1", "relay_port": 443}
+    assert ra.relay_address(env.client.fetch_credential(SESSION_A, [])) == ("2001:db8::1", 443)
 
 
 def test_docker_desktop_keeps_remote_relay_and_verifies(env, monkeypatch):
