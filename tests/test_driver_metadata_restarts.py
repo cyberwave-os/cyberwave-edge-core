@@ -170,6 +170,10 @@ def test_saves_inside_the_debounce_become_one_restart(edge: Any) -> None:
         ("speaker_device", "hw:1,0"),
         ("audio_routing", {"out": "left"}),
         ("audio_device", {"name": "C920", "index": 2}),
+        ("active_map_abort", {"map_uuid": "map-1"}),
+        ("relocalization_retry_request", {"request_id": "r1"}),
+        ("fiducial_relocalization", {"state": "failed"}),
+        ("mapping_fiducials", {"map_uuid": "map-1", "tags": [3]}),
     ],
 )
 def test_runtime_keys_never_restart(edge: Any, key: str, value: Any) -> None:
@@ -180,6 +184,29 @@ def test_runtime_keys_never_restart(edge: Any, key: str, value: Any) -> None:
 
     assert edge.restarts == []
     assert edge.inspected == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("relocalization_retry_request", {"request_id": "r1"}),
+        ("fiducial_relocalization", {"state": "failed"}),
+        ("mapping_fiducials", {"map_uuid": "map-1", "tags": [3]}),
+    ],
+)
+def test_localization_runtime_keys_never_ask_for_a_robot_driver_restart(
+    edge: Any, key: str, value: Any
+) -> None:
+    """An operator Retry or a mapping report is not a GO2 driver config change."""
+    edge.image = "cyberwaveos/go2-driver:latest"
+    edge.launch(max_speed=1)
+
+    _change(edge, key, value)
+    edge.tick(15)
+    edge.tick(15)
+
+    assert edge.restarts == []
+    assert edge.alerts == []
 
 
 def test_a_string_audio_device_is_a_pin(edge: Any) -> None:

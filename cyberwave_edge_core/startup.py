@@ -5855,6 +5855,10 @@ def reconcile_twin_json_file_sync() -> dict[str, Any]:
 
 DRIVER_RESTART_NEEDED_ALERT = "driver_restart_needed"
 DRIVER_METADATA_RESTART_SUPPRESSED_ALERT = "driver_metadata_restart_suppressed"
+# Metadata the backend, an edge bridge or a dedicated endpoint writes while the
+# robot runs. None of it configures a driver, so the config digest and the
+# changed-key list both ignore it. Keep it a superset of the backend registry's
+# reported Twin.metadata keys (test_entity_keys.py checks this copy).
 _RUNTIME_METADATA_KEYS = frozenset(
     {
         "status",
@@ -5869,6 +5873,10 @@ _RUNTIME_METADATA_KEYS = frozenset(
         "last_finalized_map_name",
         "navigation_lifecycle",
         "localization",
+        "active_map_abort",
+        "relocalization_retry_request",
+        "fiducial_relocalization",
+        "mapping_fiducials",
         "speaker_device",
         "audio_routing",
         "robot_dump",
