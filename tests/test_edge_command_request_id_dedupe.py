@@ -73,7 +73,7 @@ def test_edge_restart_request_id_fifo_evicts_oldest_after_maxlen(monkeypatch):
             },
         )
 
-    assert first_id not in startup._HANDLED_EDGE_COMMAND_REQUEST_IDS
+    assert f"restart_edge_core:{first_id}" not in startup._HANDLED_EDGE_COMMAND_REQUEST_IDS
     count_after_fill = len(thread_calls)
 
     startup._handle_edge_command_message(

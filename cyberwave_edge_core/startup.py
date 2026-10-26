@@ -418,6 +418,9 @@ def _get_active_worker_watcher() -> Optional[Any]:
 
 
 _HANDLED_EDGE_COMMAND_REQUEST_IDS: deque[str] = deque(maxlen=1024)
+_EDGE_COMMAND_HANDLERS: dict[str, Callable[[dict[str, Any]], None]] = {}
+# Guards "seen this request_id?" then "record it": MQTT and the keepalive thread both land here.
+_EDGE_COMMAND_DEDUPE_LOCK = threading.Lock()
 # Twin UUIDs whose ``cyberwave/twin/{uuid}/command`` topic is currently
 # subscribed. Tracked as a set rather than a boolean so that twins paired
 # *after* edge-core started are picked up automatically and twins that get
@@ -4555,6 +4558,17 @@ def _post_host_facts_once(token: str, watchdog: Optional[Any] = None) -> bool:
             len(facts),
             fingerprint,
         )
+        # An MQTT command sent while this edge was offline is never replayed;
+        # the next tick delivers it here.
+        for command in (result or {}).get("driver_deployments") or []:
+            try:
+                handle_edge_command(command)
+            except Exception:
+                logger.exception(
+                    "Edge command %s (request_id=%s) from /discover failed",
+                    command.get("command") if isinstance(command, dict) else "?",
+                    command.get("request_id") if isinstance(command, dict) else "?",
+                )
         network_interfaces = facts.get("network_interfaces")
         if network_interfaces:
             try:
@@ -5037,33 +5051,8 @@ def _run_edge_core_restart_worker(
             _EDGE_RESTART_IN_PROGRESS = False
 
 
-def _handle_edge_command_message(*args: Any) -> None:
-    """Handle MQTT command message for this edge."""
-    if len(args) == 1:
-        payload = args[0]
-    elif len(args) >= 2:
-        payload = args[1]
-    else:
-        return
-
-    if not isinstance(payload, dict):
-        logger.warning("Ignoring edge command with non-dict payload: %r", payload)
-        return
-
-    command = str(payload.get("command", "")).strip().lower()
-    if command != EDGE_COMMAND_RESTART and command not in remote_access.COMMANDS:
-        return
-
+def _handle_restart_command(payload: dict[str, Any]) -> None:
     request_id = str(payload.get("request_id", "")).strip()
-    if request_id:
-        if request_id in _HANDLED_EDGE_COMMAND_REQUEST_IDS:
-            return
-        _HANDLED_EDGE_COMMAND_REQUEST_IDS.append(request_id)
-
-    if command in remote_access.COMMANDS:
-        remote_access.handle_command(command, payload)
-        return
-
     # ``alert_uuid`` is the lifecycle alert created by the backend in
     # ``POST /api/v1/edges/{uuid}/restart-core``.  Missing when the
     # restart was triggered by something other than that endpoint
@@ -5083,6 +5072,79 @@ def _handle_edge_command_message(*args: Any) -> None:
         daemon=True,
     )
     worker.start()
+
+
+def register_edge_command(command: str, handler: Callable[[dict[str, Any]], None]) -> None:
+    """Act on ``command`` however the backend delivers it (MQTT or ``/edges/discover``).
+
+    A handler sees each ``request_id`` once and must return quickly: hand slow work
+    to a thread.
+    """
+    _EDGE_COMMAND_HANDLERS[command.strip().lower()] = handler
+
+
+def handle_edge_command(payload: Any) -> bool:
+    """Run the handler registered for ``payload["command"]``; True when one ran.
+
+    An unregistered command is ignored, so a newer backend can send an older edge
+    a command it does not know. A command and ``request_id`` pair is recorded before
+    the handler runs, so a repeat is dropped even while the first is still in flight.
+    A handler that raises releases it, so the backend's next delivery gets a second try.
+    """
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring edge command with non-dict payload: %r", payload)
+        return False
+
+    command = str(payload.get("command", "")).strip().lower()
+    handler = _EDGE_COMMAND_HANDLERS.get(command)
+    if handler is None:
+        return False
+
+    request_id = str(payload.get("request_id", "")).strip()
+    # One deployment's stage and activate commands share a request_id, so the
+    # command is part of the key.
+    dedupe_key = f"{command}:{request_id}" if request_id else ""
+    if dedupe_key:
+        with _EDGE_COMMAND_DEDUPE_LOCK:
+            if dedupe_key in _HANDLED_EDGE_COMMAND_REQUEST_IDS:
+                return False
+            _HANDLED_EDGE_COMMAND_REQUEST_IDS.append(dedupe_key)
+
+    try:
+        handler(payload)
+    except Exception:
+        if dedupe_key:
+            with _EDGE_COMMAND_DEDUPE_LOCK:
+                try:
+                    _HANDLED_EDGE_COMMAND_REQUEST_IDS.remove(dedupe_key)
+                except ValueError:  # already evicted from the bounded window
+                    pass
+        raise
+    return True
+
+
+def _handle_edge_command_message(*args: Any) -> None:
+    """Handle MQTT command message for this edge."""
+    if len(args) == 1:
+        payload = args[0]
+    elif len(args) >= 2:
+        payload = args[1]
+    else:
+        return
+    handle_edge_command(payload)
+
+
+def _register_builtin_edge_commands() -> None:
+    register_edge_command(EDGE_COMMAND_RESTART, _handle_restart_command)
+    for command in remote_access.COMMANDS:
+        # ``handle_command`` is looked up per call so tests can patch it.
+        register_edge_command(
+            command,
+            lambda payload, command=command: remote_access.handle_command(command, payload),
+        )
+
+
+_register_builtin_edge_commands()
 
 
 def _resolve_edge_uuid(token: str) -> Optional[str]:
