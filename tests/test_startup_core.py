@@ -1528,6 +1528,9 @@ class TestDriverStartingAlertLifecycle:
             def create(self) -> None:
                 pass
 
+            def resolve(self) -> None:
+                call_order.append("resolve:topology-card")
+
             def update_metadata(self, metadata_patch: dict, *, force: bool = False) -> None:
                 pass
 
