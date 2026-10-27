@@ -1729,6 +1729,81 @@ def _image_tag_can_move(image: str) -> bool:
     return _IMMUTABLE_IMAGE_TAG.search(tag) is None
 
 
+def _ensure_image_for_topology(
+    image: str,
+    twin_name: str,
+    twin_uuid: str,
+    *,
+    token: Optional[str],
+    watchdog: Optional[Any],
+    refreshed: set[str],
+    refresh: bool,
+) -> bool:
+    """Make *image* readable: True once it is on disk, pulling it first if need be.
+
+    The labels live in the image, which means the image has to be on disk before
+    the graph is known — hence the extra single-image pull ahead of the main
+    parallel pull phase. On a warm edge that pull is a no-op; on a cold one it
+    costs one serialized pull, which is the price of the image owning its own
+    topology.
+
+    *watchdog* is forwarded for the same reason the main pull phase takes one:
+    this runs inside ``fetch_and_run_twin_drivers``, which at boot happens
+    before ``start_pinging``, so a multi-gigabyte ROS image pulled here with no
+    ``EXTEND_TIMEOUT_USEC`` heartbeat can outrun ``TimeoutStartSec`` and have
+    systemd kill the boot -- the failure CYB-2049 added that heartbeat to stop.
+    """
+    # Refresh a moving tag before its label is read: once CI pins the driver in its
+    # own graph by an immutable tag, nothing later pulls the tag this twin points at.
+    # CI gates staging/production pinning on this (PIN_DRIVER_IMAGES_* in the driver
+    # workflows). `refreshed` lets twins sharing an image pull it once.
+    needs_pull = (
+        refresh and _image_tag_can_move(image) and image not in refreshed
+    ) or not _docker_image_exists_locally(image)
+    if not needs_pull:
+        return True
+    logger.info(
+        "Pulling %s ahead of the main pull phase to read its declared topology",
+        image,
+    )
+    # Topology discovery precedes the per-service startup cards. A cold
+    # image can take minutes here, so give this phase its own twin alert
+    # and log delivery target rather than leaving the dashboard silent.
+    _clear_stale_driver_starting_alerts([twin_uuid], log_context="topology discovery")
+    alert = DriverStartingAlertContext(twin_uuid=twin_uuid, image=image)
+    alert.create()
+    try:
+        pulled = _pull_driver_images_parallel(
+            [image],
+            watchdog=watchdog,
+            token=token,
+            pull_contexts_by_image={
+                image: [
+                    _PullDeliveryContext(
+                        twin_uuid=twin_uuid,
+                        container_name=driver_container_name(twin_uuid),
+                        driver_alert_ctx=alert,
+                    )
+                ],
+            },
+        ).get(image, False)
+    finally:
+        # The main pass owns subsequent per-service alerts, including
+        # failures. Do not leave a topology card active on cancellation.
+        alert.resolve()
+    if not pulled:
+        # Not fatal here: the main pull phase reports the failure for this
+        # twin with the alerting the operator already expects.
+        logger.warning(
+            "Could not pull %s; cannot read image-declared topology for twin '%s'",
+            image,
+            twin_name,
+        )
+        return False
+    refreshed.add(image)
+    return True
+
+
 def _image_declared_services_for_twin(
     drivers: Dict[str, Any],
     twin: Any,
@@ -1744,20 +1819,16 @@ def _image_declared_services_for_twin(
 
     With *refresh* False an image on disk is read as it is; only a missing one is pulled.
 
+    On Jetson the image is the ``jetson-`` rewrite of the driver's tag. Not every driver
+    publishes one, so when that tag cannot be pulled the graph is read from the original tag,
+    as the main pull phase does for the primary image; without that the twin fell back to a
+    single container and lost every sibling the graph declares.
+
     Consulted only when twin metadata carries no ``services`` array, so metadata
     stays authoritative and this path is dormant until a twin is trimmed.
 
-    The labels live in the image, which means the image has to be on disk before
-    the graph is known — hence the extra single-image pull ahead of the main
-    parallel pull phase. On a warm edge that pull is a no-op; on a cold one it
-    costs one serialized pull, which is the price of the image owning its own
-    topology.
-
-    *watchdog* is forwarded for the same reason the main pull phase takes one:
-    this runs inside ``fetch_and_run_twin_drivers``, which at boot happens
-    before ``start_pinging``, so a multi-gigabyte ROS image pulled here with no
-    ``EXTEND_TIMEOUT_USEC`` heartbeat can outrun ``TimeoutStartSec`` and have
-    systemd kill the boot -- the failure CYB-2049 added that heartbeat to stop.
+    The image is pulled first when it is not on disk or its tag moves (see
+    :func:`_ensure_image_for_topology`).
 
     The returned ``shared_env`` is the TWIN's, not the translator's -- see the
     substitution at the end of this function.
@@ -1768,55 +1839,24 @@ def _image_declared_services_for_twin(
     if not candidate:
         return None
 
-    image = _maybe_rewrite_jetson_tag(_resolve_driver_image_tag(candidate), twin.name)
-
-    # Refresh a moving tag before its label is read: once CI pins the driver in its
-    # own graph by an immutable tag, nothing later pulls the tag this twin points at.
-    # CI gates staging/production pinning on this (PIN_DRIVER_IMAGES_* in the driver
-    # workflows). `refreshed_images` lets twins sharing an image pull it once.
+    resolved = _resolve_driver_image_tag(candidate)
+    rewritten = _maybe_rewrite_jetson_tag(resolved, twin.name)
     refreshed = refreshed_images if refreshed_images is not None else set()
-    if (
-        refresh and _image_tag_can_move(image) and image not in refreshed
-    ) or not _docker_image_exists_locally(image):
-        logger.info(
-            "Pulling %s ahead of the main pull phase to read its declared topology",
-            image,
-        )
-        # Topology discovery precedes the per-service startup cards. A cold
-        # image can take minutes here, so give this phase its own twin alert
-        # and log delivery target rather than leaving the dashboard silent.
-        _clear_stale_driver_starting_alerts([twin_uuid], log_context="topology discovery")
-        alert = DriverStartingAlertContext(twin_uuid=twin_uuid, image=image)
-        alert.create()
-        try:
-            pulled = _pull_driver_images_parallel(
-                [image],
-                watchdog=watchdog,
-                token=token,
-                pull_contexts_by_image={
-                    image: [
-                        _PullDeliveryContext(
-                            twin_uuid=twin_uuid,
-                            container_name=driver_container_name(twin_uuid),
-                            driver_alert_ctx=alert,
-                        )
-                    ],
-                },
-            ).get(image, False)
-        finally:
-            # The main pass owns subsequent per-service alerts, including
-            # failures. Do not leave a topology card active on cancellation.
-            alert.resolve()
-        if not pulled:
-            # Not fatal here: the main pull phase reports the failure for this
-            # twin with the alerting the operator already expects.
-            logger.warning(
-                "Could not pull %s; cannot read image-declared topology for twin '%s'",
-                image,
-                twin.name,
-            )
-            return None
-        refreshed.add(image)
+    image = None
+    for tag in [rewritten] if rewritten == resolved else [rewritten, resolved]:
+        if _ensure_image_for_topology(
+            tag,
+            twin.name,
+            twin_uuid,
+            token=token,
+            watchdog=watchdog,
+            refreshed=refreshed,
+            refresh=refresh,
+        ):
+            image = tag
+            break
+    if image is None:
+        return None
 
     declared = get_image_declared_services(image, twin_uuid=twin_uuid)
     if declared is None:
@@ -3328,6 +3368,182 @@ def _container_is_twins(container_name: str, twin_uuid: str) -> bool:
     return container_name == base or container_name.startswith(f"{base}-")
 
 
+@dataclass
+class _DriverSpec:
+    twin: Any
+    twin_uuid: str
+    driver_image: str
+    driver_params: list[str]
+    child_camera_twin_uuids: list[str]
+    macos_bridge_candidates: list[str]
+    prefer_gpu: bool = False
+    gpu_spec: str = "all"
+    # Multi-container fields (None/empty for single-container mode)
+    service_name: str | None = None
+    command: list[str] | None = None
+    service_env: dict[str, str] | None = None
+    # Attached after create; see launch_detached_container.
+    extra_networks: list[str] | None = None
+    # ``{dependency service: compose condition}``; only ``service_healthy``
+    # makes the launch loop wait. See _wait_for_dependency_health.
+    depends_on: dict[str, str] | None = None
+    # Inline-``services`` lifecycle fields (see _ServiceSpec).
+    restart: str = "unless-stopped"
+    stop_timeout_s: int = 5
+    privileged: bool = True
+    min_restart_interval_s: int | None = None
+    host_env_file: str | None = None
+
+
+class DriverResolutionError(Exception):
+    """A twin's driver cannot be resolved. *kind* tells the caller which alert to raise."""
+
+    UNUSABLE_TOPOLOGY = "unusable_topology"
+    NO_DRIVER_IMAGE = "no_driver_image"
+
+    def __init__(self, kind: str, detail: str = "") -> None:
+        super().__init__(detail or kind)
+        self.kind = kind
+
+
+def resolve_twin_driver_specs(
+    twin: Any,
+    twin_uuid: str,
+    drivers: Dict[str, Any],
+    *,
+    child_registry_ids: set[str],
+    child_camera_twin_uuids: list[str],
+    macos_bridge_candidates: list[str],
+    token: Optional[str],
+    watchdog: Optional[Any] = None,
+    refreshed_images: Optional[set[str]] = None,
+    refresh: bool = True,
+) -> list[_DriverSpec]:
+    """The containers one twin runs, resolved from its ``drivers`` block.
+
+    Twin metadata wins so a robot pinned to a one-off topology keeps it; the
+    image-declared graph is what a trimmed twin resolves to (CYB-3469); a plain
+    ``docker_image`` is the single-container fallback. Raises
+    :class:`DriverResolutionError` when the twin declares a topology this edge cannot
+    resolve, or names no image. Alerting and the launch itself stay with the caller.
+
+    It reads the driver image's labels, so an image that is not on disk is pulled (with
+    *refresh* False only a missing one is). A local driver override applies as before.
+    """
+    try:
+        multi = _get_driver_services(drivers, child_registry_ids=child_registry_ids)
+        if multi is None:
+            multi = _image_declared_services_for_twin(
+                drivers,
+                twin,
+                twin_uuid,
+                child_registry_ids=child_registry_ids,
+                token=token,
+                watchdog=watchdog,
+                refreshed_images=refreshed_images,
+                refresh=refresh,
+            )
+    except (RuntimeError, ValueError) as exc:
+        # A declared bundle must not degrade to intelligence defaults,
+        # but its failure (an unusable image graph, or invalid inline
+        # ``services`` metadata) is local to this twin. Let the remaining
+        # twins proceed to the pull and launch passes.
+        logger.error("Twin '%s' declares an unusable topology: %s", twin.name, exc)
+        raise DriverResolutionError(DriverResolutionError.UNUSABLE_TOPOLOGY, str(exc)) from exc
+    if multi is not None:
+        svc_specs, shared_env, shared_params = multi
+        logger.info(
+            "Multi-container mode for twin '%s': %d service(s)",
+            twin.name,
+            len(svc_specs),
+        )
+        specs: list[_DriverSpec] = []
+        for svc in svc_specs:
+            svc_image = _resolve_driver_image_tag(svc.image)
+            svc_image = _maybe_rewrite_jetson_tag(svc_image, twin.name)
+            merged_env = {**shared_env, **svc.env}
+            merged_params = shared_params + svc.params
+            specs.append(_DriverSpec(
+                twin=twin,
+                twin_uuid=twin_uuid,
+                driver_image=svc_image,
+                driver_params=merged_params,
+                child_camera_twin_uuids=child_camera_twin_uuids,
+                macos_bridge_candidates=macos_bridge_candidates,
+                prefer_gpu=svc.prefer_gpu,
+                gpu_spec=svc.gpu_spec,
+                service_name=svc.name,
+                command=svc.command,
+                service_env=merged_env,
+                extra_networks=list(svc.extra_networks),
+                depends_on=dict(svc.depends_on),
+                restart=svc.restart,
+                stop_timeout_s=svc.stop_timeout_s,
+                privileged=svc.privileged,
+                min_restart_interval_s=svc.min_restart_interval_s,
+                host_env_file=svc.host_env_file,
+            ))
+        return specs
+
+    driver_image, driver_params, driver_prefer_gpu, driver_gpu_spec = (
+        _get_best_driver_image_and_params(drivers, child_registry_ids=child_registry_ids)
+    )
+
+    overrides = load_driver_overrides()
+    if twin_uuid in overrides:
+        override_image = overrides[twin_uuid]
+        logger.info(
+            "Applying local driver override for twin '%s': %s -> %s",
+            twin.name,
+            driver_image,
+            override_image,
+        )
+        driver_image = override_image
+        driver_params = []
+
+    if not driver_image:
+        logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
+        raise DriverResolutionError(DriverResolutionError.NO_DRIVER_IMAGE)
+
+    driver_image = _resolve_driver_image_tag(driver_image)
+    driver_image = _maybe_rewrite_jetson_tag(driver_image, twin.name)
+
+    return [
+        _DriverSpec(
+            twin=twin,
+            twin_uuid=twin_uuid,
+            driver_image=driver_image,
+            driver_params=driver_params,
+            child_camera_twin_uuids=child_camera_twin_uuids,
+            macos_bridge_candidates=macos_bridge_candidates,
+            prefer_gpu=driver_prefer_gpu,
+            gpu_spec=driver_gpu_spec,
+        )
+    ]
+
+
+def _alert_unresolved_driver(twin: Any, twin_uuid: str, error: DriverResolutionError) -> None:
+    """Raise the ``driver_start_failure`` alert for a twin whose driver did not resolve."""
+    if error.kind == DriverResolutionError.UNUSABLE_TOPOLOGY:
+        name = "Unusable declared topology"
+        description = (
+            f"Twin '{twin.name}' declares a topology this edge "
+            f"cannot resolve: {error}. Troubleshooting: "
+            f"{DRIVER_TROUBLESHOOTING_URL}"
+        )
+    else:
+        name = "No driver_docker_image in asset metadata"
+        description = f"No driver_docker_image in asset metadata for twin '{twin.name}'"
+    try:
+        _send_alert_for_twin(
+            twin_uuid, name, description, "driver_start_failure", severity="error"
+        )
+    except Exception as alert_exc:
+        logger.warning(
+            "Could not send %s alert for twin %s: %s", error.kind, twin_uuid, alert_exc
+        )
+
+
 def fetch_and_run_twin_drivers(
     token: str,
     environment_uuid: str,
@@ -3419,32 +3635,6 @@ def fetch_and_run_twin_drivers(
     # ------------------------------------------------------------------
     # Pass 1: Resolve driver images and collect per-twin launch specs.
     # ------------------------------------------------------------------
-
-    @dataclass
-    class _DriverSpec:
-        twin: Any
-        twin_uuid: str
-        driver_image: str
-        driver_params: list[str]
-        child_camera_twin_uuids: list[str]
-        macos_bridge_candidates: list[str]
-        prefer_gpu: bool = False
-        gpu_spec: str = "all"
-        # Multi-container fields (None/empty for single-container mode)
-        service_name: str | None = None
-        command: list[str] | None = None
-        service_env: dict[str, str] | None = None
-        # Attached after create; see launch_detached_container.
-        extra_networks: list[str] | None = None
-        # ``{dependency service: compose condition}``; only ``service_healthy``
-        # makes the launch loop wait. See _wait_for_dependency_health.
-        depends_on: dict[str, str] | None = None
-        # Inline-``services`` lifecycle fields (see _ServiceSpec).
-        restart: str = "unless-stopped"
-        stop_timeout_s: int = 5
-        privileged: bool = True
-        min_restart_interval_s: int | None = None
-        host_env_file: str | None = None
 
     driver_specs: list[_DriverSpec] = []
     # Entry images already refreshed this boot: twins that share one pull it once.
@@ -3625,135 +3815,23 @@ def fetch_and_run_twin_drivers(
                     ",".join(macos_bridge_candidates),
                 )
 
-        # --- Multi-container mode: metadata first, then the image ---------
-        # Twin metadata wins so a robot pinned to a one-off topology keeps it;
-        # the image-declared graph is what a trimmed twin resolves to. CYB-3469.
         try:
-            multi = _get_driver_services(
+            specs = resolve_twin_driver_specs(
+                twin,
+                twin_uuid,
                 drivers,
                 child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
+                child_camera_twin_uuids=child_camera_uuids,
+                macos_bridge_candidates=macos_bridge_candidates,
+                token=token,
+                watchdog=watchdog,
+                refreshed_images=refreshed_images,
+                refresh=pull_images,
             )
-            if multi is None:
-                multi = _image_declared_services_for_twin(
-                    drivers,
-                    twin,
-                    twin_uuid,
-                    child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
-                    token=token,
-                    watchdog=watchdog,
-                    refreshed_images=refreshed_images,
-                    refresh=pull_images,
-                )
-        except (RuntimeError, ValueError) as exc:
-            # A declared bundle must not degrade to intelligence defaults,
-            # but its failure (an unusable image graph, or invalid inline
-            # ``services`` metadata) is local to this twin. Let the remaining
-            # twins proceed to the pull and launch passes.
-            logger.error("Twin '%s' declares an unusable topology: %s", twin.name, exc)
-            try:
-                _send_alert_for_twin(
-                    twin_uuid,
-                    "Unusable declared topology",
-                    (
-                        f"Twin '{twin.name}' declares a topology this edge "
-                        f"cannot resolve: {exc}. Troubleshooting: "
-                        f"{DRIVER_TROUBLESHOOTING_URL}"
-                    ),
-                    "driver_start_failure",
-                    severity="error",
-                )
-            except Exception as alert_exc:
-                logger.warning(
-                    "Could not send declared-topology alert for twin %s: %s",
-                    twin_uuid,
-                    alert_exc,
-                )
+        except DriverResolutionError as exc:
+            _alert_unresolved_driver(twin, twin_uuid, exc)
             continue
-        if multi is not None:
-            svc_specs, shared_env, shared_params = multi
-            logger.info(
-                "Multi-container mode for twin '%s': %d service(s)",
-                twin.name,
-                len(svc_specs),
-            )
-            for svc in svc_specs:
-                svc_image = _resolve_driver_image_tag(svc.image)
-                svc_image = _maybe_rewrite_jetson_tag(svc_image, twin.name)
-                merged_env = {**shared_env, **svc.env}
-                merged_params = shared_params + svc.params
-                driver_specs.append(_DriverSpec(
-                    twin=twin,
-                    twin_uuid=twin_uuid,
-                    driver_image=svc_image,
-                    driver_params=merged_params,
-                    child_camera_twin_uuids=child_camera_uuids,
-                    macos_bridge_candidates=macos_bridge_candidates,
-                    prefer_gpu=svc.prefer_gpu,
-                    gpu_spec=svc.gpu_spec,
-                    service_name=svc.name,
-                    command=svc.command,
-                    service_env=merged_env,
-                    extra_networks=list(svc.extra_networks),
-                    depends_on=dict(svc.depends_on),
-                    restart=svc.restart,
-                    stop_timeout_s=svc.stop_timeout_s,
-                    privileged=svc.privileged,
-                    min_restart_interval_s=svc.min_restart_interval_s,
-                    host_env_file=svc.host_env_file,
-                ))
-            continue
-
-        # --- Single-container mode (existing path) ----------------------
-        driver_image, driver_params, driver_prefer_gpu, driver_gpu_spec = (
-            _get_best_driver_image_and_params(
-                drivers,
-                child_registry_ids=child_registry_ids_by_parent.get(twin_uuid, set()),
-            )
-        )
-
-        _driver_overrides = load_driver_overrides()
-        if twin_uuid in _driver_overrides:
-            override_image = _driver_overrides[twin_uuid]
-            logger.info(
-                "Applying local driver override for twin '%s': %s -> %s",
-                twin.name,
-                driver_image,
-                override_image,
-            )
-            driver_image = override_image
-            driver_params = []
-
-        if not driver_image:
-            logger.info("No driver_docker_image in asset metadata for twin '%s'", twin.name)
-            try:
-                _send_alert_for_twin(
-                    twin_uuid,
-                    "No driver_docker_image in asset metadata",
-                    f"No driver_docker_image in asset metadata for twin '{twin.name}'",
-                    "driver_start_failure",
-                    severity="error",
-                )
-            except Exception as alert_exc:
-                logger.warning(
-                    "Could not send no-driver-image alert for twin %s: %s",
-                    twin_uuid,
-                    alert_exc,
-                )
-            continue
-
-        driver_image = _resolve_driver_image_tag(driver_image)
-        driver_image = _maybe_rewrite_jetson_tag(driver_image, twin.name)
-
-        driver_specs.append(_DriverSpec(
-            twin=twin,
-            twin_uuid=twin_uuid,
-            driver_image=driver_image,
-            driver_params=driver_params,
-            child_camera_twin_uuids=child_camera_uuids,
-            macos_bridge_candidates=macos_bridge_candidates,
-            prefer_gpu=driver_prefer_gpu,
-            gpu_spec=driver_gpu_spec,
-        ))
+        driver_specs.extend(specs)
 
     # ------------------------------------------------------------------
     # Pass 0: Health-gated twins go last.
