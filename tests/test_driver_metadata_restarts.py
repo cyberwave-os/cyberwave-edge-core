@@ -800,3 +800,39 @@ def test_a_ui_edit_right_after_a_restart_reaches_the_driver(
     for _ in range(4):
         sync_tick(15)
     assert edge.restarts == [{CONTAINER}]
+
+
+class TestStagedUpdateProgressIsNotDriverConfig:
+    """Staging reports progress every few seconds, and the backend patches each report into
+    `driver_pins[...].deployment`. If that counted as driver configuration, a download would
+    restart a sensor driver, or raise "Driver restart needed", over and over."""
+
+    BASE = {"drivers": {"default": {"docker_image": "drv:1.0.0"}}, "name": "cam"}
+
+    def _with_pins(self, **deployment: Any) -> dict[str, Any]:
+        return {
+            **self.BASE,
+            "driver_pins": {"drv": {"release": "1.0.0", "deployment": deployment}},
+        }
+
+    def test_progress_updates_do_not_change_the_config_digest(self):
+        started = self._with_pins(phase="staging", progress={"images_done": 0})
+        later = self._with_pins(phase="staging", progress={"images_done": 2, "bytes_done": 9})
+
+        assert startup._driver_config_digest(started) == startup._driver_config_digest(later)
+
+    def test_a_pin_appearing_does_not_change_the_config_digest(self):
+        assert startup._driver_config_digest(self.BASE) == startup._driver_config_digest(
+            self._with_pins(phase="staged")
+        )
+
+    def test_a_real_configuration_change_still_does(self):
+        changed = {**self.BASE, "name": "renamed"}
+
+        assert startup._driver_config_digest(changed) != startup._driver_config_digest(self.BASE)
+
+    def test_a_driver_image_change_still_does(self):
+        """That one is the activation itself; see the activation PR for how it is handled."""
+        changed = {**self.BASE, "drivers": {"default": {"docker_image": "drv:2.0.0"}}}
+
+        assert startup._driver_config_digest(changed) != startup._driver_config_digest(self.BASE)

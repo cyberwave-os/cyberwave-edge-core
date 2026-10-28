@@ -46,7 +46,7 @@ from rich.console import Console
 # reintroduce the cycle the bottom-of-file relative imports exist to break.
 # Re-exported because DRIVER_CONTAINER_PREFIX was defined here historically and
 # other modules still read it off ``startup``.
-from . import health_gating, remote_access
+from . import driver_update_state, driver_updates, health_gating, remote_access
 from .docker_helpers import DRIVER_CONTAINER_PREFIX as DRIVER_CONTAINER_PREFIX
 from .docker_helpers import driver_container_name
 
@@ -2019,6 +2019,7 @@ def _pull_driver_images_parallel(
                     img_name, pulled = future.result()
                     if pulled:
                         logger.info("Pulled %s", img_name)
+                        driver_update_state.record_pull(img_name)
                         results[img_name] = True
                     elif _docker_image_exists_locally(img_name):
                         logger.warning(
@@ -5161,6 +5162,28 @@ def register_edge_command(command: str, handler: Callable[[dict[str, Any]], None
     _EDGE_COMMAND_HANDLERS[command.strip().lower()] = handler
 
 
+def _edge_command_key(command: str, request_id: str) -> str:
+    """The dedupe key. One deployment's stage and activate commands share a request_id, so
+    the command is part of it. Empty (never deduplicated) without a request_id."""
+    return f"{command}:{request_id}" if request_id else ""
+
+
+def forget_edge_command(command: str, request_id: str) -> None:
+    """Let the backend's next delivery of *command* run again.
+
+    For a handler that hands its work to a thread and so cannot raise when the work fails:
+    the thread calls this when it could not finish the job in a way the backend will see.
+    """
+    key = _edge_command_key(command, request_id)
+    if not key:
+        return
+    with _EDGE_COMMAND_DEDUPE_LOCK:
+        try:
+            _HANDLED_EDGE_COMMAND_REQUEST_IDS.remove(key)
+        except ValueError:  # already evicted from the bounded window
+            pass
+
+
 def handle_edge_command(payload: Any) -> bool:
     """Run the handler registered for ``payload["command"]``; True when one ran.
 
@@ -5179,9 +5202,7 @@ def handle_edge_command(payload: Any) -> bool:
         return False
 
     request_id = str(payload.get("request_id", "")).strip()
-    # One deployment's stage and activate commands share a request_id, so the
-    # command is part of the key.
-    dedupe_key = f"{command}:{request_id}" if request_id else ""
+    dedupe_key = _edge_command_key(command, request_id)
     if dedupe_key:
         with _EDGE_COMMAND_DEDUPE_LOCK:
             if dedupe_key in _HANDLED_EDGE_COMMAND_REQUEST_IDS:
@@ -5214,6 +5235,7 @@ def _handle_edge_command_message(*args: Any) -> None:
 
 def _register_builtin_edge_commands() -> None:
     register_edge_command(EDGE_COMMAND_RESTART, _handle_restart_command)
+    register_edge_command(driver_updates.STAGE_COMMAND, driver_updates.handle_stage_command)
     for command in remote_access.COMMANDS:
         # ``handle_command`` is looked up per call so tests can patch it.
         register_edge_command(
@@ -6047,6 +6069,9 @@ _RUNTIME_METADATA_KEYS = frozenset(
         "audio_routing",
         "robot_dump",
         "edge_fingerprint",
+        # Staged-update progress the backend patches into each pin's deployment
+        # while an image downloads, every few seconds. Not driver configuration.
+        "driver_pins",
     }
 )
 _METADATA_RESTART_DEBOUNCE_SECONDS = 10.0

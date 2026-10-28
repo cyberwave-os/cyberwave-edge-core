@@ -554,33 +554,19 @@ def docker_reap_workload_containers(
 
 
 def docker_prune_unused_images() -> bool:
-    """Remove unused Docker images that are older than 2 hours.
+    """Remove the Docker images nothing needs; True when the cleanup could run.
 
-    The ``--filter until=2h`` guard protects freshly-built or freshly-pulled
-    local images (e.g. a dev test image tagged moments before a service
-    restart) from being collected before the worker container has a chance to
-    start and reference them.
-
-    Returns True on success.
+    Images a staged driver update will start, images pulled in the last two hours,
+    images any container uses and images created in the last two hours are kept. That is
+    never more than ``docker image prune --all --filter until=2h`` removed, but unlike
+    it, an image that was pulled long after it was built is not removed from under a
+    staged update. See :mod:`image_gc`.
     """
     if not docker_available():
         return False
-    try:
-        subprocess.run(
-            ["docker", "image", "prune", "--all", "--force", "--filter", "until=2h"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        logger.info("Docker unused image prune completed")
-        return True
-    except subprocess.CalledProcessError as exc:
-        logger.warning("Docker image prune failed: %s", exc)
-        return False
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning("Docker image prune error: %s", exc)
-        return False
+    from .image_gc import gc_driver_images
+
+    return gc_driver_images()
 
 
 # Docker 23.0 narrowed bare ``docker volume prune`` to anonymous volumes and

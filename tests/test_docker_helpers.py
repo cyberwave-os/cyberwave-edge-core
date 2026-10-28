@@ -717,24 +717,17 @@ class TestDockerPruneUnusedImages:
         monkeypatch.setattr(dh.subprocess, "run", raise_os_error)
         assert dh.docker_prune_unused_images() is False
 
-    def test_passes_correct_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_removes_images_one_by_one_instead_of_pruning_them_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No blanket `docker image prune --all`: that would take a staged update's images."""
         monkeypatch.setattr(dh, "docker_available", lambda: True)
         captured: list[list[str]] = []
         monkeypatch.setattr(
             dh.subprocess, "run", lambda cmd, **kw: captured.append(cmd) or _make_completed()
         )
         dh.docker_prune_unused_images()
-        # The until=2h guard keeps freshly-pulled images that no container has
-        # had a chance to reference yet.
-        assert captured[0] == [
-            "docker",
-            "image",
-            "prune",
-            "--all",
-            "--force",
-            "--filter",
-            "until=2h",
-        ]
+        assert ["docker", "image", "prune"] not in [cmd[:3] for cmd in captured]
 
 
 # ---------------------------------------------------------------------------
