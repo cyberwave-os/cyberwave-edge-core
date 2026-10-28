@@ -57,6 +57,7 @@ def edge(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     state.uninspectable = set()
     state.fetch_error = None
     state.launch_ok = True
+    state.activation_during_launch = None
 
     def _inspect(name: str) -> dict[str, Any] | None:
         state.inspected.append(name)
@@ -75,6 +76,10 @@ def edge(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     def _fetch_and_run(token, environment_uuid, fingerprint, *, only_container_names=None, **kwargs):
         state.restarts.append(set(only_container_names or ()))
         state.fetch_kwargs.append(kwargs)
+        # Whether an activation could start for the twin while this launch runs.
+        state.activation_during_launch = startup.begin_driver_activation(TWIN)
+        if state.activation_during_launch:
+            startup.end_driver_activation(TWIN)
         if state.fetch_error:
             raise state.fetch_error
         results = []
@@ -836,3 +841,163 @@ class TestStagedUpdateProgressIsNotDriverConfig:
         changed = {**self.BASE, "drivers": {"default": {"docker_image": "drv:2.0.0"}}}
 
         assert startup._driver_config_digest(changed) != startup._driver_config_digest(self.BASE)
+
+
+class TestDuringAnUpdate:
+    """An activation recreates the twin's containers itself, and a downloaded update waits for the
+    operator: neither should be pre-empted by the settings reconciler."""
+
+    def test_a_twin_being_activated_is_left_alone(self, edge: Any) -> None:
+        edge.launch(audio_gain_db=0)
+        assert startup.begin_driver_activation(TWIN)
+        try:
+            _change(edge, "audio_gain_db", 6)
+            edge.tick(15)
+            assert edge.restarts == []
+            assert edge.alerts == []
+        finally:
+            startup.end_driver_activation(TWIN)
+
+    def test_once_it_ends_a_real_change_is_applied_as_usual(self, edge: Any) -> None:
+        edge.launch(audio_gain_db=0)
+        startup.begin_driver_activation(TWIN)
+        _change(edge, "audio_gain_db", 6)
+        edge.tick(15)
+        startup.end_driver_activation(TWIN)
+
+        edge.tick(15)
+
+        assert edge.restarts == [{CONTAINER}]
+
+    def test_the_backend_putting_the_old_release_back_after_a_rollback_is_not_a_change(
+        self, edge: Any
+    ) -> None:
+        old, new = {"driver": {"image": "x:1.0.0"}}, {"driver": {"image": "x:2.0.0"}}
+        edge.launch(drivers=old)
+        _change(edge, "drivers", new)
+        startup._rebaseline_after_rollback(TWIN, old)
+
+        _change(edge, "drivers", old)
+        edge.tick(60)
+
+        assert edge.restarts == []
+        assert edge.alerts == []
+
+    def test_a_downloaded_update_stops_the_automatic_restart_and_says_why(
+        self, edge: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        from cyberwave_edge_core import driver_update_state
+
+        edge.launch(audio_gain_db=0)
+        driver_update_state.write_staged_record(
+            {"request_id": "req-1", "twin_uuid": TWIN, "images": []}
+        )
+        titles: list[str] = []
+        monkeypatch.setattr(
+            startup,
+            "_send_alert_for_twin",
+            lambda twin, name, desc, kind, **kw: titles.append(name),
+        )
+
+        _change(edge, "audio_gain_db", 6)
+        edge.tick(15)
+
+        assert edge.restarts == []
+        assert titles == ["Driver update waiting"]
+
+    def test_an_update_already_applied_at_a_restart_no_longer_blocks_restarts(
+        self, edge: Any
+    ) -> None:
+        """"At next restart" sends the edge no command, so its record is never deleted."""
+        from cyberwave_edge_core import driver_update_state
+
+        edge.launch(audio_gain_db=0)
+        driver_update_state.write_staged_record(
+            {"request_id": "req-1", "twin_uuid": TWIN, "images": [{"image": MIC_IMAGE}]}
+        )
+
+        _change(edge, "audio_gain_db", 6)
+        edge.tick(15)
+
+        assert edge.restarts == [{CONTAINER}]
+
+    def test_an_activation_cannot_start_while_a_settings_restart_launches_the_twin(
+        self, edge: Any
+    ) -> None:
+        edge.launch(audio_gain_db=0)
+        _change(edge, "audio_gain_db", 6)
+
+        edge.tick(15)
+
+        assert edge.restarts == [{CONTAINER}]
+        assert edge.activation_during_launch is False
+        # and the claim is released afterwards
+        assert startup.begin_driver_activation(TWIN) is True
+        startup.end_driver_activation(TWIN)
+
+    def test_a_failed_settings_restart_still_releases_the_launch_claim(self, edge: Any) -> None:
+        edge.launch(audio_gain_db=0)
+        edge.fetch_error = RuntimeError("docker exploded")
+        _change(edge, "audio_gain_db", 6)
+
+        edge.tick(15)
+
+        assert startup.begin_driver_activation(TWIN) is True
+        startup.end_driver_activation(TWIN)
+
+    @staticmethod
+    def _stage_and_pin(edge: Any, deployment: Any) -> None:
+        """A downloaded update, and the backend's record of it in the twin's metadata."""
+        from cyberwave_edge_core import driver_update_state
+
+        driver_update_state.write_staged_record(
+            {"request_id": "req-1", "twin_uuid": TWIN, "images": [{"image": "other:2.0.0"}]}
+        )
+        pin: dict[str, Any] = {"release": "1.0.0"}
+        if deployment is not None:
+            pin["deployment"] = deployment
+        edge.write(TWIN, driver_pins={"some-driver": pin})
+
+    def test_an_update_the_operator_scheduled_holds_a_settings_restart(self, edge: Any) -> None:
+        edge.launch(audio_gain_db=0)
+        self._stage_and_pin(
+            edge, {"request_id": "req-1", "phase": "staged", "activation": "next_restart"}
+        )
+
+        _change(edge, "audio_gain_db", 6)
+        edge.tick(15)
+
+        assert edge.restarts == []
+
+    def test_an_update_that_is_only_downloaded_does_not_hold_a_settings_restart(
+        self, edge: Any
+    ) -> None:
+        edge.launch(audio_gain_db=0)
+        self._stage_and_pin(edge, {"request_id": "req-1", "phase": "staged", "activation": None})
+
+        _change(edge, "audio_gain_db", 6)
+        edge.tick(15)
+
+        assert edge.restarts == [{CONTAINER}]
+
+    def test_a_cancelled_update_does_not_hold_a_settings_restart(self, edge: Any) -> None:
+        edge.launch(audio_gain_db=0)
+        self._stage_and_pin(edge, None)  # the backend dropped the deployment
+
+        _change(edge, "audio_gain_db", 6)
+        edge.tick(15)
+
+        assert edge.restarts == [{CONTAINER}]
+
+    def test_an_update_staged_for_another_twin_changes_nothing_here(self, edge: Any) -> None:
+        from cyberwave_edge_core import driver_update_state
+
+        edge.launch(audio_gain_db=0)
+        driver_update_state.write_staged_record(
+            {"request_id": "req-1", "twin_uuid": CHILD, "images": []}
+        )
+
+        _change(edge, "audio_gain_db", 6)
+        edge.tick(15)
+
+        assert edge.restarts == [{CONTAINER}]

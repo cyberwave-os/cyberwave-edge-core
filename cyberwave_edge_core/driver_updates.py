@@ -16,8 +16,8 @@ A command is delivered more than once, so staging is idempotent: a request that 
 has a staged record only re-reports ``staged``. If the final report cannot be sent, the
 command is released from the dedupe window, so the next delivery tries again.
 
-The edge does not advertise ``driver_staging_v1`` yet (activation must exist first), so
-the backend sends none of this to a real edge.
+Every edge advertises ``driver_staging_v1``; whether the backend stages for a given twin is
+its own call (the deploy policy of the twin's pin).
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 STAGE_COMMAND = "stage_driver_update"
 CAPABILITY = "driver_staging_v1"
+
 
 # Error codes the backend stores on a failed deployment.
 INVALID_COMMAND = "invalid_command"
@@ -225,12 +226,15 @@ class StatusReporter:
         progress: Optional[Mapping[str, int]] = None,
         error_code: Optional[str] = None,
         error: Optional[str] = None,
+        observed: Optional[Mapping[str, str]] = None,
     ) -> bool:
         from . import startup
 
         body: dict[str, Any] = {"phase": phase}
         if progress is not None:
             body["progress"] = dict(progress)
+        if observed is not None:
+            body["observed"] = dict(observed)
         if error_code is not None:
             body["error_code"] = error_code
         if error is not None:
@@ -342,6 +346,23 @@ def _pull_images(images: list[ManifestImage], reporter: StatusReporter, total: i
             raise
 
 
+def _describe(images: list[ManifestImage]) -> str:
+    """``image@digest`` for each, for the log: which build, not just which tag."""
+    return ", ".join(
+        f"{image.image}@{image.digest[:19]}" if image.digest else image.image for image in images
+    )
+
+
+def _running_drivers_block(twin_uuid: str) -> Optional[dict[str, Any]]:
+    """The ``drivers`` block of the twin's JSON on this edge, as of its last sync."""
+    from . import startup
+
+    data = startup._read_twin_json(twin_uuid) if twin_uuid else None
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    drivers = metadata.get("drivers") if isinstance(metadata, dict) else None
+    return dict(drivers) if isinstance(drivers, dict) and drivers else None
+
+
 def stage(request: StageRequest, reporter: StatusReporter) -> None:
     """Pull and verify the release's images, write the staged record, report ``staged``.
 
@@ -355,6 +376,16 @@ def stage(request: StageRequest, reporter: StatusReporter) -> None:
         raise StageError(DOCKER_UNAVAILABLE, "Docker is not available on this edge")
     profile, variant, images = select_images(request.manifest)
     total = len(images)
+    logger.info(
+        "Staging %s: %s %s for twin %s, profile %s, variant %s: %s",
+        request.request_id,
+        request.package,
+        request.target_version,
+        request.twin_uuid,
+        profile,
+        variant,
+        _describe(images),
+    )
     reporter.send(
         "staging",
         progress={"images_done": 0, "images_total": total, "bytes_done": 0, "bytes_total": 0},
@@ -367,6 +398,13 @@ def stage(request: StageRequest, reporter: StatusReporter) -> None:
             UNKNOWN, "Could not record the release's images as in use, so they are not safe to stage"
         )
     missing = [image for image in images if not _is_verified(image)]
+    logger.info(
+        "Staging %s: %d of %d image(s) already here, pulling %s",
+        request.request_id,
+        total - len(missing),
+        total,
+        _describe(missing) or "nothing",
+    )
     if missing:
         ensure_free_space()
         _pull_images(missing, reporter, total)
@@ -384,6 +422,9 @@ def stage(request: StageRequest, reporter: StatusReporter) -> None:
 
     record = {
         "request_id": request.request_id,
+        # What the twin is configured to run now, so a failed activation can start it
+        # again: by then the backend has already written the new release over it.
+        "previous_drivers": _running_drivers_block(request.twin_uuid),
         "twin_uuid": request.twin_uuid,
         "package": request.package,
         "target_version": request.target_version,
@@ -398,6 +439,12 @@ def stage(request: StageRequest, reporter: StatusReporter) -> None:
         "staged_at": time.time(),
     }
     state.write_staged_record(record)
+    logger.info(
+        "Staged %s: %d image(s) verified and held for twin %s",
+        request.request_id,
+        total,
+        request.twin_uuid,
+    )
     # A newer deployment for the same twin and package replaces the older ones, which the
     # backend no longer tracks: let go of their images too.
     state.delete_superseded_records(record)

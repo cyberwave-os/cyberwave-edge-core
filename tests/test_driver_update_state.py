@@ -162,3 +162,24 @@ class TestForgetting:
             "other-twin",
             "same-twin-other-package",
         ]
+
+
+class TestWaiting:
+    def test_a_record_waits_until_its_images_run(self):
+        state.write_staged_record(
+            {"request_id": "req-1", "twin_uuid": "t1", "images": [{"image": "a:1"}, {"image": "b:1"}]}
+        )
+
+        assert state.twin_has_staged_update("t1")
+        assert state.twin_has_staged_update("t1", running=["a:1"])
+        assert not state.twin_has_staged_update("t1", running=["b:1", "a:1", "c:1"])
+
+    def test_another_twins_record_does_not_wait_here(self):
+        state.write_staged_record({"request_id": "req-1", "twin_uuid": "t2", "images": []})
+
+        assert not state.twin_has_staged_update("t1")
+
+    def test_a_record_naming_no_images_always_waits(self):
+        state.write_staged_record({"request_id": "req-1", "twin_uuid": "t1", "images": []})
+
+        assert state.twin_has_staged_update("t1", running=["a:1"])

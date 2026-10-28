@@ -21,7 +21,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from .utils import atomic_write_text
 
@@ -207,3 +207,60 @@ def previous_image_sets(*, now: Optional[float] = None) -> set[str]:
         if isinstance(entry, dict) and float(entry.get("keep_until") or 0) > moment:
             images.update(str(image) for image in entry.get("images") or [])
     return images
+
+
+def twin_has_staged_update(
+    twin_uuid: str,
+    *,
+    running: Iterable[str] = (),
+    scheduled_requests: Optional[set[str]] = None,
+) -> bool:
+    """Whether a downloaded update is waiting to be switched to for *twin_uuid*.
+
+    A record whose images all run already was applied at a restart, so it waits for nothing.
+    With *scheduled_requests* (the deployments the operator has chosen to apply), a record
+    outside it waits for nothing either: it was cancelled, or is only downloaded so far.
+    """
+    running_images = set(running)
+    for record in read_staged_records():
+        if record.get("twin_uuid") != twin_uuid:
+            continue
+        if scheduled_requests is not None and record.get("request_id") not in scheduled_requests:
+            continue
+        staged = {
+            str(image["image"])
+            for image in record.get("images") or []
+            if isinstance(image, dict) and image.get("image")
+        }
+        if not staged or not staged <= running_images:
+            return True
+    return False
+
+
+def record_previous_set(
+    twin_uuid: str,
+    request_id: str,
+    images: list[str],
+    *,
+    keep_seconds: float,
+    now: Optional[float] = None,
+) -> None:
+    """Keep *images* (what *twin_uuid* ran before an update) from the image cleanup for a while.
+
+    Entries past their time are dropped as a new one is written.
+    """
+    moment = time.time() if now is None else now
+    path = updates_dir() / PREVIOUS_FILE
+    previous = _read_json(path)
+    previous = previous if isinstance(previous, dict) else {}
+    previous = {
+        twin: entry
+        for twin, entry in previous.items()
+        if isinstance(entry, dict) and float(entry.get("keep_until") or 0) > moment
+    }
+    previous[twin_uuid] = {
+        "request_id": request_id,
+        "images": sorted(set(images)),
+        "keep_until": moment + keep_seconds,
+    }
+    _write_json(path, previous)

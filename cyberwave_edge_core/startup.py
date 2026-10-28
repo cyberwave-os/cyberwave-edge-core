@@ -35,7 +35,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from cyberwave import Cyberwave
 from cyberwave.edge.platform import is_usbip_server_running as _is_usbip_server_running
@@ -46,7 +46,13 @@ from rich.console import Console
 # reintroduce the cycle the bottom-of-file relative imports exist to break.
 # Re-exported because DRIVER_CONTAINER_PREFIX was defined here historically and
 # other modules still read it off ``startup``.
-from . import driver_update_state, driver_updates, health_gating, remote_access
+from . import (
+    driver_activation,
+    driver_update_state,
+    driver_updates,
+    health_gating,
+    remote_access,
+)
 from .docker_helpers import DRIVER_CONTAINER_PREFIX as DRIVER_CONTAINER_PREFIX
 from .docker_helpers import driver_container_name
 
@@ -370,6 +376,84 @@ def _edge_core_restart_in_progress() -> bool:
     """
     with _EDGE_RESTART_LOCK:
         return _EDGE_RESTART_IN_PROGRESS
+
+
+# Twins whose drivers a staged update is switching right now. Revival, the settings
+# reconciler and an edge-core restart all start the same containers, so each leaves
+# these alone (or, for a restart, waits) until the switch has finished or been rolled back.
+_ACTIVATION_CONDITION = threading.Condition()
+_ACTIVATING_TWINS: set[str] = set()
+# Twins the runtime loop is starting containers for right now (driver revival, a settings
+# restart), with a count each. An activation of such a twin is refused until they are up, as
+# they are refused while it runs: the claim has to hold in both directions.
+_LAUNCHING_TWINS: dict[str, int] = {}
+
+
+def begin_loop_launch(twin_uuids: Iterable[str]) -> bool:
+    """Claim *twin_uuids* for a launch from the runtime loop; False if one is being activated."""
+    twins = {twin for twin in twin_uuids if twin}
+    with _ACTIVATION_CONDITION:
+        if twins & _ACTIVATING_TWINS:
+            return False
+        for twin in twins:
+            _LAUNCHING_TWINS[twin] = _LAUNCHING_TWINS.get(twin, 0) + 1
+        return True
+
+
+def end_loop_launch(twin_uuids: Iterable[str]) -> None:
+    with _ACTIVATION_CONDITION:
+        for twin in {twin for twin in twin_uuids if twin}:
+            if _LAUNCHING_TWINS.get(twin, 0) <= 1:
+                _LAUNCHING_TWINS.pop(twin, None)
+            else:
+                _LAUNCHING_TWINS[twin] -= 1
+
+
+def begin_driver_activation(twin_uuid: str) -> bool:
+    """Claim *twin_uuid* for an activation; False when it, or the whole edge, is busy.
+
+    Refused while an edge-core restart or a camera-drift restart is running, while this twin
+    is already being activated, and while the runtime loop is starting its containers.
+    Release it with :func:`end_driver_activation`.
+    """
+    with _ACTIVATION_CONDITION:
+        with _CAMERA_DRIFT_RESTART_LOCK:
+            drift_restart = _CAMERA_DRIFT_RESTART_IN_PROGRESS
+        if (
+            twin_uuid in _ACTIVATING_TWINS
+            or twin_uuid in _LAUNCHING_TWINS
+            or drift_restart
+            or _edge_core_restart_in_progress()
+        ):
+            return False
+        _ACTIVATING_TWINS.add(twin_uuid)
+        return True
+
+
+def end_driver_activation(twin_uuid: str) -> None:
+    with _ACTIVATION_CONDITION:
+        _ACTIVATING_TWINS.discard(twin_uuid)
+        _ACTIVATION_CONDITION.notify_all()
+
+
+def driver_activation_in_progress(twin_uuid: Optional[str] = None) -> bool:
+    """Whether *twin_uuid* (or, with None, any twin) is being activated."""
+    with _ACTIVATION_CONDITION:
+        return bool(_ACTIVATING_TWINS) if twin_uuid is None else twin_uuid in _ACTIVATING_TWINS
+
+
+def wait_for_driver_activations(timeout: float) -> bool:
+    """Block until no activation is running; False if *timeout* seconds passed first.
+
+    A restart sets its own flag first, which stops new activations from starting, so
+    this only has to outwait the ones already under way.
+    """
+    with _ACTIVATION_CONDITION:
+        return _ACTIVATION_CONDITION.wait_for(lambda: not _ACTIVATING_TWINS, timeout)
+
+
+#: How long a restart waits for an activation in flight before it goes ahead regardless.
+ACTIVATION_WAIT_BEFORE_RESTART_SECONDS = 600.0
 
 
 # Shared handle to the watcher's monitored ``WorkerManager``.
@@ -1729,6 +1813,30 @@ def _image_tag_can_move(image: str) -> bool:
     return _IMMUTABLE_IMAGE_TAG.search(tag) is None
 
 
+# A tag that names one build: a version (``humble-0.2.0``) or a commit (``...-sha-1a2b3c4``),
+# the two the release manifest accepts. A tag led by a moving name (``dev``, ``latest``)
+# never counts, whatever follows it.
+#
+# This is deliberately wider than `_image_tag_can_move` above, which only trusts a per-build
+# ``sha`` tag: that one decides whether an image is pulled again to *refresh* it before its
+# labels are read, this one whether a copy already on disk may stand in for a pull, which is
+# what a release's version tags are for. If a version tag is ever re-pointed at a new build,
+# only the per-build tags are safe in both places.
+_PINNED_IMAGE_TAG = re.compile(r"\d+\.\d+\.\d+|(?:^|-)sha-[0-9a-f]{7,40}$")
+
+
+def _image_is_pinned(image: str) -> bool:
+    """True when *image* names one build, so a copy already on disk is the one it names."""
+    from .worker_manager import _MUTABLE_TAG_BASENAMES
+
+    if "@" in image:
+        return True
+    tag = _split_image_tag(image)[1]
+    if tag is None or tag.split("-", 1)[0].lower() in _MUTABLE_TAG_BASENAMES:
+        return False
+    return _PINNED_IMAGE_TAG.search(tag) is not None
+
+
 def _ensure_image_for_topology(
     image: str,
     twin_name: str,
@@ -1959,6 +2067,13 @@ def _pull_driver_images_parallel(
         logger.info("Using the local build of %s; local-only tags are not pulled", image)
         results[image] = True
         unique_images.remove(image)
+    # A tag that names one build needs no pull when the build is already here: a staged
+    # update's images, and every driver on a restart.
+    for image in [img for img in unique_images if _image_is_pinned(img)]:
+        if _docker_image_exists_locally(image):
+            logger.info("Using the local copy of %s; its tag names one build", image)
+            results[image] = True
+            unique_images.remove(image)
     if not unique_images:
         return results
     contexts_map = pull_contexts_by_image or {}
@@ -2552,6 +2667,15 @@ def reconcile_driver_revival(
         summary["skipped_debounce"] = len(down_names)
         return summary
 
+    # An activation recreates its twin's containers itself.
+    down_names = [
+        name
+        for name in down_names
+        if not driver_activation_in_progress(_CONTAINER_TWIN_MAP.get(name, ""))
+    ]
+    if not down_names:
+        return summary
+
     # After the debounce: it inspects every down container.
     down_names = _revivable_driver_containers(down_names, summary)
     if not down_names:
@@ -2574,6 +2698,9 @@ def reconcile_driver_revival(
         len(down_names),
         ", ".join(down_names),
     )
+    revived_twins = {_CONTAINER_TWIN_MAP.get(name, "") for name in down_names}
+    if not begin_loop_launch(revived_twins):
+        return summary
     try:
         # Only the down containers: launching recreates its container, so an
         # unscoped pass would restart every healthy sibling as well.
@@ -2586,6 +2713,8 @@ def reconcile_driver_revival(
     except Exception:
         logger.exception("Driver revival run failed")
         return summary
+    finally:
+        end_loop_launch(revived_twins)
 
     launched = {
         driver_container_name(result["twin_uuid"], result.get("service_name"))
@@ -2712,15 +2841,21 @@ def _run_camera_config_drift_restart_worker(token: str) -> None:
     global _EDGE_RESTART_IN_PROGRESS, _CAMERA_DRIFT_RESTART_IN_PROGRESS
 
     with _EDGE_RESTART_LOCK:
-        if _EDGE_RESTART_IN_PROGRESS:
-            logger.info(
-                "Skipping camera config drift restart: edge restart already in progress"
-            )
-            return
-        _EDGE_RESTART_IN_PROGRESS = True
+        already_restarting = _EDGE_RESTART_IN_PROGRESS
+        if not already_restarting:
+            _EDGE_RESTART_IN_PROGRESS = True
+    if already_restarting:
+        logger.info("Skipping camera config drift restart: edge restart already in progress")
+        # Nothing else clears the flag on this path, and it also refuses driver
+        # activations, so leaving it set would answer every one of them with "busy".
+        with _CAMERA_DRIFT_RESTART_LOCK:
+            _CAMERA_DRIFT_RESTART_IN_PROGRESS = False
+        return
 
     try:
         try:
+            if not wait_for_driver_activations(ACTIVATION_WAIT_BEFORE_RESTART_SECONDS):
+                logger.warning("Restarting drivers with a driver activation still running")
             _perform_edge_core_restart(token)
         except Exception:
             logger.exception("Camera config drift restart failed")
@@ -3553,6 +3688,8 @@ def fetch_and_run_twin_drivers(
     watchdog: Optional[Any] = None,
     only_container_names: Optional[set[str]] = None,
     pull_images: bool = True,
+    only_twin_uuids: Optional[set[str]] = None,
+    drivers_override: Optional[Mapping[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch twins for the environment, match by edge fingerprint, and run drivers.
 
@@ -3571,6 +3708,12 @@ def fetch_and_run_twin_drivers(
     With *pull_images* False a driver relaunches on the image already on disk and only a
     missing image is pulled: a settings restart applies settings, it does not upgrade the
     driver, and it runs inside the runtime loop, whose watchdog a long pull would outlast.
+
+    *only_twin_uuids* limits both passes to those twins (and the twins attached to them), and
+    unlike *only_container_names* starts every service the twin's topology now declares, so a
+    release that adds a service gets it. *drivers_override* maps a twin to the ``drivers``
+    block to resolve instead of the one in its metadata: how a failed activation starts the
+    previous release again after the backend has already written the new one.
 
     Returns a list of result dicts with twin info and whether the container
     started successfully.
@@ -3657,6 +3800,10 @@ def fetch_and_run_twin_drivers(
             for name in only_container_names
             for uuid in scope_twins
             if uuid
+        ):
+            continue
+        if only_twin_uuids is not None and not any(
+            uuid in only_twin_uuids for uuid in scope_twins if uuid
         ):
             continue
 
@@ -3754,6 +3901,8 @@ def fetch_and_run_twin_drivers(
             continue
 
         drivers = twin_metadata.get("drivers")
+        if drivers_override and twin_uuid in drivers_override:
+            drivers = drivers_override[twin_uuid]
         asset_metadata = getattr(asset, "metadata", {}) or {}
         if not isinstance(asset_metadata, dict):
             asset_metadata = {}
@@ -3870,6 +4019,8 @@ def fetch_and_run_twin_drivers(
             for spec in driver_specs
             if driver_container_name(spec.twin_uuid, spec.service_name) in only_container_names
         ]
+    if only_twin_uuids is not None:
+        driver_specs = [spec for spec in driver_specs if spec.twin_uuid in only_twin_uuids]
 
     # ------------------------------------------------------------------
     # Pass 1a: Drop orphan ``driver_starting`` alerts left by interrupted
@@ -4618,6 +4769,8 @@ def _post_host_facts_once(token: str, watchdog: Optional[Any] = None) -> bool:
             if layers:
                 facts["watchdog_layers"] = list(layers)
 
+    facts["capabilities"] = [driver_updates.CAPABILITY]
+
     hostname = socket.gethostname() or ""
     try:
         plat = f"{platform.system()}-{platform.machine()}".strip("-")
@@ -5095,6 +5248,8 @@ def _run_edge_core_restart_worker(
         return
 
     try:
+        if not wait_for_driver_activations(ACTIVATION_WAIT_BEFORE_RESTART_SECONDS):
+            logger.warning("Restarting edge-core with a driver activation still running")
         token = load_token()
         if not token:
             logger.warning(
@@ -5236,6 +5391,9 @@ def _handle_edge_command_message(*args: Any) -> None:
 def _register_builtin_edge_commands() -> None:
     register_edge_command(EDGE_COMMAND_RESTART, _handle_restart_command)
     register_edge_command(driver_updates.STAGE_COMMAND, driver_updates.handle_stage_command)
+    register_edge_command(
+        driver_activation.ACTIVATE_COMMAND, driver_activation.handle_activate_command
+    )
     for command in remote_access.COMMANDS:
         # ``handle_command`` is looked up per call so tests can patch it.
         register_edge_command(
@@ -6147,6 +6305,20 @@ def _rebaseline_driver_metadata(twin_uuid: str) -> None:
         state.pending = digest
 
 
+def _rebaseline_after_rollback(twin_uuid: str, previous_drivers: dict[str, Any]) -> None:
+    """Treat the metadata with the earlier ``drivers`` block as what the twin now runs.
+
+    The backend puts that block back when it learns the update failed; the reconciler must
+    not then restart drivers that are already running it.
+    """
+    state = _DRIVER_METADATA_STATE.get(twin_uuid)
+    data = _read_twin_json(twin_uuid) if state else None
+    if state is None or data is None:
+        return
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    state.apply(_driver_config_digest({**metadata, "drivers": previous_drivers}))
+
+
 def _metadata_restart_target(twin_uuid: str, data: dict[str, Any]) -> str:
     if twin_uuid in _CONTAINER_TWIN_MAP.values():
         return twin_uuid
@@ -6228,6 +6400,33 @@ def _container_metadata_change_state(
     return "stale"
 
 
+def _scheduled_update_requests(twin_uuids: Iterable[str]) -> Optional[set[str]]:
+    """Request ids of the downloaded updates the operator has chosen to apply.
+
+    Read from the ``driver_pins`` the backend syncs into twin metadata: a deployment counts
+    once it carries an activation choice ("now" or "at next restart"). A cancelled one is
+    gone from the metadata and a merely downloaded one has no choice yet, so neither holds a
+    settings change back. None when no twin has ``driver_pins`` at all (a backend that does
+    not write them), which keeps every staged record counting.
+    """
+    scheduled: set[str] = set()
+    known = False
+    for twin_uuid in twin_uuids:
+        data = _read_twin_json(twin_uuid)
+        metadata = data.get("metadata") if isinstance(data, dict) else None
+        pins = metadata.get("driver_pins") if isinstance(metadata, dict) else None
+        if not isinstance(pins, dict):
+            continue
+        known = True
+        for entry in pins.values():
+            deployment = entry.get("deployment") if isinstance(entry, dict) else None
+            if not isinstance(deployment, dict) or not deployment.get("request_id"):
+                continue
+            if deployment.get("activation") or deployment.get("phase") == "activating":
+                scheduled.add(str(deployment["request_id"]))
+    return scheduled if known else None
+
+
 def _settle_driver_metadata_change(
     twin_uuid: str,
     data: dict[str, Any],
@@ -6244,6 +6443,8 @@ def _settle_driver_metadata_change(
         return
 
     target = _metadata_restart_target(twin_uuid, data)
+    if driver_activation_in_progress(target) or driver_activation_in_progress(twin_uuid):
+        return
     containers = sorted(name for name, owner in _CONTAINER_TWIN_MAP.items() if owner == target)
     inspected = [_inspect_driver_container(name) for name in containers]
     inspects = [i for i in inspected if i]
@@ -6260,7 +6461,19 @@ def _settle_driver_metadata_change(
 
     keys = ", ".join(sorted(state.keys)) or "metadata"
     images = [_resolve_container_driver_image(i) or "" for i in inspects]
-    if not all(map(_is_sensor_driver_image, images)) or any(map(_restart_floor_seconds, inspects)):
+    # A downloaded update is applied when the operator chooses, so its metadata change must
+    # not restart a driver on its own, however harmless that driver's restart would be.
+    scheduled = _scheduled_update_requests({target, twin_uuid})
+    update_waiting = driver_update_state.twin_has_staged_update(
+        target, running=images, scheduled_requests=scheduled
+    ) or driver_update_state.twin_has_staged_update(
+        twin_uuid, running=images, scheduled_requests=scheduled
+    )
+    if (
+        update_waiting
+        or not all(map(_is_sensor_driver_image, images))
+        or any(map(_restart_floor_seconds, inspects))
+    ):
         logger.info(
             "Twin %s settings changed (%s); %s needs a manual restart",
             twin_uuid,
@@ -6269,8 +6482,13 @@ def _settle_driver_metadata_change(
         )
         if _send_metadata_restart_alert(
             twin_uuid,
-            "Driver restart needed",
-            "Settings changed; restart the driver to apply them.",
+            "Driver update waiting" if update_waiting else "Driver restart needed",
+            (
+                "A driver update has been downloaded; it applies the next time the driver "
+                "restarts."
+                if update_waiting
+                else "Settings changed; restart the driver to apply them."
+            ),
             DRIVER_RESTART_NEEDED_ALERT,
             state,
         ):
@@ -6310,6 +6528,9 @@ def _settle_driver_metadata_change(
     environment_uuid = load_environment_uuid()
     if not (token and fingerprint and environment_uuid):
         return
+    restarted_twins = {target, twin_uuid}
+    if not begin_loop_launch(restarted_twins):
+        return
     times.append(now)
     _METADATA_RESTART_SUPPRESSED.discard(target)
     logger.info(
@@ -6328,6 +6549,8 @@ def _settle_driver_metadata_change(
     except Exception:
         logger.exception("Restart of %s for twin %s settings failed", target, twin_uuid)
         results = []
+    finally:
+        end_loop_launch(restarted_twins)
     outcomes = [
         bool(result.get("success"))
         for result in results or []

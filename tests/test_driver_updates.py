@@ -232,6 +232,38 @@ class TestStage:
         assert [image["image"] for image in record["images"]] == host.pulled
         assert reporter.phases()[0] == "staging"
 
+    def test_it_snapshots_what_the_twin_is_configured_to_run_for_a_later_rollback(
+        self, host, monkeypatch
+    ):
+        running = {"default": {"docker_image": "cyberwaveos/go2:humble-0.1.0"}}
+        monkeypatch.setattr(
+            startup, "_read_twin_json", lambda twin_uuid: {"metadata": {"drivers": running}}
+        )
+
+        self._stage()
+
+        assert state.read_staged_record("req-1")["previous_drivers"] == running
+
+    def test_without_a_twin_json_the_snapshot_is_empty_not_an_error(self, host, monkeypatch):
+        monkeypatch.setattr(startup, "_read_twin_json", lambda twin_uuid: None)
+
+        self._stage()
+
+        assert state.read_staged_record("req-1")["previous_drivers"] is None
+
+    def test_the_log_says_which_images_are_staged_and_which_were_pulled(self, host, caplog):
+        host.local["cyberwaveos/go2:humble-0.2.0"] = [f"cyberwaveos/go2@{DIGEST_A}"]
+
+        with caplog.at_level("INFO", logger="cyberwave_edge_core.driver_updates"):
+            self._stage()
+
+        text = caplog.text
+        assert "Staging req-1: go2-ros2-driver 0.2.0 for twin twin-1, profile default, variant robot" in text
+        assert f"cyberwaveos/go2:humble-0.2.0@{DIGEST_A[:19]}" in text
+        assert f"cyberwaveos/nav2:humble-0.2.0@{DIGEST_B[:19]}" in text
+        assert "1 of 2 image(s) already here, pulling cyberwaveos/nav2:humble-0.2.0@" in text
+        assert "Staged req-1: 2 image(s) verified and held for twin twin-1" in text
+
     def test_images_already_here_at_the_right_digest_are_not_pulled_again(self, host):
         host.local["cyberwaveos/go2:humble-0.2.0"] = [f"cyberwaveos/go2@{DIGEST_A}"]
         host.local["cyberwaveos/nav2:humble-0.2.0"] = [f"cyberwaveos/nav2@{DIGEST_B}"]
@@ -498,25 +530,6 @@ class TestHandleCommand:
     def test_the_command_is_registered_with_the_edge(self):
         assert startup._EDGE_COMMAND_HANDLERS[du.STAGE_COMMAND] is du.handle_stage_command
 
-    def test_the_capability_is_not_advertised_yet(self, monkeypatch):
-        """Until activation exists the backend must not send this to a real edge."""
-        sent: dict[str, Any] = {}
-        host_metrics = types.ModuleType("cyberwave.edge.host_metrics")
-        host_metrics.read_host_facts = lambda: SimpleNamespace(to_dict=dict)
-        monkeypatch.setitem(sys.modules, "cyberwave.edge.host_metrics", host_metrics)
-        monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: "fp-test")
-
-        def discover(**kwargs):
-            sent.update(kwargs)
-            return {"twins": []}
-
-        client = SimpleNamespace(edges=SimpleNamespace(discover=discover))
-        monkeypatch.setattr(startup, "Cyberwave", lambda *a, **k: client)
-
-        assert startup._post_host_facts_once("tok") is True
-
-        assert du.CAPABILITY not in (sent["host_facts"].get("capabilities") or [])
-
 
 class TestStatusReporter:
     @pytest.fixture
@@ -566,6 +579,14 @@ class TestStatusReporter:
             "phase": "failed",
             "error_code": "digest_mismatch",
             "error": "nope",
+        }
+
+    def test_what_runs_after_a_switch_is_sent_as_observed(self, api):
+        du.StatusReporter("req-1").send("active", observed={"cyberwave-driver-1": "drv:2.0.0"})
+
+        assert api.calls[0]["body"] == {
+            "phase": "active",
+            "observed": {"cyberwave-driver-1": "drv:2.0.0"},
         }
 
     def test_progress_is_sent_in_the_shape_the_backend_stores(self, api):
