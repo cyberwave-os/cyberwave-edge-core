@@ -745,7 +745,20 @@ def test_restart_drops_saved_session_that_is_not_live(env, state):
     assert not ra.session_file_path().exists()
 
 
-def test_restart_keeps_saved_session_on_transient_state_error(env):
+@pytest.fixture
+def resume_waits(env, monkeypatch):
+    """Record the resume backoff instead of sleeping; stop once the states run out."""
+    waits: list[float] = []
+
+    def wait(delay):
+        waits.append(delay)
+        return not env.client.states
+
+    monkeypatch.setattr(env.manager._closing, "wait", wait)
+    return waits
+
+
+def test_restart_keeps_saved_session_on_transient_state_error(env, resume_waits):
     env.client.states = [ra.RemoteAccessHTTPError(None, "ConnectError")]
     _saved_session_restart(env, SESSION_A)
     assert env.manager._tunnel is None
@@ -756,3 +769,107 @@ def test_restart_discards_invalid_saved_session(env):
     _saved_session_restart(env, "../../not-a-uuid")
     assert env.client.calls == [("claim", None)]
     assert not ra.session_file_path().exists()
+
+
+def test_restart_offline_resumes_once_the_backend_is_back(env, resume_waits):
+    env.client.states = [
+        ra.RemoteAccessHTTPError(None, "ConnectError"),
+        ra.RemoteAccessHTTPError(None, "ConnectError"),
+        ra.RemoteAccessHTTPError(503, "unavailable"),
+        {"session_id": SESSION_A, "status": "active", "live": True},
+    ]
+    _saved_session_restart(env, SESSION_A)
+    assert resume_waits == [15.0, 30.0, 60.0]
+    assert env.manager._tunnel.session_id == SESSION_A
+    assert env.docker.status == "running"
+
+
+def test_resume_backoff_is_capped(env, resume_waits):
+    env.client.states = [ra.RemoteAccessHTTPError(None, "ConnectError")] * 7
+    _saved_session_restart(env, SESSION_A)
+    assert resume_waits == [15.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+
+
+def test_resume_retries_a_transient_credential_failure(env, resume_waits):
+    live = {"session_id": SESSION_A, "status": "active", "live": True}
+    env.client.states = [live, live]
+    env.client.credential_errors = [ra.RemoteAccessHTTPError(None, "ReadTimeout")]
+    _saved_session_restart(env, SESSION_A)
+    assert resume_waits == [15.0]
+    assert env.manager._tunnel.session_id == SESSION_A
+
+
+def test_resume_retries_a_transient_key_claim_failure(env, resume_waits):
+    live = {"session_id": SESSION_A, "status": "active", "live": True}
+    env.client.states = [live, live]
+    env.client.claim_error = ra.RemoteAccessHTTPError(None, "ConnectError")
+    original_wait = env.manager._closing.wait
+
+    def wait(delay):
+        env.client.claim_error = None
+        return original_wait(delay)
+
+    env.manager._closing.wait = wait
+    _saved_session_restart(env, SESSION_A)
+    assert resume_waits == [15.0]
+    assert env.manager._tunnel.session_id == SESSION_A
+
+
+def test_a_resume_that_loses_the_race_with_shutdown_starts_no_tunnel(env):
+    """shutdown() can land between the state check and the tunnel start."""
+    ra.save_session(SESSION_A)
+    env.manager._edge_uuid = EDGE_UUID
+
+    def state_then_shutdown(session_id):
+        env.manager.shutdown()
+        return {"session_id": session_id, "status": "active", "live": True}
+
+    env.client.session_state = state_then_shutdown
+    assert env.manager._resume_saved_session() is False
+    assert env.manager._tunnel is None
+    assert ("credential", SESSION_A) not in env.client.calls
+    assert ra.session_file_path().exists()
+
+
+def test_shutdown_stops_the_resume_retries(env):
+    env.client.states = [ra.RemoteAccessHTTPError(None, "ConnectError")]
+    env.manager.shutdown()
+    _saved_session_restart(env, SESSION_A)
+    assert [c[0] for c in env.client.calls] == ["claim", "state"]
+    assert ra.session_file_path().exists()
+
+
+@pytest.mark.parametrize(
+    ("error", "kept"),
+    [
+        (ra.RemoteAccessHTTPError(410, "Gone"), False),
+        (ra.RemoteAccessHTTPError(None, "ReadTimeout"), True),
+        (ra.RemoteAccessHTTPError(429, "Too Many Requests"), True),
+        (ra.RemoteAccessHTTPError(408, "Request Timeout"), True),
+    ],
+)
+def test_only_a_transient_credential_failure_keeps_the_saved_session(env, error, kept):
+    ra.save_session(SESSION_A)
+    env.client.credential_errors = [error]
+    env.manager.open_tunnel(SESSION_A)
+    assert env.manager._tunnel is None
+    assert ra.session_file_path().exists() is kept
+
+
+@pytest.mark.parametrize(
+    ("reclaim_error", "kept"),
+    [
+        (ra.RemoteAccessHTTPError(None, "ConnectError"), True),
+        (ra.RemoteAccessHTTPError(503, "unavailable"), True),
+        (ra.RemoteAccessHTTPError(409, "key mismatch"), False),
+    ],
+)
+def test_a_key_reset_followed_by_an_unreachable_reclaim_keeps_the_session(env, reclaim_error, kept):
+    """The credential call answers 409 after an ADMIN key reset; the re-claim then fails."""
+    ra.save_session(SESSION_A)
+    env.manager._key_claimed = True
+    env.client.credential_errors = [ra.RemoteAccessHTTPError(409, "key reset")]
+    env.client.claim_error = reclaim_error
+    env.manager.open_tunnel(SESSION_A)
+    assert env.manager._tunnel is None
+    assert ra.session_file_path().exists() is kept

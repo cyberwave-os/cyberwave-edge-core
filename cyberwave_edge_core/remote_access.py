@@ -86,12 +86,23 @@ DOCKER_RUN_TIMEOUT_SECONDS = 300
 STARTUP_GRACE_SECONDS = 20.0
 STARTUP_POLL_SECONDS = 1.0
 WATCHDOG_INTERVAL_SECONDS = 30.0
+# Resuming a saved session after a restart retries on this backoff while the
+# backend's remote-access calls fail transiently. The resume only starts once
+# edge-core has resolved its edge on the backend, so this covers a partial
+# outage: the lookup answered, then the key claim or credential fetch did not.
+RESUME_RETRY_INITIAL_SECONDS = 15.0
+RESUME_RETRY_MAX_SECONDS = 300.0
 FAILURE_LOG_LINES = 20
 FAILURE_MESSAGE_MAX_CHARS = 1500
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _EXITED_STATUSES = frozenset({"exited", "dead", "none"})
 _EDGE_KEY_LOCK = threading.Lock()
+
+
+def _is_transient(status_code: Optional[int]) -> bool:
+    """A network error, a timeout, rate limiting or a 5xx: the backend may well answer later."""
+    return status_code is None or status_code in (408, 429) or status_code >= 500
 
 
 class RemoteAccessHTTPError(Exception):
@@ -554,6 +565,7 @@ class RemoteAccessManager:
         self._edge_uuid: Optional[str] = None
         self._key_claimed = False
         self._initialized = False
+        self._closing = threading.Event()
 
     # -- setup -------------------------------------------------------------
 
@@ -572,23 +584,38 @@ class RemoteAccessManager:
         ).start()
 
     def _claim_key_and_resume(self) -> None:
-        try:
-            self.ensure_key_claimed()
-        except Exception:
-            logger.exception("Remote access key claim failed")
-        try:
-            self._resume_saved_session()
-        except Exception:
-            logger.exception("Remote access session resume failed")
+        delay = RESUME_RETRY_INITIAL_SECONDS
+        while True:
+            try:
+                self.ensure_key_claimed()
+            except Exception:
+                logger.exception("Remote access key claim failed")
+            try:
+                retry = self._resume_saved_session()
+            except Exception:
+                logger.exception("Remote access session resume failed")
+                return
+            if not retry:
+                return
+            logger.info(
+                "Remote access: backend unreachable; retrying session resume in %.0f s", delay
+            )
+            if self._closing.wait(delay):
+                return
+            delay = min(delay * 2, RESUME_RETRY_MAX_SECONDS)
 
-    def _resume_saved_session(self) -> None:
-        """Reopen the tunnel a crashed or restarted edge-core left while still live."""
+    def _resume_saved_session(self) -> bool:
+        """Reopen the tunnel a crashed or restarted edge-core left while still live.
+
+        Returns True when the backend could not be reached and resuming is
+        worth another try.
+        """
         session_id = load_saved_session()
         if session_id is None:
-            return
+            return False
         client = self._client()
         if client is None:
-            return
+            return False
         try:
             state = client.session_state(session_id)
         except RemoteAccessHTTPError as exc:
@@ -600,7 +627,7 @@ class RemoteAccessManager:
             )
             if exc.status_code in (403, 404, 409):
                 forget_session()
-            return
+            return _is_transient(exc.status_code)
         if not state.get("live"):
             logger.info(
                 "Remote access: saved session %s is %s; not resuming",
@@ -608,12 +635,16 @@ class RemoteAccessManager:
                 state.get("status") or "not live",
             )
             forget_session()
-            return
+            return False
         with self._lock:
-            if self._tunnel is not None:
-                return
+            # shutdown() sets _closing before it takes the lock: a resume that
+            # gets the lock after it must not start frpc on the way out.
+            if self._tunnel is not None or self._closing.is_set():
+                return False
             logger.info("Remote access: resuming tunnel for session %s", session_id)
             self.open_tunnel(session_id)
+            # open_tunnel keeps the session file only when it failed transiently.
+            return self._tunnel is None and load_saved_session() == session_id
 
     def _client(self) -> Optional[_BackendClient]:
         startup = _startup()
@@ -641,8 +672,12 @@ class RemoteAccessManager:
         if self._key_claimed:
             return True
         client = client or self._client()
-        if client is None:
-            return False
+        return client is not None and self._claim_key(client) is None
+
+    def _claim_key(self, client: _BackendClient) -> Optional[RemoteAccessHTTPError]:
+        """Claim the edge key; return the backend's refusal, or None once it is claimed."""
+        if self._key_claimed:
+            return None
         try:
             client.claim_key()
         except RemoteAccessHTTPError as exc:
@@ -658,10 +693,10 @@ class RemoteAccessManager:
                 logger.error("Remote access: backend rejected the edge key: %s", exc)
             else:
                 logger.warning("Remote access: key claim failed (%s): %s", exc.status_code, exc)
-            return False
+            return exc
         self._key_claimed = True
         logger.info("Remote access edge key claimed")
-        return True
+        return None
 
     # -- commands ------------------------------------------------------------
 
@@ -682,9 +717,11 @@ class RemoteAccessManager:
                 self._stop_locked()
 
             client = self._client()
-            if client is None or not self.ensure_key_claimed(client):
+            claim_error = self._claim_key(client) if client is not None else None
+            if client is None or claim_error is not None:
                 logger.warning("Remote access: cannot open tunnel for session %s", session_id)
-                forget_session()
+                if claim_error is None or not _is_transient(claim_error.status_code):
+                    forget_session()
                 return
 
             try:
@@ -696,7 +733,8 @@ class RemoteAccessManager:
                     exc.status_code,
                     exc,
                 )
-                forget_session()
+                if not _is_transient(exc.status_code):
+                    forget_session()
                 return
 
             token = str(credential.get("token") or "")
@@ -729,6 +767,7 @@ class RemoteAccessManager:
 
     def shutdown(self) -> None:
         """Stop frpc on edge-core exit, keeping the session file so the next start resumes."""
+        self._closing.set()
         with self._lock:
             current = self._tunnel
             if current is None:
@@ -751,7 +790,13 @@ class RemoteAccessManager:
             if exc.status_code not in (403, 409):
                 raise
             self._key_claimed = False
-            if not self.ensure_key_claimed(client):
+            claim_error = self._claim_key(client)
+            if claim_error is not None:
+                if _is_transient(claim_error.status_code):
+                    # The re-claim could not reach the backend: report that, so
+                    # the caller keeps the session rather than treating the
+                    # original 403/409 as final.
+                    raise claim_error from exc
                 raise
         return client.fetch_credential(session_id, host_keys, ssh_user)
 
