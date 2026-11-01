@@ -9,6 +9,7 @@ Covers:
 """
 from __future__ import annotations
 
+import itertools
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -171,6 +172,28 @@ class TestDriverReadinessProbes:
             [TWIN_A], timeout_seconds=0.1, poll_interval=0.05
         )
         assert result[TWIN_A_CONTAINER] == "timeout"
+
+    def test_wall_clock_step_does_not_end_the_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # NTP stepping the clock 46 h forward mid-boot, as on a Jetson
+        # without an RTC battery.
+        wall = itertools.count(start=1_000.0, step=46 * 3600.0)
+        statuses = iter(["created", "running"])
+        monkeypatch.setattr(
+            startup,
+            "_list_driver_containers",
+            lambda include_stopped: [TWIN_A_CONTAINER],
+        )
+        monkeypatch.setattr(
+            startup, "_get_container_status_fast", lambda name: next(statuses)
+        )
+        monkeypatch.setattr(startup.time, "time", lambda: next(wall))
+
+        result = startup._wait_for_driver_readiness(
+            [TWIN_A], timeout_seconds=5.0, poll_interval=0.01
+        )
+        assert result[TWIN_A_CONTAINER] == "running"
 
     def test_child_twin_no_container_skipped(
         self, monkeypatch: pytest.MonkeyPatch

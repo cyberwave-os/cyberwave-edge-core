@@ -495,11 +495,18 @@ class TestRemoveCachedTwinJsonFiles:
 
 
 class TestReconcileDriverRestartFailures:
-    def test_stops_and_alerts_when_restart_threshold_is_exceeded(self, monkeypatch):
+    # A wall clock stepped 46 h on every tick (NTP after a boot without an RTC
+    # battery) must not empty the window.
+    @pytest.mark.parametrize("wall_step", [0.0, 46 * 3600.0], ids=["steady", "stepped"])
+    def test_stops_and_alerts_when_restart_threshold_is_exceeded(
+        self, monkeypatch, wall_step
+    ):
         container_name = "cyberwave-driver-1234abcd"
         twin_uuid = "11111111-1111-1111-1111-111111111111"
         restart_counts = iter([0, 1, 2, 3, 4, 5])
         timestamps = itertools.count(start=0, step=10)
+        wall = itertools.count(start=1_000.0, step=wall_step)
+        monkeypatch.setattr(startup.time, "time", lambda: next(wall))
 
         startup._CONTAINER_LAST_RESTART_COUNT.clear()
         startup._CONTAINER_RESTART_HISTORY.clear()
@@ -511,7 +518,7 @@ class TestReconcileDriverRestartFailures:
             "_list_driver_containers",
             lambda include_stopped: [container_name],
         )
-        monkeypatch.setattr(startup.time, "time", lambda: float(next(timestamps)))
+        monkeypatch.setattr(startup, "now_monotonic", lambda: float(next(timestamps)))
         monkeypatch.setattr(
             startup,
             "_inspect_driver_container",
@@ -559,7 +566,7 @@ class TestReconcileDriverRestartFailures:
             "_list_driver_containers",
             lambda include_stopped: [container_name],
         )
-        monkeypatch.setattr(startup.time, "time", lambda: float(next(timestamps)))
+        monkeypatch.setattr(startup, "now_monotonic", lambda: float(next(timestamps)))
         monkeypatch.setattr(
             startup,
             "_inspect_driver_container",

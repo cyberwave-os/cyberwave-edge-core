@@ -53,6 +53,7 @@ from . import (
     health_gating,
     remote_access,
 )
+from ._clock import now_monotonic
 from .docker_helpers import DRIVER_CONTAINER_PREFIX as DRIVER_CONTAINER_PREFIX
 from .docker_helpers import driver_container_name
 
@@ -2242,7 +2243,9 @@ def _resolve_container_driver_image(
 
 def _track_container_restarts(container_name: str, restart_count: int) -> tuple[int, int]:
     """Track per-container restart events and return (new_restarts, restarts_in_window)."""
-    now = time.time()
+    # Monotonic: a device without an RTC battery boots at its last saved time
+    # and NTP then steps the clock, which on wall time skews this window.
+    now = now_monotonic()
     window_start = now - DRIVER_RESTART_LOOP_WINDOW_SECONDS
     history = _CONTAINER_RESTART_HISTORY.setdefault(container_name, deque())
     while history and history[0] < window_start:
@@ -4377,10 +4380,12 @@ def _wait_for_driver_readiness(
         logger.debug("No driver containers found for twin UUIDs; skipping readiness wait")
         return {}
 
-    deadline = time.time() + timeout_seconds
+    # Monotonic: NTP often steps the clock forward during boot, which on wall
+    # time would end this wait at once and report every driver as timed out.
+    deadline = time.monotonic() + timeout_seconds
     final_statuses: dict[str, str] = {}
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         pending = []
         for container_name in relevant:
             if container_name in final_statuses:
