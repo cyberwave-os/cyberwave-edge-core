@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import errno
 import os
 import platform
 from pathlib import Path
@@ -319,6 +320,250 @@ class TestHardwareWatchdog:
         assert hw.enabled is False
 
 
+class TestHardwareWatchdogTimeout:
+    @pytest.fixture(autouse=True)
+    def _no_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CYBERWAVE_HARDWARE_WATCHDOG_TIMEOUT_SECONDS", raising=False)
+
+    def test_twice_watchdog_sec_with_a_floor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 60_000_000)
+        assert wd_mod.resolve_hardware_watchdog_timeout() == 120
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 90_000_000)
+        assert wd_mod.resolve_hardware_watchdog_timeout() == 180
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        assert wd_mod.resolve_hardware_watchdog_timeout() == 120
+        assert HardwareWatchdog()._timeout == 120
+
+    def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 60_000_000)
+        monkeypatch.setenv("CYBERWAVE_HARDWARE_WATCHDOG_TIMEOUT_SECONDS", "300")
+        assert wd_mod.resolve_hardware_watchdog_timeout() == 300
+        monkeypatch.setenv("CYBERWAVE_HARDWARE_WATCHDOG_TIMEOUT_SECONDS", "soon")
+        assert wd_mod.resolve_hardware_watchdog_timeout() == 120
+
+    def test_open_warns_when_the_driver_applies_a_short_timeout(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import fcntl
+        import struct
+
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        device = tmp_path / "watchdog"
+        device.touch()
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_DEV", str(device))
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 60_000_000)
+        monkeypatch.delenv("CYBERWAVE_HARDWARE_WATCHDOG", raising=False)
+        requested: list[int] = []
+
+        def ioctl(fd: int, request: int, arg: bytes) -> bytes:
+            requested.append(struct.unpack("i", arg)[0])
+            return struct.pack("i", 30)
+
+        monkeypatch.setattr(fcntl, "ioctl", ioctl)
+        hw = HardwareWatchdog()
+        with caplog.at_level("WARNING"):
+            assert hw.open() is True
+        hw.close()
+
+        assert requested == [120]
+        assert "not above WatchdogSec" in caplog.text
+        assert device.read_bytes() == b"V"
+
+    def test_open_warns_when_the_driver_refuses_the_timeout_and_keeps_a_short_one(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A Raspberry Pi's bcm2835_wdt rejects anything above 15 s with EINVAL."""
+        import fcntl
+        import struct
+
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        device = tmp_path / "watchdog"
+        device.touch()
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_DEV", str(device))
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 60_000_000)
+        monkeypatch.delenv("CYBERWAVE_HARDWARE_WATCHDOG", raising=False)
+
+        def ioctl(fd: int, request: int, arg: bytes) -> bytes:
+            if request == wd_mod._WDIOC_SETTIMEOUT:
+                raise OSError(errno.EINVAL, "Invalid argument")
+            assert request == wd_mod._WDIOC_GETTIMEOUT
+            return struct.pack("i", 15)
+
+        monkeypatch.setattr(fcntl, "ioctl", ioctl)
+        hw = HardwareWatchdog()
+        with caplog.at_level("INFO"):
+            assert hw.open() is True
+        hw.close()
+
+        assert "refused by the driver, effective=15s" in caplog.text
+        assert "Hardware watchdog timeout (15s) is not above WatchdogSec (60s)" in caplog.text
+
+    def test_open_reads_the_kept_timeout_from_sysfs_without_the_ioctl(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import fcntl
+
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        device = tmp_path / "watchdog"
+        device.touch()
+        sysfs = tmp_path / "watchdog0"
+        sysfs.mkdir()
+        (sysfs / "timeout").write_text("15\n")
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_DEV", str(device))
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_SYSFS", str(sysfs))
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", 60_000_000)
+        monkeypatch.delenv("CYBERWAVE_HARDWARE_WATCHDOG", raising=False)
+
+        def ioctl(fd: int, request: int, arg: bytes) -> bytes:
+            raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
+
+        monkeypatch.setattr(fcntl, "ioctl", ioctl)
+        hw = HardwareWatchdog()
+        with caplog.at_level("WARNING"):
+            assert hw.open() is True
+        hw.close()
+
+        assert "Hardware watchdog timeout (15s) is not above WatchdogSec" in caplog.text
+
+
+class TestHardwareWatchdogDisarm:
+    def _pipe(self, hw: HardwareWatchdog) -> int:
+        read_fd, write_fd = os.pipe()
+        hw._fd = write_fd
+        hw.enabled = True
+        return read_fd
+
+    def test_close_writes_the_magic_character(self) -> None:
+        hw = HardwareWatchdog(timeout_seconds=120)
+        read_fd = self._pipe(hw)
+        hw.ping()
+        hw.close()
+        assert os.read(read_fd, 16) == b"1V"
+        assert hw.enabled is False
+        os.close(read_fd)
+
+    def test_a_close_that_interrupts_a_ping_is_left_to_the_ping(self) -> None:
+        """A signal handler runs on the pinging thread: blocking would deadlock,
+        and a ping written after the ``V`` would cancel the disarm."""
+        hw = HardwareWatchdog(timeout_seconds=120)
+        read_fd = self._pipe(hw)
+        with hw._lock:
+            hw.close()
+            assert hw._fd is not None
+        hw.ping()
+        assert os.read(read_fd, 16) == b"1V"
+        assert hw._fd is None
+        os.close(read_fd)
+
+    def test_a_close_racing_a_ping_on_another_thread_is_not_lost(self) -> None:
+        """The ping released the lock between close's failed acquire and the flag."""
+
+        class _FreedInBetween:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def acquire(self, blocking: bool = True) -> bool:
+                self.attempts += 1
+                return self.attempts > 1
+
+            def release(self) -> None:
+                pass
+
+        hw = HardwareWatchdog(timeout_seconds=120)
+        read_fd = self._pipe(hw)
+        hw._lock = _FreedInBetween()  # type: ignore[assignment]
+        hw.close()
+        assert os.read(read_fd, 16) == b"V"
+        assert hw._fd is None
+        assert hw._close_pending is False
+        os.close(read_fd)
+
+    def test_disarm_now_ignores_the_lock(self) -> None:
+        hw = HardwareWatchdog(timeout_seconds=120)
+        read_fd = self._pipe(hw)
+        with hw._lock:
+            hw.disarm_now()
+        assert os.read(read_fd, 16) == b"V"
+        assert hw._fd is None
+        os.close(read_fd)
+
+    def _sysfs(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str, nowayout: str):
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        sysfs = tmp_path / "sysfs"
+        sysfs.mkdir()
+        (sysfs / "state").write_text(f"{state}\n")
+        (sysfs / "nowayout").write_text(f"{nowayout}\n")
+        device = tmp_path / "watchdog"
+        device.touch()
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_SYSFS", str(sysfs))
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_DEV", str(device))
+        monkeypatch.delenv("CYBERWAVE_HARDWARE_WATCHDOG", raising=False)
+        return device
+
+    def test_disarm_stale_stops_a_running_timer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        device = self._sysfs(monkeypatch, tmp_path, "active", "0")
+        assert HardwareWatchdog(timeout_seconds=120).disarm_stale() is True
+        assert device.read_bytes() == b"V"
+
+    @pytest.mark.parametrize(("state", "nowayout"), [("inactive", "0"), ("active", "1")])
+    def test_disarm_stale_never_arms_or_fights_nowayout(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str, nowayout: str
+    ) -> None:
+        device = self._sysfs(monkeypatch, tmp_path, state, nowayout)
+        assert HardwareWatchdog(timeout_seconds=120).disarm_stale() is False
+        assert device.read_bytes() == b""
+
+    def test_disarm_stale_without_sysfs_does_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_SYSFS", str(tmp_path / "missing"))
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_DEV", str(tmp_path / "never-opened"))
+        assert HardwareWatchdog(timeout_seconds=120).disarm_stale() is False
+
+    def test_sigabrt_disarms_then_dies_with_the_default_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import signal
+
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        handlers: dict[int, object] = {}
+        exit_hooks: list[object] = []
+        kills: list[tuple[int, int]] = []
+        monkeypatch.setattr(wd_mod.signal, "signal", lambda sig, h: handlers.__setitem__(sig, h))
+        monkeypatch.setattr(wd_mod.atexit, "register", exit_hooks.append)
+        monkeypatch.setattr(wd_mod.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        monkeypatch.setattr(wd_mod.faulthandler, "dump_traceback", lambda **kw: None)
+        pw = ProcessWatchdog(hardware_watchdog_timeout=120)
+        read_fd = self._pipe(pw.hardware)
+
+        pw.install_disarm_handlers()
+        assert exit_hooks == [pw.hardware.close]
+        handlers[signal.SIGABRT](signal.SIGABRT, None)
+
+        assert os.read(read_fd, 16) == b"V"
+        assert handlers[signal.SIGABRT] is signal.SIG_DFL
+        assert kills == [(os.getpid(), signal.SIGABRT)]
+        os.close(read_fd)
+
+
 # ---------------------------------------------------------------------------
 # ProcessWatchdog
 # ---------------------------------------------------------------------------
@@ -406,6 +651,25 @@ class TestProcessWatchdog:
         pw.start_pinging()
 
         assert len(opens) == 1, "hardware.open() must run at most once"
+
+    def test_shutdown_during_open_closes_the_device(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A SIGTERM between the stopping check and the open must not leave it armed."""
+        import cyberwave_edge_core.watchdog as wd_mod
+
+        monkeypatch.setattr(wd_mod, "_WATCHDOG_USEC", None)
+        monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", None)
+
+        pw = ProcessWatchdog()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            pw.hardware, "open", lambda: calls.append("open") or pw.begin_shutdown()
+        )
+        monkeypatch.setattr(pw.hardware, "close", lambda: calls.append("close"))
+        monkeypatch.setattr(pw, "ping", lambda: calls.append("ping"))
+
+        pw.start_pinging()
+
+        assert calls == ["open", "close"]
 
     def test_start_wrapper_calls_both_phases(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Backwards-compat :meth:`start` runs both phases in order."""
@@ -589,6 +853,7 @@ class TestProtectEdgeCoreOom:
 
 def test_startup_extensions_have_absolute_deadline(monkeypatch):
     import cyberwave_edge_core.watchdog as wd_mod
+
     now = [100.0]
     sent = []
     monkeypatch.setattr(wd_mod.time, "monotonic", lambda: now[0])
@@ -608,6 +873,7 @@ def test_startup_extensions_have_absolute_deadline(monkeypatch):
 
 def test_startup_deadline_follows_startup_timeout_setting(monkeypatch):
     import cyberwave_edge_core.watchdog as wd_mod
+
     monkeypatch.setenv("CYBERWAVE_STARTUP_TIMEOUT_MINUTES", "90")
     monkeypatch.setattr(wd_mod.time, "monotonic", lambda: 100.0)
     assert wd_mod.ProcessWatchdog()._startup_deadline == 100.0 + 90 * 60
@@ -615,6 +881,7 @@ def test_startup_deadline_follows_startup_timeout_setting(monkeypatch):
 
 def test_shutdown_disables_extensions_and_readiness(monkeypatch):
     import cyberwave_edge_core.watchdog as wd_mod
+
     sent = []
     monkeypatch.setattr(wd_mod, "_NOTIFY_SOCKET", "/run/systemd/notify")
     monkeypatch.setattr(wd_mod, "_sd_notify", sent.append)
@@ -628,3 +895,57 @@ def test_shutdown_disables_extensions_and_readiness(monkeypatch):
     assert sent == ["STOPPING=1"]
     assert not watchdog._ready_signalled
     assert not opened
+
+
+def _boot_cli(monkeypatch: pytest.MonkeyPatch, calls: list[str]):
+    """Run the edge-core CLI's default command with every boot step mocked."""
+    from unittest.mock import Mock
+
+    from click.testing import CliRunner
+
+    import cyberwave_edge_core.watchdog as wd_mod
+    from cyberwave_edge_core import main, resource_monitor
+
+    process_watchdog = Mock()
+    process_watchdog.hardware.disarm_stale.side_effect = lambda: calls.append("disarm_stale")
+    process_watchdog.hardware.close.side_effect = lambda: calls.append("close")
+    handlers: dict[int, object] = {}
+    monkeypatch.setattr(wd_mod, "ProcessWatchdog", lambda: process_watchdog)
+    monkeypatch.setattr(wd_mod, "protect_edge_core_oom", lambda: None)
+    monkeypatch.setattr(resource_monitor, "SystemResourceMonitor", Mock())
+    monkeypatch.setattr(
+        main.signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler)
+    )
+    monkeypatch.setattr(main, "_sigterm_handler", lambda signum, frame: calls.append("sigterm"))
+    monkeypatch.setattr(main, "run_runtime_loop", Mock())
+
+    def boot(**_kwargs):
+        calls.append("startup")
+        return True
+
+    monkeypatch.setattr(main, "run_startup_checks", boot)
+    result = CliRunner().invoke(main.cli, [])
+    assert result.exit_code == 0, result.output
+    return process_watchdog, handlers
+
+
+def test_boot_disarms_a_stale_hardware_timer_before_the_startup_checks(monkeypatch):
+    calls: list[str] = []
+    _boot_cli(monkeypatch, calls)
+    assert calls.index("disarm_stale") < calls.index("startup")
+
+
+def test_sigterm_closes_the_hardware_watchdog(monkeypatch):
+    """The ordered shutdown stops containers without pinging.
+
+    An armed hardware timer left running through it would reset the board.
+    """
+    import signal
+
+    calls: list[str] = []
+    process_watchdog, handlers = _boot_cli(monkeypatch, calls)
+    process_watchdog.install_disarm_handlers.assert_called_once_with()
+    calls.clear()
+    handlers[signal.SIGTERM](signal.SIGTERM, None)
+    assert calls == ["sigterm", "close"]
+    process_watchdog.begin_shutdown.assert_called()

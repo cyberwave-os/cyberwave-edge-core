@@ -98,8 +98,12 @@ def cli(ctx: click.Context) -> None:
         def request_shutdown(signum: int, frame: object) -> None:
             _sigterm_handler(signum, frame)
             watchdog.begin_shutdown()
+            # The ordered shutdown stops every container without pinging, so
+            # an armed hardware timer could reset the board mid-stop.
+            watchdog.hardware.close()
 
         signal.signal(signal.SIGTERM, request_shutdown)
+        watchdog.install_disarm_handlers()
         # Rebind systemd's ``MainPID`` to this process *before any other
         # notify-socket traffic*. Under PyInstaller ``--onefile`` the
         # bootloader holds the original ``MainPID`` / ``$WATCHDOG_PID``
@@ -118,6 +122,10 @@ def cli(ctx: click.Context) -> None:
         # PID-restricted — and is emitted by ``mark_ready`` below
         # only after the blocking boot work finishes.
         watchdog.claim_main_pid()
+        # A previous instance that was SIGKILL-ed left the hardware timer
+        # counting; /dev/watchdog is only opened again after startup, so an
+        # offline or slow boot would otherwise be cut short by a board reset.
+        watchdog.hardware.disarm_stale()
         resource_monitor = SystemResourceMonitor()
 
         # Prime the monitor so the bootstrap edge_health publisher started

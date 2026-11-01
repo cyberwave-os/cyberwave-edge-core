@@ -463,7 +463,9 @@ The CLI side matches: on Linux, `cyberwave edge start`, `restart` and `install` 
 
 #### Hardware watchdog (Raspberry Pi)
 
-On Linux devices with `/dev/watchdog` (all Raspberry Pi models), Edge Core optionally drives the hardware watchdog timer. If the edge-core process stops pinging within 60 seconds, the SoC resets the board. This is a last-resort safety net for kernel-level hangs or total process death.
+On Linux devices with `/dev/watchdog` (all Raspberry Pi models), Edge Core optionally drives the hardware watchdog timer. If the edge-core process stops pinging for longer than the hardware timeout, the SoC resets the board. This is a last-resort safety net for kernel-level hangs or total process death.
+
+Edge Core asks for twice the unit's `WatchdogSec`, and at least 120 seconds, so a hung process is first restarted by systemd and only a hang that outlives that reboots the board. Override it with `CYBERWAVE_HARDWARE_WATCHDOG_TIMEOUT_SECONDS`. A driver may round or clamp the request, and some refuse it outright and keep their own timeout: a Raspberry Pi's `bcm2835_wdt` tops out at 15 seconds. The log line `Hardware watchdog enabled (requested timeout=…, effective=…)` shows the timeout actually running, and a warning follows when it is not above `WatchdogSec`.
 
 Disable with `CYBERWAVE_HARDWARE_WATCHDOG=false`.
 
@@ -488,6 +490,7 @@ Set `CYBERWAVE_BATTERY_WH` to your battery pack's watt-hour capacity to enable a
 | Variable | Default | Description |
 |---|---|---|
 | `CYBERWAVE_HARDWARE_WATCHDOG` | `true` | Enable/disable the hardware watchdog (`/dev/watchdog`) |
+| `CYBERWAVE_HARDWARE_WATCHDOG_TIMEOUT_SECONDS` | twice `WatchdogSec`, at least `120` | Hardware watchdog timeout requested from the driver. Keep it above `WatchdogSec`. See *Hardware watchdog*. |
 | `CYBERWAVE_WORKER_AUTO_MEMORY_LIMIT` | `true` | Enable/disable auto-detected memory limits on ≤4 GB hosts |
 | `CYBERWAVE_WORKER_STARTUP_PROBE_SECONDS` | `30` | Seconds to wait for the worker container to reach `running` state after `docker run` |
 | `CYBERWAVE_WORKER_READY_TIMEOUT_SECONDS` | `900` | Seconds to wait for the worker *process* to finish starting (load and warm up its models) once its container is running |

@@ -26,10 +26,13 @@ Provides three layers of resilience for edge devices running under heavy load
 
 from __future__ import annotations
 
+import atexit
 import errno
+import faulthandler
 import logging
 import os
 import platform
+import signal
 import socket
 import struct
 import threading
@@ -83,6 +86,7 @@ def startup_heartbeat(
     finally:
         done.set()
         thread.join()
+
 
 # ---------------------------------------------------------------------------
 # Systemd watchdog (sd_notify protocol)
@@ -247,9 +251,58 @@ class SystemdWatchdog:
 # ---------------------------------------------------------------------------
 
 _WATCHDOG_DEV = "/dev/watchdog"
-# Only the ``SETTIMEOUT`` ioctl is used; ``KEEPALIVE`` is replaced by a plain
-# ``write(1)`` and ``GETSUPPORT`` is unused.  See ``linux/watchdog.h``.
+# Only the ``SETTIMEOUT`` and ``GETTIMEOUT`` ioctls are used; ``KEEPALIVE`` is
+# replaced by a plain ``write(1)`` and ``GETSUPPORT`` is unused.  See
+# ``linux/watchdog.h``.
 _WDIOC_SETTIMEOUT = 0xC0045706
+_WDIOC_GETTIMEOUT = 0x80045707
+# ``/dev/watchdog`` is the legacy alias of the first registered timer.
+_WATCHDOG_SYSFS = "/sys/class/watchdog/watchdog0"
+
+_HARDWARE_TIMEOUT_ENV = "CYBERWAVE_HARDWARE_WATCHDOG_TIMEOUT_SECONDS"
+_HARDWARE_TIMEOUT_MIN_SECONDS = 120
+
+
+def _current_hardware_timeout(fd: int) -> Optional[int]:
+    """The timeout the driver is running, or ``None`` when it cannot be read."""
+    try:
+        import fcntl
+
+        buf = fcntl.ioctl(fd, _WDIOC_GETTIMEOUT, struct.pack("i", 0))
+        return struct.unpack("i", buf)[0]
+    except OSError:
+        pass
+    try:
+        return int(Path(_WATCHDOG_SYSFS, "timeout").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def resolve_hardware_watchdog_timeout() -> int:
+    """Hardware timeout: the env override, else twice ``WatchdogSec`` (>= 120 s).
+
+    It must stay comfortably above ``WatchdogSec``.  A hung process is then
+    caught by systemd first (``SIGABRT``, which disarms the timer, then a
+    service restart) and the board reset is left for hangs the process
+    cannot answer: a wedged kernel, or an interpreter that never runs the
+    ``SIGABRT`` handler and ends in ``SIGKILL``.
+    """
+    raw = os.environ.get(_HARDWARE_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        logger.warning("Ignoring invalid %s=%r", _HARDWARE_TIMEOUT_ENV, raw)
+    watchdog_seconds = (_WATCHDOG_USEC or 0) // 1_000_000
+    return max(_HARDWARE_TIMEOUT_MIN_SECONDS, 2 * watchdog_seconds)
+
+
+def _hardware_watchdog_disabled() -> bool:
+    env_flag = os.environ.get("CYBERWAVE_HARDWARE_WATCHDOG", "").lower()
+    return env_flag in ("0", "false", "no", "off", "disabled")
 
 
 class HardwareWatchdog:
@@ -262,12 +315,18 @@ class HardwareWatchdog:
 
     Opening the device starts the watchdog.  The ``V`` magic-close
     convention is honoured: writing ``V`` before close disarms the timer
-    so a graceful shutdown does not trigger a reboot.
+    so a graceful shutdown does not trigger a reboot.  Any later write
+    cancels a pending ``V``, so :meth:`close` may run from a signal handler
+    that interrupted :meth:`ping`: it then leaves the close to the ping.
     """
 
-    def __init__(self, *, timeout_seconds: int = 60) -> None:
+    def __init__(self, *, timeout_seconds: Optional[int] = None) -> None:
         self._fd: Optional[int] = None
-        self._timeout = timeout_seconds
+        self._timeout = (
+            timeout_seconds if timeout_seconds is not None else resolve_hardware_watchdog_timeout()
+        )
+        self._lock = threading.Lock()
+        self._close_pending = False
         self.enabled = False
 
     def open(self) -> bool:
@@ -278,8 +337,7 @@ class HardwareWatchdog:
             logger.debug("Hardware watchdog device %s not found", _WATCHDOG_DEV)
             return False
 
-        env_flag = os.environ.get("CYBERWAVE_HARDWARE_WATCHDOG", "").lower()
-        if env_flag in ("0", "false", "no", "off", "disabled"):
+        if _hardware_watchdog_disabled():
             logger.info("Hardware watchdog disabled via CYBERWAVE_HARDWARE_WATCHDOG")
             return False
 
@@ -302,18 +360,39 @@ class HardwareWatchdog:
             return False
 
         self._fd = fd
+        effective: Optional[int] = None
         try:
             buf = struct.pack("i", self._timeout)
             import fcntl
 
-            fcntl.ioctl(fd, _WDIOC_SETTIMEOUT, buf)
+            # The driver writes back the timeout it actually applied, which
+            # can differ from the request (rounded, or clamped to its range).
+            effective = struct.unpack("i", fcntl.ioctl(fd, _WDIOC_SETTIMEOUT, buf))[0]
             logger.info(
-                "Hardware watchdog enabled (timeout=%ds)",
+                "Hardware watchdog enabled (requested timeout=%ds, effective=%ds)",
                 self._timeout,
+                effective,
             )
         except OSError:
+            # The driver refused the request (a Raspberry Pi's bcm2835_wdt tops
+            # out at 15 s) and keeps its own timeout: read that one back.
+            effective = _current_hardware_timeout(fd)
             logger.info(
-                "Hardware watchdog opened (could not set custom timeout; using kernel default)",
+                "Hardware watchdog enabled (requested timeout=%ds refused by the driver, "
+                "effective=%s)",
+                self._timeout,
+                f"{effective}s" if effective is not None else "unknown",
+            )
+
+        watchdog_seconds = (_WATCHDOG_USEC or 0) / 1_000_000
+        if effective is not None and watchdog_seconds and effective <= watchdog_seconds:
+            logger.warning(
+                "Hardware watchdog timeout (%ds) is not above WatchdogSec (%.0fs): a hang "
+                "reboots the board before systemd can restart the service; raise %s, or "
+                "set CYBERWAVE_HARDWARE_WATCHDOG=false if the driver cannot go that high",
+                effective,
+                watchdog_seconds,
+                _HARDWARE_TIMEOUT_ENV,
             )
 
         self.enabled = True
@@ -321,26 +400,93 @@ class HardwareWatchdog:
 
     def ping(self) -> None:
         """Keep the hardware watchdog alive."""
-        if self._fd is None:
-            return
-        try:
-            os.write(self._fd, b"1")
-        except OSError as exc:
-            logger.warning("Hardware watchdog ping failed: %s", exc)
+        with self._lock:
+            fd = self._fd
+            if fd is None:
+                return
+            try:
+                os.write(fd, b"1")
+            except OSError as exc:
+                logger.warning("Hardware watchdog ping failed: %s", exc)
+        if self._close_pending:
+            self.close()
 
     def close(self) -> None:
         """Disarm and close the hardware watchdog (magic close)."""
+        # Non-blocking: a signal handler that interrupted ``ping`` on this
+        # thread would otherwise deadlock on the lock that ping holds.
+        if not self._lock.acquire(blocking=False):
+            self._close_pending = True
+            # A ping on another thread may have released the lock after the
+            # failed acquire and before the flag was set: it has already read
+            # the flag, so take the lock now if it is free.
+            if not self._lock.acquire(blocking=False):
+                return
+        try:
+            self._magic_close()
+        finally:
+            self._close_pending = False
+            self._lock.release()
+
+    def disarm_now(self) -> None:
+        """Magic-close without taking the lock, for a handler about to die.
+
+        Only for the ``SIGABRT`` path: the process is killed right after, so
+        an interrupted ``ping`` never resumes to write again and undo the ``V``.
+        That holds only while every ``ping`` runs on the main thread, where the
+        handler runs; a ping from another thread could re-arm the timer here.
+        """
+        self._magic_close()
+
+    def _magic_close(self) -> None:
         if self._fd is None:
             return
+        fd, self._fd = self._fd, None
+        self.enabled = False
         try:
-            os.write(self._fd, b"V")
-            os.close(self._fd)
+            os.write(fd, b"V")
+            os.close(fd)
             logger.info("Hardware watchdog disarmed and closed")
         except OSError:
             logger.debug("Error closing hardware watchdog", exc_info=True)
+
+    def disarm_stale(self) -> bool:
+        """Stop a timer a previous edge-core left running.  Returns True if it did.
+
+        A ``SIGKILL``-ed instance closes the device without ``V``, so the timer
+        keeps counting and resets the board while this instance is still
+        booting (``/dev/watchdog`` is only opened again after startup).
+        Opening the device arms it, so it is only touched when sysfs says the
+        timer is already ``active`` and ``nowayout`` allows a disarm.
+        """
+        if self._fd is not None or platform.system() != "Linux" or _hardware_watchdog_disabled():
+            return False
+        try:
+            state = Path(_WATCHDOG_SYSFS, "state").read_text().strip()
+            nowayout = Path(_WATCHDOG_SYSFS, "nowayout").read_text().strip()
+        except OSError:
+            return False
+        if state != "active":
+            return False
+        if nowayout != "0":
+            logger.warning(
+                "Hardware watchdog is still running from a previous instance and nowayout "
+                "is set; the board resets unless startup finishes in time"
+            )
+            return False
+        try:
+            fd = os.open(_WATCHDOG_DEV, os.O_WRONLY)
+        except OSError as exc:
+            logger.debug("Cannot open hardware watchdog to disarm it: %s", exc)
+            return False
+        try:
+            os.write(fd, b"V")
+        except OSError:
+            logger.debug("Error disarming stale hardware watchdog", exc_info=True)
         finally:
-            self._fd = None
-            self.enabled = False
+            os.close(fd)
+        logger.warning("Disarmed a hardware watchdog left running by a previous instance")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +533,7 @@ class ProcessWatchdog:
     silently dropped from a child PID" surfaces immediately.
     """
 
-    def __init__(self, *, hardware_watchdog_timeout: int = 60) -> None:
+    def __init__(self, *, hardware_watchdog_timeout: Optional[int] = None) -> None:
         self.systemd = SystemdWatchdog()
         self.hardware = HardwareWatchdog(timeout_seconds=hardware_watchdog_timeout)
         self._ready_signalled = False
@@ -484,6 +630,11 @@ class ProcessWatchdog:
         if self._pinging_started or self._stopping:
             return
         self.hardware.open()
+        if self._stopping:
+            # SIGTERM landed while the device was opening: its close found no fd
+            # yet, so close here or the timer stays armed through the stop.
+            self.hardware.close()
+            return
         layers = self.active_layers()
         if layers:
             logger.info("Watchdog ping loop started (layers: %s)", ", ".join(layers))
@@ -548,6 +699,30 @@ class ProcessWatchdog:
         """Gracefully shut down watchdog layers."""
         self.begin_shutdown()
         self.hardware.close()
+
+    def install_disarm_handlers(self) -> None:
+        """Disarm the hardware timer on ``SIGABRT`` and at interpreter exit.
+
+        systemd sends ``SIGABRT`` when ``WatchdogSec`` lapses and restarts the
+        service; without a disarm the still-armed timer would also reset the
+        board.  The handler dumps every thread's stack (what ``SIGABRT``'s
+        core dump used to be for), writes ``V`` and re-raises with the
+        default action.  It only runs if the interpreter still reaches
+        bytecode: a hang in C code holding the GIL ends in ``SIGKILL`` and
+        the hardware reset stays the backstop.  Main thread only.
+        """
+
+        def on_abort(signum: int, frame: object) -> None:
+            try:
+                faulthandler.dump_traceback(all_threads=True)
+            except Exception:
+                pass
+            self.hardware.disarm_now()
+            signal.signal(signal.SIGABRT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGABRT)
+
+        signal.signal(signal.SIGABRT, on_abort)
+        atexit.register(self.hardware.close)
 
 
 # ---------------------------------------------------------------------------
