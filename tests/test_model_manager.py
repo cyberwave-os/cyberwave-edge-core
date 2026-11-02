@@ -18,6 +18,7 @@ Covers:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import subprocess
@@ -42,6 +43,7 @@ from cyberwave_edge_core.model_manager import (
     _derive_filename,
     _extract_checksum,
     _extract_download_url,
+    _extract_requires,
     _extract_runtime,
     _Manifest,
     _redact_url,
@@ -366,6 +368,243 @@ def test_ensure_models_clears_previous_failures(tmp_path: Path) -> None:
     manager.last_ensure_failures = {"old_model": "old error"}
     manager.ensure_models(["yolov8n"])
     assert manager.last_ensure_failures == {}
+
+
+# ---------------------------------------------------------------------------
+# Companion files: metadata["requires"]
+# ---------------------------------------------------------------------------
+
+
+def _set_cached(cache_dir: Path, model_id: str, **fields: Any) -> None:
+    """Change fields of a model already in the manifest."""
+    manifest_path = cache_dir / "manifest.json"
+    manifest = _Manifest.load(manifest_path)
+    cached = manifest.get(model_id)
+    assert cached is not None
+    for name, value in fields.items():
+        setattr(cached, name, value)
+    manifest.set(cached)
+    manifest.save(manifest_path)
+
+
+def _catalog(entries: dict[str, dict[str, Any]]):
+    """A ``_fetch_catalog_entry`` that answers from *entries* by model id."""
+
+    def _fetch(self: ModelManager, model_id: str) -> dict[str, Any]:
+        return entries[model_id]
+
+    return _fetch
+
+
+def _entry(model_id: str, *, requires: list[str] | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "download_url": f"https://dl.example.com/{model_id}",
+        "runtime": "ultralytics",
+        "filename": model_id,
+    }
+    if requires is not None:
+        entry["metadata"] = {"requires": requires}
+    return entry
+
+
+def _stream_by_url(self: ModelManager, url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(url.encode())
+
+
+def test_ensure_models_downloads_what_a_model_requires(tmp_path: Path) -> None:
+    entries = {
+        "yoloe.pt": _entry("yoloe.pt", requires=["encoder.ts"]),
+        "encoder.ts": _entry("encoder.ts", requires=[]),
+    }
+    manager = _make_manager(tmp_path)
+
+    with (
+        patch.object(ModelManager, "_fetch_catalog_entry", _catalog(entries)),
+        patch.object(ModelManager, "_stream_download", _stream_by_url),
+    ):
+        result = manager.ensure_models(["yoloe.pt"])
+
+    assert set(result) == {"yoloe.pt", "encoder.ts"}
+    assert result["encoder.ts"] == tmp_path / "encoder.ts" / "encoder.ts"
+    assert result["encoder.ts"].read_bytes() == b"https://dl.example.com/encoder.ts"
+    assert manager.last_ensure_failures == {}
+    assert manager.last_companion_failures == {}
+    manifest = _Manifest.load(tmp_path / "manifest.json")
+    assert manifest.get("yoloe.pt").requires == ["encoder.ts"]  # type: ignore[union-attr]
+    assert manifest.get("encoder.ts").requires == []  # type: ignore[union-attr]
+
+
+def test_a_model_deferred_to_the_worker_still_gets_what_it_requires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The packaged (frozen) Edge Core cannot download a YOLOE checkpoint, which has no
+    ``download_url``, so it defers the model to the worker. The text encoder the model
+    requires has a pinned URL and must still be fetched."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    deferred = {"runtime": "ultralytics", "metadata": {"requires": ["encoder.ts"]}}
+    entries = {"yoloe.pt": deferred, "encoder.ts": _entry("encoder.ts", requires=[])}
+    manager = _make_manager(tmp_path)
+
+    with (
+        patch.object(ModelManager, "_fetch_catalog_entry", _catalog(entries)),
+        patch.object(ModelManager, "_stream_download", _stream_by_url),
+    ):
+        result = manager.ensure_models(["yoloe.pt"])
+
+    assert set(result) == {"encoder.ts"}  # yoloe.pt itself is the worker's to download
+    assert result["encoder.ts"].read_bytes() == b"https://dl.example.com/encoder.ts"
+    assert manager.last_ensure_failures == {}
+    assert manager.last_companion_failures == {}
+
+
+def test_requires_are_found_again_without_the_catalog(tmp_path: Path) -> None:
+    """A restart on a device that cannot reach the catalog still resolves them."""
+    entries = {
+        "yoloe.pt": _entry("yoloe.pt", requires=["encoder.ts"]),
+        "encoder.ts": _entry("encoder.ts"),
+    }
+    first = _make_manager(tmp_path)
+    with (
+        patch.object(ModelManager, "_fetch_catalog_entry", _catalog(entries)),
+        patch.object(ModelManager, "_stream_download", _stream_by_url),
+    ):
+        first.ensure_models(["yoloe.pt"])
+
+    second = _make_manager(tmp_path)  # the catalog probe is a no-op: offline
+    err = AssertionError("everything is cached")
+    with patch.object(second, "_download_model", side_effect=err):
+        result = second.ensure_models(["yoloe.pt"])
+
+    assert set(result) == {"yoloe.pt", "encoder.ts"}
+
+
+def test_a_companion_that_cannot_be_fetched_does_not_fail_the_model(
+    tmp_path: Path,
+) -> None:
+    _write_fake_model(tmp_path, "yoloe.pt")
+    _set_cached(tmp_path, "yoloe.pt", requires=["encoder.ts"])
+    manager = _make_manager(tmp_path)
+
+    def _download_raises(model_id: str) -> Path:
+        raise RuntimeError("offline")
+
+    with patch.object(manager, "_download_model", side_effect=_download_raises):
+        result = manager.ensure_models(["yoloe.pt"])
+
+    assert set(result) == {"yoloe.pt"}
+    assert manager.last_ensure_failures == {}  # the worker still starts
+    assert set(manager.last_companion_failures) == {"encoder.ts"}
+    assert "offline" in manager.last_companion_failures["encoder.ts"]
+
+
+def test_requires_are_followed_transitively_and_a_cycle_stops(tmp_path: Path) -> None:
+    for model_id, needs in (("a", ["b"]), ("b", ["c"]), ("c", ["a"])):
+        _write_fake_model(tmp_path, model_id)
+        _set_cached(tmp_path, model_id, requires=needs)
+    manager = _make_manager(tmp_path)
+
+    result = manager.ensure_models(["a"])
+
+    assert set(result) == {"a", "b", "c"}
+
+
+def test_a_model_that_is_both_requested_and_required_is_reported_as_requested(
+    tmp_path: Path,
+) -> None:
+    _write_fake_model(tmp_path, "a")
+    _set_cached(tmp_path, "a", requires=["b"])
+    manager = _make_manager(tmp_path)
+
+    def _download_raises(model_id: str) -> Path:
+        raise RuntimeError("offline")
+
+    with patch.object(manager, "_download_model", side_effect=_download_raises):
+        manager.ensure_models(["a", "b"])
+
+    assert set(manager.last_ensure_failures) == {"b"}
+    assert manager.last_companion_failures == {}
+
+
+def test_a_prestaged_model_never_sends_the_catalog_a_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fake_model(tmp_path, "yoloe.pt")
+    _set_cached(tmp_path, "yoloe.pt", downloaded_from=SOURCE_KIND_PRESTAGED)
+
+    def _must_not_ask(self: ModelManager, model_id: str) -> None:
+        raise AssertionError("pre-staged files are operator-curated")
+
+    monkeypatch.setattr(ModelManager, "_fetch_catalog_entry_safe", _must_not_ask)
+    manager = _make_manager(tmp_path)
+
+    assert set(manager.ensure_models(["yoloe.pt"])) == {"yoloe.pt"}
+
+
+def test_requires_not_learned_offline_are_looked_for_again_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fake_model(tmp_path, "yoloe.pt")  # cached before the field existed
+
+    offline = _make_manager(tmp_path)
+    assert set(offline.ensure_models(["yoloe.pt"])) == {"yoloe.pt"}
+    manifest = _Manifest.load(tmp_path / "manifest.json")
+    assert manifest.get("yoloe.pt").requires is None  # type: ignore[union-attr]  # not "none needed"
+
+    monkeypatch.setattr(
+        ModelManager,
+        "_fetch_catalog_entry_safe",
+        lambda self, model_id: _entry(model_id, requires=["encoder.ts"]),
+    )
+    _write_fake_model(tmp_path, "encoder.ts")
+    online = _make_manager(tmp_path)
+
+    assert set(online.ensure_models(["yoloe.pt"])) == {"yoloe.pt", "encoder.ts"}
+    manifest = _Manifest.load(tmp_path / "manifest.json")
+    assert manifest.get("yoloe.pt").requires == ["encoder.ts"]  # type: ignore[union-attr]
+
+
+def test_extract_requires_reads_metadata_and_cleans_the_list() -> None:
+    assert _extract_requires({}) == []
+    assert _extract_requires({"metadata": None}) == []
+    assert _extract_requires({"metadata": {"requires": "encoder.ts"}}) == []
+    assert _extract_requires(
+        {"metadata": {"requires": [" encoder.ts ", "", 7, "encoder.ts", "b"]}}
+    ) == ["encoder.ts", "b"]
+
+
+def test_requires_ids_that_could_leave_the_cache_are_ignored() -> None:
+    """An id becomes a directory under the cache; catalog metadata must not pick the path."""
+    unsafe = ["../x", "a/../../b", "/etc/passwd", "a\\b", "bad\x00id", "..", "   "]
+    assert _extract_requires({"metadata": {"requires": [*unsafe, "ok.ts", "org/name"]}}) == [
+        "ok.ts",
+        "org/name",
+    ]
+
+
+def test_an_unreachable_catalog_is_probed_once_per_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warm-cache probe already failed; asking again for ``requires`` doubles the wait."""
+    _write_fake_model(tmp_path, "yoloe.pt")  # no requires in the manifest
+    probes: list[str] = []
+
+    def _unreachable(self: ModelManager, model_id: str) -> None:
+        probes.append(model_id)
+
+    monkeypatch.setattr(ModelManager, "_fetch_catalog_entry_safe", _unreachable)
+    manager = _make_manager(tmp_path)
+
+    assert set(manager.ensure_models(["yoloe.pt"])) == {"yoloe.pt"}
+    assert probes == ["yoloe.pt"]
+
+
+def test_a_manifest_entry_written_before_requires_existed_loads() -> None:
+    cached = CachedModel.from_dict(
+        {"model_id": "a", "local_path": "/x", "size_bytes": 1, "downloaded_at": ""}
+    )
+    assert cached.requires is None
+    assert CachedModel.from_dict({**cached.to_dict(), "requires": ["b"]}).requires == ["b"]
 
 
 # ---------------------------------------------------------------------------
@@ -1982,16 +2221,14 @@ def test_download_retries_short_circuit_on_403(
     """An expired GCS signed URL returns 403; retrying the same URL is
     pointless. ``_download_with_retries`` should bail immediately so the
     caller can fall through to the next source."""
-    import httpx
+    downloads = pytest.importorskip("cyberwave.downloads")
 
     manager = _make_manager(tmp_path)
     attempts: list[int] = []
 
     def _fake_stream(url: str, dest: Path) -> None:
         attempts.append(len(attempts) + 1)
-        request = httpx.Request("GET", url)
-        response = httpx.Response(403, request=request)
-        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+        raise downloads.DownloadAuthError("forbidden", status=403)
 
     monkeypatch.setattr(manager, "_stream_download", _fake_stream)
     monkeypatch.setattr("cyberwave_edge_core.model_manager.MAX_DOWNLOAD_RETRIES", 5)
@@ -2003,16 +2240,14 @@ def test_download_retries_short_circuit_on_403(
 
 def test_download_retries_continue_on_500(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Server-side errors (5xx) and network errors are still retried."""
-    import httpx
+    downloads = pytest.importorskip("cyberwave.downloads")
 
     manager = _make_manager(tmp_path)
     attempts: list[int] = []
 
     def _fake_stream(url: str, dest: Path) -> None:
         attempts.append(len(attempts) + 1)
-        request = httpx.Request("GET", url)
-        response = httpx.Response(500, request=request)
-        raise httpx.HTTPStatusError("server error", request=request, response=response)
+        raise downloads.DownloadError("server error", status=500)
 
     monkeypatch.setattr(manager, "_stream_download", _fake_stream)
     monkeypatch.setattr("cyberwave_edge_core.model_manager.MAX_DOWNLOAD_RETRIES", 3)
@@ -2029,7 +2264,7 @@ def test_signed_url_403_falls_through_to_upstream(
     """End-to-end: a 403 from the signed URL must not block the upstream
     fallback. Combined with the retry short-circuit, this means an
     expired signed URL costs a single HTTP attempt before we move on."""
-    import httpx
+    downloads = pytest.importorskip("cyberwave.downloads")
 
     model_id = "yolov8n"
     content = b"upstream weights"
@@ -2048,9 +2283,7 @@ def test_signed_url_403_falls_through_to_upstream(
     def _fake_stream(url: str, dest: Path) -> None:
         attempts.append(url)
         if url == artifact_url:
-            request = httpx.Request("GET", url)
-            response = httpx.Response(403, request=request)
-            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+            raise downloads.DownloadAuthError("forbidden", status=403)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content)
 
@@ -2426,3 +2659,82 @@ def test_owner_uid_gid_ignored_when_os_lchown_unavailable(
         owner_uid_gid=(1234, 5678),
     )
     assert manager._owner_uid_gid is None
+
+
+# ---------------------------------------------------------------------------
+# The shared download step (``cyberwave.downloads``) behind ``_stream_download``
+# ---------------------------------------------------------------------------
+
+
+class _FileServer:
+    """A local HTTP server answering every GET with a fixed body; it records the requests."""
+
+    def __init__(self, body: bytes = b"weights" * 1000) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        self.requests: list[dict[str, str]] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                outer.requests.append({k.lower(): v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self._httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._httpd.server_port}"
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+@pytest.fixture
+def file_server(monkeypatch: pytest.MonkeyPatch):
+    downloads = pytest.importorskip("cyberwave.downloads")
+    if getattr(downloads, "IS_STUB", False):  # the conftest stand-in cannot download
+        pytest.skip("needs the real cyberwave SDK's download step")
+    for name in ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    server = _FileServer()
+    yield server
+    server.close()
+
+
+def test_stream_download_sends_the_token_to_the_backend_only(
+    tmp_path: Path, file_server: _FileServer
+) -> None:
+    to_backend = _make_manager(tmp_path / "a", token="SECRET", base_url=file_server.url)
+    elsewhere = _make_manager(tmp_path / "b", token="SECRET", base_url="https://api.test")
+
+    to_backend._stream_download(f"{file_server.url}/m.pt", tmp_path / "a" / "m.pt")
+    elsewhere._stream_download(f"{file_server.url}/m.pt", tmp_path / "b" / "m.pt")
+
+    assert file_server.requests[0]["authorization"] == "Bearer SECRET"
+    assert "authorization" not in file_server.requests[1]
+    assert (tmp_path / "a" / "m.pt").read_bytes() == b"weights" * 1000
+
+
+def test_a_full_disk_is_logged_and_still_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    downloads = pytest.importorskip("cyberwave.downloads")
+    manager = _make_manager(tmp_path)
+
+    def full(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(downloads, "download_file", full)
+
+    with caplog.at_level("ERROR"), pytest.raises(OSError):
+        manager._stream_download("https://x/m.pt?sig=SECRET", tmp_path / "m.pt")
+
+    assert "Disk full" in caplog.text
+    assert "SECRET" not in caplog.text  # the signed query string is redacted

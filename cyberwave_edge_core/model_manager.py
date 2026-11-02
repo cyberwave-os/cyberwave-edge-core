@@ -58,6 +58,16 @@ Resolution order for ``ensure_model(model_id)``
 
 6. Otherwise raise ``RuntimeError``.
 
+Companion files (``metadata["requires"]``)
+------------------------------------------
+
+A catalog entry may list other entries it needs (ids as ``ensure_model`` takes them) for
+weights a library fetches itself by bare filename: YOLOE-26's text encoder
+(``mobileclip2_b.ts``). :meth:`ensure_models` follows ``requires`` after each model,
+transitively, and caches the companions like any model; the list is kept in the
+manifest for offline restarts. A companion that cannot be fetched does not stop the
+worker (the library downloads it itself, as before): see :attr:`last_companion_failures`.
+
 The cache directory is bind-mounted read-only into the worker container at
 ``/app/models/``. The SDK's ``cw.models.load()`` resolves paths from that
 mount — Edge Core is responsible for pre-populating it before starting the
@@ -78,7 +88,6 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -97,9 +106,6 @@ MAX_DOWNLOAD_RETRIES = 3
 
 #: Seconds to wait between download retry attempts (exponential base).
 DOWNLOAD_RETRY_BASE_DELAY = 2.0
-
-#: Chunk size for streaming HTTP downloads (bytes).
-DOWNLOAD_CHUNK_SIZE = 64 * 1024  # 64 KiB
 
 #: API endpoint for fetching a model catalog entry.
 ML_MODELS_ENDPOINT = "/api/v1/mlmodels"
@@ -262,13 +268,15 @@ def _is_orphan_staging_dir(model_dir: Path) -> bool:
     directory as safely-deletable iff every entry inside is either:
 
     * The metadata sidecar (``MODEL_METADATA_FILENAME``), or
-    * A partial streaming temp file (``.dl_*.part`` — the prefix used by
-      :func:`_stream_download`).
+    * A partial streaming temp file (``.dl_*`` — see
+      :func:`cyberwave.downloads.is_partial_download`).
 
     Any other entry (a half-written weight file with an unexpected
     extension, an operator-staged file, a sub-directory) blocks the
     prune, so a human always wins over the self-heal.
     """
+    from cyberwave.downloads import is_partial_download
+
     if not model_dir.is_dir():
         return False
     try:
@@ -279,9 +287,7 @@ def _is_orphan_staging_dir(model_dir: Path) -> bool:
         if not entry.is_file():
             return False
         name = entry.name
-        if name == MODEL_METADATA_FILENAME:
-            continue
-        if name.startswith(".dl_") and name.endswith(".part"):
+        if name == MODEL_METADATA_FILENAME or is_partial_download(name):
             continue
         return False
     return True
@@ -342,6 +348,10 @@ class CachedModel:
     checksum_sha256: Optional[str] = None
     runtime: Optional[str] = None
     downloaded_from: Optional[str] = None
+    #: Ids of the entries this one needs (``metadata["requires"]``). ``None`` means
+    #: not known yet (written before the field existed, or the catalog was
+    #: unreachable); ``[]`` means known to need nothing.
+    requires: Optional[list[str]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -357,6 +367,7 @@ class CachedModel:
             checksum_sha256=data.get("checksum_sha256"),
             runtime=data.get("runtime"),
             downloaded_from=data.get("downloaded_from"),
+            requires=_clean_requires(data.get("requires")),
         )
 
 
@@ -462,6 +473,14 @@ class ModelManager:
         )
         self._manifest = _Manifest.load(self._manifest_path)
         self.last_ensure_failures: dict[str, str] = {}
+        #: Companion files (``requires``) the last :meth:`ensure_models` could not
+        #: fetch, by id. Kept apart from :attr:`last_ensure_failures`: the worker
+        #: still starts, and the library falls back to its own download.
+        self.last_companion_failures: dict[str, str] = {}
+        # ``requires`` read from a catalog entry during this run, by model id, and the
+        # ids whose catalog probe failed (not asked again: each try costs a timeout).
+        self._requires_seen: dict[str, list[str]] = {}
+        self._catalog_unreachable: set[str] = set()
         # Recover any ``*.__cw_normalize__`` files left by a mid-rename
         # crash in :meth:`_normalize_flat_prestaged_layout`, then prune
         # empty orphan staging directories from failed downloads.
@@ -610,19 +629,25 @@ class ModelManager:
         """Batch version of :meth:`ensure_model`.
 
         Returns a mapping of ``model_id → local_path`` for every model that
-        could be resolved. Models that fail to download are logged as
-        warnings and omitted from the result rather than raising.
+        could be resolved, including the companion files they ``require``
+        (see the module docstring). Models that fail to download are logged
+        as warnings and omitted from the result rather than raising.
 
         After this call, :attr:`last_ensure_failures` contains the mapping
-        of ``model_id → error_message`` for models that could not be
-        resolved, which callers can inspect to send alerts.
+        of ``model_id → error_message`` for the models in *model_ids* that
+        could not be resolved, which callers can inspect to send alerts.
+        Companion files that could not be resolved are in
+        :attr:`last_companion_failures` instead: they do not stop a worker
+        from starting.
 
         :class:`_RuntimeManagedDeferred` is **not** a failure: it means
         the edge host cannot pre-download a runtime-managed weight (e.g.
         frozen PyInstaller binary) but the worker container will resolve
         it on first inference. Such models are omitted from both the
         result and ``last_ensure_failures`` so they do not trigger a
-        misleading ``model_download_failure`` alert (CYB-2103).
+        misleading ``model_download_failure`` alert (CYB-2103). What a deferred
+        model ``requires`` is still fetched here: the catalog pins those files, so
+        the worker does not have to download them itself.
 
         When *should_stop* returns True, the remaining models are skipped
         (a download already in progress still completes) so that a shutdown
@@ -630,23 +655,77 @@ class ModelManager:
         """
         results: dict[str, Path] = {}
         failures: dict[str, str] = {}
-        for model_id in model_ids:
+        companion_failures: dict[str, str] = {}
+        # (model id, id of the model that requires it, or None for a requested one).
+        # Requested models are all queued first, so one that is also somebody's
+        # companion is reported as requested.
+        queue: list[tuple[str, Optional[str]]] = [(mid, None) for mid in model_ids]
+        seen: set[str] = set()
+        index = 0
+        while index < len(queue):
+            raw_id, required_by = queue[index]
+            index += 1
+            model_id = raw_id.strip()
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
             if should_stop is not None and should_stop():
                 logger.info("Stop requested; skipping remaining model downloads")
                 break
             try:
                 results[model_id] = self.ensure_model(model_id)
             except _RuntimeManagedDeferred as exc:
+                # The worker downloads this model itself, but what it requires is still
+                # ours to fetch.
                 logger.info("Model '%s' deferred to worker runtime: %s", model_id, exc)
             except Exception as exc:
-                logger.warning(
-                    "Failed to ensure model '%s': %s — worker will handle gracefully",
-                    model_id,
-                    exc,
-                )
-                failures[model_id] = str(exc)
+                if required_by is None:
+                    logger.warning(
+                        "Failed to ensure model '%s': %s — worker will handle gracefully",
+                        model_id,
+                        exc,
+                    )
+                    failures[model_id] = str(exc)
+                else:
+                    logger.warning(
+                        "Failed to ensure '%s' (required by '%s'): %s — the runtime will "
+                        "download it itself when it needs it",
+                        model_id,
+                        required_by,
+                        exc,
+                    )
+                    companion_failures[model_id] = str(exc)
+                continue
+            for companion in self._requires_of(model_id):
+                queue.append((companion, model_id))
         self.last_ensure_failures = failures
+        self.last_companion_failures = companion_failures
         return results
+
+    def _requires_of(self, model_id: str) -> list[str]:
+        """Ids *model_id* needs: this run's catalog entry, else the manifest, else a probe.
+
+        A pre-staged model never asks the catalog. When nothing can be learned the
+        answer is ``[]`` and is not remembered, so a later run still looks.
+        """
+        cached = self._manifest.get(model_id)
+        learned = self._requires_seen.get(model_id)
+        if learned is None:
+            if cached is not None and cached.requires is not None:
+                return list(cached.requires)
+            if cached is not None and cached.downloaded_from == SOURCE_KIND_PRESTAGED:
+                return []
+            if model_id in self._catalog_unreachable:
+                return []
+            entry = self._fetch_catalog_entry_safe(model_id)
+            if entry is None:
+                return []
+            learned = _extract_requires(entry)
+        if cached is not None and cached.requires != learned:
+            cached.requires = list(learned)
+            self._manifest.set(cached)
+            self._save_manifest()
+        return learned
 
     def list_cached_models(self) -> list[CachedModel]:
         """Return all models currently in the local cache."""
@@ -909,7 +988,9 @@ class ModelManager:
         """
         catalog_entry = self._fetch_catalog_entry_safe(model_id)
         if catalog_entry is None:
+            self._catalog_unreachable.add(model_id)
             return False
+        self._requires_seen[model_id] = _extract_requires(catalog_entry)
 
         expected_checksum = _extract_checksum(catalog_entry)
         if not expected_checksum:
@@ -1333,6 +1414,7 @@ class ModelManager:
         catalog metadata missing).
         """
         catalog_entry = self._fetch_catalog_entry(model_id)
+        self._requires_seen[model_id] = _extract_requires(catalog_entry)
 
         # Gate 3: fail fast on a known Hailo HEF / accelerator arch
         # mismatch before incurring the download cost. Silent no-op
@@ -1502,8 +1584,8 @@ class ModelManager:
                 "upstream_url": upstream_url,
             },
         )
-        # ``_stream_download`` writes the weight via ``tempfile.mkstemp`` →
-        # ``os.replace``, which keeps the file owned by the current process
+        # ``_stream_download`` writes the weight to a temp file and
+        # ``os.replace``s it into place, which keeps the file owned by the current process
         # (root, under systemd). Re-apply the container-user ownership
         # here so a downstream worker container can read both the weight
         # file and its sidecar.
@@ -1520,6 +1602,7 @@ class ModelManager:
             checksum_sha256=checksum,
             runtime=runtime,
             downloaded_from=source_kind,
+            requires=self._requires_seen.get(model_id),
         )
         self._manifest.set(cached)
         self._save_manifest()
@@ -1807,42 +1890,28 @@ class ModelManager:
         ) from last_exc
 
     def _stream_download(self, url: str, dest: Path) -> None:
-        """Stream *url* directly to *dest* via a temp file.
+        """Download *url* to *dest* with the SDK's shared download step.
 
         The Authorization header is only attached when *url* points at the
         Cyberwave backend; signed GCS URLs reject extra Authorization
-        headers, and upstream public mirrors do not need our token.
+        headers, and upstream public mirrors do not need our token. The
+        shared step also drops the header if the backend redirects elsewhere.
+        One attempt: retrying is :meth:`_download_with_retries`'s job.
         """
-        import httpx
+        from cyberwave.downloads import download_file
 
         headers: dict[str, str] = {}
         if url.startswith(self._base_url):
             headers["Authorization"] = f"Bearer {self._api_token}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp_fd, tmp_path_str = tempfile.mkstemp(dir=dest.parent, prefix=".dl_")
-        tmp_path = Path(tmp_path_str)
         try:
-            with (
-                os.fdopen(tmp_fd, "wb") as fh,
-                httpx.stream(
-                    "GET", url, headers=headers, timeout=300.0, follow_redirects=True
-                ) as resp,
-            ):
-                resp.raise_for_status()
-                for chunk in resp.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                    fh.write(chunk)
-            tmp_path.replace(dest)
+            download_file(url, dest, headers=headers)
         except OSError as exc:
-            tmp_path.unlink(missing_ok=True)
             if exc.errno == errno.ENOSPC:
                 logger.error(
                     "Disk full while downloading model from %s — free space in %s and retry",
                     _redact_url(url),
                     dest.parent,
                 )
-            raise
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
             raise
 
 
@@ -1896,19 +1965,15 @@ def _redact_url(url: str) -> str:
 
 
 def _is_auth_failure(exc: BaseException) -> bool:
-    """Return True if *exc* represents an HTTP 401/403 from httpx.
+    """Return True if *exc* is the shared download step's HTTP 401/403 error.
 
     Used to short-circuit the download retry loop: auth failures will not
     become valid by waiting, and the caller can fall through to the next
     source (e.g. expired signed URL → upstream public URL).
     """
-    try:
-        import httpx
-    except ImportError:
-        return False
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (401, 403)
-    return False
+    from cyberwave.downloads import DownloadAuthError
+
+    return isinstance(exc, DownloadAuthError)
 
 
 #: Map weight-file extensions to SDK runtime names. Mirrors the SDK's
@@ -1972,6 +2037,36 @@ def _extract_checksum(entry: dict[str, Any]) -> Optional[str]:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
+
+
+def _clean_requires(value: Any) -> Optional[list[str]]:
+    """A ``requires`` value as a list of distinct usable ids, or ``None`` if not a list."""
+    if not isinstance(value, list):
+        return None
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        model_id = item.strip()
+        # An id names a directory under the cache: never a way out of it.
+        unsafe = (
+            not model_id
+            or model_id.startswith("/")
+            or "\\" in model_id
+            or "\x00" in model_id
+            or ".." in model_id.split("/")
+        )
+        if not unsafe and model_id not in cleaned:
+            cleaned.append(model_id)
+    return cleaned
+
+
+def _extract_requires(entry: dict[str, Any]) -> list[str]:
+    """Ids a catalog entry needs, from ``entry["metadata"]["requires"]`` (else ``[]``)."""
+    metadata = entry.get("metadata")
+    if not isinstance(metadata, dict):
+        return []
+    return _clean_requires(metadata.get("requires")) or []
 
 
 def _extract_runtime(entry: dict[str, Any]) -> Optional[str]:

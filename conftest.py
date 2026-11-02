@@ -25,6 +25,7 @@ def _ensure_real_or_stub_cyberwave_sdk() -> None:
     """Try to import the real SDK first; fall back to stubs otherwise."""
     try:
         import cyberwave  # noqa: F401
+        import cyberwave.downloads  # noqa: F401  (0.7.5+: the shared model download step)
         import cyberwave.edge  # noqa: F401
         import cyberwave.edge.host_metrics  # noqa: F401
         import cyberwave.edge.platform  # noqa: F401
@@ -66,12 +67,37 @@ def _ensure_real_or_stub_cyberwave_sdk() -> None:
     )
     _fake_cw.mqtt_identity = _fake_mqtt_identity  # type: ignore[attr-defined]
 
+    # ``ModelManager`` calls the shared download step (and its partial-download test,
+    # when it is built). Only what those callers need; a test that wants a real download
+    # skips itself when ``IS_STUB`` is set.
+    class _DownloadError(RuntimeError):
+        def __init__(self, message: str = "", *, status: int | None = None) -> None:
+            super().__init__(message)
+            self.status = status
+
+    class _DownloadAuthError(_DownloadError):
+        pass
+
+    def _download_file_stub(*_args: object, **_kwargs: object) -> str:
+        raise NotImplementedError("the real cyberwave SDK is not installed")
+
+    _fake_downloads = types.ModuleType("cyberwave.downloads")
+    _fake_downloads.IS_STUB = True  # type: ignore[attr-defined]
+    _fake_downloads.DownloadError = _DownloadError  # type: ignore[attr-defined]
+    _fake_downloads.DownloadAuthError = _DownloadAuthError  # type: ignore[attr-defined]
+    _fake_downloads.download_file = _download_file_stub  # type: ignore[attr-defined]
+    _fake_downloads.is_partial_download = (  # type: ignore[attr-defined]
+        lambda name: name.startswith(".dl_")
+    )
+    _fake_cw.downloads = _fake_downloads  # type: ignore[attr-defined]
+
     sys.modules.setdefault("cyberwave", _fake_cw)
     sys.modules.setdefault("cyberwave.fingerprint", _fake_fp)
     sys.modules.setdefault("cyberwave.edge", _fake_edge)
     sys.modules.setdefault("cyberwave.edge.platform", _fake_edge_platform)
     sys.modules.setdefault("cyberwave.edge.host_metrics", _fake_host_metrics)
     sys.modules.setdefault("cyberwave.mqtt_identity", _fake_mqtt_identity)
+    sys.modules.setdefault("cyberwave.downloads", _fake_downloads)
 
 
 _ensure_real_or_stub_cyberwave_sdk()
