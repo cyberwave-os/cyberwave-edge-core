@@ -26,7 +26,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             variant: amd64
             docker_image: "ubuntu:22.04" # Ubuntu 22.04 / glibc 2.35 baseline
             docker_platform: "linux/amd64"
@@ -167,7 +167,7 @@ jobs:
   #     matrix:
   #       include:
   #         - arch: x86_64
-  #           runner: ubuntu-latest
+  #           runner: ubuntu-24.04
   #           platform: linux/amd64
   #         - arch: aarch64
   #           runner: ubuntu-24.04-arm
@@ -287,7 +287,7 @@ jobs:
 
   publish-to-buildkite:
     name: Publish to Buildkite Package Registries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build-deb]
     steps:
       - name: Download all .deb artifacts
@@ -374,7 +374,7 @@ jobs:
 
   create-github-release:
     name: Create GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build-deb]
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
