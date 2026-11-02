@@ -1551,10 +1551,61 @@ def _retag(image: str, tag: str) -> str:
     return f"{head}{slash}{repo}:{tag}"
 
 
+#: A graph opts in to its twin's own DDS domain with ``x-cyberwave.ros_domain``.
+#: The value is ``per_twin``: every service that declares ``ROS_DOMAIN_ID`` gets
+#: :func:`ros_domain_id_for_twin`. The compose file keeps its legacy literal
+#: ``ROS_DOMAIN_ID``, so an Edge Core that predates this key ignores it and
+#: starts the graph exactly as before, instead of passing an unknown
+#: ``${CW_ROS_DOMAIN_ID}`` through to the containers.
+_ROS_DOMAIN_EXTENSION_KEY = "ros_domain"
+_PER_TWIN_ROS_DOMAIN = "per_twin"
+
+
+def _service_env(
+    service: Dict[str, Any], subs: Dict[str, str], ros_domain: str | None
+) -> Dict[str, str]:
+    """A service's rendered environment, on the graph's own DDS domain if it has one.
+
+    Only a service that already declares ``ROS_DOMAIN_ID`` is moved: one that
+    does not speak DDS has no domain to change.
+    """
+    env = {
+        key: _substitute(value, subs)
+        for key, value in _compose_env(service.get("environment")).items()
+    }
+    if ros_domain is not None and "ROS_DOMAIN_ID" in env:
+        env["ROS_DOMAIN_ID"] = ros_domain
+    return env
+
+
+def _graph_ros_domain(doc: Dict[str, Any], twin_uuid: str) -> str | None:
+    """The ``ROS_DOMAIN_ID`` this graph's services get, or None to keep theirs.
+
+    Derived here, only for a graph that opted in, so a malformed
+    ``CYBERWAVE_ROS_DOMAIN_ID`` fails the graphs that would use it and no other.
+    """
+    extension = doc.get("x-cyberwave") or {}
+    if not isinstance(extension, dict):
+        return None
+    requested = extension.get(_ROS_DOMAIN_EXTENSION_KEY)
+    if requested is None:
+        return None
+    if requested != _PER_TWIN_ROS_DOMAIN:
+        raise ValueError(
+            f"unsupported x-cyberwave.{_ROS_DOMAIN_EXTENSION_KEY} {requested!r}; "
+            f"expected {_PER_TWIN_ROS_DOMAIN!r}"
+        )
+    # No twin (a preflight render, a sim harness without one): keep the file's.
+    if not twin_uuid:
+        return None
+    return str(ros_domain_id_for_twin(twin_uuid))
+
+
 def _specs_from_compose(
     doc: Dict[str, Any],
     subs: Dict[str, str],
     pin_overrides: Optional[Dict[str, str]] = None,
+    twin_uuid: str = "",
 ) -> tuple[list[_ServiceSpec], dict[str, str], list[str]] | None:
     """Map a rendered Compose document onto ``_ServiceSpec`` objects.
 
@@ -1575,6 +1626,8 @@ def _specs_from_compose(
         return None
     networks = doc.get("networks") if isinstance(doc.get("networks"), dict) else {}
     volumes = doc.get("volumes") if isinstance(doc.get("volumes"), dict) else {}
+
+    ros_domain = _graph_ros_domain(doc, twin_uuid)
 
     specs: list[_ServiceSpec] = []
     for name in _order_by_dependencies(raw_services):
@@ -1636,10 +1689,7 @@ def _specs_from_compose(
                 image=resolved_image,
                 name=name,
                 command=command,
-                env={
-                    key: _substitute(value, subs)
-                    for key, value in _compose_env(service.get("environment")).items()
-                },
+                env=_service_env(service, subs, ros_domain),
                 params=params,
                 prefer_gpu=bool(extension.get("prefer_gpu", False)),
                 gpu_spec=str(extension.get("gpu", "all")),
@@ -1747,6 +1797,49 @@ def _resolve_channel_tag(
     if ":" in image:
         return image.rsplit(":", 1)[1], "image reference"
     return "", "unset"
+
+
+#: Edge Core's environment variable that pins every declared graph on this host
+#: to one ROS domain, overriding the per-twin domain below.
+ROS_DOMAIN_ID_ENV = "CYBERWAVE_ROS_DOMAIN_ID"
+
+#: The domain every graph shared before it was derived per twin. Excluded from
+#: the derived range so a new graph never lands beside an older image still on it.
+LEGACY_ROS_DOMAIN_ID = 42
+
+#: Derived domains are 1..101: ROS 2's recommended range on Linux (higher ids'
+#: ports fall into the ephemeral range), without the default 0.
+_ROS_DOMAIN_ID_MIN = 1
+_ROS_DOMAIN_ID_MAX = 101
+
+
+def ros_domain_id_for_twin(twin_uuid: str) -> int:
+    """The ROS domain a twin's declared graph runs on.
+
+    Every service of the graph is host-networked (or on the twin's own bridge
+    network) and must share one domain; graphs of OTHER twins, on this host or
+    anywhere on the LAN, must not, or their discovery traffic and identically
+    named frames (`link1` on every Piper) leak into each other's DDS graph.
+    So the domain is spread over the range from the twin's UUID: random across
+    twins, stable across restarts. It is not collision-free -- two twins can
+    hash to the same domain -- which is what an explicit
+    ``CYBERWAVE_ROS_DOMAIN_ID`` is for until domains are negotiated on the LAN.
+    """
+    pinned = os.environ.get(ROS_DOMAIN_ID_ENV, "").strip()
+    if pinned:
+        try:
+            domain = int(pinned)
+        except ValueError:
+            raise ValueError(
+                f"{ROS_DOMAIN_ID_ENV}={pinned!r} is not an integer DDS domain"
+            ) from None
+        if not 0 <= domain <= 232:
+            raise ValueError(f"{ROS_DOMAIN_ID_ENV}={pinned!r} is outside DDS domains 0..232")
+        return domain
+    span = _ROS_DOMAIN_ID_MAX - _ROS_DOMAIN_ID_MIN  # one slot fewer: 42 is skipped
+    digest = hashlib.sha256(twin_uuid.strip().lower().encode()).digest()
+    domain = _ROS_DOMAIN_ID_MIN + int.from_bytes(digest[:8], "big") % span
+    return domain + 1 if domain >= LEGACY_ROS_DOMAIN_ID else domain
 
 
 def _resolve_sim_proxy_tag(sim_proxy_tag: Optional[str] = None) -> tuple[str, str]:
@@ -1864,6 +1957,7 @@ def compose_substitutions(
     ``CW_CHANNEL_TAG``: ros2-sim-proxy is built by a different workflow, with a
     tag grammar that carries no ROS distro, so the driver stack's channel never
     names a tag it publishes. See :func:`_resolve_sim_proxy_tag`.
+
 
     ``CW_TWIN_NS`` is the ROS namespace every service in a twin's graph shares,
     built by exactly the transformation the driver images' ``docker-entrypoint``
@@ -2113,7 +2207,9 @@ def get_image_declared_services(
         navigation_profile=navigation_profile or None,
     )
     try:
-        resolved = _specs_from_compose(doc, preflight_substitutions, pin_overrides)
+        resolved = _specs_from_compose(
+            doc, preflight_substitutions, pin_overrides, twin_uuid=twin_uuid
+        )
     except ValueError:
         logger.exception("Image %s declares an unusable compose graph for %r", image, name)
         return None
@@ -2148,7 +2244,7 @@ def get_image_declared_services(
         )
         # Preflight already proved the graph shape; this pass only replaces the
         # placeholder volume with the materialized one.
-        resolved = _specs_from_compose(doc, substitutions, pin_overrides)
+        resolved = _specs_from_compose(doc, substitutions, pin_overrides, twin_uuid=twin_uuid)
 
     if resolved is not None:
         logger.info(

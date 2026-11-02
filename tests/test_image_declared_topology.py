@@ -1585,6 +1585,76 @@ def test_the_sim_proxy_tag_is_not_the_driver_channel(monkeypatch: Any) -> None:
     assert subs["CW_SIM_PROXY_TAG"] == "production"
 
 
+def test_each_twin_gets_its_own_stable_ros_domain(monkeypatch: Any) -> None:
+    """Spread across twins, stable for one, never the legacy shared 42."""
+    monkeypatch.delenv(ds.ROS_DOMAIN_ID_ENV, raising=False)
+    uuids = [f"{i:08x}-a95f-4939-9fd7-99a19dfa41ff" for i in range(2000)]
+    domains = [ds.ros_domain_id_for_twin(u) for u in uuids]
+    assert set(domains) == set(range(1, 102)) - {ds.LEGACY_ROS_DOMAIN_ID}
+    assert ds.ros_domain_id_for_twin(uuids[0]) == domains[0]
+    assert ds.ros_domain_id_for_twin(uuids[0].upper()) == domains[0]
+
+
+def test_an_operator_can_pin_the_ros_domain(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ds.ROS_DOMAIN_ID_ENV, "7")
+    assert ds.ros_domain_id_for_twin("c5d38d58-a95f-4939-9fd7-99a19dfa41ff") == 7
+    monkeypatch.setenv(ds.ROS_DOMAIN_ID_ENV, "300")
+    with pytest.raises(ValueError, match="0..232"):
+        ds.ros_domain_id_for_twin("c5d38d58-a95f-4939-9fd7-99a19dfa41ff")
+    # A typo names the variable, not just "invalid literal for int()".
+    monkeypatch.setenv(ds.ROS_DOMAIN_ID_ENV, "4x2")
+    with pytest.raises(ValueError, match=ds.ROS_DOMAIN_ID_ENV):
+        ds.ros_domain_id_for_twin("c5d38d58-a95f-4939-9fd7-99a19dfa41ff")
+
+
+def _domain_graph(extension: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "x-cyberwave": extension,
+        "services": {
+            "plant": {"image": "d:x", "environment": {"ROS_DOMAIN_ID": "42"}},
+            "web": {"image": "w:x", "environment": {"PORT": "80"}},
+        },
+    }
+
+
+def _domains(doc: dict[str, Any], twin_uuid: str = "") -> dict[str, str | None]:
+    subs = ds.compose_substitutions(channel_tag="humble", twin_uuid=twin_uuid)
+    specs, _, _ = ds._specs_from_compose(doc, subs, twin_uuid=twin_uuid)
+    return {spec.name: spec.env.get("ROS_DOMAIN_ID") for spec in specs}
+
+
+_TWIN = "c5d38d58-a95f-4939-9fd7-99a19dfa41ff"
+
+
+def test_an_opted_in_graph_runs_on_its_twins_domain(monkeypatch: Any) -> None:
+    """The file keeps the legacy literal; Edge Core moves only the DDS services."""
+    monkeypatch.delenv(ds.ROS_DOMAIN_ID_ENV, raising=False)
+    domains = _domains(_domain_graph({"ros_domain": "per_twin"}), _TWIN)
+    assert domains == {"plant": str(ds.ros_domain_id_for_twin(_TWIN)), "web": None}
+
+
+def test_a_graph_that_does_not_opt_in_keeps_its_domain(monkeypatch: Any) -> None:
+    """Every other driver's graph is untouched, and so is a render with no twin."""
+    assert _domains(_domain_graph({}), _TWIN)["plant"] == "42"
+    assert _domains(_domain_graph({"ros_domain": "per_twin"}))["plant"] == "42"
+
+
+def test_a_malformed_pinned_domain_fails_only_graphs_that_use_it(
+    monkeypatch: Any,
+) -> None:
+    """A typo in CYBERWAVE_ROS_DOMAIN_ID must not take down a Go2 or Kinova graph
+    that keeps its own literal domain; only an opted-in graph reads the value."""
+    monkeypatch.setenv(ds.ROS_DOMAIN_ID_ENV, "4x2")
+    assert _domains(_domain_graph({}), _TWIN)["plant"] == "42"
+    with pytest.raises(ValueError, match=ds.ROS_DOMAIN_ID_ENV):
+        _domains(_domain_graph({"ros_domain": "per_twin"}), _TWIN)
+
+
+def test_an_unknown_ros_domain_policy_is_refused() -> None:
+    with pytest.raises(ValueError, match="x-cyberwave.ros_domain"):
+        _domains(_domain_graph({"ros_domain": "lan_scan"}))
+
+
 def test_zenoh_connect_is_always_resolved_for_declared_topologies(
     monkeypatch: Any,
 ) -> None:
