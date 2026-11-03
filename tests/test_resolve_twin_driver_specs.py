@@ -138,12 +138,29 @@ class TestMultiContainer:
         assert raised.value.kind == startup.DriverResolutionError.UNUSABLE_TOPOLOGY
         assert str(error) in str(raised.value)
 
+    def test_an_unpinned_stack_is_refused_under_its_own_kind(self, monkeypatch):
+        def _boom(*_a, **_k):
+            raise startup.UnpinnedStackError("slam=cyberwaveos/ros2-slam:humble-dev")
+
+        monkeypatch.setattr(startup, "_get_driver_services", lambda *_a, **_k: None)
+        monkeypatch.setattr(startup, "_image_declared_services_for_twin", _boom)
+
+        with pytest.raises(startup.DriverResolutionError) as raised:
+            _resolve()
+
+        assert raised.value.kind == startup.DriverResolutionError.UNPINNED_STACK
+        assert "ros2-slam:humble-dev" in str(raised.value)
+
 
 class TestAlerts:
     @pytest.mark.parametrize(
         ("kind", "title"),
         [
             (startup.DriverResolutionError.UNUSABLE_TOPOLOGY, "Unusable declared topology"),
+            (
+                startup.DriverResolutionError.UNPINNED_STACK,
+                "Driver stack is not pinned to one release",
+            ),
             (
                 startup.DriverResolutionError.NO_DRIVER_IMAGE,
                 "No driver_docker_image in asset metadata",

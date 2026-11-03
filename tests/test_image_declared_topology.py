@@ -874,6 +874,76 @@ def test_the_label_still_wins_when_nothing_overrides_it(monkeypatch: Any) -> Non
     assert all(s.image.endswith(":jetson-humble-staging") for s in specs)
 
 
+@pytest.mark.parametrize(
+    "image_tag",
+    ["jetson-humble-0.1.23", "humble-0.1.3"],
+)
+def test_a_release_tag_beats_the_label(monkeypatch: Any, image_tag: str) -> None:
+    """The release the twin names decides the siblings, not the label's train."""
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    specs, _, _ = ds.get_image_declared_services(f"cyberwaveos/go2-ros2-driver:{image_tag}")
+    assert specs, "the graph did not resolve at all"
+    assert all(s.image.endswith(f":{image_tag}") for s in specs), (
+        f"siblings resolved to {sorted({s.image for s in specs})}"
+    )
+
+
+@pytest.mark.parametrize(
+    "image_tag",
+    [
+        "humble-pr-123-sha-abc",  # PR re-tag: the label is the truthful one
+        "humble-0.1.3-dev.5",  # dev prerelease: its siblings are not published under it
+        "humble-dev",  # moving channel
+        "humble",  # moving channel
+        "0.1.3",  # no distro: not a release tag
+    ],
+)
+def test_a_tag_that_is_not_a_release_keeps_following_the_label(
+    monkeypatch: Any, image_tag: str
+) -> None:
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    specs, _, _ = ds.get_image_declared_services(f"cyberwaveos/go2-ros2-driver:{image_tag}")
+    assert all(s.image.endswith(":jetson-humble-staging") for s in specs), (
+        f"siblings resolved to {sorted({s.image for s in specs})}"
+    )
+
+
+def test_the_channel_tag_env_beats_a_release_tag(monkeypatch: Any) -> None:
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    monkeypatch.setenv(ds.CHANNEL_TAG_ENV, "humble-pr-3749-sha-abc123")
+    specs, _, _ = ds.get_image_declared_services("go2-ros2-driver:jetson-humble-0.1.23")
+    assert all(s.image.endswith(":humble-pr-3749-sha-abc123") for s in specs)
+
+
+def test_an_explicit_channel_tag_beats_a_release_tag(monkeypatch: Any) -> None:
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    specs, _, _ = ds.get_image_declared_services(
+        "go2-ros2-driver:jetson-humble-0.1.23", channel_tag="from-argument"
+    )
+    assert all(s.image.endswith(":from-argument") for s in specs)
+
+
+def test_a_release_tag_does_not_unpin_a_pinned_graph(monkeypatch: Any) -> None:
+    """A graph CI pinned runs its literal tags: the release tag is not an override."""
+    _labels(monkeypatch, _label_set(PINNED_DOC, variant="sim"))
+    result = ds.get_image_declared_services("img:jazzy-0.1.2", variant="sim")
+    assert result is not None
+    images = {spec.name: spec.image for spec in result[0]}
+    assert images["nav2"] == _PINNED_NAV2
+    assert images["driver"] == _PINNED_DRIVER
+
+
+def test_the_release_tag_source_is_logged(monkeypatch: Any, caplog: Any) -> None:
+    _labels(monkeypatch, _label_set(ROBOT_DOC))
+    with caplog.at_level("INFO"):
+        ds.get_image_declared_services("go2-ros2-driver:jetson-humble-0.1.23")
+    rendered = [r.getMessage() for r in caplog.records]
+    assert any(
+        "channel=jetson-humble-0.1.23" in line and "image reference (release tag)" in line
+        for line in rendered
+    ), rendered
+
+
 def test_the_resolved_channel_source_is_logged(monkeypatch: Any, caplog: Any) -> None:
     """ "Which train did the siblings come from, and why" has to be greppable."""
     _labels(monkeypatch, _label_set(ROBOT_DOC))
@@ -2105,10 +2175,345 @@ def test_service_image_override_preserves_declared_topology(
         },
     }
     specs, _, _ = _declared_for(drivers)
-    assert specs[0].image == "drv:x86"
+    assert specs[0].image == "drv:jetson"
     assert mapper.image == "cyberwaveos/ros2-slam:jetson-humble-mapalign-895e91bbb2"
     assert mapper.depends_on == {"plant": "service_healthy"}
     assert mapper.command == ["map_stream_bridge"]
+
+
+_OWN = "cyberwaveos/go2-ros2-driver"
+_SLAM = "cyberwaveos/ros2-slam"
+_NAV2 = "cyberwaveos/ros2-nav2"
+
+
+def _go2_graph(graph: list[Any], *, plant: str, slam: str, nav2: str) -> None:
+    """Replace the fixture's graph, keeping the list the stub hands back."""
+    graph[:] = [
+        ds._ServiceSpec(image=plant, name="plant"),
+        ds._ServiceSpec(image=plant, name="bridges"),
+        ds._ServiceSpec(image=slam, name="slam"),
+        ds._ServiceSpec(image=nav2, name="nav-bridge"),
+        ds._ServiceSpec(image="redis:7", name="redis"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "twin_tag",
+    [
+        "humble-dev-sha-a1b2c3d4e5f6",
+        "humble-0.1.3-dev.5",
+        "humble-0.1.3-rc.7",
+        "humble-staging-sha-a1b2c3d4e5f6",
+        "humble-pr-4549-sha-a1b2c3d4e5f6",
+        "humble-dev",
+        "humble-0.1.3",
+    ],
+)
+def test_the_services_of_the_twin_image_run_the_tag_the_user_wrote(
+    _declared_graph_on_disk: list[Any], twin_tag: str
+) -> None:
+    """Whatever tag the twin names, `plant` and `bridges` run it, not the channel."""
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-dev",
+        slam=f"{_SLAM}:humble-dev-sha-0123456789ab",
+        nav2=f"{_NAV2}:humble-dev-sha-0123456789ab",
+    )
+    image = f"{_OWN}:{twin_tag}"
+    specs, _, _ = _declared_for({"default": {"docker_image": image}})
+    by_name = {s.name: s.image for s in specs}
+    assert by_name["plant"] == image
+    assert by_name["bridges"] == image
+    assert by_name["slam"] == f"{_SLAM}:humble-dev-sha-0123456789ab"
+    assert by_name["nav-bridge"] == f"{_NAV2}:humble-dev-sha-0123456789ab"
+    assert by_name["redis"] == "redis:7"
+
+
+def test_a_different_namespace_with_the_same_repo_name_is_not_rewritten() -> None:
+    specs = [
+        ds._ServiceSpec(image="other-registry/go2-ros2-driver:humble-dev", name="helper"),
+        ds._ServiceSpec(image=f"{_OWN}:humble-dev", name="plant"),
+    ]
+    image = f"{_OWN}:humble-0.1.23"
+
+    startup._run_the_twin_image_in_its_own_services(specs, image, "go2-1")
+
+    assert specs[0].image == "other-registry/go2-ros2-driver:humble-dev"
+    assert specs[1].image == image
+
+
+def test_a_digest_reference_in_the_twin_is_what_the_own_services_run(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-dev",
+        slam=f"{_SLAM}:humble-dev-sha-0123456789ab",
+        nav2=f"{_NAV2}:humble-dev-sha-0123456789ab",
+    )
+    image = f"{_OWN}@sha256:{'a' * 64}"
+    specs, _, _ = _declared_for({"default": {"docker_image": image}})
+    assert {s.image for s in specs if s.name in {"plant", "bridges"}} == {image}
+
+
+def test_a_service_image_override_still_beats_the_twin_image(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-dev",
+        slam=f"{_SLAM}:humble-dev-sha-0123456789ab",
+        nav2=f"{_NAV2}:humble-dev-sha-0123456789ab",
+    )
+    pinned = f"{_OWN}@sha256:{'b' * 64}"
+    drivers = {
+        "default": {
+            "docker_image": f"{_OWN}:humble-dev-sha-a1b2c3d4e5f6",
+            "service_image_overrides": {"bridges": pinned},
+        }
+    }
+    specs, _, _ = _declared_for(drivers)
+    by_name = {s.name: s.image for s in specs}
+    assert by_name["plant"] == f"{_OWN}:humble-dev-sha-a1b2c3d4e5f6"
+    assert by_name["bridges"] == pinned
+
+
+def test_the_channel_override_keeps_the_whole_graph_on_its_train(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any]
+) -> None:
+    """The operator pinned one train on purpose, driver services included."""
+    monkeypatch.setenv(ds.CHANNEL_TAG_ENV, "humble-pr-3749-sha-abc123")
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-pr-3749-sha-abc123",
+        slam=f"{_SLAM}:humble-pr-3749-sha-abc123",
+        nav2=f"{_NAV2}:humble-pr-3749-sha-abc123",
+    )
+    specs, _, _ = _declared_for({"default": {"docker_image": f"{_OWN}:humble-dev"}})
+    assert specs[0].image == f"{_OWN}:humble-pr-3749-sha-abc123"
+
+
+def test_siblings_that_follow_moving_tags_refuse_the_twin(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-dev",
+        slam=f"{_SLAM}:humble-dev",
+        nav2=f"{_NAV2}:humble-dev-sha-0123456789ab",
+    )
+    with pytest.raises(startup.UnpinnedStackError) as raised:
+        _declared_for({"default": {"docker_image": f"{_OWN}:humble-dev-sha-a1b2c3d4e5f6"}})
+    message = str(raised.value)
+    assert f"slam={_SLAM}:humble-dev" in message
+    assert "nav-bridge=" not in message and "redis=" not in message
+    assert "service_image_overrides" in message
+
+
+def test_a_graph_with_pinned_siblings_is_accepted(_declared_graph_on_disk: list[Any]) -> None:
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-dev-sha-0123456789ab",
+        slam=f"{_SLAM}:humble-dev-sha-0123456789ab",
+        nav2=f"{_NAV2}:humble-0.1.3",
+    )
+    assert _declared_for({"default": {"docker_image": f"{_OWN}:humble-dev-sha-0123456789ab"}})
+
+
+def test_a_floating_sibling_the_user_pinned_in_overrides_is_accepted(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-dev",
+        slam=f"{_SLAM}:humble-dev",
+        nav2=f"{_NAV2}:humble-dev",
+    )
+    drivers = {
+        "default": {
+            "docker_image": f"{_OWN}:humble-dev-sha-a1b2c3d4e5f6",
+            "service_image_overrides": {
+                "slam": f"{_SLAM}@sha256:{'c' * 64}",
+                "nav-bridge": f"{_NAV2}:custom-build",
+            },
+        }
+    }
+    specs, _, _ = _declared_for(drivers)
+    assert {s.name: s.image for s in specs}["nav-bridge"] == f"{_NAV2}:custom-build"
+
+
+def _placeholder_graph(graph: list[Any], tag: str) -> None:
+    """An unpinned Go2 graph as it resolves for *tag*: siblings still declared by placeholder."""
+    def spec(name: str, repo: str) -> Any:
+        return ds._ServiceSpec(
+            image=f"{repo}:{tag}", declared_image=f"{repo}:${{CW_CHANNEL_TAG}}", name=name
+        )
+
+    graph[:] = [spec("plant", _OWN), spec("slam", _SLAM), spec("nav-bridge", _NAV2)]
+
+
+def test_a_release_tag_does_not_make_unpinned_siblings_look_pinned(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    """A version-shaped tag a placeholder chose is not a build: no such sibling image exists."""
+    _placeholder_graph(_declared_graph_on_disk, "jetson-humble-0.1.23")
+    with pytest.raises(startup.UnpinnedStackError) as raised:
+        _declared_for({"default": {"docker_image": f"{_OWN}:jetson-humble-0.1.23"}})
+    message = str(raised.value)
+    assert f"slam={_SLAM}:jetson-humble-0.1.23 (follows ${{CW_CHANNEL_TAG}})" in message
+    assert f"nav-bridge={_NAV2}:jetson-humble-0.1.23 (follows ${{CW_CHANNEL_TAG}})" in message
+    assert "plant=" not in message
+
+
+def test_siblings_pinned_by_ci_at_a_version_shaped_tag_are_accepted(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    """The same tag shape, written literally by CI, is a build and passes."""
+    own, slam = f"{_OWN}:humble-0.1.3", f"{_SLAM}:humble-0.1.8"
+    _declared_graph_on_disk[:] = [
+        ds._ServiceSpec(image=own, declared_image=own, name="plant"),
+        ds._ServiceSpec(image=slam, declared_image=slam, name="slam"),
+    ]
+    assert _declared_for({"default": {"docker_image": f"{_OWN}:humble-0.1.3"}})
+
+
+def test_a_placeholder_sibling_the_user_pinned_in_overrides_is_accepted(
+    _declared_graph_on_disk: list[Any],
+) -> None:
+    _placeholder_graph(_declared_graph_on_disk, "jetson-humble-0.1.23")
+    drivers = {
+        "default": {
+            "docker_image": f"{_OWN}:jetson-humble-0.1.23",
+            "service_image_overrides": {
+                "slam": f"{_SLAM}:jetson-humble-dev-sha-26a31a61007c",
+                "nav-bridge": f"{_NAV2}:jetson-humble-dev-sha-26a31a61007c",
+            },
+        }
+    }
+    specs, _, _ = _declared_for(drivers)
+    assert {s.name: s.image for s in specs}["slam"] == f"{_SLAM}:jetson-humble-dev-sha-26a31a61007c"
+
+
+def test_the_declared_image_is_recorded_before_substitution() -> None:
+    doc = {
+        "services": {
+            "slam": {"image": f"{_SLAM}:${{CW_CHANNEL_TAG}}"},
+            "nav": {"image": f"{_NAV2}:humble-dev-sha-0123456789ab"},
+        }
+    }
+    specs, _, _ = ds._specs_from_compose(doc, ds.compose_substitutions(channel_tag="humble-0.1.3"))
+    by_name = {s.name: s for s in specs}
+    assert by_name["slam"].image == f"{_SLAM}:humble-0.1.3"
+    assert by_name["slam"].declared_image == f"{_SLAM}:${{CW_CHANNEL_TAG}}"
+    assert by_name["nav"].declared_image == f"{_NAV2}:humble-dev-sha-0123456789ab"
+
+
+def test_a_single_container_driver_is_never_refused(_declared_graph_on_disk: list[Any]) -> None:
+    """No sibling images, nothing to align: the check only exists for stacks."""
+    _declared_graph_on_disk[:] = [ds._ServiceSpec(image=f"{_OWN}:humble-dev", name="plant")]
+    specs, _, _ = _declared_for({"default": {"docker_image": f"{_OWN}:humble-dev"}})
+    assert specs[0].image == f"{_OWN}:humble-dev"
+
+
+def test_the_channel_override_is_not_refused(
+    monkeypatch: Any, _declared_graph_on_disk: list[Any]
+) -> None:
+    monkeypatch.setenv(ds.CHANNEL_TAG_ENV, "humble-dev")
+    _go2_graph(
+        _declared_graph_on_disk,
+        plant=f"{_OWN}:humble-dev",
+        slam=f"{_SLAM}:humble-dev",
+        nav2=f"{_NAV2}:humble-dev",
+    )
+    assert _declared_for({"default": {"docker_image": f"{_OWN}:humble-dev"}})
+
+
+@pytest.mark.parametrize(
+    ("image", "labels", "expected"),
+    [
+        ("r/d:jetson-humble-0.1.23", {ds._CHANNEL_TAG_LABEL: "jetson-humble"},
+         ("jetson-humble-0.1.23", "image reference (release tag)")),
+        ("r/d:humble-0.1.3", {ds._CHANNEL_TAG_LABEL: "humble"},
+         ("humble-0.1.3", "image reference (release tag)")),
+        ("r/d:humble-pr-1-sha-0123456789ab", {ds._CHANNEL_TAG_LABEL: "humble-dev"},
+         ("humble-dev", ds._CHANNEL_TAG_LABEL)),
+        ("r/d:humble-0.1.3-dev.5", {ds._CHANNEL_TAG_LABEL: "humble-dev"},
+         ("humble-dev", ds._CHANNEL_TAG_LABEL)),
+        ("r/d:humble-0.1.3-rc.7", {ds._CHANNEL_TAG_LABEL: "humble-staging"},
+         ("humble-staging", ds._CHANNEL_TAG_LABEL)),
+        ("r/d:humble-dev-sha-0123456789ab", {ds._CHANNEL_TAG_LABEL: "humble-dev"},
+         ("humble-dev", ds._CHANNEL_TAG_LABEL)),
+        ("r/d:0.1.3", {ds._CHANNEL_TAG_LABEL: "humble"}, ("humble", ds._CHANNEL_TAG_LABEL)),
+        ("r/d:humble-dev", {}, ("humble-dev", "image reference")),
+        ("r/d", {}, ("", "unset")),
+        ("r/d@sha256:" + "a" * 64, {ds._CHANNEL_TAG_LABEL: "humble"},
+         ("humble", ds._CHANNEL_TAG_LABEL)),
+    ],
+)
+def test_resolve_channel_tag_table(
+    monkeypatch: Any, image: str, labels: dict[str, str], expected: tuple[str, str]
+) -> None:
+    monkeypatch.delenv(ds.CHANNEL_TAG_ENV, raising=False)
+    assert ds._resolve_channel_tag(image, labels) == expected
+
+
+def test_resolve_channel_tag_precedence_argument_then_env_then_release(monkeypatch: Any) -> None:
+    image, labels = "r/d:jetson-humble-0.1.23", {ds._CHANNEL_TAG_LABEL: "jetson-humble"}
+    monkeypatch.setenv(ds.CHANNEL_TAG_ENV, "from-env")
+    assert ds._resolve_channel_tag(image, labels, "from-arg") == ("from-arg", "argument")
+    assert ds._resolve_channel_tag(image, labels) == ("from-env", ds.CHANNEL_TAG_ENV)
+    monkeypatch.delenv(ds.CHANNEL_TAG_ENV)
+    assert ds._resolve_channel_tag(image, labels)[0] == "jetson-humble-0.1.23"
+
+
+@pytest.mark.parametrize(
+    ("image", "repo", "namespace"),
+    [
+        ("cyberwaveos/go2-ros2-driver:humble-dev", "go2-ros2-driver", "cyberwaveos"),
+        ("cyberwaveos/go2-ros2-driver", "go2-ros2-driver", "cyberwaveos"),
+        (f"cyberwaveos/go2-ros2-driver@sha256:{'a' * 64}", "go2-ros2-driver", "cyberwaveos"),
+        ("registry:5000/cyberwaveos/ros2-slam:x", "ros2-slam", "registry:5000/cyberwaveos"),
+        ("redis:7", "redis", ""),
+        ("drv", "drv", ""),
+    ],
+)
+def test_image_repo_name_and_namespace(image: str, repo: str, namespace: str) -> None:
+    assert startup._image_repo_name(image) == repo
+    assert startup._image_namespace(image) == namespace
+
+
+def test_refusal_names_every_floating_sibling_and_the_way_out() -> None:
+    specs = [
+        ds._ServiceSpec(image=f"{_OWN}:humble-0.1.23", name="plant"),
+        ds._ServiceSpec(image=f"{_SLAM}:humble-dev", name="slam"),
+        ds._ServiceSpec(image=f"{_NAV2}:humble", name="nav2"),
+        ds._ServiceSpec(image="redis:7", name="redis"),
+    ]
+    with pytest.raises(startup.UnpinnedStackError) as raised:
+        startup._refuse_unpinned_siblings(specs, f"{_OWN}:humble-0.1.23", "go2-1", set())
+    message = str(raised.value)
+    assert f"slam={_SLAM}:humble-dev" in message and f"nav2={_NAV2}:humble" in message
+    assert "plant=" not in message and "redis=" not in message
+    assert "service_image_overrides" in message
+
+
+@pytest.mark.parametrize("tag", ["humble", "jetson-humble", "humble-dev", ""])
+def test_a_twin_on_a_moving_tag_is_not_refused(tag: str) -> None:
+    image = f"{_OWN}:{tag}" if tag else _OWN
+    specs = [
+        ds._ServiceSpec(image=image, name="plant"),
+        ds._ServiceSpec(image=f"{_SLAM}:humble", name="slam"),
+        ds._ServiceSpec(image=f"{_NAV2}:humble", name="nav2"),
+    ]
+    startup._refuse_unpinned_siblings(specs, image, "go2-1", set())
+
+
+def test_a_bare_image_name_is_never_refused() -> None:
+    specs = [
+        ds._ServiceSpec(image="drv:x", name="plant"),
+        ds._ServiceSpec(image="helper:x", name="helper"),
+    ]
+    startup._refuse_unpinned_siblings(specs, "drv:x", "t", set())
 
 
 def test_service_image_override_rejects_unknown_service(

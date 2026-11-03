@@ -298,6 +298,7 @@ def _pull_images(images: list[ManifestImage], reporter: StatusReporter, total: i
 
     token = load_token()
     lock = threading.Lock()
+    failed = threading.Event()
     seen: dict[str, tuple[int, int]] = {}
     finished = total - len(images)
 
@@ -310,7 +311,7 @@ def _pull_images(images: list[ManifestImage], reporter: StatusReporter, total: i
 
     def pull(image: ManifestImage) -> None:
         nonlocal finished
-        if reporter.superseded:
+        if reporter.superseded or failed.is_set():
             return
 
         def on_progress(progress: Any) -> None:
@@ -327,6 +328,9 @@ def _pull_images(images: list[ManifestImage], reporter: StatusReporter, total: i
                 on_progress=on_progress,
             )
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as exc:
+            # Stop queued workers here: the pool can dequeue the next image
+            # before as_completed() observes this future's exception.
+            failed.set()
             raise StageError(PULL_FAILED, f"Could not pull {image.image}: {exc}") from exc
         state.record_pull(image.image)
         with lock:

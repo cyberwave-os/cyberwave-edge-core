@@ -494,6 +494,49 @@ class TestFetchAndRunTwinDriversIntegration:
         assert results[0]["success"] is True
         assert run_docker.call_count == 1
 
+    def test_an_unpinned_stack_is_refused_with_its_own_alert_and_skips_only_its_twin(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Log error plus a `driver_start_failure` alert naming the services; other twins start."""
+        self._patch_common(tmp_path, monkeypatch)
+        bad_twin = _make_fake_twin(name="go2-unpinned")
+        good_twin = _make_fake_twin(
+            uuid="dddddddd-dddd-dddd-dddd-dddddddddddd",
+            name="good-twin",
+        )
+        client = self._make_client([bad_twin, good_twin])
+
+        monkeypatch.setattr(startup, "Cyberwave", lambda *a, **k: client)
+        send = MagicMock()
+        monkeypatch.setattr(startup, "_send_alert_for_twin", send)
+
+        def declared(_drivers, twin, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            if twin.name == "go2-unpinned":
+                raise startup.UnpinnedStackError("slam=cyberwaveos/ros2-slam:humble-dev")
+            return None
+
+        monkeypatch.setattr(startup, "_image_declared_services_for_twin", declared)
+        run_docker = MagicMock(return_value=True)
+        monkeypatch.setattr(startup, "_run_docker_image", run_docker)
+
+        with caplog.at_level("ERROR"):
+            results = startup.fetch_and_run_twin_drivers(_TOKEN, _ENV_UUID, _FINGERPRINT)
+
+        assert [result["twin_uuid"] for result in results] == [good_twin.uuid]
+        assert run_docker.call_count == 1
+        send.assert_called_once()
+        args, kwargs = send.call_args
+        assert args[0] == bad_twin.uuid
+        assert args[1] == "Driver stack is not pinned to one release"
+        assert "slam=cyberwaveos/ros2-slam:humble-dev" in args[2]
+        assert "go2-unpinned" in args[2]
+        assert args[3] == "driver_start_failure"
+        assert kwargs["severity"] == "error"
+        assert any(
+            "go2-unpinned" in r.getMessage() and "refused" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
     def test_invalid_declared_topology_only_skips_its_twin(self, tmp_path, monkeypatch):
         """A bad bundle must not cancel the pull and launch passes for other twins."""
         self._patch_common(tmp_path, monkeypatch)

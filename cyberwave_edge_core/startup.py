@@ -1913,6 +1913,99 @@ def _ensure_image_for_topology(
     return True
 
 
+def _image_repo_name(image: str) -> str:
+    """Repository name of *image* without namespace, tag or digest."""
+    repo = _split_image_tag(image.split("@", 1)[0])[0]
+    return repo.rsplit("/", 1)[-1]
+
+
+def _image_namespace(image: str) -> str:
+    """Registry namespace of *image*: ``cyberwaveos`` for ``cyberwaveos/ros2-slam:x``."""
+    repo = _split_image_tag(image.split("@", 1)[0])[0]
+    return repo.rpartition("/")[0]
+
+
+class UnpinnedStackError(RuntimeError):
+    """A driver image's sibling services are not pinned to a release."""
+
+
+def _run_the_twin_image_in_its_own_services(
+    specs: list[Any], image: str, twin_name: str
+) -> None:
+    """Make the services of the twin's own driver image run exactly *image*.
+
+    The graph names its own repository as `<repo>:${CW_CHANNEL_TAG}`, which resolves
+    to a channel, not to the tag written in the twin. A service of the same repository
+    takes the twin's reference (tag or digest) so `docker ps` shows what was asked for.
+    Sibling repositories are untouched; `CYBERWAVE_DRIVER_CHANNEL_TAG` keeps the whole graph.
+    """
+    if "CW_CHANNEL_TAG" in _explicit_pin_overrides(None, None):
+        return
+    own_repo = _image_repo_name(image)
+    namespace = _image_namespace(image)
+    for spec in specs:
+        if (
+            _image_repo_name(spec.image) == own_repo
+            and _image_namespace(spec.image) == namespace
+            and spec.image != image
+        ):
+            logger.info(
+                "Twin %s: service %s runs the twin's image %s, not %s",
+                twin_name,
+                spec.name,
+                image,
+                spec.image,
+            )
+            spec.image = image
+
+
+def _refuse_unpinned_siblings(
+    specs: list[Any], image: str, twin_name: str, explicit: set[str]
+) -> None:
+    """Raise :class:`UnpinnedStackError` when a sibling of *image* is not pinned to a build.
+
+    A sibling (same registry namespace, other repository) is pinned only when CI wrote
+    its tag literally. One on a moving tag, or still declared by placeholder, is refused
+    even if the tag looks like a version: siblings keep their own version counters, so
+    `ros2-slam:humble-0.1.23` is not a published build. Services in
+    `service_image_overrides` (*explicit*) and `CYBERWAVE_DRIVER_CHANNEL_TAG` pass. A twin
+    on a moving tag names no build, only a channel its siblings follow, so it is not refused.
+    """
+    if "CW_CHANNEL_TAG" in _explicit_pin_overrides(None, None):
+        return
+    if not _image_is_pinned(image):
+        return
+    own_repo = _image_repo_name(image)
+    namespace = _image_namespace(image)
+    if not namespace:
+        # No namespace (a local build): nothing tells a sibling from a third-party image.
+        return
+    explicit_placeholders = _explicit_pin_overrides(None, None)
+
+    def follows_a_channel(spec: Any) -> str:
+        match = re.search(r"\$\{(\w+)\}", spec.declared_image)
+        if match and match.group(1) not in explicit_placeholders:
+            return match.group(1)
+        return ""
+
+    floating = [
+        f"{spec.name}={spec.image}"
+        + (f" (follows ${{{follows_a_channel(spec)}}})" if follows_a_channel(spec) else "")
+        for spec in specs
+        if spec.name not in explicit
+        and _image_repo_name(spec.image) != own_repo
+        and _image_namespace(spec.image) == namespace
+        and (not _image_is_pinned(spec.image) or follows_a_channel(spec))
+    ]
+    if floating:
+        raise UnpinnedStackError(
+            f"driver image {image} does not pin its sibling services to a release, so they "
+            f"would run moving tags and may not come from the same release as the driver: "
+            f"{', '.join(floating)}. Use a driver release whose images are pinned, or pin "
+            f"each of these services in service_image_overrides."
+        )
+
+
 def _image_declared_services_for_twin(
     drivers: Dict[str, Any],
     twin: Any,
@@ -1971,6 +2064,7 @@ def _image_declared_services_for_twin(
     if declared is None:
         return None
     specs, _translator_shared_env, shared_params = declared
+    _run_the_twin_image_in_its_own_services(specs, image, twin.name)
 
     image_overrides = select_driver_service_image_overrides(
         drivers, child_registry_ids=child_registry_ids
@@ -1991,6 +2085,7 @@ def _image_declared_services_for_twin(
                     image_overrides[spec.name],
                 )
                 spec.image = image_overrides[spec.name]
+    _refuse_unpinned_siblings(specs, image, twin.name, set(image_overrides or {}))
 
     # The twin's `shared_env`, in place of the translator's empty one.
     #
@@ -3538,6 +3633,7 @@ class DriverResolutionError(Exception):
     """A twin's driver cannot be resolved. *kind* tells the caller which alert to raise."""
 
     UNUSABLE_TOPOLOGY = "unusable_topology"
+    UNPINNED_STACK = "unpinned_stack"
     NO_DRIVER_IMAGE = "no_driver_image"
 
     def __init__(self, kind: str, detail: str = "") -> None:
@@ -3587,6 +3683,9 @@ def resolve_twin_driver_specs(
         # but its failure (an unusable image graph, or invalid inline
         # ``services`` metadata) is local to this twin. Let the remaining
         # twins proceed to the pull and launch passes.
+        if isinstance(exc, UnpinnedStackError):
+            logger.error("Twin '%s' refused: %s", twin.name, exc)
+            raise DriverResolutionError(DriverResolutionError.UNPINNED_STACK, str(exc)) from exc
         logger.error("Twin '%s' declares an unusable topology: %s", twin.name, exc)
         raise DriverResolutionError(DriverResolutionError.UNUSABLE_TOPOLOGY, str(exc)) from exc
     if multi is not None:
@@ -3668,6 +3767,12 @@ def _alert_unresolved_driver(twin: Any, twin_uuid: str, error: DriverResolutionE
         description = (
             f"Twin '{twin.name}' declares a topology this edge "
             f"cannot resolve: {error}. Troubleshooting: "
+            f"{DRIVER_TROUBLESHOOTING_URL}"
+        )
+    elif error.kind == DriverResolutionError.UNPINNED_STACK:
+        name = "Driver stack is not pinned to one release"
+        description = (
+            f"Twin '{twin.name}' was not started: {error}. Troubleshooting: "
             f"{DRIVER_TROUBLESHOOTING_URL}"
         )
     else:
@@ -4672,6 +4777,9 @@ def _send_worker_start_failure_alerts(
 # Re-exported from driver_selection for backward compat.
 from .driver_selection import (
     _get_best_driver_image_and_params as _get_best_driver_image_and_params,  # noqa: E402
+)
+from .driver_selection import (  # noqa: E402
+    _explicit_pin_overrides as _explicit_pin_overrides,
 )
 from .driver_selection import _get_driver_services as _get_driver_services  # noqa: E402
 from .driver_selection import (  # noqa: E402

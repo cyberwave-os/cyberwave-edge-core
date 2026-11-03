@@ -323,6 +323,8 @@ class _ServiceSpec:
     command: list[str] | None = None
     env: dict[str, str] = field(default_factory=dict)
     params: list[str] = field(default_factory=list)
+    # The image as declared, before substitution: a `${...}` means a channel chose its tag.
+    declared_image: str = ""
     prefer_gpu: bool = False
     gpu_spec: str = "all"
     # Networks beyond the first, attached after create. `docker create` honours
@@ -560,6 +562,8 @@ def _get_driver_services(
 _COMPOSE_LABEL_PREFIX = "io.cyberwave.driver.compose"
 _COMPOSE_SCHEMA_LABEL = f"{_COMPOSE_LABEL_PREFIX}.schema"
 _CHANNEL_TAG_LABEL = "io.cyberwave.image.channel-tag"
+# `<distro>-X.Y.Z`, optionally `jetson-` led. PR, prerelease and moving tags do not match.
+_RELEASE_IMAGE_TAG = re.compile(r"^(?:[a-z][a-z0-9]*-)+\d+\.\d+\.\d+$")
 _NAVIGATION_CONFIG_PROFILE_LABEL = "io.cyberwave.navigation.config-profile"
 _NAVIGATION_ROS_DISTRO_LABEL = "io.cyberwave.navigation.ros-distro"
 # CANONICAL EXPLANATION -- the Dockerfile, the build workflow and the two test
@@ -1691,6 +1695,7 @@ def _specs_from_compose(
                 command=command,
                 env=_service_env(service, subs, ros_domain),
                 params=params,
+                declared_image=image,
                 prefer_gpu=bool(extension.get("prefer_gpu", False)),
                 gpu_spec=str(extension.get("gpu", "all")),
                 extra_networks=extra_networks,
@@ -1773,29 +1778,29 @@ def _resolve_channel_tag(
 ) -> tuple[str, str]:
     """Return ``(channel tag, where it came from)``.
 
-    Precedence: an explicit argument, then :data:`CHANNEL_TAG_ENV`, then the
-    image's own ``io.cyberwave.image.channel-tag`` label, then the tag in the
-    image reference. The source is returned so the caller can log it -- when a
-    graph comes up on the wrong images, "which train did the siblings resolve to,
-    and why" is the question, and the answer is otherwise invisible: every
-    sibling is a plausible image that pulls and runs.
+    Precedence: an explicit argument, then :data:`CHANNEL_TAG_ENV`, then a release
+    tag in the image reference (:data:`_RELEASE_IMAGE_TAG`), then the image's
+    ``io.cyberwave.image.channel-tag`` label, then any other tag in the reference.
+    The source is returned so the caller can log it.
 
-    The image's own tag is a last resort rather than a peer of the label. They
-    disagree exactly when an image is re-tagged -- a PR build tagged
-    `humble-pr-123-sha-abc` still carries `channel-tag=humble-dev` -- and in
-    production the label is the truthful one, because it records the train the
-    image was BUILT in rather than the name someone gave it afterwards.
+    A release tag is the version the user chose, so it outranks the label, which
+    records only the train the image was BUILT in. Any other tag is a last resort:
+    a re-tagged PR build (`humble-pr-123-sha-abc`) still carries
+    `channel-tag=humble-dev`, and there the label is the truthful one.
     """
     if channel_tag:
         return channel_tag, "argument"
     from_env = os.environ.get(CHANNEL_TAG_ENV, "").strip()
     if from_env:
         return from_env, CHANNEL_TAG_ENV
+    ref_tag = image.rsplit(":", 1)[1] if ":" in image else ""
+    if ref_tag and _RELEASE_IMAGE_TAG.match(ref_tag):
+        return ref_tag, "image reference (release tag)"
     from_label = labels.get(_CHANNEL_TAG_LABEL, "")
     if from_label:
         return from_label, _CHANNEL_TAG_LABEL
-    if ":" in image:
-        return image.rsplit(":", 1)[1], "image reference"
+    if ref_tag:
+        return ref_tag, "image reference"
     return "", "unset"
 
 
