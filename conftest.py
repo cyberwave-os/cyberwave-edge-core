@@ -9,12 +9,19 @@
    developer environment); otherwise installs minimal stubs so the test
    suite can run in CI/sandbox environments that intentionally exclude
    the SDK dependency.
+
+3. Refuses in-process connections that leave the host. Tests use placeholder
+   tokens with production's default URLs, so anything left unmocked would
+   otherwise reach the live API and MQTT broker.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import ipaddress
 import os
+import socket
 import sys
 import types
 
@@ -101,3 +108,35 @@ def _ensure_real_or_stub_cyberwave_sdk() -> None:
 
 
 _ensure_real_or_stub_cyberwave_sdk()
+
+
+def _stays_on_host(address: object) -> bool:
+    if not isinstance(address, tuple):  # AF_UNIX, e.g. the Docker socket
+        return True
+    try:
+        return ipaddress.ip_address(address[0]).is_loopback
+    except ValueError:
+        return address[0] == "localhost"
+
+
+def _block_off_host_connections() -> None:
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def connect(self: socket.socket, address: object) -> None:
+        if not _stays_on_host(address):
+            raise ConnectionRefusedError(
+                errno.ECONNREFUSED, f"edge-core tests stay on loopback, refused {address}"
+            )
+        real_connect(self, address)  # type: ignore[arg-type]
+
+    def connect_ex(self: socket.socket, address: object) -> int:
+        if not _stays_on_host(address):
+            return errno.ECONNREFUSED
+        return real_connect_ex(self, address)  # type: ignore[arg-type]
+
+    socket.socket.connect = connect  # type: ignore[method-assign]
+    socket.socket.connect_ex = connect_ex  # type: ignore[method-assign]
+
+
+_block_off_host_connections()
