@@ -1,6 +1,6 @@
 [project]
 name = "cyberwave-edge-core"
-version = "0.1.30"
+version = "0.1.31"
 description = "The core component of the Cyberwave Edge Node"
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
@@ -26,7 +26,7 @@ dependencies = [
     "httpx>=0.25.0",
     "rich>=13.0.0",
     # 0.7.3 is the first SDK with ``cyberwave.mqtt_identity`` (driver_credentials).
-    "cyberwave>=0.7.3",
+    "cyberwave>=0.7.5",
     # Engine HTTP API client. Required for byte-level docker pull progress
     # (the CLI suppresses byte deltas on a non-TTY pipe, so the subprocess
     # path can only ever surface coarse layer-count progress). driver_logs
