@@ -7916,15 +7916,17 @@ def _reconcile_worker_watcher(
         )
         mqtt_publish: Optional[Any] = None
         mqtt_health_topic: Optional[str] = None
-        try:
-            cw_mqtt = _get_shared_mqtt_client(token)
-            if cw_mqtt and getattr(cw_mqtt, "mqtt", None):
-                prefix = cw_mqtt.mqtt.topic_prefix
-                first_twin = twin_uuids[0] if twin_uuids else environment_uuid
-                mqtt_health_topic = f"{prefix}cyberwave/twin/{first_twin}/worker_health"
-                mqtt_publish = cw_mqtt.mqtt.publish
-        except Exception:
-            logger.debug("Could not set up MQTT for worker health publishing")
+        # Health is published on a twin topic; without a twin the broker ACL
+        # denies every publish, so an edge with none publishes nothing.
+        if twin_uuids:
+            try:
+                cw_mqtt = _get_shared_mqtt_client(token)
+                if cw_mqtt and getattr(cw_mqtt, "mqtt", None):
+                    prefix = cw_mqtt.mqtt.topic_prefix
+                    mqtt_health_topic = f"{prefix}cyberwave/twin/{twin_uuids[0]}/worker_health"
+                    mqtt_publish = cw_mqtt.mqtt.publish
+            except Exception:
+                logger.debug("Could not set up MQTT for worker health publishing")
 
         existing_watcher = WorkerWatcher(
             workers_dir=workers_dir,

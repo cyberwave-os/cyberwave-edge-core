@@ -97,6 +97,44 @@ class TestReconcileWorkerWatcher:
         assert startup._get_monitored_worker_manager() is mock_wm_instance
         startup._set_monitored_worker_manager(None)
 
+    def _create_watcher(self, monkeypatch, tmp_path, twin_uuids):
+        monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env-uuid")
+        monkeypatch.setattr(startup, "load_token", lambda: "tok")
+        monkeypatch.setattr(startup, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(startup, "get_runtime_env_var", lambda *a, **kw: None)
+        monkeypatch.setattr(startup, "get_or_create_fingerprint", lambda: "fp")
+        monkeypatch.setattr(startup, "_resolve_worker_sync_twin_uuids", lambda *a, **kw: twin_uuids)
+        mqtt_client = MagicMock()
+        mqtt_client.mqtt.topic_prefix = ""
+        get_client = MagicMock(return_value=mqtt_client)
+        monkeypatch.setattr(startup, "_get_shared_mqtt_client", get_client)
+        watcher_cls = MagicMock()
+
+        with (
+            patch("cyberwave_edge_core.worker_watcher.WorkerWatcher", watcher_cls),
+            patch("cyberwave_edge_core.worker_manager.WorkerManager", MagicMock()),
+            patch("cyberwave_edge_core.worker_health.WorkerHealthMonitor", MagicMock()),
+            patch("cyberwave_edge_core.model_manager.ModelManager", MagicMock()),
+        ):
+            startup._reconcile_worker_watcher(None)
+        startup._set_monitored_worker_manager(None)
+        startup._set_active_worker_watcher(None)
+        return watcher_cls.call_args.kwargs, get_client
+
+    def test_worker_health_goes_to_the_first_twin(self, monkeypatch, tmp_path):
+        kwargs, _ = self._create_watcher(monkeypatch, tmp_path, ["twin-a", "twin-b"])
+
+        assert kwargs["mqtt_health_topic"] == "cyberwave/twin/twin-a/worker_health"
+        assert kwargs["mqtt_publish"] is not None
+
+    def test_edge_without_twins_publishes_no_worker_health(self, monkeypatch, tmp_path):
+        # The environment UUID is no twin, so the ACL denied every publish on it.
+        kwargs, get_client = self._create_watcher(monkeypatch, tmp_path, [])
+
+        assert kwargs["mqtt_health_topic"] is None
+        assert kwargs["mqtt_publish"] is None
+        get_client.assert_not_called()
+
     def test_reuses_existing_watcher(self, monkeypatch, tmp_path):
         monkeypatch.setattr(startup, "load_environment_uuid", lambda: "env-uuid")
         monkeypatch.setattr(startup, "load_token", lambda: "tok")
