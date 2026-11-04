@@ -51,6 +51,7 @@ dpkg -i "${PACKAGE_FILE}"
 echo "=== Verifying installed binary ==="
 /usr/bin/cyberwave-edge-core --help
 /usr/bin/cyberwave-edge-core __selfcheck_sdk
+/usr/bin/cyberwave-edge-core __selfcheck_tls
 
 echo "=== Verifying systemd unit ownership ==="
 # No unit and no --install: must be a no-op that exits 0.

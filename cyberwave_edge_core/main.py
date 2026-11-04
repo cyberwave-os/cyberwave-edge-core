@@ -3,6 +3,8 @@
 import logging
 import os
 import signal
+import socket
+import ssl
 import sys
 import time
 
@@ -79,6 +81,18 @@ def run_sdk_selfcheck() -> int:
         return 1
 
     click.echo("sdk-rest-ok")
+    return 0
+
+
+def run_tls_selfcheck(host: str) -> int:
+    """Verify ``host``:443 against the default CA store, which MQTT's TLS uses too."""
+    try:
+        with socket.create_connection((host, 443), timeout=10) as sock:
+            with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
+                click.echo(f"tls-ok: {host} ({tls.version()})")
+    except OSError as exc:
+        click.echo(f"tls-failed: {host}: {exc} ({ssl.get_default_verify_paths()})", err=True)
+        return 1
     return 0
 
 
@@ -179,6 +193,13 @@ def cli(ctx: click.Context) -> None:
 def selfcheck_sdk() -> None:
     """Hidden packaged-runtime check for generated SDK imports."""
     raise click.exceptions.Exit(run_sdk_selfcheck())
+
+
+@cli.command(name="__selfcheck_tls", hidden=True)
+@click.argument("host", default="github.com")
+def selfcheck_tls(host: str) -> None:
+    """Hidden packaged-runtime check that TLS verification finds CA certificates."""
+    raise click.exceptions.Exit(run_tls_selfcheck(host))
 
 
 @cli.command(name="__ensure-systemd-unit", hidden=True)
