@@ -186,6 +186,7 @@ def _min_free_bytes() -> float:
 
 def ensure_free_space() -> None:
     """Make room before a pull: collect unused images if short, fail if still short."""
+    from . import startup
     from .image_gc import gc_driver_images
 
     root = docker_data_root()
@@ -193,7 +194,8 @@ def ensure_free_space() -> None:
     if shutil.disk_usage(root).free >= needed:
         return
     logger.info("Little free space under %s; collecting unused images before staging", root)
-    gc_driver_images(aggressive=True)
+    # A flap-stopped driver whose container is gone is revived from its image.
+    gc_driver_images(aggressive=True, keep=startup._flap_stopped_images())
     free = shutil.disk_usage(root).free
     if free < needed:
         raise StageError(

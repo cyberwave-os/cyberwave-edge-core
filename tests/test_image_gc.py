@@ -130,6 +130,22 @@ class TestWhatIsKept:
 
         assert docker.removed == []
 
+    def test_an_image_the_caller_keeps_by_id_is_kept(self, docker):
+        """A flap-stopped driver's image: its container may be gone, revival needs it."""
+        docker.add("sha256:flap", tags=["drv:1.0.0"])
+        docker.add("sha256:old", tags=["old:1"])
+
+        _gc(keep={"sha256:flap"})
+
+        assert docker.removed == [["old:1"]]
+
+    def test_an_image_the_caller_keeps_by_reference_is_kept(self, docker):
+        docker.add("sha256:flap", tags=["drv:1.0.0"])
+
+        _gc(keep={"drv:1.0.0"})
+
+        assert docker.removed == []
+
     def test_an_image_created_in_the_last_two_hours_is_kept(self, docker):
         """The old `until=2h` guard: a fresh local build no container has started yet."""
         docker.add("sha256:fresh", age_hours=1.5, tags=["local:dev"])

@@ -146,12 +146,17 @@ def _protected_ids(
     }
 
 
-def gc_driver_images(*, aggressive: bool = False, now: Optional[float] = None) -> bool:
+def gc_driver_images(
+    *,
+    aggressive: bool = False,
+    now: Optional[float] = None,
+    keep: Iterable[str] = (),
+) -> bool:
     """Remove unused images as described in the module docstring; True when it could run.
 
     *aggressive* also drops rollback sets that are still inside their keep period, for a
     disk that is short. Staged images, images in use and images pulled in the last two
-    hours are never removed.
+    hours are never removed, nor the images *keep* names (an image ID or reference).
     """
     if not docker_available():
         return False
@@ -175,7 +180,13 @@ def gc_driver_images(*, aggressive: bool = False, now: Optional[float] = None) -
     kept = state.staged_images() | state.recent_pulls(now=moment)
     if not aggressive:
         kept |= state.previous_image_sets(now=moment)
-    protected = _protected_ids(images, kept, frozenset(state.staged_digests())) | in_use
+    keep = {str(item) for item in keep if item}
+    kept |= {item for item in keep if not item.startswith("sha256:")}
+    protected = (
+        _protected_ids(images, kept, frozenset(state.staged_digests()))
+        | in_use
+        | {item for item in keep if item.startswith("sha256:")}
+    )
 
     removable = sorted(
         (

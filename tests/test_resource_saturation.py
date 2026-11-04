@@ -62,6 +62,7 @@ def edge(monkeypatch: pytest.MonkeyPatch) -> Any:
         return 1
 
     monkeypatch.setattr(startup, "resolve_active_alerts_for_twin", _resolve)
+    state.resolve = _resolve
 
     def snapshot(cpu: float | None = 20.0, memory: float | None = 40.0, disk: float | None = 50.0):
         state.clock += 30.0
@@ -313,3 +314,42 @@ def test_a_reading_between_the_clear_level_and_the_threshold_resolves_nothing_ye
     edge.snapshot(cpu=92, memory=40, disk=50)
 
     assert not any(kind == "edge_cpu_saturation" for _, kind in edge.resolved)
+
+
+def test_an_offline_restart_leaves_the_resolutions_for_a_reachable_backend(
+    edge: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each resolve would wait out DNS; the watchdog killed edge-core on an offline boot."""
+    attempts: list[str] = []
+
+    def _unreachable(twin: str, kind: str, *, strict: bool = False) -> int:
+        attempts.append(kind)
+        raise ConnectionError("Temporary failure in name resolution")
+
+    monkeypatch.setattr(startup, "resolve_active_alerts_for_twin", _unreachable)
+    startup.adopt_saturation_alerts_left_open()
+
+    edge.snapshot(cpu=20, memory=40, disk=50)
+    edge.snapshot(cpu=20, memory=40, disk=50)
+
+    assert attempts == ["edge_cpu_saturation"], "the first failure opens the breaker"
+    assert startup.cloud_reconciliation_paused()
+
+    startup.note_cloud_success()
+    monkeypatch.setattr(startup, "resolve_active_alerts_for_twin", edge.resolve)
+    edge.snapshot(cpu=20, memory=40, disk=50)
+
+    expected = {(twin, f"edge_{r}_saturation") for twin in (TWIN_A, TWIN_B) for r in ("cpu", "memory", "disk")}
+    assert set(edge.resolved) == expected
+
+
+def test_a_saturation_alert_waits_for_a_reachable_backend(edge: Any) -> None:
+    startup.note_cloud_failure(ConnectionError("Temporary failure in name resolution"))
+
+    edge.snapshot(cpu=97)
+    edge.snapshot(cpu=97)
+    assert edge.sent == []
+
+    startup.note_cloud_success()
+    edge.snapshot(cpu=97)
+    assert _types(edge.sent) == [(TWIN_A, "edge_cpu_saturation"), (TWIN_B, "edge_cpu_saturation")]

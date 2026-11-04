@@ -661,6 +661,18 @@ class TestDockerPruneStoppedCyberwaveContainers:
 
         assert dh.docker_prune_stopped_cyberwave_containers() == 1
 
+    def test_keeps_named_containers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_ps(prefix: str, include_stopped: bool = False) -> list[str]:
+            return ["cyberwave-a", "cyberwave-flapped"] if include_stopped else []
+
+        removed_names: list[str] = []
+        monkeypatch.setattr(dh, "docker_available", lambda: True)
+        monkeypatch.setattr(dh, "docker_ps_by_prefix", fake_ps)
+        monkeypatch.setattr(dh, "docker_rm", lambda name: removed_names.append(name) or True)
+
+        assert dh.docker_prune_stopped_cyberwave_containers(keep_names={"cyberwave-flapped"}) == 1
+        assert removed_names == ["cyberwave-a"]
+
     def test_uses_custom_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured_prefixes: list[str] = []
 

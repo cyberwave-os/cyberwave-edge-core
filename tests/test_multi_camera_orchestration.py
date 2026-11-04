@@ -638,7 +638,12 @@ class TestDriverRevivalReconciliation:
         startup.reconcile_driver_revival()
         if revived:
             fetch_mock.assert_called_once_with(
-                "tok", "env", "fp", only_container_names={TWIN_A_CONTAINER}
+                "tok",
+                "env",
+                "fp",
+                watchdog=None,
+                only_container_names={TWIN_A_CONTAINER},
+                pull_images=False,
             )
         else:
             fetch_mock.assert_not_called()
@@ -683,7 +688,12 @@ class TestDriverRevivalReconciliation:
         summary = startup.reconcile_driver_revival()
 
         fetch_mock.assert_called_once_with(
-            "tok", "env", "fp", only_container_names={TWIN_A_CONTAINER}
+            "tok",
+            "env",
+            "fp",
+            watchdog=None,
+            only_container_names={TWIN_A_CONTAINER},
+            pull_images=False,
         )
         assert summary["down"] == 1
         assert summary["revived_attempted"] == 1
@@ -799,7 +809,9 @@ class _Host:
         self.stopped.discard(TWIN_A_CONTAINER)
         self.running.add(TWIN_A_CONTAINER)
 
-    def _fetch(self, *_a: object, only_container_names: set[str]) -> list[dict]:
+    def _fetch(
+        self, *_a: object, only_container_names: set[str], **_kw: object
+    ) -> list[dict]:
         self.revivals.append(set(only_container_names))
         if not self.linked:
             return []

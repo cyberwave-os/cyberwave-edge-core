@@ -193,6 +193,10 @@ def _publish_driver_log_message(
     """Publish a driver log line to MQTT when a publish context is available."""
     if not mqtt_client or not mqtt_topic:
         return
+    # The shared client stays in use while paho reconnects it; the SDK would
+    # log a warning for every line published in the meantime.
+    if not getattr(mqtt_client.mqtt, "connected", True):
+        return
 
     try:
         mqtt_client.mqtt.publish(

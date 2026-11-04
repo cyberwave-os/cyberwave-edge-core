@@ -449,10 +449,12 @@ def docker_prune_stopped_cyberwave_containers(
     prefix: str = "cyberwave",
     *,
     keep_label: str | None = None,
+    keep_names: Collection[str] = (),
 ) -> int:
     """Remove all stopped containers whose name starts with *prefix*.
 
     Containers carrying *keep_label* are kept; if they cannot be listed, nothing is pruned.
+    Containers named in *keep_names* are kept too.
 
     Returns the number of containers successfully removed.
     """
@@ -461,7 +463,7 @@ def docker_prune_stopped_cyberwave_containers(
 
     stopped = docker_ps_by_prefix(prefix, include_stopped=True)
     running = set(docker_ps_by_prefix(prefix, include_stopped=False))
-    to_remove = [name for name in stopped if name not in running]
+    to_remove = [name for name in stopped if name not in running and name not in keep_names]
     if keep_label and to_remove:
         kept = docker_names_with_label(keep_label)
         if kept is None:
@@ -553,8 +555,10 @@ def docker_reap_workload_containers(
     return orphans
 
 
-def docker_prune_unused_images() -> bool:
+def docker_prune_unused_images(*, keep: Collection[str] = ()) -> bool:
     """Remove the Docker images nothing needs; True when the cleanup could run.
+
+    Images named in *keep* (an image ID or reference) are kept as well.
 
     Images a staged driver update will start, images pulled in the last two hours,
     images any container uses and images created in the last two hours are kept. That is
@@ -566,7 +570,7 @@ def docker_prune_unused_images() -> bool:
         return False
     from .image_gc import gc_driver_images
 
-    return gc_driver_images()
+    return gc_driver_images(keep=keep)
 
 
 # Docker 23.0 narrowed bare ``docker volume prune`` to anonymous volumes and

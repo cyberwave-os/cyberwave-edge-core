@@ -401,7 +401,25 @@ class TestFreeSpace:
 
         du.ensure_free_space()
 
-        assert calls == [{"aggressive": True}]
+        assert calls == [{"aggressive": True, "keep": set()}]
+
+    def test_short_space_keeps_the_image_of_a_flap_stopped_driver(self, monkeypatch):
+        free = iter([1 * 1024**3, 20 * 1024**3])
+        monkeypatch.setattr(du, "docker_data_root", lambda: "/var/lib/docker")
+        monkeypatch.setattr(du.shutil, "disk_usage", lambda _p: SimpleNamespace(free=next(free)))
+        monkeypatch.setitem(
+            startup._FLAP_STOPPED,
+            "cyberwave-driver-gone",
+            startup._FlapStop(backoff=120, due_at=0, image="sha256:flap"),
+        )
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "cyberwave_edge_core.image_gc.gc_driver_images", lambda **kw: calls.append(kw)
+        )
+
+        du.ensure_free_space()
+
+        assert calls == [{"aggressive": True, "keep": {"sha256:flap"}}]
 
     def test_still_short_after_collecting_fails_with_insufficient_disk(self, monkeypatch):
         monkeypatch.setattr(du, "docker_data_root", lambda: "/var/lib/docker")

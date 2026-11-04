@@ -268,9 +268,9 @@ class TestStartupWorkerSyncStep:
         keep working unchanged.
         """
         monkeypatch.setattr(startup, "load_token", lambda: "token-123")
-        monkeypatch.setattr(startup, "validate_token", lambda token: True)
+        monkeypatch.setattr(startup, "check_token", lambda token: startup.TOKEN_VALID)
         monkeypatch.setattr(startup, "check_mqtt_connection", lambda token: True)
-        monkeypatch.setattr(startup, "register_edge", lambda token: True)
+        monkeypatch.setattr(startup, "register_edge_outcome", lambda token: startup.EDGE_REGISTERED)
         monkeypatch.setattr(
             startup,
             "load_environment_uuid",

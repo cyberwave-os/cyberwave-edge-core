@@ -15,6 +15,7 @@ This module exposes each check individually (for the ``status`` command)
 and a single ``run_startup_checks()`` orchestrator for the boot path.
 """
 
+import errno
 import hashlib
 import importlib.metadata
 import json
@@ -55,7 +56,7 @@ from . import (
 )
 from ._clock import now_monotonic
 from .docker_helpers import DRIVER_CONTAINER_PREFIX as DRIVER_CONTAINER_PREFIX
-from .docker_helpers import driver_container_name
+from .docker_helpers import driver_container_name, parse_docker_timestamp_ns
 
 # Graceful fallback for edge-cores paired with an older SDK wheel that
 # predates ``read_host_power_draw`` — matches the pattern in
@@ -1213,15 +1214,124 @@ def _resolve_mqtt_kwargs() -> dict[str, Any]:
 
 
 SDK_REQUEST_TIMEOUT_SECONDS = 10.0
+# A dead uplink shows up as a connect that never completes; bound it on its own
+# so a connect attempt does not spend the whole read budget.
+SDK_CONNECT_TIMEOUT_SECONDS = 4.0
 
 
-def bound_sdk_request_timeouts(seconds: float = SDK_REQUEST_TIMEOUT_SECONDS) -> None:
-    """Give SDK requests without a timeout a per-attempt one (idempotent; no-op if unpatchable).
+def _bounded_sdk_retries() -> Any:
+    """urllib3 retries for the SDK pool: one retry of a failed connect, nothing else.
 
-    Not a loop bound: urllib3's ``Retry(3)`` can stretch one GET to ~40 s, and calls add up.
+    urllib3's default ``Retry(3)`` retried connects and reads four times over, so
+    one call to an unreachable backend took ~40 s. With the default timeouts a
+    call now gives up after ~8 s when it cannot connect and ~14 s when the server
+    stays silent (18 s at worst, a retried connect followed by a silent server).
+    A read timeout is not retried: the server got the request and stayed silent,
+    and waiting again would double the bound. A connection dropped before any
+    response is retried once, on a fresh connection, for the idempotent methods
+    urllib3 retries reads for (never a POST): a pooled keep-alive connection the
+    peer or a NAT closed mid-request is not an outage, and failing on it would
+    open the cloud breaker. Redirects keep urllib3's default. Name resolution is not
+    covered: ``getaddrinfo`` runs under the resolver's own timeout (10 s on the
+    Jetson), so a failed lookup is not retried either: the next one right after
+    would fail the same way.
+    """
+    from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+    from urllib3.util.retry import Retry
+
+    dns_errors: tuple[type[BaseException], ...]
+    try:
+        from urllib3.exceptions import NameResolutionError
+
+        dns_errors = (NameResolutionError,)
+    except ImportError:  # urllib3 < 2 reports DNS failures as NewConnectionError
+        dns_errors = ()
+
+    class _BoundedRetry(Retry):
+        def increment(  # type: ignore[no-untyped-def]
+            self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None
+        ):
+            if isinstance(error, (*dns_errors, ReadTimeoutError)):
+                raise MaxRetryError(_pool, url, error) from error
+            return super().increment(method, url, response, error, _pool, _stacktrace)
+
+    return _BoundedRetry(
+        total=None,
+        connect=1,
+        read=1,
+        status=0,
+        other=0,
+        redirect=3,
+        respect_retry_after_header=False,
+    )
+
+
+def _bound_sdk_pool_retries(rest_client: Any) -> None:
+    """Install :func:`_bounded_sdk_retries` on *rest_client*'s pool manager, once.
+
+    A ``retries`` the SDK configuration set itself is kept.
+    """
+    pool_manager = getattr(rest_client, "pool_manager", None)
+    pool_kw = getattr(pool_manager, "connection_pool_kw", None)
+    if not isinstance(pool_kw, dict) or "retries" in pool_kw:
+        return
+    try:
+        pool_kw["retries"] = _bounded_sdk_retries()
+    except ImportError:
+        return
+    # Pools already built keep the default; in-flight requests are unaffected.
+    pool_manager.clear()
+
+
+def _bound_sdk_default_timeout(timeout: tuple[float, float]) -> None:
+    """Make *timeout* the SDK's own default for a call that passes none.
+
+    SDKs that bound REST calls themselves fill the timeout in ``Cyberwave.call_api``
+    from ``config.timeout`` (300 s read, sized for uploads), so the request reaches
+    the patched ``RESTClientObject.request`` with a timeout already set and the
+    edge bound never applies. Older SDKs have no such default; nothing to do there.
+    """
+    try:
+        from cyberwave import client as sdk_client
+    except ImportError:
+        return
+    if not callable(getattr(sdk_client, "_default_request_timeout", None)):
+        return
+
+    def _default_request_timeout(
+        _configured: Any, *, has_body: bool = False, **_ignored: Any
+    ) -> tuple[Optional[float], float]:
+        # Unlike the SDK, a call with a body keeps the connect bound too. urllib3
+        # applies it to sending the body as well, but edge-core's SDK bodies are
+        # small JSON (twin updates, alerts, host facts), and an unbounded connect
+        # on a silent uplink lasts the kernel's ~127 s SYN retries, past the
+        # watchdog. Large transfers go through httpx. Unknown keywords from a
+        # newer SDK are ignored rather than failing every call.
+        return timeout
+
+    sdk_client._default_request_timeout = _default_request_timeout
+
+
+def bound_sdk_request_timeouts(
+    seconds: float = SDK_REQUEST_TIMEOUT_SECONDS,
+    *,
+    connect_seconds: float = SDK_CONNECT_TIMEOUT_SECONDS,
+) -> None:
+    """Bound SDK requests that carry no timeout (idempotent; no-op if unpatchable).
+
+    Such a request gets ``(connect_seconds, seconds)`` as its (connect, read)
+    timeout, and the client's pool gets :func:`_bounded_sdk_retries`. A caller
+    that passes its own ``_request_timeout`` keeps it, so a long read stays
+    possible. Still not a loop bound: calls add up, see :func:`cloud_reconciliation_paused`.
+    While the breaker is open on an unreachable backend, every request fails at
+    once instead, whoever makes it (see :func:`cloud_calls_fail_fast`). Any answer
+    that is not an outage (a status below 500, other than 429) closes the breaker,
+    whichever call got it.
     """
     import inspect
 
+    timeout = (min(connect_seconds, seconds), seconds)
+    _bound_sdk_default_timeout(timeout)
     try:
         from cyberwave.rest import rest
     except ImportError:
@@ -1235,34 +1345,284 @@ def bound_sdk_request_timeouts(seconds: float = SDK_REQUEST_TIMEOUT_SECONDS) -> 
     position = parameters.index("_request_timeout") - 1  # among the arguments after self
 
     def request(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if cloud_calls_fail_fast():
+            raise ConnectionError("Cyberwave backend unreachable; cloud calls paused")
+        if not getattr(self, "_cw_retries_bounded", False):
+            _bound_sdk_pool_retries(self)
+            self._cw_retries_bounded = True
         if len(args) > position:
             if args[position] is None:
-                args = (*args[:position], seconds, *args[position + 1 :])
+                args = (*args[:position], timeout, *args[position + 1 :])
         elif kwargs.get("_request_timeout") is None:
-            kwargs["_request_timeout"] = seconds
-        return original(self, *args, **kwargs)
+            kwargs["_request_timeout"] = timeout
+        response = original(self, *args, **kwargs)
+        if _cloud_backoff_seconds:
+            status = getattr(response, "status", None)
+            if isinstance(status, int) and 0 < status < 500 and status != 429:
+                note_cloud_success()
+        return response
 
     request._cw_bounded = True  # type: ignore[attr-defined]
     rest.RESTClientObject.request = request
 
 
+# -- Backend reachability ----------------------------------------------------
+#
+# Outcomes of the boot-time cloud checks. "unreachable" means the request never
+# got a verdict from the backend (connection, timeout, DNS, TLS, 5xx, 429); the
+# edge then runs degraded instead of exiting, see run_startup_checks.
+TOKEN_VALID = "valid"
+TOKEN_REJECTED = "rejected"
+CLOUD_UNREACHABLE = "unreachable"
+EDGE_REGISTERED = "registered"
+EDGE_REGISTRATION_FAILED = "failed"
+
+
+def _http_status_of(exc: BaseException) -> Optional[int]:
+    """The HTTP status an SDK error carries (``status_code`` or ``status``), if any."""
+    for attribute in ("status_code", "status"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _first_http_status(exc: BaseException) -> Optional[int]:
+    """The first HTTP status found along *exc*'s ``__cause__``/``__context__`` chain."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = _http_status_of(current)
+        if status is not None:
+            return status
+        current = current.__cause__ or current.__context__
+    return None
+
+
+# Socket errors that are not ConnectionError subclasses but still mean the
+# network, not this host, is at fault (a connect on a dead route).
+_NETWORK_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in ("ENETUNREACH", "ENETDOWN", "EHOSTUNREACH", "EHOSTDOWN", "ETIMEDOUT")
+    if hasattr(errno, name)
+)
+
+
+def _is_cloud_unreachable_error(exc: BaseException) -> bool:
+    """Whether *exc* means the backend could not be reached, not that it said no.
+
+    Walks ``__cause__`` / ``__context__``: the SDK re-raises a urllib3 error as a
+    ``CyberwaveAPIError`` without a status. The first status found decides: 0 (the
+    generated client's TLS failure), 429 and 5xx are an outage, any other is the
+    backend's answer.
+    """
+    try:
+        from urllib3 import exceptions as urllib3_exceptions
+
+        transport_errors: tuple[type[BaseException], ...] = (
+            urllib3_exceptions.MaxRetryError,
+            urllib3_exceptions.NewConnectionError,
+            urllib3_exceptions.TimeoutError,
+            urllib3_exceptions.ProtocolError,
+            urllib3_exceptions.SSLError,
+            urllib3_exceptions.ProxyError,
+        )
+    except ImportError:  # pragma: no cover - urllib3 ships with the SDK
+        transport_errors = ()
+    try:
+        from cyberwave.exceptions import CyberwaveConnectionError
+
+        transport_errors += (CyberwaveConnectionError,)
+    except ImportError:  # pragma: no cover - defensive, older SDK
+        pass
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = _http_status_of(current)
+        if status is not None:
+            return status == 0 or status == 429 or status >= 500
+        # Not any OSError: a missing CA bundle, a permission error or running out
+        # of file descriptors is a local fault to surface, not an outage.
+        if isinstance(current, (ConnectionError, TimeoutError, socket.gaierror, *transport_errors)):
+            return True
+        if isinstance(current, OSError) and current.errno in _NETWORK_ERRNOS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+# Circuit breaker for the runtime loop's cloud steps. One unreachable backend
+# costs every REST call its full timeout, and a tick makes many of them, so
+# after a network error the cloud steps are skipped for a while (30 s doubling
+# to 5 min) instead of starving the watchdog. Local supervision (log
+# followers, flap detection, Docker cleanup) keeps running. Monotonic clock.
+# When the backend could not be reached at all, every SDK request fails at once
+# during the pause too (see bound_sdk_request_timeouts): it would only wait out
+# its DNS and connect timeouts. A backend that answered 5xx or 429 costs a call
+# no such wait, so calls outside the loop's cloud steps still go through then.
+_CLOUD_BACKOFF_INITIAL_SECONDS = 30.0
+_CLOUD_BACKOFF_MAX_SECONDS = 300.0
+_cloud_backoff_seconds = 0.0
+_cloud_paused_until = 0.0
+_cloud_unreachable = False
+_cloud_breaker_lock = threading.Lock()
+
+
+def note_cloud_failure(exc: BaseException) -> bool:
+    """Pause cloud reconciliation when *exc* is a network error; True when it did."""
+    global _cloud_backoff_seconds, _cloud_paused_until, _cloud_unreachable
+    if not _is_cloud_unreachable_error(exc):
+        return False
+    status = _first_http_status(exc)
+    unreachable = status is None or status == 0
+    now = time.monotonic()
+    with _cloud_breaker_lock:
+        if now < _cloud_paused_until:
+            # A call that was already in flight when the breaker opened, or one
+            # that failed fast because it is open.
+            _cloud_unreachable = _cloud_unreachable or unreachable
+            return True
+        if _cloud_backoff_seconds and now - _cloud_paused_until < _CLOUD_BACKOFF_MAX_SECONDS:
+            backoff = min(_cloud_backoff_seconds * 2, _CLOUD_BACKOFF_MAX_SECONDS)
+        else:
+            backoff = _CLOUD_BACKOFF_INITIAL_SECONDS
+        _cloud_backoff_seconds = backoff
+        _cloud_paused_until = now + backoff
+        _cloud_unreachable = unreachable
+    logger.warning(
+        "Backend unreachable (%s: %s); pausing cloud reconciliation for %.0fs",
+        type(exc).__name__,
+        exc,
+        backoff,
+    )
+    return True
+
+
+def note_twin_call_failure(exc: BaseException) -> None:
+    """Like :func:`note_cloud_failure`, for a call about one twin: an HTTP answer never pauses.
+
+    A 5xx or 429 on one twin's update or fetch says something about that twin, and
+    it fails again on every tick: pausing on it would skip every later cloud step
+    for as long as that twin stays broken. Only a backend that could not be
+    reached (no status, or the generated client's TLS failure 0) opens the breaker.
+    """
+    if _first_http_status(exc) in (None, 0):
+        note_cloud_failure(exc)
+
+
+def note_cloud_success() -> None:
+    """Close the breaker: the backend answered."""
+    global _cloud_backoff_seconds, _cloud_paused_until, _cloud_unreachable
+    with _cloud_breaker_lock:
+        if _cloud_backoff_seconds:
+            logger.info("Backend reachable again; resuming cloud reconciliation")
+        _cloud_backoff_seconds = 0.0
+        _cloud_paused_until = 0.0
+        _cloud_unreachable = False
+
+
+def cloud_reconciliation_paused() -> bool:
+    """Whether the runtime loop should skip its cloud steps this tick."""
+    return time.monotonic() < _cloud_paused_until
+
+
+def cloud_calls_fail_fast() -> bool:
+    """Whether an SDK request should fail at once: paused on a backend that could not be reached."""
+    return _cloud_unreachable and cloud_reconciliation_paused()
+
+
+# Whether the shared MQTT client was connected at the previous runtime tick.
+_shared_mqtt_was_connected: Optional[bool] = None
+
+
+def _end_cloud_pause_on_mqtt_reconnect() -> None:
+    """Probe the backend now when the shared MQTT client has just reconnected.
+
+    The broker coming back is the first sign the uplink has, while the breaker
+    may still have up to 5 minutes to sit out. Only the transition counts: a
+    broker that stays up during an API-only outage leaves the backoff alone.
+    The backoff itself is kept, so a probe that fails again pauses for longer.
+    """
+    global _shared_mqtt_was_connected, _cloud_paused_until, _last_degraded_retry_at
+    client = _shared_mqtt_client
+    if client is None:
+        return
+    connected = bool(getattr(client.mqtt, "connected", False))
+    reconnected = connected and _shared_mqtt_was_connected is False
+    _shared_mqtt_was_connected = connected
+    if not reconnected:
+        return
+    now = time.monotonic()
+    with _cloud_breaker_lock:
+        if now >= _cloud_paused_until:
+            return
+        _cloud_paused_until = now
+    _last_degraded_retry_at = None
+    logger.info("MQTT broker reachable again; probing the backend instead of waiting out the pause")
+
+
+def _connect_shared_mqtt_in_background(mqtt: Any) -> bool:
+    """Let paho's network thread keep (re)connecting *mqtt*; False without that SDK support."""
+    connect_in_background = getattr(mqtt, "connect_in_background", None)
+    if connect_in_background is None:
+        return False
+    try:
+        connect_in_background()
+    except Exception as exc:
+        logger.warning("Shared MQTT client could not start connecting in the background: %s", exc)
+        return False
+    return True
+
+
 def _get_shared_mqtt_client(token: str) -> Any:
-    """Return a shared MQTT client, creating and connecting it on first call."""
+    """Return the shared MQTT client, creating it on first call.
+
+    A client that lost its connection is returned as it is, not replaced: paho's
+    network thread reconnects it and the SDK resubscribes every handler on
+    connect, so the command subscriptions recorded against it
+    (``_EDGE_COMMAND_SUBSCRIBED``, ``_SUBSCRIBED_TWIN_COMMAND_UUIDS``) stay true.
+    A replacement would have left them on the dead client. A client whose first
+    connect failed is kept the same way, connecting in the background; its
+    publishes are dropped until then.
+    """
     global _shared_mqtt_client
     with _shared_mqtt_lock:
-        if _shared_mqtt_client is not None and _shared_mqtt_client.mqtt.connected:
-            return _shared_mqtt_client
+        existing = _shared_mqtt_client
+        if existing is not None:
+            mqtt = existing.mqtt
+            if not mqtt.connected and not getattr(mqtt, "connecting_in_background", True):
+                _connect_shared_mqtt_in_background(mqtt)
+            return existing
         base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
         mqtt_kwargs = _resolve_mqtt_kwargs()
         try:
             client = Cyberwave(base_url=base_url, api_key=token, **mqtt_kwargs)
-            client.mqtt.connect()
-            _shared_mqtt_client = client
-            logger.info("Shared MQTT client connected for log forwarding")
-            return client
         except Exception as exc:
             logger.warning("Failed to create shared MQTT client: %s", exc)
             return None
+        try:
+            # paho's default reconnect backoff grows to 120 s.
+            client.mqtt._client.client.reconnect_delay_set(min_delay=1, max_delay=30)
+        except Exception:
+            logger.debug("Could not shorten the MQTT reconnect delay", exc_info=True)
+        # The blocking connect waits ~30 s on a dead uplink; skip it while the
+        # backend is known to be unreachable.
+        if not cloud_reconciliation_paused():
+            try:
+                client.mqtt.connect()
+                _shared_mqtt_client = client
+                logger.info("Shared MQTT client connected for log forwarding")
+                return client
+            except Exception as exc:
+                logger.warning("Failed to connect the shared MQTT client: %s", exc)
+        if not _connect_shared_mqtt_in_background(client.mqtt):
+            return None
+        _shared_mqtt_client = client
+        logger.info("Shared MQTT client connecting in the background")
+        return client
 
 
 def _mask_token(token: str) -> str:
@@ -1481,10 +1841,13 @@ def get_runtime_env_var(name: str, default: Optional[str] = None) -> Optional[st
     return default
 
 
-def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
-    """Validate *token* by listing workspaces via the Cyberwave SDK.
+def check_token(token: str, *, base_url: Optional[str] = None) -> str:
+    """Check *token* by listing workspaces via the Cyberwave SDK.
 
-    Returns ``True`` when the SDK call succeeds (i.e. the token is valid).
+    Returns :data:`TOKEN_VALID`, :data:`CLOUD_UNREACHABLE` when the backend gave
+    no verdict (see :func:`_is_cloud_unreachable_error`), or
+    :data:`TOKEN_REJECTED` for any answer that is not a success (401/403, and
+    also an unexpected 4xx such as a wrong base URL's 404).
     """
     base_url = base_url or get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL)
     masked_token = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else "***"
@@ -1492,11 +1855,23 @@ def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
     try:
         client = Cyberwave(base_url=base_url, api_key=token)
         client.workspaces.list()
-        logger.info("Token validated successfully (workspaces listed)")
-        return True
     except Exception as exc:
+        if note_cloud_failure(exc):
+            logger.warning("Token validation could not reach %s: %s", base_url, exc)
+            return CLOUD_UNREACHABLE
         logger.warning("Token validation failed (%s): %s", base_url, exc)
-        return False
+        return TOKEN_REJECTED
+    logger.info("Token validated successfully (workspaces listed)")
+    note_cloud_success()
+    return TOKEN_VALID
+
+
+def validate_token(token: str, *, base_url: Optional[str] = None) -> bool:
+    """Validate *token* by listing workspaces via the Cyberwave SDK.
+
+    Returns ``True`` when the SDK call succeeds (i.e. the token is valid).
+    """
+    return check_token(token, base_url=base_url) == TOKEN_VALID
 
 
 def check_mqtt_connection(token: str) -> bool:
@@ -2487,8 +2862,134 @@ def _build_driver_restart_loop_message(
     )
 
 
+# Drivers the flap detector stopped. They used to stay down until edge-core
+# restarted, yet a crash loop is often caused outside the driver (an unplugged
+# device, a dead uplink), so revival brings them back on a capped backoff: 2 min
+# after the stop, doubling with each revival up to 30 min. The record is dropped
+# once the container has kept running for 10 min, however it came back, or after
+# six revivals in a row that find no spec for it. The restart-loop alert goes out once
+# per such episode, not once per revival; one no stop could deliver goes out at revival.
+_FLAP_REVIVAL_BACKOFF_INITIAL_SECONDS = 120.0
+_FLAP_REVIVAL_BACKOFF_MAX_SECONDS = 1800.0
+_FLAP_STABLE_RUN_SECONDS = 600.0
+# A pass whose asset lookup failed also finds no spec, so one miss proves nothing.
+# Six misses on the capped backoff take about 90 min, which rides out a backend
+# outage and still forgets a service that really left the topology.
+_FLAP_FORGET_AFTER_MISSES = 6
+
+
+@dataclass
+class _FlapStop:
+    backoff: float
+    due_at: float  # monotonic; revival waits until then
+    revivals: int = 0
+    no_spec_passes: int = 0  # revival passes that found no spec for the container
+    image: Optional[str] = None  # image ID, kept from image GC while the record lives
+    alerted: bool = False  # an alert for this episode reached the backend
+    # (twin, message) of the last stop's alert that the backend did not get
+    undelivered_alert: Optional[tuple[str, str]] = None
+
+
+_FLAP_STOPPED: dict[str, _FlapStop] = {}
+
+
+def _record_flap_stop(container_name: str, inspect_data: dict[str, Any]) -> bool:
+    """Schedule the revival of a container the flap detector stopped; True for a new episode."""
+    now = time.monotonic()
+    image = inspect_data.get("Image")
+    image = image if isinstance(image, str) and image else None
+    record = _FLAP_STOPPED.get(container_name)
+    if record is None:
+        _FLAP_STOPPED[container_name] = _FlapStop(
+            backoff=_FLAP_REVIVAL_BACKOFF_INITIAL_SECONDS,
+            due_at=now + _FLAP_REVIVAL_BACKOFF_INITIAL_SECONDS,
+            image=image,
+        )
+        return True
+    record.due_at = now + record.backoff
+    record.image = image or record.image
+    logger.warning(
+        "Driver container %s flapped again after %d revival(s); next revival in %ds",
+        container_name,
+        record.revivals,
+        int(record.backoff),
+    )
+    return False
+
+
+def _note_flap_revival(container_name: str, now: float) -> None:
+    """Count a revival of a flap-stopped container and double its backoff."""
+    record = _FLAP_STOPPED.get(container_name)
+    if record is None:
+        return
+    record.revivals += 1
+    record.backoff = min(record.backoff * 2, _FLAP_REVIVAL_BACKOFF_MAX_SECONDS)
+    # A launch that fails leaves the container down; this spaces out the next try.
+    record.due_at = now + record.backoff
+
+
+def _flap_stopped_images() -> set[str]:
+    # Staging reads this from its worker thread while the loop thread adds and
+    # drops records; list() copies the values without yielding to it.
+    return {record.image for record in list(_FLAP_STOPPED.values()) if record.image}
+
+
+def _send_restart_loop_alert(twin_uuid: str, message: str) -> None:
+    _send_alert_for_twin(
+        twin_uuid,
+        "Driver restart loop detected",
+        message,
+        "driver_restart_loop",
+        severity="error",
+    )
+
+
+def _send_undelivered_flap_alert(container_name: str) -> None:
+    """Send the alert of an episode whose every stop happened while the backend was down."""
+    flap = _FLAP_STOPPED.get(container_name)
+    if flap is None or flap.alerted or flap.undelivered_alert is None:
+        return
+    twin_uuid, message = flap.undelivered_alert
+    try:
+        _send_restart_loop_alert(
+            twin_uuid,
+            f"{message} It was stopped while the backend was unreachable and is being "
+            "revived now.",
+        )
+    except Exception as exc:
+        # Kept for the next stop or revival of the episode.
+        logger.warning(
+            "Failed to send the delayed restart-loop alert for twin %s (container=%s): %s",
+            twin_uuid,
+            container_name,
+            exc,
+        )
+        return
+    flap.alerted = True
+    flap.undelivered_alert = None
+
+
+def _container_running(inspect_data: dict[str, Any]) -> bool:
+    state = inspect_data.get("State")
+    return isinstance(state, dict) and state.get("Running") is True
+
+
+def _seconds_since_started(inspect_data: dict[str, Any]) -> float:
+    """How long the container has run since docker last started it; 0 when unknown."""
+    state = inspect_data.get("State")
+    started_ns = parse_docker_timestamp_ns(
+        str((state if isinstance(state, dict) else {}).get("StartedAt") or "")
+    )
+    if started_ns is None:
+        return 0.0
+    return max(0.0, time.time() - started_ns / 1e9)
+
+
 def reconcile_driver_restart_failures() -> dict[str, int]:
-    """Detect flapping drivers and stop them after too many restarts."""
+    """Detect flapping drivers and stop them after too many restarts.
+
+    A stopped driver is revived later on a backoff, see :data:`_FLAP_STOPPED`.
+    """
     all_containers = _list_driver_containers(include_stopped=True)
     active_names = set(all_containers)
 
@@ -2496,6 +2997,10 @@ def reconcile_driver_restart_failures() -> dict[str, int]:
         _CONTAINER_LAST_RESTART_COUNT.pop(stale, None)
     for stale in set(_CONTAINER_RESTART_HISTORY) - active_names:
         _CONTAINER_RESTART_HISTORY.pop(stale, None)
+    # A flap-stopped container a failed revival removed stays mapped and
+    # due; one this edge no longer manages (its twin unlinked) is dropped.
+    for stale in set(_FLAP_STOPPED) - set(_CONTAINER_TWIN_MAP):
+        _FLAP_STOPPED.pop(stale, None)
 
     summary = {"inspected": 0, "flapping": 0, "stopped": 0, "alerts_sent": 0}
     for container_name in all_containers:
@@ -2503,6 +3008,20 @@ def reconcile_driver_restart_failures() -> dict[str, int]:
         if not inspect_data:
             continue
         summary["inspected"] += 1
+
+        # Uptime comes from docker, so it holds whoever started the container
+        # (a revival, an activation, an operator), and a docker restart resets it.
+        if (
+            container_name in _FLAP_STOPPED
+            and _container_running(inspect_data)
+            and _seconds_since_started(inspect_data) >= _FLAP_STABLE_RUN_SECONDS
+        ):
+            del _FLAP_STOPPED[container_name]
+            logger.info(
+                "Driver container %s has run %ds since its last start; flap backoff reset",
+                container_name,
+                int(_FLAP_STABLE_RUN_SECONDS),
+            )
 
         try:
             restart_count = int(inspect_data.get("RestartCount") or 0)
@@ -2524,6 +3043,8 @@ def reconcile_driver_restart_failures() -> dict[str, int]:
         stopped = _stop_driver_container(container_name)
         if stopped:
             summary["stopped"] += 1
+        _record_flap_stop(container_name, inspect_data)
+        flap = _FLAP_STOPPED[container_name]
 
         _CONTAINER_RESTART_HISTORY.pop(container_name, None)
         logger.error(
@@ -2540,23 +3061,23 @@ def reconcile_driver_restart_failures() -> dict[str, int]:
             stopped,
         )
 
-        if not twin_uuid:
+        # One alert per episode. A stop while the backend is unreachable cannot
+        # deliver it, so a later stop in the same episode, or its revival, sends it.
+        if not twin_uuid or flap.alerted:
             continue
+        message = _build_driver_restart_loop_message(
+            twin_name=twin_name,
+            container_name=container_name,
+            restart_count=restart_count,
+            restart_window_count=restarts_in_window,
+        )
         try:
-            _send_alert_for_twin(
-                twin_uuid,
-                "Driver restart loop detected",
-                _build_driver_restart_loop_message(
-                    twin_name=twin_name,
-                    container_name=container_name,
-                    restart_count=restart_count,
-                    restart_window_count=restarts_in_window,
-                ),
-                "driver_restart_loop",
-                severity="error",
-            )
+            _send_restart_loop_alert(twin_uuid, message)
+            flap.alerted = True
+            flap.undelivered_alert = None
             summary["alerts_sent"] += 1
         except Exception as exc:
+            flap.undelivered_alert = (twin_uuid, message)
             logger.warning(
                 "Failed to send restart-loop alert for twin %s (container=%s): %s",
                 twin_uuid,
@@ -2612,7 +3133,10 @@ def reconcile_driver_health_for_worker() -> dict[str, str]:
                 (twin_uuid or "unknown")[:8],
                 status,
             )
-            if twin_uuid:
+            # A revived flap-stopped driver that flaps again was alerted on
+            # for its episode already.
+            flap = _FLAP_STOPPED.get(name)
+            if twin_uuid and not (flap is not None and flap.revivals):
                 try:
                     _send_alert_for_twin(
                         twin_uuid,
@@ -2655,7 +3179,11 @@ def _removed_containers_due(now: float) -> list[str]:
         for name, status in _DRIVER_HEALTH_PREVIOUS.items()
         if status == "removed"
         and name in _CONTAINER_TWIN_MAP
-        and (_CONTAINER_RESTART_POLICY.get(name) != "no" or name in _RESTART_FLOOR_DEFERRED)
+        and (
+            _CONTAINER_RESTART_POLICY.get(name) != "no"
+            or name in _RESTART_FLOOR_DEFERRED
+            or name in _FLAP_STOPPED
+        )
     }
     for name in [n for n in _REMOVED_SINCE if n not in removed]:
         del _REMOVED_SINCE[name]
@@ -2670,6 +3198,7 @@ def _removed_containers_due(now: float) -> list[str]:
 def reconcile_driver_revival(
     *,
     skip_revival: bool = False,
+    watchdog: Optional[Any] = None,
 ) -> dict[str, int]:
     """Re-spawn driver containers that exited cleanly.
 
@@ -2706,9 +3235,15 @@ def reconcile_driver_revival(
     tick — used when the flap detector just stopped a driver, so we
     don't immediately undo its decision.
 
-    A ``restart: "no"`` service, or one the flap detector stopped, stays down
-    even once pruned, unless its relaunch was refused on its floor; one with
-    a ``min_restart_interval_s`` floor waits until the floor has passed.
+    A ``restart: "no"`` service stays down even once pruned, unless its
+    relaunch was refused on its floor; one with a ``min_restart_interval_s``
+    floor waits until the floor has passed. One the flap detector stopped
+    comes back once its backoff has passed (see :data:`_FLAP_STOPPED`).
+
+    The relaunch runs on the images already on disk (only a missing one is
+    pulled) and forwards *watchdog*: this runs inside the runtime loop, whose
+    watchdog a long pull would outlast. Nothing is relaunched while the
+    backend is unreachable, since a launch needs it.
 
     Returns a summary dict.  All values default to 0 so callers can log
     a single line regardless of which branch fired.
@@ -2720,8 +3255,10 @@ def reconcile_driver_revival(
         "skipped_restart_no": 0,
         "skipped_restart_floor": 0,
         "skipped_flap_protection": 0,
+        "skipped_flap_backoff": 0,
         "skipped_debounce": 0,
         "skipped_no_credentials": 0,
+        "skipped_backend_unreachable": 0,
         "revived_attempted": 0,
     }
     if _DRIVER_HEALTH_STALE:
@@ -2758,6 +3295,10 @@ def reconcile_driver_revival(
         summary["skipped_flap_protection"] = len(down_names)
         return summary
 
+    if cloud_reconciliation_paused():
+        summary["skipped_backend_unreachable"] = len(down_names)
+        return summary
+
     if (
         _LAST_REVIVAL_ATTEMPT_AT is not None
         and (now - _LAST_REVIVAL_ATTEMPT_AT) < _REVIVAL_BACKOFF_SECONDS
@@ -2786,6 +3327,7 @@ def reconcile_driver_revival(
         summary["skipped_no_credentials"] = len(down_names)
         return summary
 
+    last_attempt_at = _LAST_REVIVAL_ATTEMPT_AT
     _LAST_REVIVAL_ATTEMPT_AT = now
     # Containers handed to the scoped pass, not ones it launched: a down
     # container whose service has left the topology matches no spec.
@@ -2796,9 +3338,19 @@ def reconcile_driver_revival(
         len(down_names),
         ", ".join(down_names),
     )
-    revived_twins = {_CONTAINER_TWIN_MAP.get(name, "") for name in down_names}
+    twins_by_name = {name: _CONTAINER_TWIN_MAP.get(name, "") for name in down_names}
+    revived_twins = set(twins_by_name.values())
     if not begin_loop_launch(revived_twins):
         return summary
+    # The state each flap record had before this attempt, given back if the
+    # attempt cannot reach the backend: that is not a revival.
+    flap_before = {
+        name: (record.revivals, record.backoff, record.due_at)
+        for name in down_names
+        if (record := _FLAP_STOPPED.get(name)) is not None
+    }
+    for name in down_names:
+        _note_flap_revival(name, now)
     try:
         # Only the down containers: launching recreates its container, so an
         # unscoped pass would restart every healthy sibling as well.
@@ -2806,13 +3358,27 @@ def reconcile_driver_revival(
             token,
             environment_uuid,
             fingerprint,
+            watchdog=watchdog,
             only_container_names=set(down_names),
+            pull_images=False,
         )
-    except Exception:
-        logger.exception("Driver revival run failed")
+    except Exception as exc:
+        if note_cloud_failure(exc):
+            # Nothing was launched. The breaker spaces out the retry, and the
+            # first pass after the backend answers revives the drivers.
+            _LAST_REVIVAL_ATTEMPT_AT = last_attempt_at
+            for name, (revivals, backoff, due_at) in flap_before.items():
+                record = _FLAP_STOPPED.get(name)
+                if record is not None:
+                    record.revivals, record.backoff, record.due_at = revivals, backoff, due_at
+        else:
+            logger.exception("Driver revival run failed")
         return summary
     finally:
         end_loop_launch(revived_twins)
+    # After the launch, so the report does not delay the robot coming back.
+    for name in down_names:
+        _send_undelivered_flap_alert(name)
 
     launched = {
         driver_container_name(result["twin_uuid"], result.get("service_name"))
@@ -2820,27 +3386,60 @@ def reconcile_driver_revival(
     }
     for name in down_names:
         if _DRIVER_HEALTH_PREVIOUS.get(name) != "removed":
+            _note_flap_revival_outcome(name, launched=name in launched)
             continue
         if name in launched:
             _REMOVED_MISSES.pop(name, None)
             continue
+        # A failed flap revival removes its container, so a flap-stopped
+        # driver usually lands here; it keeps the longer outage allowance.
+        forget_after = (
+            _FLAP_FORGET_AFTER_MISSES if name in _FLAP_STOPPED else _REMOVED_FORGET_AFTER_MISSES
+        )
         misses = _REMOVED_MISSES.get(name, 0) + 1
-        if misses < _REMOVED_FORGET_AFTER_MISSES:
+        if misses < forget_after:
             _REMOVED_MISSES[name] = misses
             logger.info(
                 "Removed driver container %s got no spec (%d/%d); retrying before forgetting it",
                 name,
                 misses,
-                _REMOVED_FORGET_AFTER_MISSES,
+                forget_after,
             )
             continue
         logger.info("Forgetting removed driver container %s: no linked twin declares it", name)
         _forget_driver_container(name)
 
+    # A launch that fails after create removes the container and unmaps it.
+    # Keep a flap-stopped one mapped, so its record outlives the stale sweep
+    # and the removed-container path revives it again on its backoff.
+    for name in down_names:
+        if name in _FLAP_STOPPED and twins_by_name[name]:
+            _CONTAINER_TWIN_MAP.setdefault(name, twins_by_name[name])
+
     return summary
 
 
+def _note_flap_revival_outcome(name: str, *, launched: bool) -> None:
+    """Drop the flap record of a container no linked twin declares any more.
+
+    Its service has left the topology, so revival would retry it forever and
+    the record would keep it from the prune and its image from image GC.
+    """
+    flap = _FLAP_STOPPED.get(name)
+    if flap is None:
+        return
+    if launched:
+        flap.no_spec_passes = 0
+        return
+    flap.no_spec_passes += 1
+    if flap.no_spec_passes < _FLAP_FORGET_AFTER_MISSES:
+        return
+    logger.info("Dropping the flap record of driver container %s: no linked twin declares it", name)
+    del _FLAP_STOPPED[name]
+
+
 def _forget_driver_container(name: str) -> None:
+    _FLAP_STOPPED.pop(name, None)
     _CONTAINER_TWIN_MAP.pop(name, None)
     _CONTAINER_RESTART_POLICY.pop(name, None)
     _DRIVER_HEALTH_PREVIOUS.pop(name, None)
@@ -2868,7 +3467,17 @@ def _revivable_driver_containers(down_names: list[str], summary: dict[str, int])
     from .driver_launcher import _restart_floor_decision
 
     eligible: list[str] = []
+    now = time.monotonic()
     for name in down_names:
+        flap = _FLAP_STOPPED.get(name)
+        if flap is not None and now < flap.due_at:
+            summary["skipped_flap_backoff"] += 1
+            logger.debug(
+                "Driver container %s was stopped for flapping; revival in %ds",
+                name,
+                int(flap.due_at - now),
+            )
+            continue
         inspect = docker_inspect(name)
         if isinstance(inspect, dict):
             host_config = inspect.get("HostConfig")
@@ -2880,8 +3489,9 @@ def _revivable_driver_containers(down_names: list[str], summary: dict[str, int])
             inspect = {}
             restart = _CONTAINER_RESTART_POLICY.get(name, "")
         # restart=no is about the driver exiting on its own, not about the
-        # stop-then-refuse edge-core did itself (a restart inside the floor).
-        if restart == "no" and name not in _RESTART_FLOOR_DEFERRED:
+        # stop-then-refuse edge-core did itself (a restart inside the floor),
+        # nor about the flap detector's stop.
+        if restart == "no" and name not in _RESTART_FLOOR_DEFERRED and flap is None:
             summary["skipped_restart_no"] += 1
             logger.debug(
                 "Driver container %s exited and is declared restart=no; leaving it stopped",
@@ -4797,10 +5407,16 @@ from .driver_selection import (  # noqa: E402
 
 
 def register_edge(token: str) -> bool:
+    return register_edge_outcome(token) == EDGE_REGISTERED
+
+
+def register_edge_outcome(token: str) -> str:
+    """Register this edge; :data:`EDGE_REGISTERED`, :data:`CLOUD_UNREACHABLE` or
+    :data:`EDGE_REGISTRATION_FAILED`."""
     fingerprint = get_or_create_fingerprint()
     if not fingerprint:
         logger.warning("Could not load or create edge fingerprint")
-        return False
+        return EDGE_REGISTRATION_FAILED
 
     base_url = get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     logger.info("Registering edge with fingerprint=%s at %s", fingerprint, base_url)
@@ -4818,10 +5434,12 @@ def register_edge(token: str) -> bool:
                 logger.debug("Could not persist edge.json after registration: %s", exc)
         else:
             logger.warning("Edge registration returned falsy response")
-        return bool(edge)
+        return EDGE_REGISTERED if edge else EDGE_REGISTRATION_FAILED
     except Exception as exc:
         logger.warning("Edge registration failed: %s: %s", type(exc).__name__, exc)
-        return False
+        if note_cloud_failure(exc):
+            return CLOUD_UNREACHABLE
+        return EDGE_REGISTRATION_FAILED
 
 
 # Period for the REST keepalive that bumps ``Edge.last_seen_at``. The
@@ -5860,8 +6478,9 @@ def ensure_twin_command_subscriptions() -> bool:
                     token, environment_uuid, fingerprint
                 )
             )
-        except Exception:
-            logger.exception("Could not list linked twins for command subscription")
+        except Exception as exc:
+            if not note_cloud_failure(exc):
+                logger.exception("Could not list linked twins for command subscription")
             return False
 
         # Fast path: nothing to add or remove. Avoids touching the MQTT
@@ -6098,6 +6717,7 @@ def _sync_twin_json_file_with_backend(
         )
         return True
     except Exception as exc:
+        note_twin_call_failure(exc)
         logger.warning("Failed to sync twin JSON for %s: %s", twin_uuid, exc)
         return False
 
@@ -6184,8 +6804,10 @@ def _pull_twin_json_file_from_backend(
     try:
         twin = client.twins.get_raw(twin_uuid)
     except Exception as exc:
+        note_twin_call_failure(exc)
         logger.debug("Twin pull skipped for %s: backend fetch failed (%s)", twin_uuid, exc)
         return None
+    note_cloud_success()
 
     backend_data = _coerce_twin_to_dict(twin)
     if backend_data is None:
@@ -6280,7 +6902,9 @@ def reconcile_twin_json_file_sync() -> dict[str, Any]:
         "pulled": 0,
         "metadata_changes": metadata_changes,
     }
-    if not active_twin_uuids:
+    # A paused breaker leaves the local changes unsynced (their checksums are
+    # not advanced), so they are pushed once the backend is back.
+    if not active_twin_uuids or cloud_reconciliation_paused():
         return summary
 
     client = _build_twin_sync_client()
@@ -6289,6 +6913,8 @@ def reconcile_twin_json_file_sync() -> dict[str, Any]:
 
     pushed_uuids: set[str] = set()
     for twin_uuid, twin_json_file, checksum in changed_candidates:
+        if cloud_reconciliation_paused():
+            return summary
         if _sync_twin_json_file_with_backend(client, twin_uuid, twin_json_file):
             _TWIN_FILE_CHECKSUMS[twin_uuid] = checksum
             summary["synced"] += 1
@@ -6296,6 +6922,8 @@ def reconcile_twin_json_file_sync() -> dict[str, Any]:
             _rebaseline_driver_metadata(twin_uuid)
 
     for twin_uuid in sorted(active_twin_uuids):
+        if cloud_reconciliation_paused():
+            break
         if twin_uuid in pushed_uuids:
             # Already in sync this cycle; the next cycle's pull will surface
             # any concurrent backend edits.
@@ -6765,6 +7393,196 @@ def _ensure_config_subdirs() -> None:
         _chown_if_needed(subdir)
 
 
+# Set when startup ran degraded (backend unreachable); the runtime loop then
+# finishes the skipped cloud steps through ``retry_degraded_startup``.
+_DEGRADED_STARTUP_PENDING = False
+_DEGRADED_RETRY_INTERVAL_SECONDS = 60.0
+_last_degraded_retry_at: Optional[float] = None
+
+
+def _begin_degraded_startup() -> None:
+    global _DEGRADED_STARTUP_PENDING, _last_degraded_retry_at
+    _DEGRADED_STARTUP_PENDING = True
+    _last_degraded_retry_at = time.monotonic()
+    logger.warning(
+        "Backend unreachable during startup; running degraded on the containers already "
+        "on this edge and retrying the cloud steps every %ds",
+        int(_DEGRADED_RETRY_INTERVAL_SECONDS),
+    )
+
+
+# Drivers edge-core stopped on its way down. ``docker stop`` keeps an
+# ``unless-stopped`` container down across reboots, and an online boot relaunches
+# drivers from the backend; an offline boot cannot, so it restarts these instead
+# of leaving the robot without drivers until the uplink returns.
+STOPPED_DRIVERS_FILE = CONFIG_DIR / "stopped_drivers.json"
+
+
+def _remember_drivers_stopped_at_shutdown(drivers: dict[str, str]) -> None:
+    try:
+        if drivers:
+            STOPPED_DRIVERS_FILE.write_text(json.dumps(drivers))
+        elif not _DEGRADED_STARTUP_PENDING:
+            # A degraded boot that could not list Docker adopted nothing; an
+            # empty map then says nothing about the drivers, so keep the record.
+            STOPPED_DRIVERS_FILE.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not record the drivers stopped at shutdown", exc_info=True)
+
+
+def _forget_drivers_stopped_at_shutdown() -> None:
+    try:
+        STOPPED_DRIVERS_FILE.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Could not remove %s", STOPPED_DRIVERS_FILE, exc_info=True)
+
+
+def _resume_drivers_stopped_at_shutdown() -> list[str]:
+    """Start the drivers the last shutdown stopped; returns the ones started.
+
+    Each started container is adopted into ``_CONTAINER_TWIN_MAP`` so it is
+    supervised like a driver launched this boot. The record is kept: a
+    shutdown before the backend answers rewrites it from that map, and the
+    deferred startup drops it once the backend has relaunched the drivers.
+    """
+    try:
+        recorded = json.loads(STOPPED_DRIVERS_FILE.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        logger.warning("Ignoring unreadable %s", STOPPED_DRIVERS_FILE, exc_info=True)
+        return []
+    if not isinstance(recorded, dict):
+        return []
+    existing = _list_driver_containers_or_none(include_stopped=True)
+    if existing is None:
+        return []
+    running = set(_list_driver_containers(include_stopped=False))
+    resumed: list[str] = []
+    for name, twin_uuid in recorded.items():
+        if not isinstance(name, str) or not isinstance(twin_uuid, str) or name not in existing:
+            continue
+        if name not in running:
+            try:
+                result = subprocess.run(
+                    ["docker", "start", name], capture_output=True, text=True, timeout=30
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.warning("Could not restart driver %s offline: %s", name, exc)
+                continue
+            if result.returncode != 0:
+                logger.warning(
+                    "Could not restart driver %s offline: %s", name, result.stderr.strip()
+                )
+                continue
+            resumed.append(name)
+        _CONTAINER_TWIN_MAP[name] = twin_uuid
+    if resumed:
+        logger.info(
+            "Backend unreachable; restarted %d driver(s) stopped at the last shutdown: %s",
+            len(resumed),
+            ", ".join(resumed),
+        )
+    return resumed
+
+
+def degraded_startup_pending() -> bool:
+    return _DEGRADED_STARTUP_PENDING
+
+
+def retry_degraded_startup(
+    *, resource_monitor: Optional[Any] = None, watchdog: Optional[Any] = None
+) -> bool:
+    """Finish a degraded startup once the backend answers; ``True`` when it did.
+
+    Repeats what :func:`run_startup_checks` skipped: token check, edge
+    registration, the early edge heartbeat, the Zenoh router and the driver
+    launch (on the images already on disk, since this runs inside the runtime
+    loop and a long pull would outlast its watchdog). Like a normal boot, the
+    launch recreates every driver, the ones the degraded boot restarted from
+    ``stopped_drivers.json`` included: they run the settings recorded at the
+    last shutdown, and the backend's may have changed since (a new service, new
+    driver params). Worker sync and start are left to their periodic reconcilers.
+    A token the backend now rejects is only logged: exiting would stop the
+    drivers this degraded boot kept running.
+    """
+    global _DEGRADED_STARTUP_PENDING, _last_degraded_retry_at
+    if not _DEGRADED_STARTUP_PENDING or cloud_reconciliation_paused():
+        return False
+    now = time.monotonic()
+    if (
+        _last_degraded_retry_at is not None
+        and now - _last_degraded_retry_at < _DEGRADED_RETRY_INTERVAL_SECONDS
+    ):
+        return False
+    _last_degraded_retry_at = now
+
+    token = load_token()
+    if not token:
+        return False
+    token_state = check_token(token)
+    if token_state == TOKEN_REJECTED:
+        logger.error(
+            "Backend rejected the edge token after a degraded start; run 'cyberwave login'. "
+            "Drivers already running are left as they are."
+        )
+    if token_state != TOKEN_VALID:
+        return False
+    if register_edge_outcome(token) != EDGE_REGISTERED:
+        return False
+
+    environment_uuid = load_environment_uuid()
+    fingerprint = get_or_create_fingerprint()
+    if environment_uuid and fingerprint:
+        # Steps 6 and 6c of a normal boot: without them an edge whose drivers
+        # all fail to start sends no heartbeat until edge-core restarts.
+        try:
+            linked_twin_uuids = _list_linked_twin_uuids_for_fingerprint(
+                token, environment_uuid, fingerprint
+            )
+        except Exception as exc:
+            if note_cloud_failure(exc):
+                return False
+            logger.warning("Deferred edge heartbeat bootstrap failed: %s", exc)
+        else:
+            _start_bootstrap_edge_health_publisher(
+                token,
+                linked_twin_uuids,
+                edge_id=fingerprint,
+                resource_monitor=resource_monitor,
+                watchdog=watchdog,
+            )
+        zenoh_cfg = _get_zenoh_config()
+        if zenoh_cfg.router_enabled:
+            _ping_watchdog(watchdog)
+            start_zenoh_router(zenoh_cfg, environment_uuid)
+            _ping_watchdog(watchdog)
+        logger.info(
+            "Relaunching this edge's drivers with the backend's current settings "
+            "(the ones restarted offline included)"
+        )
+        try:
+            results = fetch_and_run_twin_drivers(
+                token, environment_uuid, fingerprint, watchdog=watchdog, pull_images=False
+            )
+        except Exception as exc:
+            if note_cloud_failure(exc):
+                return False
+            logger.exception("Deferred driver startup failed")
+        else:
+            logger.info(
+                "Deferred driver startup launched %d/%d driver(s)",
+                sum(1 for r in results if r.get("success")),
+                len(results),
+            )
+            if any(r.get("success") for r in results):
+                _stop_bootstrap_edge_health_publisher()
+    _forget_drivers_stopped_at_shutdown()
+    _DEGRADED_STARTUP_PENDING = False
+    logger.info("Backend reachable again; completed the startup steps deferred while offline")
+    return True
+
+
 def run_startup_checks(
     *,
     resource_monitor: Optional[Any] = None,
@@ -6774,10 +7592,17 @@ def run_startup_checks(
 
     Prints a Rich-formatted report to the console.
     Returns ``True`` when startup may proceed (fatal checks passed).
-    Returns ``False`` only for missing credentials, invalid token, or
-    failed edge registration — conditions that make edge-core unusable.
-    Non-fatal issues (MQTT, environment link, drivers, workers) are
-    reported as warnings but do not block boot.
+    Returns ``False`` only for missing credentials, a token the backend
+    rejects, or an edge registration the backend refuses — conditions that
+    make edge-core unusable. Non-fatal issues (MQTT, environment link,
+    drivers, workers) are reported as warnings but do not block boot.
+
+    A backend that cannot be reached (see :func:`_is_cloud_unreachable_error`)
+    is not fatal: startup returns ``True`` in degraded mode right after the
+    registration step, and the runtime loop finishes the skipped cloud work
+    once the backend answers (:func:`retry_degraded_startup`). Exiting would
+    not help an offline edge: systemd restarts it straight into the same
+    failure, and nothing would supervise the drivers in between.
 
     ``resource_monitor`` and ``watchdog``, when provided, are folded into
     the bootstrap ``edge_health`` publisher so the very first heartbeat
@@ -6815,9 +7640,16 @@ def run_startup_checks(
 
     # 2 — token validity
     _t0 = time.perf_counter()
-    token_valid = validate_token(token)
-    if token_valid:
+    token_state = check_token(token)
+    degraded = token_state == CLOUD_UNREACHABLE
+    if token_state == TOKEN_VALID:
         console.print(f"  [green]✓[/green] Token [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
+    elif degraded:
+        had_warnings = True
+        console.print(
+            f"  [yellow]⚠[/yellow] Token [dim](backend unreachable, "
+            f"{time.perf_counter() - _t0:.3f}s)[/dim]"
+        )
     else:
         console.print(f"  [red]✗[/red] Token [dim]({time.perf_counter() - _t0:.3f}s)[/dim]")
         console.print(f"  [red]Token validation failed against {base_url}[/red]")
@@ -6825,10 +7657,13 @@ def run_startup_checks(
         console.print("  [dim]Run 'cyberwave login' to refresh your credentials.[/dim]")
         return False
 
-    # 3 — MQTT broker
+    # 3 — MQTT broker. Skipped when degraded: its blocking connect retries
+    # would add ~30 s to a boot that already knows the uplink is down.
     _t0 = time.perf_counter()
-    mqtt_ok = check_mqtt_connection(token)
-    if mqtt_ok:
+    mqtt_ok = False if degraded else check_mqtt_connection(token)
+    if degraded:
+        console.print("  [yellow]⚠[/yellow] MQTT broker [dim](skipped: backend unreachable)[/dim]")
+    elif mqtt_ok:
         console.print(
             f"  [green]✓[/green] MQTT broker [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
         )
@@ -6840,10 +7675,16 @@ def run_startup_checks(
 
     # 4: Edge registering
     _t0 = time.perf_counter()
-    edge_ok = register_edge(token)
-    if edge_ok:
+    edge_state = CLOUD_UNREACHABLE if degraded else register_edge_outcome(token)
+    if edge_state == EDGE_REGISTERED:
         console.print(
             f"  [green]✓[/green] Edge registration [dim]({time.perf_counter() - _t0:.3f}s)[/dim]"
+        )
+    elif edge_state == CLOUD_UNREACHABLE:
+        degraded = had_warnings = True
+        console.print(
+            f"  [yellow]⚠[/yellow] Edge registration [dim](backend unreachable, "
+            f"{time.perf_counter() - _t0:.3f}s)[/dim]"
         )
     else:
         console.print(
@@ -6863,6 +7704,19 @@ def run_startup_checks(
     else:
         had_warnings = True
         console.print(f"  [yellow]⚠[/yellow] Host facts [dim]({elapsed:.3f}s)[/dim]")
+
+    if degraded:
+        _begin_degraded_startup()
+        resumed = _resume_drivers_stopped_at_shutdown()
+        console.print(
+            "\n[yellow]Backend unreachable — running degraded.[/yellow] Driver containers "
+            "already on this edge keep running"
+            + (f" ({len(resumed)} restarted after the last shutdown)" if resumed else "")
+            + " and stay supervised (logs, flap detection, cleanup); new or changed drivers, "
+            "twin sync, workflows and remote commands wait until the backend answers, when "
+            "the rest of startup completes on its own.\n"
+        )
+        return True
 
     # 5 — linked environment
     _t0 = time.perf_counter()
@@ -6956,6 +7810,8 @@ def run_startup_checks(
                 results = fetch_and_run_twin_drivers(
                     token, environment_uuid, fingerprint, watchdog=watchdog
                 )
+                # The backend now decides which drivers run.
+                _forget_drivers_stopped_at_shutdown()
             except Exception as exc:
                 had_warnings = True
                 logger.exception("Twin driver startup failed")
@@ -7454,14 +8310,18 @@ def _run_periodic_docker_cleanup() -> None:
 
     if now - _last_container_prune_time >= CONTAINER_PRUNE_INTERVAL_SECONDS:
         try:
-            docker_prune_stopped_cyberwave_containers(keep_label=MIN_RESTART_INTERVAL_LABEL)
+            # A flap-stopped driver is relaunched later from the image on disk;
+            # pruning its container would leave that image to image GC.
+            docker_prune_stopped_cyberwave_containers(
+                keep_label=MIN_RESTART_INTERVAL_LABEL, keep_names=set(_FLAP_STOPPED)
+            )
         except Exception:
             logger.exception("Unexpected error during stopped-container prune")
         _last_container_prune_time = now
 
     if now - _last_image_prune_time >= IMAGE_PRUNE_INTERVAL_SECONDS:
         try:
-            docker_prune_unused_images()
+            docker_prune_unused_images(keep=_flap_stopped_images())
         except Exception:
             logger.exception("Unexpected error during unused-image prune")
         _last_image_prune_time = now
@@ -7580,6 +8440,9 @@ def _raise_saturation(
 def _deliver_saturation_alerts(resource: str) -> None:
     saturation = _SATURATED[resource]
     for twin_uuid in sorted(saturation.undelivered):
+        # Kept for a later reading while the backend is unreachable.
+        if cloud_reconciliation_paused():
+            return
         try:
             _send_alert_for_twin(
                 twin_uuid,
@@ -7589,7 +8452,8 @@ def _deliver_saturation_alerts(resource: str) -> None:
                 severity="warning",
                 metadata=saturation.metadata,
             )
-        except Exception:
+        except Exception as exc:
+            note_twin_call_failure(exc)
             logger.warning(
                 "Could not raise edge_%s_saturation for twin %s; retrying", resource, twin_uuid
             )
@@ -7601,9 +8465,13 @@ def _resolve_saturation_alerts(resource: str) -> None:
     twins = _SATURATION_UNRESOLVED.get(resource, set())
     alerted = _SATURATED[resource].twins if resource in _SATURATED else set()
     for twin_uuid in sorted(twins - alerted):
+        # Kept for a later reading while the backend is unreachable.
+        if cloud_reconciliation_paused():
+            return
         try:
             resolve_active_alerts_for_twin(twin_uuid, f"edge_{resource}_saturation", strict=True)
-        except Exception:
+        except Exception as exc:
+            note_twin_call_failure(exc)
             logger.warning(
                 "Could not resolve edge_%s_saturation for twin %s; retrying", resource, twin_uuid
             )
@@ -7664,6 +8532,22 @@ def reconcile_resource_saturation(resource_monitor: Any) -> None:
             _raise_saturation(resource, percent, threshold, since, now)
 
 
+def _ping_watchdog(watchdog: Optional[Any]) -> None:
+    """Feed *watchdog* between runtime-loop steps.
+
+    A tick adds up many bounded network calls and Docker commands, so pinging
+    only once per tick made ``WatchdogSec`` a bound on their sum. Pinging
+    between steps bounds each step instead. It stays on the loop thread on
+    purpose: a step that hangs stops the pings, and the watchdog fires.
+    """
+    if watchdog is None:
+        return
+    try:
+        watchdog.ping()
+    except Exception:
+        logger.debug("Watchdog ping failed", exc_info=True)
+
+
 def run_runtime_loop(
     *,
     watchdog: Optional[Any] = None,
@@ -7703,23 +8587,36 @@ def run_runtime_loop(
         adopt_saturation_alerts_left_open()
 
     while not shutdown_event.is_set():
-        attached = reconcile_driver_log_streams()
-        logger.debug(
-            "Driver log follower reconcile complete (active_streams=%d, tracked=%d)",
-            attached,
-            len(_CONTAINER_LOG_THREADS),
-        )
-        restart_summary = reconcile_driver_restart_failures()
-        logger.debug(
-            (
-                "Driver restart reconcile complete "
-                "(inspected=%d, flapping=%d, stopped=%d, alerts_sent=%d)"
-            ),
-            restart_summary["inspected"],
-            restart_summary["flapping"],
-            restart_summary["stopped"],
-            restart_summary["alerts_sent"],
-        )
+        # Every step below is guarded: one that raises must not end the loop,
+        # since nothing would then supervise the drivers or feed the watchdog.
+        # The watchdog is fed between steps on this thread, so a slow tick is
+        # not mistaken for a hang while a step that really hangs still is.
+        try:
+            attached = reconcile_driver_log_streams()
+            logger.debug(
+                "Driver log follower reconcile complete (active_streams=%d, tracked=%d)",
+                attached,
+                len(_CONTAINER_LOG_THREADS),
+            )
+        except Exception:
+            logger.exception("Unexpected error in driver log stream reconciliation")
+
+        restart_summary = {"inspected": 0, "flapping": 0, "stopped": 0, "alerts_sent": 0}
+        try:
+            restart_summary = reconcile_driver_restart_failures()
+            logger.debug(
+                (
+                    "Driver restart reconcile complete "
+                    "(inspected=%d, flapping=%d, stopped=%d, alerts_sent=%d)"
+                ),
+                restart_summary["inspected"],
+                restart_summary["flapping"],
+                restart_summary["stopped"],
+                restart_summary["alerts_sent"],
+            )
+        except Exception:
+            logger.exception("Unexpected error in driver restart reconciliation")
+        _ping_watchdog(watchdog)
 
         try:
             driver_health = reconcile_driver_health_for_worker()
@@ -7735,13 +8632,33 @@ def run_runtime_loop(
         except Exception:
             logger.exception("Unexpected error in driver health reconciliation")
 
+        # Cloud steps from here on are skipped while the breaker is open
+        # (see note_cloud_failure): each would wait out its timeouts.
+        _end_cloud_pause_on_mqtt_reconnect()
+        deferred_done = False
+        if cloud_reconciliation_paused():
+            logger.debug("Backend unreachable; skipping cloud reconciliation this tick")
+        else:
+            try:
+                deferred_done = retry_degraded_startup(
+                    resource_monitor=resource_monitor, watchdog=watchdog
+                )
+            except Exception as exc:
+                if not note_cloud_failure(exc):
+                    logger.exception("Unexpected error completing the degraded startup")
+            _ping_watchdog(watchdog)
+
         try:
             # Skip revival in the same tick the flap detector stopped a
             # driver — otherwise we'd immediately undo its decision and
             # start a tug-of-war.  Debounce inside reconcile_driver_revival
-            # handles the steady-state "always-down" twin case.
+            # handles the steady-state "always-down" twin case.  Skip it as
+            # well when the deferred startup just launched the drivers: the
+            # health snapshot predates that launch, so revival would launch
+            # a driver it shows down a second time.
             revival_summary = reconcile_driver_revival(
-                skip_revival=restart_summary["stopped"] > 0,
+                skip_revival=restart_summary["stopped"] > 0 or deferred_done,
+                watchdog=watchdog,
             )
             if revival_summary["revived_attempted"]:
                 logger.info(
@@ -7753,27 +8670,37 @@ def run_runtime_loop(
                 logger.debug(
                     "Driver revival reconcile skipped "
                     "(down=%d, orphans=%d, restart_no=%d, restart_floor=%d, "
-                    "flap_protected=%d, debounced=%d, no_credentials=%d)",
+                    "flap_protected=%d, flap_backoff=%d, debounced=%d, no_credentials=%d, "
+                    "backend_unreachable=%d)",
                     revival_summary["down"],
                     revival_summary["skipped_orphan"],
                     revival_summary["skipped_restart_no"],
                     revival_summary["skipped_restart_floor"],
                     revival_summary["skipped_flap_protection"],
+                    revival_summary["skipped_flap_backoff"],
                     revival_summary["skipped_debounce"],
                     revival_summary["skipped_no_credentials"],
+                    revival_summary["skipped_backend_unreachable"],
                 )
         except Exception:
             logger.exception("Unexpected error in driver revival reconciliation")
+        _ping_watchdog(watchdog)
 
-        twin_sync_summary = reconcile_twin_json_file_sync()
-        logger.debug(
-            "Twin JSON sync reconcile complete "
-            "(tracked=%d, changed=%d, synced=%d, pulled=%d)",
-            twin_sync_summary["tracked"],
-            twin_sync_summary["changed"],
-            twin_sync_summary["synced"],
-            twin_sync_summary.get("pulled", 0),
-        )
+        twin_sync_summary: dict[str, Any] = {}
+        try:
+            twin_sync_summary = reconcile_twin_json_file_sync()
+            logger.debug(
+                "Twin JSON sync reconcile complete "
+                "(tracked=%d, changed=%d, synced=%d, pulled=%d)",
+                twin_sync_summary["tracked"],
+                twin_sync_summary["changed"],
+                twin_sync_summary["synced"],
+                twin_sync_summary.get("pulled", 0),
+            )
+        except Exception as exc:
+            if not note_cloud_failure(exc):
+                logger.exception("Unexpected error in twin JSON sync reconciliation")
+        _ping_watchdog(watchdog)
 
         try:
             reconcile_driver_metadata_restarts(
@@ -7798,45 +8725,65 @@ def run_runtime_loop(
         except Exception:
             logger.exception("Unexpected error in worker file reconciliation")
 
-        try:
-            ensure_edge_command_subscription()
-        except Exception:
-            logger.exception("Unexpected error while ensuring edge command subscription")
+        _ping_watchdog(watchdog)
 
-        try:
-            ensure_twin_command_subscriptions()
-        except Exception:
-            logger.exception("Unexpected error while ensuring twin command subscriptions")
+        if not cloud_reconciliation_paused():
+            try:
+                ensure_edge_command_subscription()
+            except Exception as exc:
+                if not note_cloud_failure(exc):
+                    logger.exception("Unexpected error while ensuring edge command subscription")
+
+        if not cloud_reconciliation_paused():
+            try:
+                ensure_twin_command_subscriptions()
+            except Exception as exc:
+                if not note_cloud_failure(exc):
+                    logger.exception("Unexpected error while ensuring twin command subscriptions")
+        _ping_watchdog(watchdog)
 
         # Keep the leases of running drivers' twin-scoped tokens alive
-        # (throttled internally; CYB-4275 G5).
-        try:
-            from . import driver_credentials as _driver_credentials
+        # (throttled internally; CYB-4275 G5). A lease that runs out while the
+        # backend is unreachable could not have been renewed anyway.
+        if not cloud_reconciliation_paused():
+            try:
+                from . import driver_credentials as _driver_credentials
 
-            _driver_credentials.maybe_renew_driver_tokens(
-                twin_uuids=lambda: set(_CONTAINER_TWIN_MAP.values()),
-                edge_token=load_token,
-                base_url=lambda: (
-                    get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL)
-                    or DEFAULT_API_URL
-                ),
-                config_dir=CONFIG_DIR,
-            )
-        except Exception:
-            logger.exception("Unexpected error while renewing driver tokens")
+                _driver_credentials.maybe_renew_driver_tokens(
+                    twin_uuids=lambda: set(_CONTAINER_TWIN_MAP.values()),
+                    edge_token=load_token,
+                    base_url=lambda: (
+                        get_runtime_env_var("CYBERWAVE_BASE_URL", DEFAULT_API_URL)
+                        or DEFAULT_API_URL
+                    ),
+                    config_dir=CONFIG_DIR,
+                )
+            except Exception as exc:
+                if not note_cloud_failure(exc):
+                    logger.exception("Unexpected error while renewing driver tokens")
+            _ping_watchdog(watchdog)
 
-        # Periodically refresh edge.json from the backend.
+        # Periodically refresh edge.json from the backend. A sync that comes
+        # due while the breaker is open runs on the first tick after it.
         _edge_json_sync_loop_counter += 1
-        if _edge_json_sync_loop_counter >= _EDGE_JSON_SYNC_INTERVAL_LOOPS:
+        if (
+            _edge_json_sync_loop_counter >= _EDGE_JSON_SYNC_INTERVAL_LOOPS
+            and not cloud_reconciliation_paused()
+        ):
             _edge_json_sync_loop_counter = 0
             try:
                 reconcile_edge_json_file_sync()
-            except Exception:
-                logger.exception("Unexpected error during edge JSON sync")
+            except Exception as exc:
+                if not note_cloud_failure(exc):
+                    logger.exception("Unexpected error during edge JSON sync")
+            _ping_watchdog(watchdog)
 
         # Periodically pull updated generated worker files from the backend.
         _worker_sync_loop_counter += 1
-        if _worker_sync_loop_counter >= _WORKER_SYNC_INTERVAL_LOOPS:
+        if (
+            _worker_sync_loop_counter >= _WORKER_SYNC_INTERVAL_LOOPS
+            and not cloud_reconciliation_paused()
+        ):
             _worker_sync_loop_counter = 0
             try:
                 worker_sync_summary = reconcile_worker_sync()
@@ -7864,18 +8811,19 @@ def run_runtime_loop(
                     logger.exception(
                         "Unexpected error during worker lifecycle reconcile"
                     )
-            except Exception:
-                logger.exception("Unexpected error during worker sync reconcile")
+            except Exception as exc:
+                if not note_cloud_failure(exc):
+                    logger.exception("Unexpected error during worker sync reconcile")
+            _ping_watchdog(watchdog)
 
         # -- Periodic Docker cleanup (CYB-1996) ------------------------------
-        _run_periodic_docker_cleanup()
+        try:
+            _run_periodic_docker_cleanup()
+        except Exception:
+            logger.exception("Unexpected error during periodic Docker cleanup")
 
         # -- Watchdog and resource monitoring at end of each cycle -----------
-        if watchdog is not None:
-            try:
-                watchdog.ping()
-            except Exception:
-                logger.debug("Watchdog ping failed", exc_info=True)
+        _ping_watchdog(watchdog)
 
         if resource_monitor is not None:
             try:
@@ -7886,6 +8834,7 @@ def run_runtime_loop(
                 reconcile_resource_saturation(resource_monitor)
             except Exception:
                 logger.exception("Unexpected error in resource saturation reconciliation")
+            _ping_watchdog(watchdog)
 
         shutdown_event.wait(LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
 
@@ -7919,6 +8868,7 @@ def _graceful_shutdown(worker_watcher: Optional[Any]) -> None:
 
     # 2. Stop driver containers (they have --stop-timeout already).
     driver_containers = list(_CONTAINER_TWIN_MAP.keys())
+    _remember_drivers_stopped_at_shutdown(dict(_CONTAINER_TWIN_MAP))
     if driver_containers:
         import subprocess as _sp
 

@@ -147,6 +147,11 @@ def cli(ctx: click.Context) -> None:
         # first heartbeat instead of "metric absent" for ~30 s.
         resource_monitor.check()
 
+        # Before the boot checks: an unbounded SDK call against a dead uplink
+        # (urllib3's default timeout and Retry(3)) held startup for minutes
+        # per call. Only calls without their own timeout are bounded; the
+        # long transfers (models, driver credentials) go through httpx.
+        bound_sdk_request_timeouts()
         startup_ok = run_startup_checks(resource_monitor=resource_monitor, watchdog=watchdog)
         if shutdown_event.is_set():
             from .startup import _graceful_shutdown, _stop_worker_container_for_restart
@@ -176,7 +181,6 @@ def cli(ctx: click.Context) -> None:
         # reconcile cycle thereafter.
         watchdog.mark_ready()
         watchdog.start_pinging(ping_interval_seconds=LOG_FOLLOWER_RECONCILE_INTERVAL_SECONDS)
-        bound_sdk_request_timeouts()
         try:
             run_runtime_loop(
                 watchdog=watchdog,

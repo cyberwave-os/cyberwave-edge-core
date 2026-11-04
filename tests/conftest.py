@@ -33,3 +33,21 @@ def _legacy_driver_tokens_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.delenv(driver_credentials.MODE_ENV, raising=False)
     monkeypatch.setattr(driver_credentials, "DEFAULT_MODE", driver_credentials.MODE_LEGACY)
+
+
+@pytest.fixture(autouse=True)
+def _closed_cloud_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with the backend reachable and no degraded or flap state.
+
+    The breaker is module-level: a test whose fake backend raises a network
+    error would otherwise pause the cloud steps of the tests after it.
+    """
+    from cyberwave_edge_core import startup  # noqa: PLC0415
+
+    monkeypatch.setattr(startup, "_cloud_paused_until", 0.0)
+    monkeypatch.setattr(startup, "_cloud_backoff_seconds", 0.0)
+    monkeypatch.setattr(startup, "_cloud_unreachable", False)
+    monkeypatch.setattr(startup, "_DEGRADED_STARTUP_PENDING", False)
+    monkeypatch.setattr(startup, "_last_degraded_retry_at", None)
+    monkeypatch.setattr(startup, "_shared_mqtt_was_connected", None)
+    monkeypatch.setattr(startup, "_FLAP_STOPPED", {})

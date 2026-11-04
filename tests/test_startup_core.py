@@ -2139,9 +2139,9 @@ class TestStartupHeartbeatOrdering:
         call_order: list[str] = []
 
         monkeypatch.setattr(startup, "load_token", lambda: "token-123")
-        monkeypatch.setattr(startup, "validate_token", lambda token: True)
+        monkeypatch.setattr(startup, "check_token", lambda token: startup.TOKEN_VALID)
         monkeypatch.setattr(startup, "check_mqtt_connection", lambda token: True)
-        monkeypatch.setattr(startup, "register_edge", lambda token: True)
+        monkeypatch.setattr(startup, "register_edge_outcome", lambda token: startup.EDGE_REGISTERED)
         # ``_upload_host_facts_on_startup`` would otherwise try to call the
         # real backend.  Treat it as best-effort (already non-fatal in
         # production) and just record the call ordering.

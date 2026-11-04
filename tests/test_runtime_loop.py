@@ -308,7 +308,8 @@ class TestRuntimeLoopSyncCadence:
         self._stop_after(3, monkeypatch)
         startup.run_runtime_loop(watchdog=FakeWatchdog())
 
-        assert ping_count[0] == 3
+        # Fed between the steps of a cycle, so several times per cycle.
+        assert ping_count[0] >= 3 and ping_count[0] % 3 == 0
 
     def test_resource_monitor_checked_each_cycle(self, monkeypatch):
         """Verify the resource monitor is checked every reconcile cycle."""
@@ -345,7 +346,7 @@ class TestRuntimeLoopSyncCadence:
         self._stop_after(2, monkeypatch)
         startup.run_runtime_loop(watchdog=FailingWatchdog())
 
-        assert ping_count[0] == 2
+        assert ping_count[0] >= 2 and ping_count[0] % 2 == 0
 
     def test_pulled_metadata_changes_reach_the_restart_reconciler(self, monkeypatch):
         self._patch_loop_deps(monkeypatch)
@@ -395,6 +396,38 @@ class TestRuntimeLoopSyncCadence:
         startup.run_runtime_loop(resource_monitor=FakeResourceMonitor())
 
         assert order == ["check", "saturation", "check", "saturation"]
+
+    def test_the_watchdog_is_fed_after_the_saturation_alerts(self, monkeypatch):
+        """Their cloud calls end the tick, ahead of the 15 s wait: unfed, the two add up."""
+        self._patch_loop_deps(monkeypatch)
+        monkeypatch.setattr(startup, "_WORKER_SYNC_INTERVAL_LOOPS", 100)
+        order = []
+
+        class FakeResourceMonitor:
+            def check(self):
+                pass
+
+        class RecordingWatchdog:
+            def ping(self):
+                order.append("ping")
+
+        monkeypatch.setattr(
+            startup, "reconcile_resource_saturation", lambda monitor: order.append("saturation")
+        )
+        real_event = startup.shutdown_event
+
+        def fake_wait(timeout=None):
+            order.append("wait")
+            real_event.set()
+            return True
+
+        monkeypatch.setattr(real_event, "wait", fake_wait)
+
+        startup.run_runtime_loop(
+            watchdog=RecordingWatchdog(), resource_monitor=FakeResourceMonitor()
+        )
+
+        assert order[-3:] == ["saturation", "ping", "wait"]
 
     def test_periodic_docker_cleanup_called(self, monkeypatch):
         """Verify _run_periodic_docker_cleanup is called each cycle."""
@@ -498,7 +531,7 @@ class TestRunPeriodicDockerCleanup:
         monkeypatch.setattr(
             _dh,
             "docker_prune_unused_images",
-            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+            lambda **kw: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
         )
         monkeypatch.setattr(_dh, "docker_prune_dangling_volumes", lambda: True)
         monkeypatch.setattr(
@@ -533,7 +566,7 @@ class TestRunPeriodicDockerCleanup:
         monkeypatch.setattr(
             _dh,
             "docker_prune_unused_images",
-            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+            lambda **kw: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
         )
 
         startup._run_periodic_docker_cleanup()
@@ -564,7 +597,7 @@ class TestRunPeriodicDockerCleanup:
         monkeypatch.setattr(
             _dh,
             "docker_prune_unused_images",
-            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+            lambda **kw: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
         )
 
         startup._run_periodic_docker_cleanup()
@@ -590,7 +623,7 @@ class TestRunPeriodicDockerCleanup:
         monkeypatch.setattr(
             _dh,
             "docker_prune_unused_images",
-            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+            lambda **kw: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
         )
 
         startup._run_periodic_docker_cleanup()
@@ -783,7 +816,7 @@ class TestRunPeriodicDockerCleanup:
         monkeypatch.setattr(
             _dh,
             "docker_prune_unused_images",
-            lambda: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
+            lambda **kw: image_prune_calls.__setitem__(0, image_prune_calls[0] + 1) or True,
         )
 
         startup._run_periodic_docker_cleanup()
