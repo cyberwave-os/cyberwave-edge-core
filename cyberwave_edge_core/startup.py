@@ -2857,7 +2857,11 @@ def _build_driver_restart_loop_message(
         f"{restart_window_count} times in the last "
         f"{int(DRIVER_RESTART_LOOP_WINDOW_SECONDS)} seconds "
         f"(total restarts reported by Docker: {restart_count}). "
-        f"The container was stopped automatically to prevent continuous rebooting. "
+        f"The container was stopped, and Edge Core will start it again in "
+        f"{int(_FLAP_REVIVAL_BACKOFF_INITIAL_SECONDS // 60)} minutes, then at "
+        f"growing intervals up to {int(_FLAP_REVIVAL_BACKOFF_MAX_SECONDS // 60)} "
+        f"minutes, until it has run for {int(_FLAP_STABLE_RUN_SECONDS // 60)} "
+        f"minutes. Stop the twin's driver before working on the robot. "
         f"Troubleshooting: {DRIVER_TROUBLESHOOTING_URL}"
     )
 

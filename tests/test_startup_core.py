@@ -550,6 +550,19 @@ class TestReconcileDriverRestartFailures:
         assert alerts[0][0][0] == twin_uuid
         assert alerts[0][0][3] == "driver_restart_loop"
 
+    def test_restart_loop_message_states_revival(self):
+        message = startup._build_driver_restart_loop_message(
+            twin_name="t",
+            container_name="c",
+            restart_count=9,
+            restart_window_count=6,
+        )
+
+        assert "start it again in 2 minutes" in message
+        assert "up to 30 minutes" in message
+        assert "run for 10 minutes" in message
+        assert "stopped automatically" not in message
+
     def test_does_not_alert_for_sparse_restarts_outside_window(self, monkeypatch):
         container_name = "cyberwave-driver-1234abcd"
         twin_uuid = "22222222-2222-2222-2222-222222222222"
